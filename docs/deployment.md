@@ -1,0 +1,447 @@
+# s-gw Deployment
+
+s-gw is deployed on the same machine that runs the coding agent. Do not deploy it as a remote MCP server that receives credential material.
+
+## Deployment Model
+
+The supported local model is:
+
+1. Install the local `s-gw` CLI and `s-gw-mcp` stdio server.
+2. Store the local ledger unlock passphrase in the user's OS credential store.
+3. Initialize the local encrypted ledger under `SGW_HOME`.
+4. Enroll secrets from the local terminal, not from chat.
+5. Configure each coding tool to launch the local stdio MCP server.
+6. Launch CLI agents through guard mode when environment credential interception is needed.
+7. Approve secret-backed actions locally with the native macOS app or `s-gw approve <request-id>`.
+
+Raw credentials stay in the local encrypted ledger and are decrypted only inside an approved local execution path.
+
+## Distribution Options
+
+### Source Package Or Tarball
+
+This is the current practical installation path before signed public downloads are available.
+
+Package:
+
+```bash
+npm run package:local
+```
+
+Install on the local machine:
+
+```bash
+npm install -g ./s-gw-0.1.0.tgz
+s-gw setup
+```
+
+For most macOS users, this is the complete first run. `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI.
+
+For source-based installs:
+
+```bash
+git clone <repo-url> s-gw
+cd s-gw
+npm install
+npm run build
+npm link
+```
+
+### Signed macOS Installer
+
+Before publishing a macOS download, package a signed and notarized installer that includes:
+
+- Node runtime or a bundled standalone executable;
+- `s-gw` CLI;
+- `s-gw-mcp` stdio server;
+- native macOS Keychain helper;
+- native macOS management app;
+- a launcher or profile script that puts `s-gw` on PATH;
+- optional managed defaults for `SGW_HOME` and policy templates.
+
+This is the preferred enterprise deployment shape for MDM/Jamf/Kandji-style rollout. The installer should not pre-seed user passphrases or raw secrets.
+
+### Homebrew
+
+Homebrew is a good developer-friendly channel after the native helper is code signed. It is less controlled than an enterprise `.pkg`, but easy for individual developers:
+
+```bash
+brew install s-gw
+```
+
+### Not Recommended: Remote MCP Hosting
+
+Do not host s-gw as a shared remote MCP service for user credentials. Remote services may provide documentation, policy templates, inventory, or aggregate reporting, but secret storage and redemption should remain local.
+
+## First-Run Setup
+
+### Recommended: One Command
+
+```bash
+s-gw setup
+```
+
+Useful variants:
+
+```bash
+s-gw setup --no-open-app
+s-gw setup --passphrase-stdin
+s-gw setup --no-menubar
+```
+
+`--no-open-console` is still accepted for compatibility with early builds.
+
+After setup:
+
+```bash
+s-gw status
+s-gw start
+s-gw stop
+s-gw guard status
+```
+
+### Manual Setup
+
+Set the local unlock passphrase:
+
+```bash
+read -rsp "s-gw passphrase: " SGW_UNLOCK
+printf '%s' "$SGW_UNLOCK" | s-gw unlock keychain set --value-stdin
+unset SGW_UNLOCK
+s-gw unlock status
+```
+
+Initialize local storage:
+
+```bash
+s-gw init
+```
+
+Enroll a secret with an exact command grant:
+
+```bash
+printf '%s' "$MY_API_TOKEN" | s-gw secret add \
+  --name demo-token \
+  --type api-token \
+  --value-stdin \
+  --inject-env API_TOKEN \
+  --allow-command "$(command -v node)"
+```
+
+Configure the coding tool using [integrations.md](integrations.md).
+
+Launch supported CLI agents through guard mode:
+
+```bash
+s-gw run codex --dry-run -- -v
+s-gw run codex -- --ask-for-approval never
+s-gw guard run claude-code -- --help
+```
+
+Guard mode tokenizes credential-looking environment values before the agent starts. It does not yet claim OS-wide prompt, file, shell, or terminal interception; those should be added through explicit agent config installers and command wrappers with backups and dry-run previews.
+
+Launch the native macOS management app:
+
+```bash
+s-gw app open
+```
+
+The app shows daemon health, Keychain status, credential handles, pending approvals, configured agents, and audit events. It uses the installed local CLI and store; raw secret values are only provided to local approved execution paths.
+
+Choose the approval mode in the app's Settings panel, or configure it from the CLI:
+
+```bash
+s-gw approval set --mode per-transaction
+s-gw approval set --mode timed-session --duration 15m
+s-gw approval set --mode login-session
+```
+
+`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint, so approving one command does not authorize unrelated commands or credentials.
+
+For managed installs, use approval policy rules for per-agent and per-credential defaults that should survive restarts:
+
+```bash
+s-gw approval policy add \
+  --name "Cursor may use dev GitHub token" \
+  --decision allow \
+  --handle "$HANDLE" \
+  --agent Cursor \
+  --command "$(command -v git)" \
+  --inject-env GITHUB_TOKEN
+
+s-gw approval policy add \
+  --name "Critical secrets ask first" \
+  --decision ask \
+  --min-severity critical \
+  --priority 10
+```
+
+Policy rules can match credential handles, types, providers, minimum severity, agent names, action kinds, commands, injected environment names, working directories, SSH targets, and SSH ports. `allow` skips the approval popup for matching requests, `ask` keeps the normal approval/grant flow, and `deny` blocks matching requests before local execution.
+
+Launch the fallback browser console when needed:
+
+```bash
+s-gw console
+```
+
+The console binds to `127.0.0.1`, serves the UI from the installed package, and injects a per-session token into the page. That token is required for local API writes such as approving or denying requests, so another browser origin cannot silently drive the credential API with a plain form post.
+
+For a background setup, install the per-user console LaunchAgent instead:
+
+```bash
+s-gw service install --start
+s-gw service status
+```
+
+This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at login and writes logs under `~/.s-gw/logs`.
+
+Launch the native menu-bar helper:
+
+```bash
+s-gw menubar open
+```
+
+Use the menu-bar count to choose what appears next to the icon:
+
+```bash
+s-gw menubar open --count pending
+s-gw menubar open --count credentials
+s-gw menubar open --count none
+```
+
+Install it as a login item:
+
+```bash
+s-gw menubar install --start --count pending
+s-gw menubar status
+```
+
+The standalone helper is the only menu-bar owner. It is a small `LSUIElement` app bundled at `dist/s-gw Menu Bar.app`, remains available when the main app is closed, opens the native app by default, and keeps the web console as a fallback action.
+
+### Windows Preview Client
+
+The package also stages a Windows client and tray helper:
+
+```powershell
+npm run build:windows-client
+s-gw app open
+s-gw helper open
+```
+
+On Windows, `s-gw app open` launches `dist\windows\s-gw-client.ps1`. It starts the local console on `127.0.0.1` if needed, then opens the UI in Edge or Chrome app mode. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
+
+The Windows Credential Manager helper is staged at `dist\windows\s-gw-credential.ps1`. It uses the Windows credential APIs and receives new values on stdin, so unlock passphrases and secret values are not passed as process arguments. Signed `.exe` wrappers, login-start registration, and MSIX/installer packaging are still separate hardening work.
+
+### Local Installer Artifacts
+
+Build both platform downloads from the current source and package version:
+
+```bash
+npm run build:installers
+```
+
+The command rebuilds the native clients and console, then writes these files under `dist/installers`:
+
+- `s-gw-VERSION-macos.dmg`, containing the local npm package and a double-clickable setup command;
+- `s-gw-VERSION-windows.zip`, containing the local npm package plus PowerShell and CMD setup launchers;
+- `s-gw-VERSION.tgz`, used by both installers and the in-app updater;
+- `SHA256SUMS.txt` and per-artifact `.sha256` files.
+
+The installer scripts require Node.js 20 or newer, install the bundled package globally, and run `s-gw setup`. They do not contain credentials or pre-seeded unlock material. The macOS DMG is not ready for public distribution until Developer ID signing and notarization are added. The Windows ZIP remains a preview until it is validated on Windows and replaced or supplemented by a signed installer format.
+
+## Data Locations
+
+Default local ledger:
+
+```text
+~/.s-gw/store.json
+```
+
+Default Keychain item:
+
+```text
+service: com.s-gw.sgw.master-passphrase
+account: <local username>
+```
+
+Environment overrides:
+
+```bash
+export SGW_HOME="$HOME/.s-gw"
+export SGW_KEYCHAIN_SERVICE="com.s-gw.sgw.master-passphrase"
+export SGW_KEYCHAIN_ACCOUNT="$USER"
+```
+
+`SGW_MASTER_PASSPHRASE` remains available for automation and tests, but should not be used in repo-scoped MCP config.
+
+### macOS Keychain backend
+
+For individual macOS users, prefer Keychain-backed handles. The local ledger stores only encrypted handle metadata and a Keychain pointer; the credential value is stored in the user's login Keychain:
+
+```bash
+printf '%s' "$GITHUB_TOKEN" | s-gw secret add-keychain \
+  --name github-prod \
+  --type api-token \
+  --value-stdin \
+  --inject-env GITHUB_TOKEN \
+  --allow-command "$(command -v gh)"
+```
+
+Use `SGW_SECRET_KEYCHAIN_SERVICE` or `--service` to isolate test, work, or user credential namespaces.
+
+### 1Password backend
+
+If credentials already live in 1Password, s-gw can use `op://...` references as an optional backend or migration source. Reusable approvals read 1Password once, then keep an encrypted local keystore copy until the approval expires or is revoked:
+
+```bash
+s-gw secret add-1password \
+  --name github-prod \
+  --type api-token \
+  --ref 'op://Example/GitHub/credential' \
+  --inject-env GITHUB_TOKEN \
+  --allow-command "$(command -v gh)" \
+  --verify
+```
+
+For interactive desktop users, the first approved reusable use may still require the normal 1Password app/CLI unlock. Later matching uses stay in s-gw until the TTL ends. For team automation, set `OP_SERVICE_ACCOUNT_TOKEN` in the environment used by the local s-gw service.
+
+## Operational Recovery
+
+If the machine sleeps or a command is killed mid-run, the in-flight request can be left in an `executing` state. s-gw reaps these automatically a few minutes after the runner goes silent, so the store self-heals without intervention. An operator who wants to clear them immediately can:
+
+```bash
+s-gw requests                       # inspect request states
+s-gw requests --recover             # fail every stranded execution now
+s-gw requests --recover REQUEST_ID  # fail one specific stranded execution
+```
+
+The native app and browser console expose the same action on a stuck request. Recovery only moves a stranded execution to `failed`; it never reveals a secret or re-runs the command. Retrying means creating a fresh request that goes through approval again.
+
+## OS Support
+
+| OS | Current status | Unlock provider | Notes |
+| --- | --- | --- | --- |
+| macOS arm64 | Primary development platform | Native Swift helper using Security.framework | Native app, menu helper, and Keychain path are covered by local tests. |
+| macOS Intel | Build-from-source candidate | Native Swift helper using Security.framework | Expected to work when built on Intel macOS with Node >= 20 and Swift toolchain, but not yet QA-tested here. |
+| Linux | Experimental CLI | `SGW_MASTER_PASSPHRASE` fallback | Needs a Secret Service/libsecret helper before desktop support. |
+| Windows | Preview client/helper | Windows Credential Manager helper | PowerShell client opens the local console in browser app mode; tray helper supports queue/status actions. Needs Windows QA, signing, and installer work before production support. |
+
+The current preview is developed primarily on macOS with the native Keychain helper. Windows has a packaged preview path through Credential Manager, but the client and helper still require broader QA, signing, and installer hardening.
+
+## Coding Tool Support
+
+| Tool | Current status | Integration path | Config doc |
+| --- | --- | --- | --- |
+| Codex CLI / IDE extension | Supported | Local plugin manifest or stdio MCP config | `~/.codex/config.toml` or plugin `.mcp.json` |
+| Claude Code | Supported | Local stdio MCP server | `claude mcp add --transport stdio ...` or `.mcp.json` |
+| Cursor | Supported | Local MCP server config | `~/.cursor/mcp.json` |
+| OpenClaw | Profiled | Local MCP server config | `~/.openclaw/openclaw.json` |
+| ZeptoClaw | Profiled | Manual local MCP registration | `~/.zeptoclaw/config.json` or `.mcp.json` |
+| Hermes Agent | Profiled | Local MCP server config | `~/.hermes/config.yaml` |
+| Windsurf | Profiled | Existing local MCP config only | `~/.codeium/windsurf/mcp_config.json` or `mcp.json` |
+| Gemini CLI | Supported | Local MCP server config | `~/.gemini/settings.json` |
+| GitHub Copilot CLI | Supported | Local MCP server config | `~/.copilot/mcp-config.json`, `.github/mcp.json`, or `.mcp.json` |
+| OpenHands | Profiled | Local MCP server config plus optional hooks | `~/.openhands/mcp.json`, `~/.openhands/hooks.json` |
+| Antigravity | Profiled | Local MCP server config plus global hooks | `~/.gemini/config/mcp_config.json`, `./.agents/mcp_config.json`, `~/.gemini/config/hooks.json` |
+| OpenCode | Supported | Local MCP server config; plugin hook surface profiled | `~/.config/opencode/opencode.json`, `opencode.json`, `.jsonc` variants |
+| OmniGent | Planned/profiled | Custom policy bridge, not normal MCP | `$OMNIGENT_CONFIG_HOME/config.yaml` or `~/.omnigent/config.yaml` |
+| VS Code + GitHub Copilot Agent Mode | Supported | Local stdio MCP server | `.vscode/mcp.json` or user MCP config |
+| Zed, JetBrains, other MCP clients | Not yet profiled | Likely possible through stdio MCP | Add after hands-on testing and docs. |
+
+Supported means s-gw has a documented standard MCP stdio path. Profiled means `s-gw agent list` and, when applicable, `s-gw agent mcp-snippet <agent>` know the likely local surfaces, but a hands-on client smoke test is still required before claiming full compatibility. Planned/profiled entries describe known integration shapes without emitting a normal MCP snippet. Automated end-to-end coverage uses the official MCP SDK client rather than every individual IDE UI.
+
+## Upgrade
+
+The native macOS app can check a GitHub Releases feed from Settings or the `Check for Updates` menu command. The default release repository is `barryqy/s-gw`. Publish release notes on the GitHub release and attach an npm tarball asset such as `s-gw-0.1.1.tgz`; the app can download that asset, run `npm install -g`, restart the service/menu helper, and reopen s-gw. If no installable tarball is attached, the app still shows the release notes and opens the release page.
+
+Upgrade the package:
+
+```bash
+npm install -g ./s-gw-0.1.1.tgz
+s-gw unlock status
+s-gw secret list
+s-gw service start
+s-gw menubar start
+s-gw app open
+```
+
+The local ledger and Keychain item should persist across package upgrades.
+
+## Uninstall
+
+Remove the tool:
+
+```bash
+s-gw menubar uninstall
+s-gw service uninstall
+npm uninstall -g s-gw
+```
+
+Remove local unlock material:
+
+```bash
+s-gw unlock keychain delete
+```
+
+Remove local ledger if desired:
+
+```bash
+rm -rf ~/.s-gw
+```
+
+Also remove the MCP server entry from each configured coding tool.
+
+## Packaging Checklist
+
+Before publishing a build:
+
+```bash
+npm run verify
+npm pack
+```
+
+For macOS production packages, also verify:
+
+- native helper exists at `dist/native/s-gw-keychain-helper`;
+- native macOS app exists at `dist/s-gw.app`;
+- `s-gw unlock status` reports `provider: "native-helper"`;
+- real Keychain + MCP e2e passes with no `SGW_MASTER_PASSPHRASE`;
+- `s-gw app open` launches the native app and shows the Overview window;
+- `s-gw console --no-open` serves the local UI and the console HTTP e2e test passes;
+- `s-gw doctor` finds the installed CLI, MCP server, native Keychain helper, and menu-bar app bundle;
+- `s-gw service install --start` loads the console LaunchAgent;
+- `s-gw menubar open` launches the menu-bar helper and sees pending requests;
+- package or installer is signed and notarized;
+- install/uninstall leaves no raw secrets in logs or shell history.
+
+For Windows preview packages, also verify:
+
+- Windows scripts exist under `dist/windows`;
+- `s-gw unlock keychain set --value-stdin` stores unlock material through Credential Manager;
+- `s-gw app open` starts the local console and opens the client shell;
+- `s-gw helper open` creates a tray icon and sees pending requests;
+- helper approve/deny actions use the CLI and do not require the console API token;
+- installer/startup registration does not log raw secrets or command stdin.
+
+## What The Package Contains
+
+The current npm/tarball package contains:
+
+- `s-gw` CLI and `s-gw-mcp` stdio MCP server;
+- compiled TypeScript under `dist`;
+- native macOS Keychain helper at `dist/native/s-gw-keychain-helper`;
+- native macOS management app at `dist/s-gw.app`;
+- native macOS menu-bar helper app at `dist/s-gw Menu Bar.app`;
+- local console HTML/CSS/JS assets under `docs/ui`;
+- integration docs and agent profile docs;
+- maintainer native source under `native`.
+
+It intentionally does not contain credentials, user policy files, npm build caches, SwiftPM `.build` caches, or any pre-seeded Keychain material.
+
+## Reference Docs
+
+- OpenAI Docs MCP quickstart covers Codex, VS Code, Cursor, and Claude Code MCP setup patterns: https://developers.openai.com/learn/docs-mcp
+- Claude Code MCP docs cover stdio servers, scopes, and `.mcp.json`: https://code.claude.com/docs/en/mcp
+- VS Code MCP configuration reference covers `.vscode/mcp.json`, stdio fields, and Agent Mode commands: https://code.visualstudio.com/docs/agents/reference/mcp-configuration
+- OpenCode MCP docs cover local MCP server configuration: https://thdxr.dev.opencode.ai/docs/mcp-servers/
+- DefenseClaw connector docs are one source for agent hook, plugin, and policy surfaces: https://github.com/cisco-ai-defense/defenseclaw/tree/main/docs-site/content/docs/connectors

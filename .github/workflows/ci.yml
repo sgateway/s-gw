@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: TypeScript, tests, and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SGW_E2E_CHROME: /usr/bin/google-chrome
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run build
+      - run: npm test
+      - run: npm audit --audit-level=high
+      - run: npm run package:dry-run
+
+  macos-native:
+    name: macOS native surfaces
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build:native
+      - run: npx vitest run tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
+
+  windows-preview:
+    name: Windows preview client
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run build:windows-client
+      - run: npx vitest run tests/windows-client.test.ts tests/installers.test.ts

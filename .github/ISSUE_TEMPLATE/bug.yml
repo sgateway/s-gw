@@ -1,0 +1,82 @@
+name: Bug report
+description: Report reproducible behavior that is not working as expected.
+title: ""
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, unlock material, private paths, or exploit details. Use private vulnerability reporting for security-sensitive findings.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use disposable data and sanitized output.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: s-gw version or commit
+      placeholder: 0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS Apple silicon
+        - macOS Intel
+        - Windows
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent or MCP client
+      placeholder: Codex, Claude Code, Cursor, OpenCode, or none
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Credential backend
+      options:
+        - macOS Keychain
+        - Windows Credential Manager
+        - Encrypted local value
+        - 1Password reference
+        - Not applicable
+        - Other
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include relevant `s-gw status` or `s-gw doctor` output after removing private data.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, unlock material, private paths, request IDs, and account details.
+          required: true
+        - label: This is not a vulnerability report or approval-bypass disclosure.
+          required: true

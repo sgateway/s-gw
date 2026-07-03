@@ -1,0 +1,2676 @@
+import * as React from "react";
+import { Responsive, type Layout, type LayoutItem, type ResponsiveLayouts as Layouts } from "react-grid-layout";
+import {
+  Activity,
+  AlertTriangle,
+  ArrowUpDown,
+  Bell,
+  CheckCircle2,
+  ChevronDown,
+  Circle,
+  Clock3,
+  Command as CommandIcon,
+  Copy,
+  Download,
+  ExternalLink,
+  FileKey2,
+  Gauge,
+  GripHorizontal,
+  KeyRound,
+  LayoutDashboard,
+  ListChecks,
+  Loader2,
+  LockKeyhole,
+  MoreVertical,
+  Network,
+  PanelRightOpen,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings,
+  Shield,
+  ShieldCheck,
+  SlidersHorizontal,
+  ScrollText,
+  Trash2,
+  UsersRound,
+  X
+} from "lucide-react";
+import { Cell, Pie, PieChart } from "recharts";
+import { toast } from "sonner";
+
+import { SgwLogo } from "@/components/SgwLogo";
+import { AgentIcon } from "@/components/AgentIcon";
+import { ProviderIdentity } from "@/components/ProviderIdentity";
+import { EventFlowDiagram, describeEventFlow, isAgentActivityEvent } from "@/components/ActivityFlowRow";
+import { UsageFlowSankey } from "@/components/UsageFlowSankey";
+import { useElementSize } from "@/hooks/use-element-size";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
+import {
+  Command,
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandShortcut
+} from "@/components/ui/command";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle
+} from "@/components/ui/sheet";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupLabel,
+  SidebarGroupContent,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuBadge,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+  useSidebar
+} from "@/components/ui/sidebar";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Toaster } from "@/components/ui/sonner";
+import {
+  addPolicy,
+  approveRequest,
+  auditCsvUrl,
+  clearGrants,
+  createSecret,
+  deletePolicy,
+  deleteSecret,
+  denyRequest,
+  fetchConsoleState,
+  saveApprovalSettings,
+  setPolicyEnabled
+} from "@/lib/api";
+import {
+  DASHBOARD_LAYOUT_KEY,
+  defaultLayouts,
+  normalizeLayouts,
+  panelIds,
+  readSavedLayouts,
+  resetLayouts,
+  saveLayouts,
+  type PanelId
+} from "@/lib/layout";
+import { credentialBackendLabel, credentialProviderPresentation } from "@/lib/credential-presentation";
+import {
+  commandName,
+  durationLabel,
+  policyConditionSummary,
+  relativeTime,
+  requestTarget,
+  severityRank,
+  shortHandle,
+  titleCase
+} from "@/lib/format";
+import type {
+  ApprovalAgentScope,
+  ApprovalMode,
+  ApprovalPolicyDecision,
+  AgentSummary,
+  ConsoleState,
+  HandleSummary,
+  RequestRecord,
+  SecretSeverity,
+  UsageFlowRow
+} from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+const ResponsiveGridLayout = Responsive;
+
+type ViewId = "overview" | "approvals" | "credentials" | "usage-flow" | "policies" | "agents" | "activity" | "audit" | "settings";
+
+type NavItem = {
+  id: ViewId;
+  label: string;
+  detail: string;
+  icon: React.ComponentType<{ className?: string }>;
+  dataNav?: string;
+};
+
+const navItems: NavItem[] = [
+  { id: "overview", label: "Overview", detail: "System posture", icon: LayoutDashboard },
+  { id: "approvals", label: "Approvals", detail: "Requests waiting", icon: Bell },
+  { id: "credentials", label: "Credentials", detail: "Local handles", icon: KeyRound },
+  { id: "usage-flow", label: "Usage Flow", detail: "Credential paths", icon: Network, dataNav: "flow" },
+  { id: "policies", label: "Policies", detail: "Reusable rules", icon: ShieldCheck },
+  { id: "agents", label: "Agents", detail: "Integration profiles", icon: UsersRound },
+  { id: "activity", label: "Activity", detail: "Agent operations", icon: Activity },
+  { id: "audit", label: "Audit Log", detail: "Complete record", icon: ScrollText },
+  { id: "settings", label: "Settings", detail: "App preferences", icon: Settings }
+];
+
+const navGroups: Array<{ label: string; items: ViewId[] }> = [
+  { label: "Operate", items: ["overview", "approvals", "credentials", "usage-flow", "activity", "audit"] },
+  { label: "Configure", items: ["policies", "agents", "settings"] }
+];
+
+const panelTitles: Record<PanelId, string> = {
+  readiness: "Operational readiness",
+  approvals: "Pending approvals",
+  credentials: "Credential handles",
+  usageFlow: "Usage Flow",
+  policy: "Policy coverage",
+  agents: "Agents",
+  activity: "Recent activity"
+};
+
+const panelIcons: Record<PanelId, React.ComponentType<{ className?: string }>> = {
+  readiness: ShieldCheck,
+  approvals: Clock3,
+  credentials: KeyRound,
+  usageFlow: Network,
+  policy: Shield,
+  agents: UsersRound,
+  activity: Activity
+};
+
+const RECENT_ACTIVITY_ROW_HEIGHT = 44;
+const RECENT_ACTIVITY_TABLE_HEADER_HEIGHT = 38;
+
+function App() {
+  const [theme, setTheme] = React.useState(() => localStorage.getItem("sgw.theme") || "dark");
+  const nativeShell = isNativeShellRoute();
+  const embedView = embeddedView();
+  const menuBar = window.location.pathname === "/menubar";
+
+  React.useEffect(() => {
+    document.documentElement.classList.toggle("light", theme === "light");
+    document.documentElement.classList.toggle("dark", theme !== "light");
+    localStorage.setItem("sgw.theme", theme);
+  }, [theme]);
+
+  React.useEffect(() => {
+    document.documentElement.dataset.nativeShell = nativeShell ? "1" : "0";
+    return () => {
+      delete document.documentElement.dataset.nativeShell;
+    };
+  }, [nativeShell]);
+
+  if (embedView) {
+    return (
+      <TooltipProvider>
+        <ConsoleProvider>
+          {(ctx) => <EmbeddedSurface ctx={ctx} compact={embedView.compact} />}
+        </ConsoleProvider>
+        <Toaster richColors />
+      </TooltipProvider>
+    );
+  }
+
+  if (menuBar) {
+    return (
+      <TooltipProvider>
+        <ConsoleProvider>
+          {(ctx) => <MenubarSurface ctx={ctx} />}
+        </ConsoleProvider>
+        <Toaster richColors />
+      </TooltipProvider>
+    );
+  }
+
+  return (
+    <TooltipProvider>
+      <ConsoleProvider>
+        {(ctx) => <ConsoleShell ctx={ctx} theme={theme} setTheme={setTheme} />}
+      </ConsoleProvider>
+      <Toaster richColors />
+    </TooltipProvider>
+  );
+}
+
+function ConsoleProvider({ children }: { children: (ctx: ConsoleContext) => React.ReactNode }) {
+  const [state, setState] = React.useState<ConsoleState | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      const next = await fetchConsoleState();
+      setState(next);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refresh();
+    const id = window.setInterval(() => void refresh(true), 5000);
+    return () => window.clearInterval(id);
+  }, [refresh]);
+
+  const ctx = React.useMemo(() => ({ state, loading, error, refresh }), [state, loading, error, refresh]);
+  return <>{children(ctx)}</>;
+}
+
+interface ConsoleContext {
+  state: ConsoleState | null;
+  loading: boolean;
+  error: string | null;
+  refresh: (quiet?: boolean) => Promise<void>;
+}
+
+function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: string; setTheme: (value: string) => void }) {
+  const [view, setViewState] = React.useState<ViewId>(() => viewFromLocation());
+  const [commandOpen, setCommandOpen] = React.useState(false);
+  const [search, setSearch] = React.useState("");
+  const [approval, setApproval] = React.useState<RequestRecord | null>(null);
+  const [credential, setCredential] = React.useState<HandleSummary | null>(null);
+  const [overviewLayouts, setOverviewLayouts] = React.useState<Layouts>(() => readSavedLayouts());
+  const nativeShell = isNativeShellRoute();
+
+  React.useEffect(() => {
+    const onPop = () => setViewState(viewFromLocation());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const setView = React.useCallback((next: ViewId) => {
+    setViewState(next);
+    const path = next === "overview" ? "/overview" : `/${next}`;
+    const shellQuery = isNativeShellRoute() ? "?native-shell=1" : "";
+    window.history.pushState({}, "", `${path}${shellQuery}`);
+  }, []);
+
+  const state = ctx.state;
+  const resetOverviewLayout = React.useCallback(() => {
+    const next = resetLayouts();
+    setOverviewLayouts(next);
+    toast.success("Dashboard layout reset");
+  }, []);
+
+  return (
+    <SidebarProvider className="sgw-console-shell">
+      <ConsoleSidebar state={state} view={view} setView={setView} />
+
+      <SidebarInset className="sgw-console-main min-w-0 bg-transparent">
+        {nativeShell ? (
+          <NativeWindowActions
+            ctx={ctx}
+            state={state}
+            theme={theme}
+            setTheme={setTheme}
+            setView={setView}
+            view={view}
+            onResetLayout={resetOverviewLayout}
+            setCommandOpen={setCommandOpen}
+          />
+        ) : (
+          <ConsoleTopbar
+            ctx={ctx}
+            state={state}
+            theme={theme}
+            setTheme={setTheme}
+            setView={setView}
+            search={search}
+            setSearch={setSearch}
+            setCommandOpen={setCommandOpen}
+          />
+        )}
+
+        <main className={cn("sgw-page-bg bg-transparent", nativeShell ? "min-h-screen pt-6" : "min-h-[calc(100vh-4rem)]")}>
+          {ctx.error ? (
+            <Alert variant="destructive" className="m-4">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Console connection issue</AlertTitle>
+              <AlertDescription>{ctx.error}</AlertDescription>
+            </Alert>
+          ) : null}
+          <ViewContent
+            ctx={ctx}
+            view={view}
+            setView={setView}
+            setApproval={setApproval}
+            setCredential={setCredential}
+            nativeShell={nativeShell}
+            layouts={overviewLayouts}
+            setLayouts={setOverviewLayouts}
+            onResetLayout={resetOverviewLayout}
+            search={search}
+            setSearch={setSearch}
+          />
+        </main>
+      </SidebarInset>
+
+      <ApprovalSheet request={approval} state={state} onOpenChange={(open) => !open && setApproval(null)} onDone={() => void ctx.refresh()} />
+      <CredentialSheet credential={credential} onOpenChange={(open) => !open && setCredential(null)} onDone={() => void ctx.refresh()} />
+      <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} setView={setView} state={state} />
+    </SidebarProvider>
+  );
+}
+
+function ConsoleTopbar({
+  ctx,
+  state,
+  theme,
+  setTheme,
+  setView,
+  search,
+  setSearch,
+  setCommandOpen
+}: {
+  ctx: ConsoleContext;
+  state: ConsoleState | null;
+  theme: string;
+  setTheme: (value: string) => void;
+  setView: (view: ViewId) => void;
+  search: string;
+  setSearch: (value: string) => void;
+  setCommandOpen: (open: boolean) => void;
+}) {
+  return (
+    <header className="sgw-topbar sticky top-0 z-30 flex h-16 items-center gap-2 overflow-hidden border-b bg-transparent px-3 backdrop-blur sm:gap-3 sm:px-4">
+      <SidebarTrigger />
+      <div className="relative hidden min-w-0 flex-1 md:block md:max-w-md">
+        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search or run a command..."
+          className="pl-9"
+          onFocus={() => setCommandOpen(true)}
+        />
+      </div>
+      <StatusPill ok={state?.status.daemonRunning} label="Local daemon running" />
+      <StatusPill ok={state?.status.unlock.activeSource !== "none"} label="Credential store unlocked" />
+      <Button variant="outline" onClick={() => setView("approvals")} className="gap-2 px-2 sm:px-3">
+        <Bell className="h-4 w-4" />
+        <span className="sr-only sm:not-sr-only">Approve Queue</span>
+        {state?.metrics.pendingApprovals ? <Badge>{state.metrics.pendingApprovals}</Badge> : null}
+      </Button>
+      <AddCredentialDialog onDone={() => void ctx.refresh()} />
+      <Button variant="outline" size="icon" onClick={() => void ctx.refresh()}>
+        {ctx.loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+      </Button>
+      <Select value={theme} onValueChange={setTheme}>
+        <SelectTrigger className="hidden w-28 sm:flex">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="dark">Dark</SelectItem>
+          <SelectItem value="light">Light</SelectItem>
+        </SelectContent>
+      </Select>
+    </header>
+  );
+}
+
+function NativeWindowActions({
+  ctx,
+  state,
+  theme,
+  setTheme,
+  setView,
+  view,
+  onResetLayout,
+  setCommandOpen
+}: {
+  ctx: ConsoleContext;
+  state: ConsoleState | null;
+  theme: string;
+  setTheme: (value: string) => void;
+  setView: (view: ViewId) => void;
+  view: ViewId;
+  onResetLayout: () => void;
+  setCommandOpen: (open: boolean) => void;
+}) {
+  const pendingCount = state?.metrics.pendingApprovals || 0;
+  const nextTheme = theme === "light" ? "dark" : "light";
+
+  return (
+    <div className="sgw-native-actions">
+      <Button variant="outline" size="icon" onClick={() => setCommandOpen(true)} className="sgw-native-action-button">
+        <CommandIcon className="h-4 w-4" />
+        <span className="sr-only">Command Palette</span>
+      </Button>
+      <Button variant="outline" onClick={() => setView("approvals")} className="sgw-native-action-button gap-2 px-2.5">
+        <Bell className="h-4 w-4" />
+        <span className="hidden md:inline">Approve Queue</span>
+        {pendingCount ? <Badge>{pendingCount}</Badge> : null}
+      </Button>
+      {view === "overview" ? (
+        <Button variant="outline" onClick={onResetLayout} className="sgw-native-action-button gap-2 px-2.5">
+          <RotateCcw className="h-4 w-4" />
+          <span className="hidden md:inline">Reset layout</span>
+        </Button>
+      ) : null}
+      <AddCredentialDialog compact triggerClassName="sgw-native-action-button sgw-native-action-add" onDone={() => void ctx.refresh()} />
+      <Button variant="outline" size="icon" onClick={() => void ctx.refresh()} className="sgw-native-action-button">
+        {ctx.loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+        <span className="sr-only">Refresh</span>
+      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="outline" size="icon" className="sgw-native-action-button">
+            <MoreVertical className="h-4 w-4" />
+            <span className="sr-only">More actions</span>
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuLabel>s-gw</DropdownMenuLabel>
+          <DropdownMenuItem onSelect={() => setView("settings")}>Settings</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setTheme(nextTheme)}>
+            Use {nextTheme} theme
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setView("activity")}>Activity</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setView("audit")}>Audit Log</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+function ConsoleSidebar({
+  state,
+  view,
+  setView
+}: {
+  state: ConsoleState | null;
+  view: ViewId;
+  setView: (view: ViewId) => void;
+}) {
+  const { setOpen } = useSidebar();
+  const navById = React.useMemo(() => new Map(navItems.map((item) => [item.id, item])), []);
+
+  const itemCount = (id: ViewId) => {
+    if (!state) return 0;
+    if (id === "approvals") return state.metrics.pendingApprovals;
+    if (id === "credentials") return state.metrics.localSecrets;
+    if (id === "agents") return state.metrics.activeAgents;
+    return 0;
+  };
+
+  return (
+    <Sidebar collapsible="icon" className="border-r border-sidebar-border/80">
+      <SidebarHeader className="sgw-sidebar-header h-14 justify-center px-3 group-data-[collapsible=icon]:px-2">
+        <div className="sgw-sidebar-titlebar flex w-full items-center justify-end gap-2 group-data-[collapsible=icon]:justify-center">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <SidebarTrigger className="sgw-sidebar-titlebar-trigger h-8 w-8 shrink-0 rounded-md text-sidebar-foreground hover:bg-sidebar-accent group-data-[collapsible=icon]:hidden" />
+            </TooltipTrigger>
+            <TooltipContent side="right">Collapse sidebar</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setOpen(true)}
+                className="sgw-sidebar-expand-button hidden shrink-0 rounded-lg text-sidebar-foreground hover:bg-sidebar-accent group-data-[collapsible=icon]:inline-flex"
+              >
+                <PanelRightOpen className="h-4 w-4" />
+                <span className="sr-only">Expand sidebar</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right">Expand sidebar</TooltipContent>
+          </Tooltip>
+        </div>
+      </SidebarHeader>
+
+      <SidebarContent className="gap-2 px-2 pb-2">
+        {navGroups.map((group) => (
+          <SidebarGroup key={group.label} className="p-0">
+            <SidebarGroupLabel className="px-2 text-[0.68rem] font-semibold uppercase tracking-normal text-sidebar-foreground/45">
+              {group.label}
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu className="gap-1">
+                {group.items.map((id) => {
+                  const item = navById.get(id);
+                  if (!item) return null;
+                  const Icon = item.icon;
+                  const count = itemCount(item.id);
+                  const active = view === item.id;
+
+                  return (
+                    <SidebarMenuItem key={item.id} className="overflow-hidden rounded-lg">
+                      <span
+                        className={cn(
+                          "pointer-events-none absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r-full bg-sidebar-primary transition-opacity",
+                          active ? "opacity-100" : "opacity-0"
+                        )}
+                      />
+                      <SidebarMenuButton
+                        data-nav={item.dataNav || item.id}
+                        isActive={active}
+                        size="lg"
+                        tooltip={item.label}
+                        onClick={() => setView(item.id)}
+                        className={cn(
+                          "sgw-sidebar-nav-button h-11 rounded-lg border px-2.5",
+                          "group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:h-9 group-data-[collapsible=icon]:w-9 group-data-[collapsible=icon]:justify-center"
+                        )}
+                      >
+                        <Icon className="h-4.5 w-4.5" />
+                        <span className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
+                          <span className="block truncate text-sm leading-4">{item.label}</span>
+                          <span className="block truncate text-[0.72rem] leading-4 text-sidebar-foreground/55 group-data-[active=true]/menu-button:text-sidebar-foreground/68">
+                            {item.detail}
+                          </span>
+                        </span>
+                      </SidebarMenuButton>
+                      {count > 0 ? (
+                        <SidebarMenuBadge className="right-2 top-3 bg-sidebar-primary/16 text-sidebar-primary">
+                          {count > 99 ? "99+" : count}
+                        </SidebarMenuBadge>
+                      ) : null}
+                    </SidebarMenuItem>
+                  );
+                })}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
+      </SidebarContent>
+
+      <SidebarFooter className="gap-3 p-3 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-2">
+        <div className="sgw-glass-panel w-full rounded-lg border border-sidebar-border/70 bg-sidebar-accent/35 p-3 text-xs shadow-sm group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:h-10 group-data-[collapsible=icon]:w-10 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:rounded-lg group-data-[collapsible=icon]:border-transparent group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:p-0">
+          <div className="flex items-center gap-2 font-medium">
+            <span className={cn("h-2.5 w-2.5 rounded-full", state?.ready ? "bg-emerald-400" : "bg-amber-400")} />
+            <span className="group-data-[collapsible=icon]:hidden">Local profile</span>
+          </div>
+          <div className="mt-3 flex items-center gap-3 text-sidebar-foreground/70 group-data-[collapsible=icon]:hidden">
+            <SgwLogo className="sgw-sidebar-footer-brand min-w-0 shrink-0" />
+            <div className="min-w-0">
+              <div className="text-[0.66rem] uppercase tracking-normal">Version</div>
+              <div className="truncate font-medium text-sidebar-foreground">v{state?.version || "0.1.0"}</div>
+            </div>
+            <div className="ml-auto text-right">
+              <div className="text-[0.66rem] uppercase tracking-normal">Queue</div>
+              <div className="font-medium text-sidebar-foreground">{state?.metrics.pendingApprovals || 0}</div>
+            </div>
+          </div>
+        </div>
+      </SidebarFooter>
+      <SidebarRail />
+    </Sidebar>
+  );
+}
+
+function ViewContent({
+  ctx,
+  view,
+  setView,
+  setApproval,
+  setCredential,
+  nativeShell,
+  layouts,
+  setLayouts,
+  onResetLayout,
+  search,
+  setSearch
+}: {
+  ctx: ConsoleContext;
+  view: ViewId;
+  setView: (view: ViewId) => void;
+  setApproval: (request: RequestRecord) => void;
+  setCredential: (credential: HandleSummary) => void;
+  nativeShell: boolean;
+  layouts: Layouts;
+  setLayouts: (layouts: Layouts) => void;
+  onResetLayout: () => void;
+  search: string;
+  setSearch: (value: string) => void;
+}) {
+  if (ctx.loading && !ctx.state) return <LoadingDashboard />;
+  if (!ctx.state) return null;
+
+  switch (view) {
+    case "approvals":
+      return <ApprovalsView state={ctx.state} setApproval={setApproval} search={search} />;
+    case "credentials":
+      return <CredentialsView state={ctx.state} setCredential={setCredential} search={search} />;
+    case "usage-flow":
+      return <UsageFlowView state={ctx.state} />;
+    case "policies":
+      return <PoliciesView state={ctx.state} onDone={() => void ctx.refresh()} search={search} />;
+    case "agents":
+      return <AgentsView state={ctx.state} search={search} />;
+    case "activity":
+      return <ActivityView state={ctx.state} search={search} setSearch={setSearch} />;
+    case "audit":
+      return <AuditLogView state={ctx.state} search={search} setSearch={setSearch} />;
+    case "settings":
+      return <SettingsView state={ctx.state} onDone={() => void ctx.refresh()} />;
+    default:
+      return (
+        <OverviewDashboard
+          state={ctx.state}
+          setView={setView}
+          setApproval={setApproval}
+          setCredential={setCredential}
+          nativeShell={nativeShell}
+          layouts={layouts}
+          setLayouts={setLayouts}
+          onResetLayout={onResetLayout}
+        />
+      );
+  }
+}
+
+function OverviewDashboard({
+  state,
+  setView,
+  setApproval,
+  setCredential,
+  nativeShell,
+  layouts,
+  setLayouts,
+  onResetLayout
+}: {
+  state: ConsoleState;
+  setView: (view: ViewId) => void;
+  setApproval: (request: RequestRecord) => void;
+  setCredential: (credential: HandleSummary) => void;
+  nativeShell: boolean;
+  layouts: Layouts;
+  setLayouts: (layouts: Layouts) => void;
+  onResetLayout: () => void;
+}) {
+  const [gridRef, gridSize] = useElementSize<HTMLDivElement>();
+
+  const onLayoutChange = (_layout: Layout, allLayouts: Layouts) => {
+    const normalized = normalizeLayouts(allLayouts);
+    setLayouts(normalized);
+    saveLayouts(normalized);
+  };
+
+  const panelBody = (id: PanelId) => {
+    switch (id) {
+      case "readiness":
+        return <ReadinessPanel state={state} />;
+      case "approvals":
+        return <PendingApprovalsPanel state={state} setApproval={setApproval} setView={setView} />;
+      case "credentials":
+        return <CredentialHandlesPanel state={state} setView={setView} setCredential={setCredential} />;
+      case "usageFlow":
+        return <UsageFlowPanel state={state} setView={setView} />;
+      case "policy":
+        return <PolicyCoveragePanel state={state} setView={setView} />;
+      case "agents":
+        return <AgentsPanel state={state} setView={setView} />;
+      case "activity":
+        return <RecentActivityPanel state={state} setView={setView} />;
+    }
+  };
+
+  return (
+    <div className="sgw-page-frame space-y-4 p-4 lg:p-5">
+      <PageHeading title="Overview" description="Real-time security posture and usage overview" />
+      {!state.ready ? <ReadinessAlert state={state} /> : null}
+      {!nativeShell ? (
+        <div className="flex justify-end">
+          <Button
+            variant="outline"
+            onClick={onResetLayout}
+          >
+            Reset layout
+          </Button>
+        </div>
+      ) : null}
+      <div ref={gridRef}>
+        {gridSize.width > 0 ? (
+          <ResponsiveGridLayout
+            className="layout"
+            width={gridSize.width}
+            layouts={layouts}
+            breakpoints={{ lg: 1100, md: 760, sm: 0 }}
+            cols={{ lg: 12, md: 8, sm: 1 }}
+            rowHeight={82}
+            margin={[16, 16]}
+            containerPadding={[0, 0]}
+            dragConfig={{ enabled: true, bounded: false, handle: ".sgw-drag-handle", cancel: "button,a,input,textarea,[role=button]", threshold: 3 }}
+            resizeConfig={{ enabled: true, handles: ["se"] }}
+            onLayoutChange={onLayoutChange}
+          >
+            {panelIds.map((id) => (
+              <div key={id}>
+                <DashboardCard panelId={id} layouts={layouts} setLayouts={setLayouts}>
+                  {panelBody(id)}
+                </DashboardCard>
+              </div>
+            ))}
+          </ResponsiveGridLayout>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function DashboardCard({
+  panelId,
+  layouts,
+  setLayouts,
+  children
+}: {
+  panelId: PanelId;
+  layouts: Layouts;
+  setLayouts: (layouts: Layouts) => void;
+  children: React.ReactNode;
+}) {
+  const Icon = panelIcons[panelId];
+  const apply = (fn: (item: LayoutItem) => LayoutItem) => {
+    const next: Layouts = {};
+    for (const [breakpoint, layout] of Object.entries(layouts)) {
+      const current = (layout || []) as Layout;
+      next[breakpoint] = current.map((item) => (item.i === panelId ? fn(item) : item));
+    }
+    const normalized = normalizeLayouts(next);
+    setLayouts(normalized);
+    saveLayouts(normalized);
+  };
+
+  return (
+    <Card className="flex h-full min-h-0 flex-col overflow-hidden border-border/70 bg-card/80 shadow-sm">
+      <CardHeader className="sgw-drag-handle flex cursor-move flex-row items-center justify-between space-y-0 px-4 py-3">
+        <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+          <Icon className="h-4 w-4 text-primary" />
+          {panelTitles[panelId]}
+        </CardTitle>
+        <div className="flex items-center gap-1">
+          <GripHorizontal className="h-4 w-4 text-muted-foreground" />
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon-sm" className="h-7 w-7">
+                <MoreVertical className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuLabel>Panel layout</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => apply((item) => ({ ...item, y: Math.max(0, item.y - 3) }))}>Move earlier</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => apply((item) => ({ ...item, y: item.y + 3 }))}>Move later</DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => apply((item) => ({ ...item, w: Math.max(item.minW || 2, 3), h: Math.max(item.minH || 2, 3) }))}>Size small</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => apply((item) => ({ ...item, w: Math.max(item.minW || 3, 6), h: Math.max(item.minH || 3, 4) }))}>Size medium</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => apply((item) => ({ ...item, w: 12, h: Math.max(item.h, 4) }))}>Size wide</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => apply((item) => ({ ...item, h: item.h + 2 }))}>Size tall</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </CardHeader>
+      <CardContent className="min-h-0 flex-1 overflow-hidden px-4 pb-4">{children}</CardContent>
+    </Card>
+  );
+}
+
+function ReadinessPanel({ state }: { state: ConsoleState }) {
+  const rows = [
+    ["Local daemon", state.status.daemonRunning ? "Running" : "Stopped", state.status.daemonRunning],
+    ["Credential store", state.status.unlock.activeSource !== "none" ? "Unlocked" : "Locked", state.status.unlock.activeSource !== "none"],
+    ["Policy engine", "Active", true],
+    ["Audit logging", "Enabled", true]
+  ] as const;
+  return (
+    <div className="grid gap-3">
+      {rows.map(([label, value, ok]) => (
+        <div key={label} className="flex items-center justify-between gap-3 text-sm">
+          <span className="flex items-center gap-2">
+            {ok ? <CheckCircle2 className="h-4 w-4 text-emerald-400" /> : <AlertTriangle className="h-4 w-4 text-amber-400" />}
+            {label}
+          </span>
+          <span className="text-muted-foreground">{value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PendingApprovalsPanel({ state, setApproval, setView }: { state: ConsoleState; setApproval: (request: RequestRecord) => void; setView: (view: ViewId) => void }) {
+  const first = state.pendingRequests[0];
+  return (
+    <div className="flex h-full flex-col justify-between gap-3">
+      <div>
+        <div className="text-4xl font-semibold">{state.metrics.pendingApprovals}</div>
+        <div className="mt-1 text-sm text-amber-300">{state.metrics.pendingApprovals ? "Approval needed" : "No pending approvals"}</div>
+      </div>
+      {first ? (
+        <div className="rounded-md border bg-muted/25 p-3 text-sm">
+          <div className="flex items-center gap-2 font-medium">
+            <AgentIcon name={first.agentName} className="h-7 w-7" />
+            <span>{first.agentName || "Agent"}</span>
+          </div>
+          <div className="text-muted-foreground">{commandName(first)} · {requestTarget(first)}</div>
+          <Button className="mt-3 w-full" onClick={() => setApproval(first)} data-approve={first.id}>Review request</Button>
+        </div>
+      ) : (
+        <Button variant="outline" onClick={() => setView("approvals")}>Open approvals</Button>
+      )}
+    </div>
+  );
+}
+
+function CredentialHandlesPanel({
+  state,
+  setView,
+  setCredential
+}: {
+  state: ConsoleState;
+  setView: (view: ViewId) => void;
+  setCredential: (credential: HandleSummary) => void;
+}) {
+  return (
+    <div className="min-h-0">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Provider</TableHead>
+            <TableHead className="text-right">Secrets</TableHead>
+            <TableHead>Severity</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {state.credentials.slice(0, 5).map((item) => (
+            <TableRow key={item.provider} className="cursor-pointer" onClick={() => setView("credentials")}>
+              <TableCell className="font-medium"><ProviderIdentity provider={item.provider} /></TableCell>
+              <TableCell className="text-right">{item.secrets}</TableCell>
+              <TableCell><SeverityBadge severity={item.severity} /></TableCell>
+            </TableRow>
+          ))}
+          {state.credentials.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={3} className="text-muted-foreground">No credentials yet</TableCell>
+            </TableRow>
+          ) : null}
+        </TableBody>
+      </Table>
+      {state.handles[0] ? (
+        <Button variant="link" className="mt-2 px-0" onClick={() => setCredential(state.handles[0])}>Inspect newest handle</Button>
+      ) : null}
+    </div>
+  );
+}
+
+function UsageFlowPanel({ state, setView }: { state: ConsoleState; setView: (view: ViewId) => void }) {
+  return (
+    <UsageFlowSankey
+      flow={state.usageFlow}
+      compact
+      className="h-full min-h-0"
+      onExpand={() => setView("usage-flow")}
+    />
+  );
+}
+
+function PolicyCoveragePanel({ state, setView }: { state: ConsoleState; setView: (view: ViewId) => void }) {
+  const reduceMotion = useReducedMotion();
+  const allowed = state.approvalPolicyRules.filter((rule) => rule.enabled && rule.decision === "allow").length;
+  const ask = state.approvalPolicyRules.filter((rule) => rule.enabled && rule.decision === "ask").length;
+  const denied = state.approvalPolicyRules.filter((rule) => rule.enabled && rule.decision === "deny").length;
+  const data = [
+    { name: "Allowed", value: Math.max(allowed, 1), fill: "var(--color-allowed)" },
+    { name: "Ask", value: Math.max(ask, 1), fill: "var(--color-ask)" },
+    { name: "Denied", value: Math.max(denied, 1), fill: "var(--color-denied)" }
+  ];
+  const chartConfig = {
+    allowed: { label: "Allowed", color: "oklch(0.72 0.18 145)" },
+    ask: { label: "Ask", color: "oklch(0.76 0.18 75)" },
+    denied: { label: "Denied", color: "oklch(0.64 0.205 28)" }
+  } satisfies ChartConfig;
+
+  return (
+    <div className="grid h-full grid-cols-[1fr_auto] items-center gap-2">
+      <ChartContainer
+        config={chartConfig}
+        className="sgw-policy-pie-motion mx-auto aspect-square h-full max-h-44"
+        data-policy-pie-motion={reduceMotion ? "static" : "animated"}
+      >
+        <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+          <ChartTooltip content={<ChartTooltipContent hideLabel />} />
+          <Pie
+            data={data}
+            dataKey="value"
+            nameKey="name"
+            innerRadius={42}
+            outerRadius={66}
+            startAngle={90}
+            endAngle={-270}
+            paddingAngle={2}
+            cornerRadius={4}
+            stroke="var(--card)"
+            strokeWidth={3}
+            isAnimationActive={!reduceMotion}
+            animationBegin={400}
+            animationDuration={1500}
+            animationEasing="ease-out"
+          >
+            {data.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
+          </Pie>
+        </PieChart>
+      </ChartContainer>
+      <div className="space-y-2 text-sm">
+        <div className="text-3xl font-semibold">{state.approvalPolicyRules.filter((rule) => rule.enabled).length}</div>
+        <div className="text-muted-foreground">Enabled rules</div>
+        <Button variant="outline" size="sm" onClick={() => setView("policies")}>Manage policies</Button>
+      </div>
+    </div>
+  );
+}
+
+function AgentsPanel({ state, setView }: { state: ConsoleState; setView: (view: ViewId) => void }) {
+  return (
+    <div className="grid gap-2">
+      {state.agents.slice(0, 6).map((agent) => (
+        <div key={agent.id} className="flex items-center justify-between rounded-md border bg-muted/20 px-3 py-2 text-sm">
+          <span className="flex min-w-0 items-center gap-2">
+            <AgentIcon name={agent.name} className="h-6 w-6" />
+            <span className="truncate">{agent.name}</span>
+          </span>
+          <Badge variant="outline">{agent.status}</Badge>
+        </div>
+      ))}
+      <Button variant="link" className="justify-start px-0" onClick={() => setView("agents")}>View agent catalog</Button>
+    </div>
+  );
+}
+
+function RecentActivityPanel({ state, setView }: { state: ConsoleState; setView: (view: ViewId) => void }) {
+  const [listRef, listSize] = useElementSize<HTMLDivElement>();
+  const activityRows = state.audit.filter((event) => isAgentActivityEvent(event, state));
+  const availableForRows = Math.max(
+    RECENT_ACTIVITY_ROW_HEIGHT,
+    listSize.height - RECENT_ACTIVITY_TABLE_HEADER_HEIGHT
+  );
+  const visibleCount = listSize.height > 0
+    ? Math.max(1, Math.floor(availableForRows / RECENT_ACTIVITY_ROW_HEIGHT))
+    : 3;
+  const rows = activityRows.slice(0, visibleCount);
+
+  return (
+    <div className="sgw-recent-event-panel flex h-full min-h-0 flex-col" data-recent-activity>
+      <div className="sgw-recent-event-summary">
+        <span className="sgw-event-chip">Agent Activity Events</span>
+        <span>{activityRows.length.toLocaleString()} results</span>
+      </div>
+      <div
+        ref={listRef}
+        className="sgw-recent-event-list min-h-0 flex-1 overflow-hidden"
+        data-recent-activity-list
+        data-total-rows={activityRows.length}
+        data-visible-rows={rows.length}
+      >
+        <div className="sgw-recent-event-table">
+          {rows.length > 0 ? (
+            <div className="sgw-recent-event-head">
+              <span>Source</span>
+              <span>Event type</span>
+              <span>Status</span>
+              <span>Destination</span>
+            </div>
+          ) : null}
+          {rows.map((event, index) => {
+            const flow = describeEventFlow(event, state);
+            return (
+              <div className="sgw-recent-event-row" data-overview-event-row key={eventRowKey(event, index)}>
+                <span className="sgw-event-source-cell">
+                  <AgentIcon name={flow.sourceLabel} className="h-6 w-6" />
+                  <span>{flow.sourceLabel}</span>
+                </span>
+                <span className="sgw-event-type-pill">{recentEventKind(event.type)}</span>
+                <EventStatusLabel tone={flow.tone} status={flow.status} />
+                <span className="truncate">{flow.destinationLabel}</span>
+              </div>
+            );
+          })}
+          {activityRows.length === 0 ? <EmptyEventRows message="No agent activity yet." /> : null}
+        </div>
+      </div>
+      <Button variant="link" className="h-7 shrink-0 self-start px-0 text-xs" onClick={() => setView("activity")}>View all activity</Button>
+    </div>
+  );
+}
+
+function recentEventKind(eventType: string): string {
+  const parts = eventType.split(".").filter(Boolean);
+  if (parts[0] === "approval" && parts[1] === "grant") return "Grant";
+  return titleCase(parts[0] || "event");
+}
+
+function ApprovalsView({ state, setApproval, search }: { state: ConsoleState; setApproval: (request: RequestRecord) => void; search: string }) {
+  const rows = filterText(state.requests, search, (request) => `${request.id} ${request.agentName} ${request.reason} ${request.handle} ${requestTarget(request)}`);
+  return (
+    <PageFrame title="Approvals" description="Review credential-backed actions before s-gw executes them locally.">
+      <DataCard>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Agent</TableHead>
+              <TableHead>Command</TableHead>
+              <TableHead>Target</TableHead>
+              <TableHead>State</TableHead>
+              <TableHead className="hidden text-right sm:table-cell">Requested</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((request) => (
+              <TableRow key={request.id} className="cursor-pointer" onClick={() => setApproval(request)}>
+                <TableCell className="font-medium">
+                  <span className="flex items-center gap-2">
+                    <AgentIcon name={request.agentName} className="h-7 w-7" />
+                    <span>{request.agentName || "Agent"}</span>
+                  </span>
+                </TableCell>
+                <TableCell>{commandName(request)}</TableCell>
+                <TableCell className="max-w-[340px] truncate">{requestTarget(request)}</TableCell>
+                <TableCell><RequestStateBadge state={request.state} /></TableCell>
+                <TableCell className="hidden text-right text-muted-foreground sm:table-cell">{relativeTime(request.updatedAt)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </DataCard>
+    </PageFrame>
+  );
+}
+
+function CredentialsView({ state, setCredential, search }: { state: ConsoleState; setCredential: (credential: HandleSummary) => void; search: string }) {
+  const rows = filterText(state.handles, search, (handle) => {
+    const provider = credentialProviderPresentation(handle.provider, handle.backend).label;
+    const backend = credentialBackendLabel(handle.backend);
+    return `${handle.name} ${handle.handle} ${provider} ${backend} ${handle.type} ${handle.policy.injectEnv}`;
+  });
+  return (
+    <PageFrame title="Credentials" description="Local handles, detector metadata, storage backend, and allowed command policy.">
+      <DataCard>
+        <Table className="table-fixed md:min-w-[900px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[40%] md:w-[28%]">Name</TableHead>
+              <TableHead className="w-[30%] md:w-[150px]">Provider</TableHead>
+              <TableHead className="w-[30%] md:w-[165px]">Backend</TableHead>
+              <TableHead className="hidden w-[210px] md:table-cell">Handle</TableHead>
+              <TableHead className="hidden w-[90px] md:table-cell">Severity</TableHead>
+              <TableHead className="hidden w-[90px] text-right md:table-cell">Updated</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((handle) => (
+              <TableRow key={handle.handle} className="cursor-pointer" onClick={() => setCredential(handle)}>
+                <TableCell className="truncate font-medium" title={handle.name}>{handle.name}</TableCell>
+                <TableCell><ProviderIdentity provider={handle.provider} backend={handle.backend} /></TableCell>
+                <TableCell className="text-xs sm:text-sm">{credentialBackendLabel(handle.backend)}</TableCell>
+                <TableCell className="hidden truncate font-mono text-xs md:table-cell" title={handle.handle}>{shortHandle(handle.handle)}</TableCell>
+                <TableCell className="hidden md:table-cell"><SeverityBadge severity={handle.severity || "low"} /></TableCell>
+                <TableCell className="hidden text-right text-muted-foreground md:table-cell">{relativeTime(handle.updatedAt)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </DataCard>
+    </PageFrame>
+  );
+}
+
+function UsageFlowView({ state }: { state: ConsoleState }) {
+  return (
+    <PageFrame title="Usage Flow" description="Agent credential use classified by agent, authentication type, and target type.">
+      <ResizablePanelGroup orientation="horizontal" className="min-h-[680px] rounded-lg border bg-card/70">
+        <ResizablePanel defaultSize={68} minSize={45}>
+          <div className="h-full p-4">
+            <UsageFlowSankey flow={state.usageFlow} className="h-full min-h-[620px]" />
+          </div>
+        </ResizablePanel>
+        <ResizableHandle withHandle />
+        <ResizablePanel defaultSize={32} minSize={24}>
+          <div className="h-full overflow-auto p-4">
+            <h3 className="mb-3 text-base font-semibold">Flow details</h3>
+            <FlowRowsTable rows={state.usageFlow.rows} />
+          </div>
+        </ResizablePanel>
+      </ResizablePanelGroup>
+    </PageFrame>
+  );
+}
+
+function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: () => void; search: string }) {
+  const [dialogOpen, setDialogOpen] = React.useState(false);
+  const rows = filterText(state.approvalPolicyRules, search, (rule) => `${rule.name} ${rule.decision} ${policyConditionSummary(rule.conditions)}`);
+  return (
+    <PageFrame title="Policies" description="Define when agents may use credentials without interrupting you, and when s-gw should always ask or deny.">
+      <div className="mb-4 flex justify-end">
+        <PolicyDialog open={dialogOpen} onOpenChange={setDialogOpen} onDone={onDone} />
+      </div>
+      <DataCard>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Status</TableHead>
+              <TableHead>Name</TableHead>
+              <TableHead>Decision</TableHead>
+              <TableHead>Conditions</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((rule) => (
+              <TableRow key={rule.id}>
+                <TableCell>
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      checked={rule.enabled}
+                      aria-label={`${rule.enabled ? "Disable" : "Enable"} ${rule.name}`}
+                      onCheckedChange={async (checked) => {
+                        await setPolicyEnabled(rule.id, checked);
+                        toast.success(checked ? "Policy enabled" : "Policy disabled");
+                        onDone();
+                      }}
+                    />
+                    <PolicyEnabledStatus enabled={rule.enabled} />
+                  </div>
+                </TableCell>
+                <TableCell className="font-medium">{rule.name}</TableCell>
+                <TableCell><DecisionBadge decision={rule.decision} /></TableCell>
+                <TableCell className="max-w-[560px] truncate">{policyConditionSummary(rule.conditions)}</TableCell>
+                <TableCell className="text-right">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={async () => {
+                      await deletePolicy(rule.id);
+                      toast.success("Policy deleted");
+                      onDone();
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </DataCard>
+    </PageFrame>
+  );
+}
+
+function PolicyEnabledStatus({ enabled }: { enabled: boolean }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex min-w-[76px] items-center gap-1.5 text-xs font-medium",
+        enabled ? "text-emerald-300" : "text-muted-foreground"
+      )}
+      aria-label={enabled ? "Policy enabled" : "Policy disabled"}
+    >
+      {enabled ? (
+        <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+      ) : (
+        <Circle className="h-4 w-4" aria-hidden="true" />
+      )}
+      {enabled ? "Enabled" : "Disabled"}
+    </span>
+  );
+}
+
+function AgentsView({ state, search }: { state: ConsoleState; search: string }) {
+  const [selectedAgent, setSelectedAgent] = React.useState<AgentSummary | null>(null);
+  const rows = filterText(state.agents, search, (agent) => `${agent.name} ${agent.id} ${agent.status}`);
+  const mcpReady = state.agents.filter((agent) => agent.mcp.supported).length;
+  const hookAware = state.agents.filter((agent) => agent.hooks.supported).length;
+
+  return (
+    <PageFrame title="Agents" description="Connect coding agents to s-gw, copy verified configuration, and inspect supported protection surfaces.">
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <Badge variant="outline">{state.agents.length} profiles</Badge>
+        <Badge variant="outline">{mcpReady} MCP-ready</Badge>
+        <Badge variant="outline">{hookAware} hook-aware</Badge>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {rows.map((agent) => (
+          <Card key={agent.id} className="flex min-h-[184px] flex-col">
+            <CardHeader className="pb-3">
+              <div className="flex items-start justify-between gap-3">
+                <CardTitle className="flex min-w-0 items-center gap-2 text-base">
+                  <AgentIcon name={agent.name} className="h-9 w-9 shrink-0" />
+                  <span className="truncate">{agent.name}</span>
+                </CardTitle>
+                <AgentSupportBadge status={agent.status} />
+              </div>
+              <CardDescription className="truncate font-mono text-xs">
+                {agent.mcp.configPaths[0] || "No MCP configuration path"}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="mt-auto space-y-3">
+              <div className="flex flex-wrap gap-1.5">
+                <Badge variant="secondary">MCP {agent.mcp.supported ? agent.mcp.format.toUpperCase() : "unavailable"}</Badge>
+                <Badge variant="secondary">Hooks {agent.hooks.supported ? agent.hooks.kind : "none"}</Badge>
+                {agent.skills.supported ? <Badge variant="secondary">Skills</Badge> : null}
+              </div>
+              <Button
+                variant={agent.mcp.supported ? "outline" : "ghost"}
+                size="sm"
+                className="w-full"
+                onClick={() => setSelectedAgent(agent)}
+                data-agent-mcp={agent.id}
+              >
+                {agent.mcp.supported ? "MCP snippet" : "View integration status"}
+              </Button>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <AgentConfigurationSheet agent={selectedAgent} onOpenChange={(open) => !open && setSelectedAgent(null)} />
+    </PageFrame>
+  );
+}
+
+function AgentSupportBadge({ status }: { status: string }) {
+  const label = status === "supported" ? "Supported" : status === "manual" ? "Manual setup" : titleCase(status);
+  return <Badge variant={status === "supported" ? "outline" : "secondary"}>{label}</Badge>;
+}
+
+function AgentConfigurationSheet({
+  agent,
+  onOpenChange
+}: {
+  agent: AgentSummary | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  if (!agent) return null;
+
+  const copy = async (value: string, label: string) => {
+    try {
+      await copyText(value);
+      toast.success(`${label} copied`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Copy failed");
+    }
+  };
+
+  return (
+    <Sheet open onOpenChange={onOpenChange}>
+      <SheetContent
+        className="w-[min(620px,calc(100vw-16px))] overflow-y-auto sm:max-w-none"
+        data-agent-detail={agent.id}
+      >
+        <SheetHeader>
+          <SheetTitle className="flex items-center gap-3">
+            <AgentIcon name={agent.name} className="h-10 w-10" />
+            <span>{agent.name}</span>
+            <AgentSupportBadge status={agent.status} />
+          </SheetTitle>
+          <SheetDescription>
+            Configure s-gw locally for this agent. Raw credentials remain outside the agent configuration.
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="space-y-6 px-4 pb-6">
+          <section className="grid gap-2 text-sm sm:grid-cols-2">
+            <AgentCapability label="MCP" value={agent.mcp.supported ? `${agent.mcp.format.toUpperCase()} · ${agent.mcp.writeMode}` : "Not available"} />
+            <AgentCapability label="Guard mode" value="Available" />
+            <AgentCapability label="Hooks" value={agent.hooks.supported ? `${agent.hooks.kind} · ${agent.hooks.events.length} events` : "Not available"} />
+            <AgentCapability label="CodeGuard" value={agent.codeGuard.supported ? titleCase(agent.codeGuard.route) : "Not available"} />
+          </section>
+
+          {agent.mcp.snippet ? (
+            <section className="space-y-3 border-t pt-5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold">MCP configuration</h3>
+                  <p className="text-xs text-muted-foreground">Paste this into one of the supported configuration files.</p>
+                </div>
+                <Button size="sm" onClick={() => void copy(agent.mcp.snippet || "", "MCP snippet")} data-copy-agent-snippet>
+                  <Copy className="h-4 w-4" />
+                  Copy snippet
+                </Button>
+              </div>
+              <pre className="max-h-64 overflow-auto rounded-md border bg-black/25 p-3 font-mono text-xs leading-5 text-foreground"><code>{agent.mcp.snippet}</code></pre>
+              <AgentPathList label="Configuration paths" paths={agent.mcp.configPaths} />
+              {agent.mcp.notes.map((note) => <p key={note} className="text-xs text-muted-foreground">{note}</p>)}
+              <CopyCommand value={agent.snippetCommand} label="Generate from CLI" onCopy={copy} />
+            </section>
+          ) : (
+            <section className="space-y-2 border-t pt-5">
+              <h3 className="text-sm font-semibold">MCP configuration</h3>
+              <p className="text-sm text-muted-foreground">This profile does not have a supported s-gw MCP configuration yet.</p>
+            </section>
+          )}
+
+          <section className="space-y-3 border-t pt-5">
+            <div>
+              <h3 className="text-sm font-semibold">Guard mode</h3>
+              <p className="text-xs text-muted-foreground">Launch the agent with credential-looking environment values replaced by local s-gw handles.</p>
+            </div>
+            <CopyCommand value={agent.guardCommand} label="Launch command" onCopy={copy} />
+          </section>
+
+          {agent.hooks.supported ? (
+            <section className="space-y-3 border-t pt-5">
+              <h3 className="text-sm font-semibold">Hook surface</h3>
+              <div className="flex flex-wrap gap-1.5">
+                {agent.hooks.events.map((event) => <Badge key={event} variant="secondary">{event}</Badge>)}
+              </div>
+              <AgentPathList label="Hook configuration" paths={agent.hooks.configPaths} />
+            </section>
+          ) : null}
+
+          {agent.codeGuard.supported ? (
+            <section className="space-y-3 border-t pt-5">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold">CodeGuard integration</h3>
+                <Button variant="ghost" size="sm" asChild>
+                  <a href={agent.codeGuard.sourceRepo} target="_blank" rel="noreferrer">
+                    Project source <ExternalLink className="h-3.5 w-3.5" />
+                  </a>
+                </Button>
+              </div>
+              <AgentPathList label="Install paths" paths={agent.codeGuard.installPaths} />
+              {agent.codeGuard.commands.length > 0 ? (
+                <CopyCommand value={agent.codeGuard.commands.join("\n")} label="Setup steps" onCopy={copy} />
+              ) : null}
+            </section>
+          ) : null}
+
+          {agent.limitations.length > 0 ? (
+            <section className="space-y-2 border-t pt-5">
+              <h3 className="text-sm font-semibold">Current limits</h3>
+              {agent.limitations.map((item) => <p key={item} className="text-xs text-muted-foreground">{item}</p>)}
+            </section>
+          ) : null}
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function AgentCapability({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b py-2">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="text-right font-medium">{value}</span>
+    </div>
+  );
+}
+
+function AgentPathList({ label, paths }: { label: string; paths: string[] }) {
+  if (paths.length === 0) return null;
+  return (
+    <div className="space-y-1.5">
+      <div className="text-xs font-medium text-muted-foreground">{label}</div>
+      {paths.map((path) => <code key={path} className="block break-all font-mono text-xs text-foreground/80">{path}</code>)}
+    </div>
+  );
+}
+
+function CopyCommand({
+  value,
+  label,
+  onCopy
+}: {
+  value: string;
+  label: string;
+  onCopy: (value: string, label: string) => Promise<void>;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border bg-black/20 p-2">
+      <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre font-mono text-xs">{value}</code>
+      <Button variant="ghost" size="icon-sm" onClick={() => void onCopy(value, label)} aria-label={`Copy ${label.toLowerCase()}`}>
+        <Copy className="h-4 w-4" />
+      </Button>
+    </div>
+  );
+}
+
+function copyText(value: string): Promise<void> {
+  const area = document.createElement("textarea");
+  area.value = value;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  if (copied) return Promise.resolve();
+
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(value);
+  }
+  return Promise.reject(new Error("Could not copy to the clipboard"));
+}
+
+function ActivityView({
+  state,
+  search,
+  setSearch
+}: {
+  state: ConsoleState;
+  search: string;
+  setSearch: (value: string) => void;
+}) {
+  const agentEvents = state.audit.filter((event) => isAgentActivityEvent(event, state));
+  return (
+    <PageFrame title="Activity" description="Agent-initiated credential operations, controls, and destinations.">
+      <EventLogTable
+        mode="activity"
+        rows={agentEvents}
+        totalRows={agentEvents.length}
+        state={state}
+        search={search}
+        setSearch={setSearch}
+        emptyMessage="No agent activity matches this view."
+      />
+    </PageFrame>
+  );
+}
+
+function AuditLogView({
+  state,
+  search,
+  setSearch
+}: {
+  state: ConsoleState;
+  search: string;
+  setSearch: (value: string) => void;
+}) {
+  return (
+    <PageFrame title="Audit Log" description="Complete local record of agent and s-gw security events.">
+      <EventLogTable
+        mode="audit"
+        rows={state.audit}
+        totalRows={state.audit.length}
+        state={state}
+        search={search}
+        setSearch={setSearch}
+        emptyMessage="No audit events match this view."
+      />
+    </PageFrame>
+  );
+}
+
+type EventColumnId = "source" | "eventType" | "status" | "eventId" | "destination" | "reasonCode" | "ruleName" | "timestamp";
+type EventSortDirection = "asc" | "desc";
+
+interface EventLogRow {
+  event: ConsoleState["audit"][number];
+  flow: ReturnType<typeof describeEventFlow>;
+  rowKey: string;
+  originalIndex: number;
+}
+
+interface EventColumn {
+  id: EventColumnId;
+  label: string;
+}
+
+const EVENT_COLUMN_LABELS: Record<EventColumnId, string> = {
+  source: "Source",
+  eventType: "Event type",
+  status: "Status",
+  eventId: "Event ID",
+  destination: "Destination",
+  reasonCode: "Reason code",
+  ruleName: "Rule name",
+  timestamp: "Date & Time"
+};
+
+const ACTIVITY_EVENT_COLUMN_ORDER: EventColumnId[] = [
+  "source", "eventType", "status", "eventId", "destination", "reasonCode", "ruleName", "timestamp"
+];
+
+const AUDIT_EVENT_COLUMN_ORDER: EventColumnId[] = [
+  "eventType", "status", "eventId", "source", "destination", "reasonCode", "ruleName", "timestamp"
+];
+
+function EventLogTable({
+  mode,
+  rows,
+  totalRows,
+  state,
+  search,
+  setSearch,
+  emptyMessage
+}: {
+  mode: "activity" | "audit";
+  rows: ConsoleState["audit"];
+  totalRows: number;
+  state: ConsoleState;
+  search: string;
+  setSearch: (value: string) => void;
+  emptyMessage: string;
+}) {
+  const [expandedKey, setExpandedKey] = React.useState<string | null>(null);
+  const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const [filterColumn, setFilterColumn] = React.useState<EventColumnId>(mode === "activity" ? "source" : "eventType");
+  const [filterDraft, setFilterDraft] = React.useState("");
+  const [columnFilters, setColumnFilters] = React.useState<Partial<Record<EventColumnId, string>>>({});
+  const [sortColumn, setSortColumn] = React.useState<EventColumnId>("timestamp");
+  const [sortDirection, setSortDirection] = React.useState<EventSortDirection>("desc");
+  const columns = React.useMemo(() => eventColumnsForMode(mode), [mode]);
+  const tableRows = React.useMemo(() => rows.map((event, index) => ({
+    event,
+    flow: describeEventFlow(event, state),
+    rowKey: eventRowKey(event, index),
+    originalIndex: index
+  })), [rows, state]);
+  const visibleRows = React.useMemo(() => {
+    const filtered = tableRows.filter((row) => (
+      rowMatchesEventSearch(row, columns, search) && rowMatchesColumnFilters(row, columns, columnFilters)
+    ));
+    return filtered.sort((left, right) => compareEventRows(left, right, sortColumn, sortDirection));
+  }, [columnFilters, columns, search, sortColumn, sortDirection, tableRows]);
+  const firstKey = visibleRows[0]?.rowKey || null;
+
+  React.useEffect(() => {
+    if (!firstKey) {
+      setExpandedKey(null);
+      return;
+    }
+
+    const hasExpanded = visibleRows.some((row) => row.rowKey === expandedKey);
+    if (!expandedKey || !hasExpanded) setExpandedKey(firstKey);
+  }, [expandedKey, firstKey, visibleRows]);
+
+  const label = mode === "activity" ? "Agent Activity Events" : "Complete Audit Events";
+  const hasColumnFilters = Object.values(columnFilters).some(Boolean);
+  const hasActiveFilters = Boolean(search.trim()) || hasColumnFilters;
+  const countLabel = hasActiveFilters
+    ? `${visibleRows.length.toLocaleString()} of ${totalRows.toLocaleString()} results`
+    : `${totalRows.toLocaleString()} results`;
+  const selectedFilterLabel = EVENT_COLUMN_LABELS[filterColumn];
+
+  function toggleSort(column: EventColumnId) {
+    if (sortColumn === column) {
+      setSortDirection((current) => current === "asc" ? "desc" : "asc");
+      return;
+    }
+    setSortColumn(column);
+    setSortDirection("asc");
+  }
+
+  function applyColumnFilter() {
+    const value = filterDraft.trim();
+    setColumnFilters((current) => {
+      const next = { ...current };
+      if (value) next[filterColumn] = value;
+      else delete next[filterColumn];
+      return next;
+    });
+    setFilterDraft("");
+  }
+
+  function removeColumnFilter(column: EventColumnId) {
+    setColumnFilters((current) => {
+      const next = { ...current };
+      delete next[column];
+      return next;
+    });
+  }
+
+  function resetFilters() {
+    setSearch("");
+    setColumnFilters({});
+    setFilterDraft("");
+  }
+
+  return (
+    <div className="sgw-event-log-card" data-event-log-card>
+      <div className="sgw-event-log-toolbar">
+        <div className="sgw-event-mode-toggle" aria-label="Event presentation mode">
+          <button type="button">Classic</button>
+          <button type="button" className="is-active">AI Assistant</button>
+        </div>
+        <div className="sgw-event-query">
+          <Search className="h-4 w-4" />
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search every column"
+            className="sgw-event-query-input"
+          />
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="sgw-event-filter-button"
+          aria-expanded={filtersOpen}
+          onClick={() => setFiltersOpen((current) => !current)}
+        >
+          <SlidersHorizontal className="h-4 w-4" />
+          Filters
+        </Button>
+        <Select defaultValue="24h">
+          <SelectTrigger className="sgw-event-range">
+            <Clock3 className="h-4 w-4" />
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="24h">Last 24 hours</SelectItem>
+            <SelectItem value="7d">Last 7 days</SelectItem>
+            <SelectItem value="30d">Last 30 days</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="sgw-event-count">{countLabel}</div>
+        {mode === "audit" ? (
+          <Button asChild variant="outline" size="sm" className="sgw-event-export">
+            <a href={auditCsvUrl()} download>
+              <Download className="h-4 w-4" />
+              Export CSV
+            </a>
+          </Button>
+        ) : null}
+      </div>
+
+      {filtersOpen ? (
+        <div className="sgw-event-filter-row" data-event-filter-row>
+          <Select
+            value={filterColumn}
+            onValueChange={(value) => {
+              const column = value as EventColumnId;
+              setFilterColumn(column);
+              setFilterDraft(columnFilters[column] || "");
+            }}
+          >
+            <SelectTrigger className="sgw-event-filter-select" aria-label="Filter column">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {columns.map((column) => (
+                <SelectItem key={column.id} value={column.id}>{column.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Input
+            value={filterDraft}
+            onChange={(event) => setFilterDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") applyColumnFilter();
+            }}
+            placeholder={`Filter ${selectedFilterLabel.toLowerCase()}`}
+            aria-label={`Filter ${selectedFilterLabel}`}
+            className="sgw-event-filter-input"
+          />
+          <Button type="button" size="sm" onClick={applyColumnFilter} disabled={!filterDraft.trim()}>
+            Apply filter
+          </Button>
+        </div>
+      ) : null}
+
+      <div className="sgw-event-chip-row">
+        <span className="sgw-event-chip">{label}</span>
+        {search ? (
+          <span className="sgw-event-chip sgw-event-column-filter-chip">
+            Search: {search}
+            <button type="button" aria-label="Clear search" onClick={() => setSearch("")}><X className="h-3 w-3" /></button>
+          </span>
+        ) : null}
+        {columns.map((column) => columnFilters[column.id] ? (
+          <span className="sgw-event-chip sgw-event-column-filter-chip" key={column.id}>
+            {column.label}: {columnFilters[column.id]}
+            <button
+              type="button"
+              aria-label={`Clear ${column.label} filter`}
+              onClick={() => removeColumnFilter(column.id)}
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        ) : null)}
+        {hasActiveFilters ? (
+          <button type="button" className="sgw-event-reset" onClick={resetFilters}>Reset all</button>
+        ) : null}
+      </div>
+
+      <div className="sgw-event-table-wrap">
+        <Table className="sgw-event-table">
+          <TableHeader>
+            <TableRow>
+              {columns.map((column) => (
+                <TableHead
+                  key={column.id}
+                  aria-sort={sortColumn === column.id ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <button
+                    type="button"
+                    className={cn("sgw-event-sort-button", sortColumn === column.id && "is-active")}
+                    data-sort-column={column.id}
+                    onClick={() => toggleSort(column.id)}
+                  >
+                    {column.label}
+                    <ArrowUpDown className={cn("h-3 w-3", sortColumn === column.id && sortDirection === "desc" && "is-desc")} />
+                  </button>
+                </TableHead>
+              ))}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {visibleRows.map((row) => {
+              const expanded = row.rowKey === expandedKey;
+
+              return (
+                <React.Fragment key={row.rowKey}>
+                  <TableRow
+                    aria-expanded={expanded}
+                    className="sgw-event-row"
+                    onClick={() => setExpandedKey(expanded ? null : row.rowKey)}
+                    data-event-row
+                  >
+                    {columns.map((column) => (
+                      <TableCell key={column.id} className={eventColumnClassName(column.id)}>
+                        {renderEventColumn(row, column.id, mode)}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                  {expanded ? (
+                    <TableRow className="sgw-event-expanded-row">
+                      <TableCell colSpan={columns.length}>
+                        <EventFlowDiagram flow={row.flow} />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </React.Fragment>
+              );
+            })}
+          </TableBody>
+        </Table>
+        {visibleRows.length === 0 ? <EmptyEventRows message={emptyMessage} /> : null}
+      </div>
+    </div>
+  );
+}
+
+function eventColumnsForMode(mode: "activity" | "audit"): EventColumn[] {
+  const order = mode === "activity" ? ACTIVITY_EVENT_COLUMN_ORDER : AUDIT_EVENT_COLUMN_ORDER;
+  return order.map((id) => ({ id, label: EVENT_COLUMN_LABELS[id] }));
+}
+
+function eventColumnValue(row: EventLogRow, column: EventColumnId): string {
+  if (column === "source") return row.flow.sourceLabel;
+  if (column === "eventType") return row.flow.eventType;
+  if (column === "status") return row.flow.status;
+  if (column === "eventId") return row.flow.eventId;
+  if (column === "destination") return row.flow.destinationLabel;
+  if (column === "reasonCode") return row.flow.reasonCode;
+  if (column === "ruleName") return row.flow.ruleName;
+  return formatEventTimestamp(row.event.ts);
+}
+
+function renderEventColumn(row: EventLogRow, column: EventColumnId, mode: "activity" | "audit"): React.ReactNode {
+  if (column === "source" && mode === "activity") {
+    return (
+      <span className="sgw-event-source-cell">
+        <AgentIcon name={row.flow.sourceLabel} className="h-6 w-6" />
+        <span>{row.flow.sourceLabel}</span>
+      </span>
+    );
+  }
+  if (column === "eventType") return <span className="sgw-event-type-pill">{row.flow.eventType}</span>;
+  if (column === "status") return <EventStatusLabel tone={row.flow.tone} status={row.flow.status} />;
+  return eventColumnValue(row, column);
+}
+
+function eventColumnClassName(column: EventColumnId): string {
+  if (column === "eventId") return "font-mono text-xs text-muted-foreground";
+  if (column === "timestamp") return "text-muted-foreground";
+  if (column === "ruleName") return "max-w-[240px] truncate";
+  return "max-w-[220px] truncate";
+}
+
+function rowMatchesEventSearch(row: EventLogRow, columns: EventColumn[], search: string): boolean {
+  const needle = search.trim().toLowerCase();
+  if (!needle) return true;
+
+  const rawValues = [row.event.type, row.event.message, row.event.handle || "", row.event.requestId || ""];
+  if (rawValues.some((value) => value.toLowerCase().includes(needle))) return true;
+  return columns.some((column) => eventColumnValue(row, column.id).toLowerCase().includes(needle));
+}
+
+function rowMatchesColumnFilters(
+  row: EventLogRow,
+  columns: EventColumn[],
+  filters: Partial<Record<EventColumnId, string>>
+): boolean {
+  for (const column of columns) {
+    const filter = filters[column.id]?.trim().toLowerCase();
+    if (!filter) continue;
+    if (!eventColumnValue(row, column.id).toLowerCase().includes(filter)) return false;
+  }
+  return true;
+}
+
+function compareEventRows(
+  left: EventLogRow,
+  right: EventLogRow,
+  column: EventColumnId,
+  direction: EventSortDirection
+): number {
+  let comparison = 0;
+  if (column === "timestamp") {
+    comparison = new Date(left.event.ts).getTime() - new Date(right.event.ts).getTime();
+  } else {
+    comparison = eventColumnValue(left, column).localeCompare(eventColumnValue(right, column), undefined, {
+      numeric: true,
+      sensitivity: "base"
+    });
+  }
+
+  if (comparison === 0) comparison = left.originalIndex - right.originalIndex;
+  return direction === "asc" ? comparison : -comparison;
+}
+
+function EventStatusLabel({ tone, status }: { tone: "success" | "pending" | "failure" | "neutral"; status: string }) {
+  return (
+    <span className={cn("sgw-event-status", `is-${tone}`)}>
+      <span />
+      {status}
+    </span>
+  );
+}
+
+function eventRowKey(event: ConsoleState["audit"][number], index: number): string {
+  return event.id || `${event.ts}-${event.type}-${event.requestId || event.handle || index}`;
+}
+
+function formatEventTimestamp(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value || "-";
+  return new Intl.DateTimeFormat(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    year: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(date);
+}
+
+function EmptyEventRows({ message }: { message: string }) {
+  return <div className="py-8 text-center text-sm text-muted-foreground">{message}</div>;
+}
+
+function SettingsView({ state, onDone }: { state: ConsoleState; onDone: () => void }) {
+  const [mode, setMode] = React.useState<ApprovalMode>(state.approvalSettings.mode);
+  const [durationMs, setDurationMs] = React.useState(String(state.approvalSettings.durationMs));
+  return (
+    <PageFrame title="Settings" description="Approval behavior, reusable grants, and local console preferences.">
+      <Tabs defaultValue="approvals">
+        <TabsList>
+          <TabsTrigger value="approvals">Approvals</TabsTrigger>
+          <TabsTrigger value="grants">Reusable grants</TabsTrigger>
+          <TabsTrigger value="about">About</TabsTrigger>
+        </TabsList>
+        <TabsContent value="approvals" className="mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Default approval mode</CardTitle>
+              <CardDescription>Each approval is still scoped by handle, action, agent, and target context.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-3">
+              <Select value={mode} onValueChange={(value) => setMode(value as ApprovalMode)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="per-transaction">Approve per transaction</SelectItem>
+                  <SelectItem value="timed-session">Approve same session for time</SelectItem>
+                  <SelectItem value="login-session">Approve current login session</SelectItem>
+                  <SelectItem value="always">Approve matching action always</SelectItem>
+                </SelectContent>
+              </Select>
+              <Input value={durationMs} onChange={(event) => setDurationMs(event.target.value)} placeholder="Duration ms" />
+              <Button
+                onClick={async () => {
+                  await saveApprovalSettings({ mode, durationMs: Number(durationMs) || 15 * 60 * 1000 });
+                  toast.success("Approval settings updated");
+                  onDone();
+                }}
+              >
+                Save approval settings
+              </Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="grants" className="mt-4">
+          <DataCard>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Handle</TableHead>
+                  <TableHead>Mode</TableHead>
+                  <TableHead>Agent</TableHead>
+                  <TableHead>Expires</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {state.approvalGrants.map((grant) => (
+                  <TableRow key={grant.id}>
+                    <TableCell className="font-mono text-xs">{shortHandle(grant.handle)}</TableCell>
+                    <TableCell>{grant.mode}</TableCell>
+                    <TableCell>
+                      {grant.agentName ? (
+                        <span className="flex items-center gap-2">
+                          <AgentIcon name={grant.agentName} className="h-6 w-6" />
+                          <span>{grant.agentName}</span>
+                        </span>
+                      ) : "Any agent"}
+                    </TableCell>
+                    <TableCell>{grant.expiresAt ? relativeTime(grant.expiresAt) : "No expiry"}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <Button
+              variant="destructive"
+              className="mt-4"
+              onClick={async () => {
+                await clearGrants();
+                toast.success("Reusable approvals cleared");
+                onDone();
+              }}
+            >
+              Clear reusable approvals
+            </Button>
+          </DataCard>
+        </TabsContent>
+        <TabsContent value="about" className="mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>s-gw {state.version}</CardTitle>
+              <CardDescription>Local credential gateway for AI coding agents.</CardDescription>
+            </CardHeader>
+            <CardContent className="text-sm text-muted-foreground">
+              Store: <span className="font-mono">{state.status.storePath}</span>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </PageFrame>
+  );
+}
+
+function EmbeddedSurface({ ctx, compact }: { ctx: ConsoleContext; compact: boolean }) {
+  React.useEffect(() => {
+    document.documentElement.dataset.embed = "usage-flow";
+    document.documentElement.dataset.embedDensity = compact ? "compact" : "full";
+    return () => {
+      delete document.documentElement.dataset.embed;
+      delete document.documentElement.dataset.embedDensity;
+    };
+  }, [compact]);
+
+  if (!ctx.state) {
+    return <div className="grid h-screen place-items-center bg-background"><Skeleton className="h-72 w-[80vw]" /></div>;
+  }
+  return (
+    <div className={cn("h-screen overflow-hidden bg-background p-2", compact ? "p-0" : "")}>
+      <UsageFlowSankey flow={ctx.state.usageFlow} compact={compact} className="h-full" />
+    </div>
+  );
+}
+
+function MenubarSurface({ ctx }: { ctx: ConsoleContext }) {
+  const state = ctx.state;
+  const [decidingId, setDecidingId] = React.useState<string | null>(null);
+  const decidingRef = React.useRef(false);
+
+  const decide = React.useCallback(async (request: RequestRecord, approving: boolean) => {
+    if (decidingRef.current) return;
+    decidingRef.current = true;
+    setDecidingId(request.id);
+    try {
+      if (approving) {
+        await approveRequest(request, { mode: "per-transaction", agentScope: "same-agent" });
+        toast.success("Request approved");
+      } else {
+        await denyRequest(request);
+        toast.success("Request denied");
+      }
+      await ctx.refresh(true);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      decidingRef.current = false;
+      setDecidingId(null);
+    }
+  }, [ctx]);
+
+  if (!state) {
+    return <div className="grid h-screen place-items-center bg-background p-4"><Skeleton className="h-56 w-full" /></div>;
+  }
+  return (
+    <div className="h-screen overflow-hidden bg-background p-3 text-sm">
+      <div className="mb-3 flex items-center justify-between">
+        <SgwLogo showText={false} />
+        <Badge variant={state.ready ? "outline" : "secondary"}>{state.ready ? "Ready" : "Needs setup"}</Badge>
+      </div>
+      <div className="grid grid-cols-3 gap-2">
+        <MiniMetric label="Pending" value={state.metrics.pendingApprovals} />
+        <MiniMetric label="Handles" value={state.metrics.localSecrets} />
+        <MiniMetric label="Agents" value={state.metrics.activeAgents} />
+      </div>
+      <Separator className="my-3" />
+      <div className="space-y-2">
+        <div className="font-medium">Approval queue</div>
+        {state.pendingRequests.slice(0, 3).map((request) => (
+          <div key={request.id} className="rounded-md border bg-card p-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex min-w-0 items-center gap-2 font-medium">
+                <AgentIcon name={request.agentName} className="h-7 w-7" />
+                <span className="truncate">{request.agentName || "Agent"}</span>
+              </span>
+              <Badge variant="secondary">{relativeTime(request.updatedAt)}</Badge>
+            </div>
+            <div className="mt-1 truncate text-muted-foreground">{commandName(request)} · {requestTarget(request)}</div>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <Button
+                size="sm"
+                onClick={() => void decide(request, true)}
+                disabled={decidingId !== null}
+                data-menubar-approve={request.id}
+              >
+                {decidingId === request.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                Approve once
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void decide(request, false)}
+                disabled={decidingId !== null}
+                data-menubar-deny={request.id}
+              >
+                Deny
+              </Button>
+            </div>
+          </div>
+        ))}
+        {state.pendingRequests.length === 0 ? <div className="text-muted-foreground">No pending approvals.</div> : null}
+      </div>
+      <div className="mt-4 flex gap-2">
+        <Button className="flex-1" onClick={() => window.location.assign("/approvals")}>Open app</Button>
+        <Button variant="outline" size="icon" onClick={() => void ctx.refresh()}>
+          <RefreshCw className="h-4 w-4" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function MiniMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-md border bg-card p-2 text-center">
+      <div className="text-lg font-semibold">{value}</div>
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+    </div>
+  );
+}
+
+function ApprovalSheet({
+  request,
+  state,
+  onOpenChange,
+  onDone
+}: {
+  request: RequestRecord | null;
+  state: ConsoleState | null;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+}) {
+  const [busy, setBusy] = React.useState(false);
+  const busyRef = React.useRef(false);
+  const handle = state?.handles.find((item) => item.handle === request?.handle);
+
+  const approve = async (choice: { mode?: ApprovalMode; durationMs?: number; agentScope?: ApprovalAgentScope }) => {
+    if (!request) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await approveRequest(request, choice);
+      toast.success("Request approved");
+      onOpenChange(false);
+      onDone();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const deny = async () => {
+    if (!request) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await denyRequest(request);
+      toast.success("Request denied");
+      onOpenChange(false);
+      onDone();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Sheet open={Boolean(request)} onOpenChange={onOpenChange}>
+      <SheetContent className="w-[min(520px,calc(100vw-24px))] sm:max-w-none">
+        <SheetHeader>
+          <SheetTitle className="flex items-center gap-2">
+            <AgentIcon name={request?.agentName} className="h-9 w-9" />
+            Approval needed
+          </SheetTitle>
+          <SheetDescription>{request?.agentName || "Agent"} wants to use a local credential handle.</SheetDescription>
+        </SheetHeader>
+        {request ? (
+          <div className="space-y-5 px-4">
+            <DetailGrid
+              rows={[
+                ["Agent", (
+                  <span className="flex items-center gap-2">
+                    <AgentIcon name={request.agentName} className="h-6 w-6" />
+                    <span>{request.agentName || "Agent"}</span>
+                  </span>
+                )],
+                ["Action", commandName(request)],
+                ["Target", requestTarget(request)],
+                ["Authentication", handle?.name || request.handle],
+                ["Handle", shortHandle(request.handle)],
+                ["Working dir", request.action.workingDir || "-"],
+                ["Risk", handle?.severity || "unknown"],
+                ["Policy", "User approval required"]
+              ]}
+            />
+            <Textarea placeholder="Optional note for this decision..." />
+          </div>
+        ) : null}
+        <SheetFooter>
+          <Button disabled={busy} onClick={() => approve({ mode: "per-transaction", agentScope: "same-agent" })} data-approve={request?.id}>
+            {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            Approve once
+          </Button>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button disabled={busy} variant="outline">
+                Allow for...
+                <ChevronDown className="ml-2 h-4 w-4" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="grid w-56 gap-2">
+              <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 15 * 60 * 1000, agentScope: "same-agent" })}>15 minutes</Button>
+              <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 60 * 60 * 1000, agentScope: "same-agent" })}>1 hour</Button>
+              <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 24 * 60 * 60 * 1000, agentScope: "same-agent" })}>1 day</Button>
+              <Button variant="ghost" onClick={() => approve({ mode: "login-session", agentScope: "same-agent" })}>Current login session</Button>
+            </PopoverContent>
+          </Popover>
+          <Button disabled={busy} variant="destructive" onClick={deny}>Deny</Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function CredentialSheet({
+  credential,
+  onOpenChange,
+  onDone
+}: {
+  credential: HandleSummary | null;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+}) {
+  const [confirm, setConfirm] = React.useState(false);
+  return (
+    <>
+      <Sheet open={Boolean(credential)} onOpenChange={onOpenChange}>
+        <SheetContent className="w-[min(560px,calc(100vw-24px))] sm:max-w-none">
+          <SheetHeader>
+            <SheetTitle>{credential?.name || "Credential"}</SheetTitle>
+            <SheetDescription>{credential ? shortHandle(credential.handle) : ""}</SheetDescription>
+          </SheetHeader>
+          {credential ? (
+            <div className="space-y-5 px-4">
+              <DetailGrid
+                rows={[
+                  ["Provider", <ProviderIdentity provider={credential.provider} backend={credential.backend} />],
+                  ["Backend", credentialBackendLabel(credential.backend)],
+                  ["Severity", credential.severity || "low"],
+                  ["Inject env", credential.policy.injectEnv || "-"],
+                  ["Allowed commands", credential.policy.allowedCommands.join(", ") || "-"],
+                  ["Source", credential.source || "-"],
+                  ["Updated", relativeTime(credential.updatedAt)]
+                ]}
+              />
+              <Button variant="destructive" onClick={() => setConfirm(true)}>
+                <Trash2 className="mr-2 h-4 w-4" />
+                Delete credential
+              </Button>
+            </div>
+          ) : null}
+        </SheetContent>
+      </Sheet>
+      <AlertDialog open={confirm} onOpenChange={setConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this credential handle?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the local handle and fails pending requests that depend on it.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={async () => {
+                if (!credential) return;
+                await deleteSecret(credential.handle);
+                toast.success("Credential deleted");
+                setConfirm(false);
+                onOpenChange(false);
+                onDone();
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+function AddCredentialDialog({
+  onDone,
+  compact = false,
+  triggerClassName
+}: {
+  onDone: () => void;
+  compact?: boolean;
+  triggerClassName?: string;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [name, setName] = React.useState("");
+  const [type, setType] = React.useState("api-token");
+  const [provider, setProvider] = React.useState("");
+  const [injectEnv, setInjectEnv] = React.useState("");
+  const [value, setValue] = React.useState("");
+  const [allowedCommand, setAllowedCommand] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button size={compact ? "icon" : "default"} className={cn("gap-2", compact ? "" : "px-2 sm:px-3", triggerClassName)}>
+          <Plus className="h-4 w-4" />
+          <span className={compact ? "sr-only" : "sr-only sm:not-sr-only"}>Add credential</span>
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add credential</DialogTitle>
+          <DialogDescription>The value is sent only to the local s-gw daemon and stored using the configured local backend.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <Input placeholder="Name" value={name} onChange={(event) => setName(event.target.value)} />
+          <div className="grid gap-3 md:grid-cols-2">
+            <Select value={type} onValueChange={setType}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="api-token">API token</SelectItem>
+                <SelectItem value="private-key">Private key</SelectItem>
+                <SelectItem value="password">Password</SelectItem>
+                <SelectItem value="credential">Credential pair</SelectItem>
+                <SelectItem value="access-key">Access key</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input placeholder="Provider, e.g. aws" value={provider} onChange={(event) => setProvider(event.target.value)} />
+          </div>
+          <Input placeholder="Inject env, e.g. AWS_ACCESS_KEY_ID" value={injectEnv} onChange={(event) => setInjectEnv(event.target.value)} />
+          <Input placeholder="Allowed command, e.g. aws" value={allowedCommand} onChange={(event) => setAllowedCommand(event.target.value)} />
+          <Textarea placeholder="Credential value" value={value} onChange={(event) => setValue(event.target.value)} />
+        </div>
+        <DialogFooter>
+          <Button
+            disabled={busy || !name || !value}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await createSecret({
+                  name,
+                  type,
+                  provider: provider || undefined,
+                  injectEnv: injectEnv || undefined,
+                  allowedCommands: allowedCommand ? [allowedCommand] : [],
+                  value,
+                  backend: "keychain"
+                });
+                toast.success("Credential handle created");
+                setOpen(false);
+                setName("");
+                setValue("");
+                onDone();
+              } catch (err) {
+                toast.error(err instanceof Error ? err.message : String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            Create handle
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function PolicyDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenChange: (open: boolean) => void; onDone: () => void }) {
+  const [name, setName] = React.useState("Codex scoped access");
+  const [decision, setDecision] = React.useState<ApprovalPolicyDecision>("ask");
+  const [agent, setAgent] = React.useState("Codex");
+  const [provider, setProvider] = React.useState("");
+  const [command, setCommand] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogTrigger asChild>
+        <Button><Plus className="mr-2 h-4 w-4" />Add policy rule</Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add policy rule</DialogTitle>
+          <DialogDescription>Rules are evaluated before the approval queue, with deny taking priority.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Rule name" />
+          <Select value={decision} onValueChange={(value) => setDecision(value as ApprovalPolicyDecision)}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ask">Ask</SelectItem>
+              <SelectItem value="allow">Allow</SelectItem>
+              <SelectItem value="deny">Deny</SelectItem>
+            </SelectContent>
+          </Select>
+          <Input value={agent} onChange={(event) => setAgent(event.target.value)} placeholder="Agent name" />
+          <Input value={provider} onChange={(event) => setProvider(event.target.value)} placeholder="Provider, e.g. ssh or aws" />
+          <Input value={command} onChange={(event) => setCommand(event.target.value)} placeholder="Command, e.g. ssh" />
+        </div>
+        <DialogFooter>
+          <Button
+            disabled={busy || !name}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await addPolicy({
+                  name,
+                  enabled: true,
+                  priority: 100,
+                  decision,
+                  agents: agent ? [agent] : [],
+                  providers: provider ? [provider] : [],
+                  commands: command ? [command] : []
+                });
+                toast.success("Policy rule added");
+                onOpenChange(false);
+                onDone();
+              } catch (err) {
+                toast.error(err instanceof Error ? err.message : String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            Add rule
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CommandPalette({
+  open,
+  onOpenChange,
+  setView,
+  state
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  setView: (view: ViewId) => void;
+  state: ConsoleState | null;
+}) {
+  const go = (view: ViewId) => {
+    setView(view);
+    onOpenChange(false);
+  };
+  return (
+    <CommandDialog open={open} onOpenChange={onOpenChange} title="Command Palette">
+      <Command>
+        <CommandInput placeholder="Search commands..." />
+        <CommandList>
+          <CommandEmpty>No command found.</CommandEmpty>
+          <CommandGroup heading="Views">
+            {navItems.map((item) => (
+              <CommandItem key={item.id} onSelect={() => go(item.id)}>
+                <item.icon className="h-4 w-4" />
+                {item.label}
+                <CommandShortcut>open</CommandShortcut>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+          <CommandGroup heading="Safe actions">
+            <CommandItem onSelect={() => go("approvals")}>
+              <Bell className="h-4 w-4" />
+              Review pending approvals
+              <CommandShortcut>{state?.metrics.pendingApprovals || 0}</CommandShortcut>
+            </CommandItem>
+            <CommandItem onSelect={() => window.open(auditCsvUrl(), "_blank")}>
+              <Download className="h-4 w-4" />
+              Download audit CSV
+            </CommandItem>
+          </CommandGroup>
+        </CommandList>
+      </Command>
+    </CommandDialog>
+  );
+}
+
+function FlowRowsTable({ rows }: { rows: UsageFlowRow[] }) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Agent</TableHead>
+          <TableHead>Authentication type</TableHead>
+          <TableHead>Target type</TableHead>
+          <TableHead className="w-16 text-right">Req.</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((row) => (
+          <TableRow key={`${row.agentId}-${row.authTypeId}-${row.targetTypeId}-${row.lastSeen}`}>
+            <TableCell>{row.agent}</TableCell>
+            <TableCell>{row.authType}</TableCell>
+            <TableCell>{row.targetType}</TableCell>
+            <TableCell className="text-right">{row.count}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+function PageFrame({ title, description, children }: { title: string; description: string; children: React.ReactNode }) {
+  return (
+    <div className="sgw-page-frame space-y-4 p-4 lg:p-5">
+      <PageHeading title={title} description={description} />
+      {children}
+    </div>
+  );
+}
+
+function PageHeading({ title, description }: { title: string; description: string }) {
+  return (
+    <div className="sgw-page-heading">
+      <h1 className="text-2xl font-semibold tracking-normal">{title}</h1>
+      <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+    </div>
+  );
+}
+
+function DataCard({ children }: { children: React.ReactNode }) {
+  return <Card><CardContent className="p-0">{children}</CardContent></Card>;
+}
+
+function StatusPill({ ok, label }: { ok?: boolean; label: string }) {
+  return (
+    <div className="sgw-glass-panel hidden items-center gap-2 rounded-full border bg-card/70 px-3 py-2 text-sm lg:flex">
+      <span className={cn("h-2 w-2 rounded-full", ok ? "bg-emerald-400" : "bg-amber-400")} />
+      {label}
+    </div>
+  );
+}
+
+function SeverityBadge({ severity }: { severity: SecretSeverity }) {
+  const variant = severityRank(severity) >= 3 ? "destructive" : severity === "medium" ? "secondary" : "outline";
+  return <Badge variant={variant}>{titleCase(severity)}</Badge>;
+}
+
+function RequestStateBadge({ state }: { state: string }) {
+  const variant = state === "pending" ? "secondary" : state === "denied" || state === "failed" ? "destructive" : "outline";
+  return <Badge variant={variant}>{titleCase(state)}</Badge>;
+}
+
+function DecisionBadge({ decision }: { decision: ApprovalPolicyDecision }) {
+  const variant = decision === "deny" ? "destructive" : decision === "allow" ? "outline" : "secondary";
+  return <Badge variant={variant}>{titleCase(decision)}</Badge>;
+}
+
+function ReadinessAlert({ state }: { state: ConsoleState }) {
+  return (
+    <Alert data-readiness-banner className={cn("show", state.ready ? "hidden" : "")}>
+      <AlertTriangle className="h-4 w-4" />
+      <AlertTitle>{state.readiness.summary || "s-gw is not ready"}</AlertTitle>
+      <AlertDescription>{state.readiness.blockers.join(" ") || "Run s-gw setup to finish local configuration."}</AlertDescription>
+    </Alert>
+  );
+}
+
+function DetailGrid({ rows }: { rows: Array<[string, React.ReactNode]> }) {
+  return (
+    <div className="grid gap-3 text-sm">
+      {rows.map(([label, value]) => (
+        <div key={label} className="grid grid-cols-[130px_1fr] gap-3 border-b border-border/60 pb-2">
+          <div className="text-muted-foreground">{label}</div>
+          <div className="min-w-0 break-words font-medium">{value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LoadingDashboard() {
+  return (
+    <div className="grid gap-4 p-6 md:grid-cols-2 xl:grid-cols-4">
+      {Array.from({ length: 8 }).map((_, index) => <Skeleton key={index} className="h-40 rounded-lg" />)}
+    </div>
+  );
+}
+
+function humanEvent(value: string): string {
+  return titleCase(value.replace(/\./g, " "));
+}
+
+function filterText<T>(items: T[], search: string, text: (item: T) => string): T[] {
+  const needle = search.trim().toLowerCase();
+  if (!needle) return items;
+  return items.filter((item) => text(item).toLowerCase().includes(needle));
+}
+
+function viewFromLocation(): ViewId {
+  const params = new URLSearchParams(window.location.search);
+  const byQuery = params.get("view");
+  const path = window.location.pathname.replace(/^\/+/, "");
+  const value = byQuery || path || "overview";
+  if (navItems.some((item) => item.id === value)) return value as ViewId;
+  if (value === "flow") return "usage-flow";
+  return "overview";
+}
+
+function isNativeShellRoute(): boolean {
+  return new URLSearchParams(window.location.search).get("native-shell") === "1";
+}
+
+function embeddedView(): { compact: boolean } | null {
+  const params = new URLSearchParams(window.location.search);
+  if (window.location.pathname === "/menubar") return null;
+  if (params.get("embed") === "usage-flow") {
+    return { compact: params.get("compact") === "1" };
+  }
+  return null;
+}
+
+export default App;
