@@ -104,7 +104,7 @@ s-gw status
 
 To build from source, use a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
 
-Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts, so source install remains the most transparent path for early evaluation.
+Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path; use the source steps below for development and contribution work.
 
 ```bash
 git clone https://github.com/sgateway/s-gw.git

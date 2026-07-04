@@ -18,24 +18,28 @@ Raw credentials stay in the local encrypted ledger and are decrypted only inside
 
 ## Distribution Options
 
-### Source Package Or Tarball
+### npm Registry
 
-This is the current practical installation path before signed public downloads are available.
-
-Package:
+The public npm package is the recommended installation path for individual users. It installs the `s-gw`, `sgw`, `s-gw-mcp`, and `secret-gateway-mcp` commands.
 
 ```bash
-npm run package:local
-```
-
-Install on the local machine:
-
-```bash
-npm install -g ./s-gw-s-gw-0.1.0.tgz
+npm install -g @s-gw/s-gw
 s-gw setup
 ```
 
 For most macOS users, this is the complete first run. `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI.
+
+### Local Tarball Or Source
+
+To build and install a tarball from a source checkout:
+
+```bash
+npm run package:local
+npm install -g ./s-gw-s-gw-0.1.0.tgz
+s-gw setup
+```
+
+The scoped npm name produces a local pack filename such as `s-gw-s-gw-0.1.0.tgz`. Release tooling renames installer payloads to the shorter `s-gw-VERSION.tgz` form.
 
 For source-based installs:
 
@@ -356,10 +360,10 @@ All clients check the public `sgateway/s-gw` GitHub Releases feed at most once e
 
 Publish release notes and attach an npm tarball asset such as `s-gw-0.1.1.tgz` with its `.sha256` file. The macOS app can verify and install that package, restart the service/menu helper, and reopen s-gw. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
 
-Upgrade the package:
+Upgrade the npm package:
 
 ```bash
-npm install -g ./s-gw-0.1.1.tgz
+npm install -g @s-gw/s-gw@latest
 s-gw unlock status
 s-gw secret list
 s-gw service start
@@ -368,6 +372,8 @@ s-gw app open
 ```
 
 The local ledger and Keychain item should persist across package upgrades.
+
+For an offline upgrade, install the verified `s-gw-VERSION.tgz` asset from the matching GitHub release instead of the registry package.
 
 ## Uninstall
 

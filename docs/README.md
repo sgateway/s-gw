@@ -2,7 +2,7 @@
 
 ## Start Here
 
-- [Quick start](quickstart.md): build s-gw and run the disposable trust-loop demo.
+- [Quick start](quickstart.md): install s-gw from npm and run the disposable trust-loop demo.
 - [Architecture](architecture.md): components, data flow, and local process boundaries.
 - [Threat model](threat-model.md): intended guarantees, attacker assumptions, and non-goals.
 - [Deployment](deployment.md): platform support, setup, packaging, upgrade, and uninstall.
