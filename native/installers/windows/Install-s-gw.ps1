@@ -32,15 +32,50 @@ $sgwCommand = Get-Command "s-gw.cmd" -ErrorAction SilentlyContinue
 if (-not $sgwCommand) {
   $sgwCommand = Get-Command "s-gw" -ErrorAction SilentlyContinue
 }
-if (-not $sgwCommand) {
-  throw "s-gw was installed but its command is not on PATH. Restart Windows and run s-gw setup."
+
+if ($sgwCommand) {
+  $sgwCommandPath = $sgwCommand.Source
+} else {
+  $npmPrefixOutput = @(& $npmCommand.Source prefix --global)
+  $npmPrefixExitCode = $LASTEXITCODE
+  if ($npmPrefixExitCode -ne 0 -or $npmPrefixOutput.Count -eq 0) {
+    throw "s-gw was installed, but npm did not report its global command directory."
+  }
+
+  $npmPrefix = [string]($npmPrefixOutput | Select-Object -Last 1)
+  $npmPrefix = $npmPrefix.Trim()
+  if ([string]::IsNullOrWhiteSpace($npmPrefix)) {
+    throw "s-gw was installed, but npm returned an empty global command directory."
+  }
+
+  $sgwCommandPath = Join-Path $npmPrefix "s-gw.cmd"
+  if (-not (Test-Path -LiteralPath $sgwCommandPath)) {
+    throw "s-gw was installed, but its command was not found at $sgwCommandPath."
+  }
+
+  $processPathEntries = @($env:Path -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($processPathEntries -notcontains $npmPrefix) {
+    $env:Path = "$env:Path;$npmPrefix"
+  }
+
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+  $savedPathEntries = @("$userPath;$machinePath" -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($savedPathEntries -notcontains $npmPrefix) {
+    $nextUserPath = $npmPrefix
+    if (-not [string]::IsNullOrWhiteSpace($userPath)) {
+      $nextUserPath = "$userPath;$npmPrefix"
+    }
+    [Environment]::SetEnvironmentVariable("Path", $nextUserPath, "User")
+    Write-Host "Added $npmPrefix to your user PATH."
+  }
 }
 
 $setupArgs = @("setup", "--port", [string]$Port)
 if ($NoOpen) {
   $setupArgs += "--no-open-app"
 }
-& $sgwCommand.Source @setupArgs
+& $sgwCommandPath @setupArgs
 if ($LASTEXITCODE -ne 0) {
   throw "Initial s-gw setup did not complete."
 }

@@ -61,4 +61,27 @@ describe("platform installers", () => {
     expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");
     expect(combined).not.toContain("op read");
   });
+
+  it("resolves the Windows command from npm without requiring a restart", async () => {
+    const installerPath = path.join(root, "native/installers/windows/Install-s-gw.ps1");
+    const windows = await readFile(installerPath, "utf8");
+
+    expect(windows).toContain("prefix --global");
+    expect(windows).toContain('$sgwCommandPath = Join-Path $npmPrefix "s-gw.cmd"');
+    expect(windows).toContain('$env:Path = "$env:Path;$npmPrefix"');
+    expect(windows).toContain('[Environment]::SetEnvironmentVariable("Path", $nextUserPath, "User")');
+    expect(windows).toContain("& $sgwCommandPath @setupArgs");
+    expect(windows).not.toContain("Restart Windows and run s-gw setup");
+
+    if (process.platform === "win32") {
+      const escapedPath = installerPath.replaceAll("'", "''");
+      const parseCommand = [
+        "$tokens = $null",
+        "$errors = $null",
+        `[System.Management.Automation.Language.Parser]::ParseFile('${escapedPath}', [ref]$tokens, [ref]$errors) | Out-Null`,
+        "if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }"
+      ].join("; ");
+      execFileSync("powershell.exe", ["-NoProfile", "-Command", parseCommand], { stdio: "pipe" });
+    }
+  });
 });
