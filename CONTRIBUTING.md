@@ -46,6 +46,12 @@ The console uses sanitized sample data when it is not connected to a live local 
 
 Changes to credential handling, approval scope, command normalization, sanitization, local HTTP authorization, or native helpers require tests that exercise the failure path as well as the successful path.
 
+## Good First Issues
+
+Good first issues should be narrow, testable, and low risk. Documentation polish, small CLI examples, focused UI copy fixes, and agent-profile metadata tests are good candidates.
+
+Avoid marking issues as good first issue when they touch credential storage, approval bypass behavior, command execution, output sanitization, native secret helpers, local HTTP authorization, or platform installers. Those areas are security-sensitive and need experienced review from the start.
+
 ## Verification
 
 Run the full local verification before opening a pull request:

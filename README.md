@@ -14,11 +14,13 @@
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-2ea44f"></a>
   <img alt="Node.js 20+" src="https://img.shields.io/badge/Node.js-20%2B-43853d">
   <a href="https://s-gw.com"><img alt="Website: s-gw.com" src="https://img.shields.io/badge/website-s--gw.com-22c55e"></a>
+  <a href="https://github.com/sgateway/s-gw/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/sgateway/s-gw?style=social"></a>
   <img alt="Project status: preview" src="https://img.shields.io/badge/status-preview-f59e0b">
 </p>
 
 <p align="center">
   <a href="https://s-gw.com">Demo</a> ·
+  <a href="https://github.com/sgateway/s-gw/releases">Downloads</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="docs/README.md">Documentation</a> ·
   <a href="SECURITY.md">Security</a> ·
@@ -27,10 +29,27 @@
 
 [![s-gw demo](docs/images/s-gw-overview.png)](https://s-gw.com)
 
-s-gw is a local gateway between coding agents and credentials. Agents work with typed handles and scoped action requests. You approve the request on your machine, s-gw resolves the credential inside a constrained local process, and the agent gets sanitized output instead of the raw value.
+Stop handing raw credentials to coding agents. s-gw gives agents typed handles, asks you to approve bounded local actions, resolves the credential inside a constrained process on your machine, and returns sanitized output instead of secret values.
 
 > [!IMPORTANT]
 > s-gw is an early preview. Storage formats and interfaces may change, Windows support is still experimental, and the project has not completed an independent security audit. Do not treat it as a replacement for endpoint security or a hardened enterprise secrets platform yet.
+
+## The Short Version
+
+- **Agent sees:** `s-gw:credential:prod-readonly`
+- **You approve:** agent, command, handle, environment binding, working directory, and target
+- **s-gw runs:** the command locally with the credential injected only into that child process
+- **Agent receives:** sanitized output, audit evidence, and no raw secret
+
+If s-gw helps your agent workflow, [star the project](https://github.com/sgateway/s-gw/stargazers). It makes the preview easier for other developers to find.
+
+## See It In Action
+
+The local console shows the approval queue, credential inventory, policy state, usage flow, and activity history without exposing secret values.
+
+![s-gw local console overview](docs/images/s-gw-overview.png)
+
+Public demo: [s-gw.com](https://s-gw.com).
 
 ## What It Does
 
@@ -46,12 +65,6 @@ s-gw is a local gateway between coding agents and credentials. Agents work with 
 - **Output sanitization:** command output is scanned before it returns to the agent, replacing detected credential values with handles.
 - **Agent-aware setup:** Codex, Claude Code, Cursor, OpenCode, Gemini CLI, GitHub Copilot, VS Code, and other MCP clients get profile-specific configuration.
 - **Local operator UI:** the macOS app, menu helper, CLI, and web console show approvals, credential inventory, policies, usage flow, activity, and audit history.
-
-## Demo
-
-Public demo: [s-gw.com](https://s-gw.com). The demo highlights the local console, trust loop, approval flow, supported agent catalog, and usage map.
-
-![s-gw local console overview](docs/images/s-gw-overview.png)
 
 ## How It Works
 
@@ -81,6 +94,8 @@ The agent never needs the unlock passphrase or raw credential. Approval is scope
 ## Quick Start
 
 Requirements: Node.js 20 or newer and a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
+
+Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts, so source install remains the most transparent path for early evaluation.
 
 ```bash
 git clone https://github.com/sgateway/s-gw.git
@@ -112,6 +127,28 @@ s-gw secret list
 ```
 
 The [end-to-end trust loop](docs/quickstart.md) walks through a disposable request, local approval, execution, and output sanitization without touching a real credential.
+
+## Try The Trust Loop
+
+Use a disposable local token to see the full flow:
+
+```bash
+printf '%s' 'demo-secret-value' | s-gw secret add-keychain \
+  --name demo-printenv-token \
+  --type api-token \
+  --value-stdin \
+  --inject-env DEMO_TOKEN \
+  --allow-command "$(command -v printenv)"
+
+s-gw request env-command <returned-handle> \
+  --command "$(command -v printenv)" \
+  --inject-env DEMO_TOKEN
+
+s-gw approve <request-id>
+s-gw execute <request-id>
+```
+
+The execution output should show a handle token instead of `demo-secret-value`.
 
 ## Agent Integration
 
@@ -181,7 +218,9 @@ Read the [threat model](docs/threat-model.md) before relying on s-gw for sensiti
 
 ## Contributing
 
-Issues and focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and use [SECURITY.md](SECURITY.md) for anything that may expose credentials or bypass approval.
+Issues and focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), browse [`good first issue`](https://github.com/sgateway/s-gw/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22), and use [SECURITY.md](SECURITY.md) for anything that may expose credentials or bypass approval.
+
+Planning a launch, write-up, or community post? The maintainer notes in [docs/community-launch.md](docs/community-launch.md) keep the public wording consistent and honest.
 
 ## License
 
