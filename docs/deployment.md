@@ -31,7 +31,7 @@ npm run package:local
 Install on the local machine:
 
 ```bash
-npm install -g ./s-gw-0.1.0.tgz
+npm install -g ./s-gw-s-gw-0.1.0.tgz
 s-gw setup
 ```
 
@@ -376,7 +376,7 @@ Remove the tool:
 ```bash
 s-gw menubar uninstall
 s-gw service uninstall
-npm uninstall -g s-gw
+npm uninstall -g @s-gw/s-gw
 ```
 
 Remove local unlock material:

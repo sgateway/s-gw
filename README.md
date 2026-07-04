@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/sgateway/s-gw/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sgateway/s-gw/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://www.npmjs.com/package/@s-gw/s-gw"><img alt="npm" src="https://img.shields.io/npm/v/%40s-gw%2Fs-gw"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-2ea44f"></a>
   <img alt="Node.js 20+" src="https://img.shields.io/badge/Node.js-20%2B-43853d">
   <a href="https://s-gw.com"><img alt="Website: s-gw.com" src="https://img.shields.io/badge/website-s--gw.com-22c55e"></a>
@@ -93,7 +94,15 @@ The agent never needs the unlock passphrase or raw credential. Approval is scope
 
 ## Quick Start
 
-Requirements: Node.js 20 or newer and a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
+Requirements: Node.js 20 or newer.
+
+```bash
+npm install -g @s-gw/s-gw
+s-gw setup
+s-gw status
+```
+
+To build from source, use a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
 
 Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts, so source install remains the most transparent path for early evaluation.
 

@@ -351,6 +351,25 @@ export class SecretStore {
     });
   }
 
+  async setInjectEnv(handle: string, injectEnv: string): Promise<HandleSummary> {
+    const trimmed = injectEnv.trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+      throw new Error(`Invalid environment variable name: ${trimmed || "(empty)"}`);
+    }
+
+    return this.mutate((store) => {
+      const secret = store.secrets.find((item) => item.handle === handle);
+      if (!secret) {
+        throw new Error(`Unknown secret handle: ${handle}`);
+      }
+
+      secret.policy = normalizePolicy({ injectEnv: trimmed }, secret.policy);
+      secret.updatedAt = new Date().toISOString();
+      store.audit.push(audit("secret.policy.updated", `Set inject environment to ${trimmed} for ${secret.name}.`, handle));
+      return summarizeSecret(secret);
+    });
+  }
+
   async getSecretRecord(handle: string): Promise<SecretRecord> {
     const store = await this.read();
     const found = store.secrets.find((secret) => secret.handle === handle);
@@ -1785,8 +1804,12 @@ function currentLoginSessionId(): string {
 
 function normalizePolicy(input?: Partial<SecretPolicy>, existing?: SecretPolicy): SecretPolicy {
   const allowedCommands = input?.allowedCommands ?? existing?.allowedCommands ?? [];
+  const injectEnv = input?.injectEnv ?? existing?.injectEnv;
+  if (injectEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(injectEnv)) {
+    throw new Error(`Invalid environment variable name: ${injectEnv}`);
+  }
   return {
-    injectEnv: input?.injectEnv ?? existing?.injectEnv,
+    injectEnv,
     allowedCommands: uniqueStrings(allowedCommands),
     maxOutputBytes: input?.maxOutputBytes ?? existing?.maxOutputBytes ?? 16_384
   };
