@@ -68,6 +68,33 @@ describe("SecretStore", () => {
     expect(handles[0].policy.injectEnv).toBe("API_TOKEN");
   });
 
+  it("updates the injection environment without reading the secret", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "policy update token",
+      type: "api-token",
+      value: fakeOpenAiToken("policy_update"),
+      policy: { injectEnv: "OLD_TOKEN" }
+    });
+
+    const updated = await store.setInjectEnv(record.handle, "NODE_AUTH_TOKEN");
+    expect(updated.policy.injectEnv).toBe("NODE_AUTH_TOKEN");
+    await expect(store.setInjectEnv(record.handle, "invalid-name")).rejects.toThrow(/invalid environment/i);
+
+    const stored = await store.getHandle(record.handle);
+    expect(stored?.policy.injectEnv).toBe("NODE_AUTH_TOKEN");
+  });
+
+  it("rejects invalid injection environment names during enrollment", async () => {
+    const store = new SecretStore();
+    await expect(store.addSecret({
+      name: "invalid env token",
+      type: "api-token",
+      value: fakeOpenAiToken("invalid_env"),
+      policy: { injectEnv: "invalid-name" }
+    })).rejects.toThrow(/invalid environment/i);
+  });
+
   it("keeps encrypted store backups before ledger overwrites", async () => {
     const store = new SecretStore();
     const firstSecret = "first-backup-secret-value-123456789";

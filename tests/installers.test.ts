@@ -13,6 +13,8 @@ describe("platform installers", () => {
     ]);
     const pkg = JSON.parse(pkgRaw);
 
+    expect(pkg.name).toBe("@s-gw/s-gw");
+    expect(pkg.publishConfig.access).toBe("public");
     expect(pkg.scripts["build:installers"]).toBe("npm run build && node scripts/build-installers.mjs");
     expect(pkg.scripts["build:rust-core"]).toBe("node scripts/build-rust-core.mjs");
     expect(pkg.files).toContain("dist");
@@ -24,6 +26,7 @@ describe("platform installers", () => {
     expect(builder).toContain("hdiutil");
     expect(builder).toContain("s-gw-${version}-macos.dmg");
     expect(builder).toContain("s-gw-${version}-windows.zip");
+    expect(builder).toContain('const packageFile = `s-gw-${version}.tgz`');
     expect(builder).toContain("SHA256SUMS.txt");
   });
 

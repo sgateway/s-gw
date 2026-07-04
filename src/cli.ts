@@ -307,6 +307,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "secret" && second === "set-inject-env") {
+    const handle = third || requireFlag(parsed.flags, "handle");
+    printJson(await store.setInjectEnv(handle, requireFlag(parsed.flags, "inject-env")));
+    return;
+  }
+
   if (first === "scan-file") {
     const target = second;
     if (!target) {
@@ -1702,6 +1708,7 @@ Commands:
   s-gw secret list
   s-gw secret delete HANDLE
   s-gw secret allow-command HANDLE [--command s-gw:ssh-session]
+  s-gw secret set-inject-env HANDLE --inject-env ENV
   s-gw onepassword status
   s-gw onepassword import [--vault Dev] [--dry-run] [--include-companions] [--allow-command CMD]
   s-gw onepassword capture --text-stdin [--vault Dev] [--name NAME] [--inject-env ENV] [--allow-command CMD]

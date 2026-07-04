@@ -1,5 +1,5 @@
 {
-  "name": "s-gw",
+  "name": "@s-gw/s-gw",
   "version": "0.1.0",
   "description": "Local credential control for AI coding agents.",
   "type": "module",
@@ -10,6 +10,9 @@
   "homepage": "https://s-gw.com",
   "bugs": {
     "url": "https://github.com/sgateway/s-gw/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "bin": {
     "s-gw": "./dist/cli.js",

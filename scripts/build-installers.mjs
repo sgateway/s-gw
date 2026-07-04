@@ -17,7 +17,8 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageInfo = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
 const version = packageInfo.version;
-const packageFile = `${packageInfo.name}-${version}.tgz`;
+const packedFile = `${packageInfo.name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`;
+const packageFile = `s-gw-${version}.tgz`;
 const outputDir = resolve(root, "dist/installers");
 const workDir = mkdtempSync(resolve(tmpdir(), "s-gw-installers-"));
 
@@ -34,7 +35,7 @@ try {
   mkdirSync(outputDir, { recursive: true });
 
   run("npm", ["pack", "--ignore-scripts", "--pack-destination", workDir], root);
-  const packed = resolve(workDir, packageFile);
+  const packed = resolve(workDir, packedFile);
   requireFile(packed);
 
   const macArtifact = buildMacInstaller(packed);
