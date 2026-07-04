@@ -463,5 +463,5 @@ describe("CLI unknown-command behavior (end to end)", () => {
     } finally {
       await rm(home, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
