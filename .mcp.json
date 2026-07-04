@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "s-gw": {
+      "command": "node",
+      "args": [
+        "./dist/mcp-server.js"
+      ],
+      "cwd": ".",
+      "env": {
+        "SGW_HOME": "~/.s-gw",
+        "SGW_AGENT_NAME": "Claude Code"
+      },
+      "note": "Local-only s-gw MCP server. Raw secrets stay in the local encrypted ledger and are never returned to the agent."
+    }
+  }
+}

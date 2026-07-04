@@ -1,0 +1,35 @@
+{
+  "name": "s-gw",
+  "version": "0.1.0",
+  "description": "Local s-gw plugin that lets coding agents use typed secret handles without receiving raw credentials.",
+  "author": {
+    "name": "Barry Yuan"
+  },
+  "keywords": [
+    "s-gw",
+    "secrets",
+    "credentials",
+    "mcp",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "s-gw",
+    "shortDescription": "Keep secrets local while agents act through handles.",
+    "longDescription": "s-gw runs locally on your machine. It detects secrets, creates typed unique handles, requires local approval for secret-backed actions, executes approved operations locally, and returns only sanitized results or completion proofs to coding agents.",
+    "developerName": "Barry Yuan",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Local Files",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use s-gw to scan this repo for secrets and return handles only.",
+      "Use s-gw to list available local secret handles.",
+      "Use s-gw to request a secret-backed command without seeing the secret value."
+    ],
+    "brandColor": "#0F766E"
+  }
+}

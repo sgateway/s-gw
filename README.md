@@ -1,0 +1,188 @@
+<p align="center">
+  <img src="assets/icons/s-gw-128.png" alt="s-gw" width="96" height="96">
+</p>
+
+<h1 align="center">s-gw</h1>
+
+<p align="center">
+  <strong>Local credential control for coding agents.</strong><br>
+  Approve bounded actions locally. Keep raw credentials out of model context and tool output.
+</p>
+
+<p align="center">
+  <a href="https://github.com/sgateway/s-gw/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sgateway/s-gw/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-2ea44f"></a>
+  <img alt="Node.js 20+" src="https://img.shields.io/badge/Node.js-20%2B-43853d">
+  <a href="https://s-gw.com"><img alt="Website: s-gw.com" src="https://img.shields.io/badge/website-s--gw.com-22c55e"></a>
+  <img alt="Project status: preview" src="https://img.shields.io/badge/status-preview-f59e0b">
+</p>
+
+<p align="center">
+  <a href="https://s-gw.com">Demo</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="docs/README.md">Documentation</a> ·
+  <a href="SECURITY.md">Security</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+[![s-gw demo](docs/images/s-gw-overview.png)](https://s-gw.com)
+
+s-gw is a local gateway between coding agents and credentials. Agents work with typed handles and scoped action requests. You approve the request on your machine, s-gw resolves the credential inside a constrained local process, and the agent gets sanitized output instead of the raw value.
+
+> [!IMPORTANT]
+> s-gw is an early preview. Storage formats and interfaces may change, Windows support is still experimental, and the project has not completed an independent security audit. Do not treat it as a replacement for endpoint security or a hardened enterprise secrets platform yet.
+
+## What It Does
+
+| Govern | Approve | Execute | Audit |
+| --- | --- | --- | --- |
+| Turn secrets into typed local handles that agents can reference safely. | Review the requesting agent, handle, command, environment binding, working directory, and target before access is granted. | Inject the credential only into the approved child process on the same machine. | Record request, approval, execution, policy, and destination evidence without storing returned raw secrets. |
+
+## Why Teams Use It
+
+- **Local custody:** raw values stay in macOS Keychain, Windows Credential Manager, 1Password, or the encrypted local ledger.
+- **Action-scoped access:** grants bind to the agent, handle, command, environment variable, working directory, target, approval mode, and optional time window.
+- **Useful handles:** agents can request real work with stable handle names instead of seeing keys, passwords, tokens, or SSH material.
+- **Output sanitization:** command output is scanned before it returns to the agent, replacing detected credential values with handles.
+- **Agent-aware setup:** Codex, Claude Code, Cursor, OpenCode, Gemini CLI, GitHub Copilot, VS Code, and other MCP clients get profile-specific configuration.
+- **Local operator UI:** the macOS app, menu helper, CLI, and web console show approvals, credential inventory, policies, usage flow, activity, and audit history.
+
+## Demo
+
+Public demo: [s-gw.com](https://s-gw.com). The demo highlights the local console, trust loop, approval flow, supported agent catalog, and usage map.
+
+![s-gw local console overview](docs/images/s-gw-overview.png)
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A["Coding agent"] -->|"Handle + action request"| G["s-gw local gateway"]
+    G --> U["Local approval"]
+    U --> R["Constrained runner"]
+    K[("Keychain / Credential Manager / encrypted store")] --> R
+    R -->|"Sanitized output"| G
+    G --> A
+```
+
+The agent never needs the unlock passphrase or raw credential. Approval is scoped to the requested operation rather than granting general access to the store.
+
+## Core Surfaces
+
+| Surface | Purpose |
+| --- | --- |
+| `s-gw` CLI | Setup, credential enrollment, approvals, policies, agent snippets, guard mode, and diagnostics. |
+| `s-gw-mcp` | Stdio MCP server for agent-facing handle discovery and request creation. |
+| Native macOS app | Approval queue, credential inventory, policy rules, usage flow, activity, and audit review. |
+| Menu-bar helper | Fast visibility into pending approvals and local daemon status. |
+| Local web console | Browser-accessible fallback UI bound to `127.0.0.1`. |
+| Guard mode | Launch agents with credential-looking environment values replaced by s-gw handles. |
+
+## Quick Start
+
+Requirements: Node.js 20 or newer and a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
+
+```bash
+git clone https://github.com/sgateway/s-gw.git
+cd s-gw
+npm ci
+npm run build
+npm link
+s-gw setup
+s-gw status
+```
+
+`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, and starts the local UI surfaces available on the current platform.
+
+Add a credential from your terminal without placing the value in chat or a process argument:
+
+```bash
+printf '%s' "$MY_API_TOKEN" | s-gw secret add-keychain \
+  --name demo-token \
+  --type api-token \
+  --value-stdin \
+  --inject-env API_TOKEN \
+  --allow-command "$(command -v printenv)"
+```
+
+Then inspect the non-secret handle metadata:
+
+```bash
+s-gw secret list
+```
+
+The [end-to-end trust loop](docs/quickstart.md) walks through a disposable request, local approval, execution, and output sanitization without touching a real credential.
+
+## Agent Integration
+
+List the known agent profiles and render the configuration for one client:
+
+```bash
+s-gw agent list
+s-gw agent mcp-snippet codex
+s-gw agent mcp-snippet claude-code
+s-gw agent mcp-snippet opencode
+```
+
+For CLI agents, guard mode can replace credential-looking launch environment values with s-gw handles before the agent starts:
+
+```bash
+s-gw run codex --dry-run -- -v
+s-gw run codex -- --ask-for-approval never
+```
+
+MCP registration does not intercept every prompt, file read, shell, or environment variable. See [agent integration](docs/integrations.md) and the [agent profile matrix](docs/agents.md) for the supported paths and current limitations.
+
+## Example Request Flow
+
+1. An agent sees `s-gw:credential:prod-readonly` and asks to run `aws sts get-caller-identity`.
+2. s-gw creates a pending request with the agent name, command, handle, environment binding, working directory, target, and policy result.
+3. You approve once, for a time window, for the login session, or deny it.
+4. s-gw starts the approved local process with the credential injected into the requested environment variable.
+5. s-gw scans the process output before it returns to the agent.
+
+The model can complete the task without receiving the raw access key.
+
+## Platform Status
+
+| Platform | Status | Credential store | User interface |
+| --- | --- | --- | --- |
+| macOS 14+ | Primary development platform | Keychain | Native app, menu helper, local web console |
+| Windows 10/11 | Preview | Credential Manager | PowerShell client, tray helper, local web console |
+| Linux | Experimental CLI | Environment-provided unlock material | Local web console |
+
+Preview installers are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The macOS DMG is ad-hoc signed and unnotarized, and the Windows package is unsigned preview software. Build the same artifacts locally with `npm run build:installers`.
+
+## Security Model
+
+s-gw is designed to reduce accidental credential exposure to coding agents. It does not protect against a compromised operating system account, a malicious approved executable, screen capture, kernel-level access, or every transformed derivative of a secret.
+
+Read the [threat model](docs/threat-model.md) before relying on s-gw for sensitive workflows. Report suspected vulnerabilities through [GitHub private vulnerability reporting](SECURITY.md), not a public issue.
+
+## Project Status
+
+- Public source distribution is preview quality.
+- macOS is the primary development and test platform.
+- Windows Credential Manager support is present but still needs broader native QA.
+- Linux currently depends on environment-provided unlock material.
+- Desktop preview downloads are unsigned and intended for evaluation.
+- The repository is prepared for open-source collaboration, but security-sensitive changes should come with focused tests and threat-model updates when behavior changes.
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Quick start and trust-loop demo](docs/quickstart.md)
+- [Architecture](docs/architecture.md)
+- [Threat model](docs/threat-model.md)
+- [Agent integrations](docs/integrations.md)
+- [Credential stores and 1Password](docs/keychain.md)
+- [Deployment and packaging](docs/deployment.md)
+- [Third-party assets and licenses](docs/ui/THIRD_PARTY_NOTICES.md)
+
+## Contributing
+
+Issues and focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and use [SECURITY.md](SECURITY.md) for anything that may expose credentials or bypass approval.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party names and artwork remain the property of their respective owners and are documented in [TRADEMARKS.md](TRADEMARKS.md) and the [third-party notices](docs/ui/THIRD_PARTY_NOTICES.md).

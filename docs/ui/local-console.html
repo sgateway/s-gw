@@ -1,0 +1,4477 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>s-gw Local Console</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      var fallback = prefersDark ? "dark" : "light";
+
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem("sgw-theme") || fallback;
+      } catch (err) {
+        document.documentElement.dataset.theme = fallback;
+      }
+
+      var embed = params.get("embed");
+      if (embed) {
+        document.documentElement.dataset.embed = embed;
+      }
+
+      var embedDensity = params.get("compact") === "1" ? "compact" : "";
+      if (embedDensity) {
+        document.documentElement.dataset.embedDensity = embedDensity;
+      }
+    }());
+  </script>
+  <script src="vendor/d3-sankey/d3-array.min.js"></script>
+  <script src="vendor/d3-sankey/d3-path.min.js"></script>
+  <script src="vendor/d3-sankey/d3-shape.min.js"></script>
+  <script src="vendor/d3-sankey/d3-sankey.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --surface-tint: #eefafa;
+      --text: #101827;
+      --muted: #5d6979;
+      --faint: #7a8797;
+      --border: #dce3eb;
+      --border-strong: #cad4df;
+      --sidebar: #fbfdff;
+      --sidebar-active: #e5f7f3;
+      --topbar: rgba(255, 255, 255, .92);
+      --input: #ffffff;
+      --accent: #0b8f83;
+      --accent-strong: #08786f;
+      --green: #14965c;
+      --blue: #1167c4;
+      --red: #d92d20;
+      --orange: #b76b00;
+      --purple: #6658d3;
+      --shadow: 0 18px 42px rgba(15, 23, 42, .05);
+      --radius: 8px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0c1219;
+      --surface: #121b24;
+      --surface-soft: #0f1720;
+      --surface-tint: #112d2c;
+      --text: #edf4f7;
+      --muted: #a3b1be;
+      --faint: #7f91a1;
+      --border: #273745;
+      --border-strong: #34485a;
+      --sidebar: #0a1118;
+      --sidebar-active: #123632;
+      --topbar: rgba(12, 18, 25, .94);
+      --input: #0e1720;
+      --accent: #27b7aa;
+      --accent-strong: #35d0c2;
+      --green: #42c783;
+      --blue: #72aaff;
+      --red: #ff8178;
+      --orange: #ffbf5a;
+      --purple: #9b94ff;
+      --shadow: 0 22px 54px rgba(0, 0, 0, .28);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background: var(--bg);
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    svg {
+      display: block;
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
+    .app-shell {
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    :root[data-embed="usage-flow"] body {
+      min-height: 0;
+      background: transparent;
+    }
+
+    :root[data-embed="usage-flow"] .app-shell {
+      display: block;
+      min-height: 0;
+    }
+
+    :root[data-embed="usage-flow"] .sidebar,
+    :root[data-embed="usage-flow"] .topbar,
+    :root[data-embed="usage-flow"] .content > :not(#usage-flow) {
+      display: none;
+    }
+
+    :root[data-embed="usage-flow"] .content {
+      padding: 0;
+    }
+
+    :root[data-embed="usage-flow"] .flow-panel {
+      margin: 0;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+      background: transparent;
+    }
+
+    :root[data-embed="usage-flow"] .flow-panel .panel-head,
+    :root[data-embed="usage-flow"] .flow-detail {
+      display: none;
+    }
+
+    :root[data-embed="usage-flow"] .flow-layout {
+      display: block;
+      padding: 0;
+      position: relative;
+    }
+
+    :root[data-embed="usage-flow"] .sankey-wrap {
+      min-height: 100vh;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    :root[data-embed="usage-flow"] .sankey-wrap svg {
+      min-width: 760px;
+      width: max(100%, 760px);
+    }
+
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .flow-legend,
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .flow-drill {
+      display: none;
+    }
+
+    :root[data-embed="usage-flow"][data-embed-density="compact"],
+    :root[data-embed="usage-flow"][data-embed-density="compact"] body,
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .app-shell,
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .content,
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .flow-panel,
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .flow-layout,
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .sankey-wrap {
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .sankey-wrap svg {
+      min-width: 0;
+      width: 100%;
+    }
+
+    :root[data-embed="usage-flow"][data-embed-density="compact"] .sankey-wrap {
+      overflow: hidden;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail {
+      position: absolute;
+      top: 12px;
+      left: auto;
+      right: 12px;
+      z-index: 5;
+      display: block;
+      width: min(760px, calc(100vw - 24px));
+      min-width: min(380px, calc(100vw - 24px));
+      height: min(520px, calc(100vh - 24px));
+      min-height: min(260px, calc(100vh - 24px));
+      max-width: calc(100vw - 24px);
+      max-height: calc(100vh - 24px);
+      resize: none;
+      background: var(--surface);
+      box-shadow: 0 18px 48px rgba(15, 23, 42, .18);
+      padding-left: 0;
+      transform: translateX(0);
+      transform-origin: right center;
+      transition: transform .2s cubic-bezier(.2, .8, .2, 1), opacity .16s ease;
+      animation: flow-detail-slide-in .22s cubic-bezier(.2, .8, .2, 1);
+      will-change: transform, opacity;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-closing="true"] .flow-detail {
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(calc(100% + 24px));
+    }
+
+    @keyframes flow-detail-slide-in {
+      from {
+        opacity: 0;
+        transform: translateX(calc(100% + 24px));
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail table {
+      min-width: 700px;
+    }
+
+    :root[data-flow-resizing="true"] {
+      cursor: ew-resize;
+      user-select: none;
+    }
+
+    .flow-resize-grip {
+      appearance: none;
+      display: none;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-resize-grip {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 8;
+      display: flex;
+      width: 16px;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      cursor: ew-resize;
+      opacity: .82;
+      transform: translateX(-50%);
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-resize-grip:hover,
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-resize-grip:focus-visible,
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail[data-flow-resizing="true"] .flow-resize-grip {
+      opacity: 1;
+      outline: none;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-resize-grip:focus-visible .flow-resize-handle {
+      outline: 2px solid color-mix(in srgb, var(--teal) 58%, transparent);
+      outline-offset: 2px;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-resize-grip::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 1px;
+      transform: translateX(-.5px);
+      pointer-events: none;
+      background: color-mix(in srgb, var(--border) 88%, transparent);
+    }
+
+    .flow-resize-handle {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      width: 10px;
+      height: 24px;
+      place-items: center;
+      border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
+      border-radius: 4px;
+      background: var(--surface);
+      color: var(--muted);
+      box-shadow: 0 2px 8px rgba(15, 23, 42, .12);
+    }
+
+    .flow-resize-handle::before {
+      content: "";
+      display: block;
+      width: 7px;
+      height: 14px;
+      background-image: radial-gradient(circle, currentColor 1.1px, transparent 1.2px);
+      background-position: 0 0;
+      background-size: 4px 5px;
+      opacity: .8;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-resize-grip:hover .flow-resize-handle,
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail[data-flow-resizing="true"] .flow-resize-handle {
+      border-color: color-mix(in srgb, var(--teal) 46%, var(--border));
+      color: color-mix(in srgb, var(--teal) 80%, var(--text));
+      box-shadow: 0 2px 10px rgba(20, 184, 166, .18);
+    }
+
+    @media (max-width: 560px) {
+      :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail {
+        left: 12px;
+        right: 12px;
+        width: auto;
+        resize: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail {
+        animation: none;
+        transition: none;
+      }
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      height: 100vh;
+      padding: 26px 16px 22px;
+      border-right: 1px solid var(--border);
+      background: var(--sidebar);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 0 10px 16px;
+      color: var(--text);
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      color: var(--accent);
+      background: #e5f7f3;
+      flex: 0 0 auto;
+    }
+
+    :root[data-theme="dark"] .brand-mark {
+      background: #123632;
+    }
+
+    .brand strong {
+      font-size: 19px;
+      line-height: 1;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .nav {
+      display: grid;
+      gap: 7px;
+    }
+
+    .nav button {
+      display: grid;
+      grid-template-columns: 24px 1fr auto;
+      align-items: center;
+      gap: 11px;
+      width: 100%;
+      min-height: 40px;
+      padding: 0 13px;
+      border: 0;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .nav button.active {
+      background: var(--sidebar-active);
+      color: var(--accent-strong);
+      font-weight: 700;
+    }
+
+    .nav .bubble,
+    .queue-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      height: 22px;
+      padding: 0 7px;
+      border-radius: 99px;
+      background: #1265c7;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .profile-card {
+      margin-top: auto;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      overflow: hidden;
+    }
+
+    .profile-button {
+      display: grid;
+      grid-template-columns: 20px 1fr 16px;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      min-height: 49px;
+      padding: 0 14px;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .version {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 44px;
+      padding: 0 16px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 99px;
+      background: var(--green);
+      flex: 0 0 auto;
+    }
+
+    .main {
+      min-width: 0;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: grid;
+      grid-template-columns: minmax(360px, 1fr) auto;
+      align-items: center;
+      gap: 22px;
+      min-height: 80px;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--topbar);
+      backdrop-filter: blur(18px);
+    }
+
+    .mobile-brand {
+      display: none;
+    }
+
+    .status-strip {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      min-width: 0;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .status-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+    }
+
+    .status-item svg {
+      width: 17px;
+      height: 17px;
+      color: #334155;
+    }
+
+    :root[data-theme="dark"] .status-item svg {
+      color: #c8d4df;
+    }
+
+    .divider {
+      width: 1px;
+      height: 24px;
+      background: var(--border);
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .search {
+      position: relative;
+      width: min(282px, 24vw);
+      min-width: 220px;
+    }
+
+    .search svg {
+      position: absolute;
+      left: 13px;
+      top: 50%;
+      width: 18px;
+      height: 18px;
+      color: var(--muted);
+      transform: translateY(-50%);
+      pointer-events: none;
+    }
+
+    .search input {
+      width: 100%;
+      height: 42px;
+      padding: 0 48px 0 40px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--input);
+      color: var(--text);
+      outline: none;
+      font-size: 14px;
+    }
+
+    .search input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+    }
+
+    .kbd {
+      position: absolute;
+      right: 11px;
+      top: 50%;
+      padding: 2px 7px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12px;
+      font-weight: 700;
+      transform: translateY(-50%);
+    }
+
+    .pill-button,
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      min-height: 42px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .pill-button {
+      padding: 0 14px;
+    }
+
+    .icon-button {
+      width: 42px;
+      padding: 0;
+    }
+
+    .theme-toggle .sun {
+      display: none;
+    }
+
+    :root[data-theme="dark"] .theme-toggle .moon {
+      display: none;
+    }
+
+    :root[data-theme="dark"] .theme-toggle .sun {
+      display: block;
+    }
+
+    .queue-button {
+      padding-right: 12px;
+      white-space: nowrap;
+    }
+
+    .content {
+      padding: 22px 18px 30px;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .metric {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      gap: 16px;
+      align-items: center;
+      min-height: 118px;
+      padding: 20px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .metric-icon {
+      display: grid;
+      place-items: center;
+      width: 46px;
+      height: 46px;
+      border-radius: 10px;
+      color: var(--accent);
+      background: #e2f5f4;
+    }
+
+    .metric-icon.blue {
+      color: var(--blue);
+      background: #eaf2ff;
+    }
+
+    .metric-icon.red {
+      color: var(--red);
+      background: #ffeceb;
+    }
+
+    :root[data-theme="dark"] .metric-icon {
+      background: #123632;
+    }
+
+    :root[data-theme="dark"] .metric-icon.blue {
+      background: #172942;
+    }
+
+    :root[data-theme="dark"] .metric-icon.red {
+      background: #34191a;
+    }
+
+    .metric-label {
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 800;
+      line-height: 1.2;
+    }
+
+    .metric-value {
+      margin-top: 7px;
+      color: var(--text);
+      font-size: 27px;
+      line-height: 1;
+      font-weight: 850;
+    }
+
+    .metric-note {
+      margin-top: 13px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.25;
+      font-weight: 500;
+    }
+
+    .metric-note.attention {
+      color: var(--red);
+    }
+
+    .panel-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(470px, .85fr);
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 60px;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      color: var(--text);
+      font-size: 18px;
+      line-height: 1.1;
+      font-weight: 850;
+    }
+
+    .title-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 25px;
+      height: 25px;
+      border-radius: 99px;
+      background: #eaf2ff;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    :root[data-theme="dark"] .title-count {
+      background: #172942;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      min-width: 620px;
+      border-collapse: collapse;
+    }
+
+    .approval-panel {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .approval-panel .table-wrap {
+      flex: 1;
+    }
+
+    .approval-panel table {
+      min-width: 820px;
+      table-layout: fixed;
+    }
+
+    .approval-panel th {
+      white-space: normal;
+      line-height: 1.2;
+    }
+
+    .approval-panel th:nth-child(1),
+    .approval-panel td:nth-child(1) {
+      width: 94px;
+    }
+
+    .approval-panel th:nth-child(2),
+    .approval-panel td:nth-child(2) {
+      width: 150px;
+    }
+
+    .approval-panel th:nth-child(3),
+    .approval-panel td:nth-child(3) {
+      width: 112px;
+    }
+
+    .approval-panel th:nth-child(4),
+    .approval-panel td:nth-child(4) {
+      width: 160px;
+    }
+
+    .approval-panel th:nth-child(5),
+    .approval-panel td:nth-child(5) {
+      width: 96px;
+    }
+
+    .approval-panel th:nth-child(6),
+    .approval-panel td:nth-child(6) {
+      width: 78px;
+    }
+
+    .approval-panel th:nth-child(7),
+    .approval-panel td:nth-child(7) {
+      width: 130px;
+    }
+
+    .approval-panel td {
+      white-space: normal;
+    }
+
+    .approval-panel td:nth-child(2),
+    .approval-panel td:nth-child(3),
+    .approval-panel td:nth-child(4) {
+      overflow-wrap: anywhere;
+    }
+
+    .approval-panel td:nth-child(1),
+    .approval-panel td:nth-child(5),
+    .approval-panel td:nth-child(6),
+    .approval-panel td:nth-child(7) {
+      overflow-wrap: normal;
+      white-space: nowrap;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: middle;
+      font-size: 13px;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--text);
+      background: var(--surface-soft);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    tbody tr {
+      transition: background .12s ease;
+    }
+
+    tbody tr:hover {
+      background: color-mix(in srgb, var(--accent) 5%, transparent);
+    }
+
+    tr.hidden-row {
+      display: none;
+    }
+
+    .agent-cell {
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      white-space: normal;
+    }
+
+    .agent-badge {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 7px;
+      color: #2e2a85;
+      background: #e6e1ff;
+      font-weight: 850;
+    }
+
+    :root[data-theme="dark"] .agent-badge {
+      color: #d6d2ff;
+      background: #282559;
+    }
+
+    .cell-sub {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.25;
+      white-space: normal;
+    }
+
+    .risk {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 0 10px;
+      border: 1px solid;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .risk.low {
+      color: #087a55;
+      border-color: #9bd8c3;
+      background: #e8f8f2;
+    }
+
+    .risk.medium {
+      color: var(--orange);
+      border-color: #ffbf63;
+      background: #fff7e8;
+    }
+
+    .risk.high {
+      color: var(--red);
+      border-color: #ff9d99;
+      background: #fff0ef;
+    }
+
+    .risk.critical {
+      color: var(--red);
+      border-color: #ff9d99;
+      background: #fff0ef;
+    }
+
+    :root[data-theme="dark"] .risk.low {
+      color: #63dbad;
+      border-color: #226b54;
+      background: #102d24;
+    }
+
+    :root[data-theme="dark"] .risk.medium {
+      color: #ffc56b;
+      border-color: #7b561f;
+      background: #2d2312;
+    }
+
+    :root[data-theme="dark"] .risk.high {
+      color: #ff9b93;
+      border-color: #7c3434;
+      background: #321819;
+    }
+
+    :root[data-theme="dark"] .risk.critical {
+      color: #ff9b93;
+      border-color: #7c3434;
+      background: #321819;
+    }
+
+    .action-group {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+      white-space: nowrap;
+    }
+
+    .action-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 30px;
+      width: 30px;
+      height: 28px;
+      padding: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .action-button svg {
+      width: 15px;
+      height: 15px;
+    }
+
+    .action-button.approve {
+      color: #087a55;
+      border-color: #9bd8c3;
+      background: #e8f8f2;
+    }
+
+    .action-button.deny {
+      color: var(--red);
+      border-color: #ffb4b1;
+      background: #fff4f3;
+    }
+
+    .action-button.busy,
+    .action-button:disabled {
+      opacity: .5;
+      cursor: progress;
+      pointer-events: none;
+    }
+
+    :root[data-theme="dark"] .action-button.approve {
+      color: #63dbad;
+      border-color: #226b54;
+      background: #102d24;
+    }
+
+    :root[data-theme="dark"] .action-button.deny {
+      color: #ff9b93;
+      border-color: #7c3434;
+      background: #321819;
+    }
+
+    .row-menu {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .row-menu svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .provider-cell {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 650;
+    }
+
+    .provider-icon {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      color: var(--text);
+      flex: 0 0 auto;
+    }
+
+    .provider-icon.text-mark {
+      font-size: 10px;
+      font-weight: 850;
+    }
+
+    code {
+      display: inline-block;
+      max-width: 210px;
+      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface-soft);
+      color: var(--text);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.2;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: middle;
+    }
+
+    .table-footer {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 0 16px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .panel-head > .table-footer {
+      min-height: auto;
+      padding: 0;
+      border-top: 0;
+      justify-content: flex-end;
+      white-space: nowrap;
+    }
+
+    .audit table {
+      min-width: 980px;
+    }
+
+    .audit td {
+      white-space: normal;
+    }
+
+    .audit td:first-child,
+    .audit td:nth-child(5),
+    .audit td:nth-child(6) {
+      white-space: nowrap;
+    }
+
+    .actor {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+    }
+
+    .event-kind {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text);
+    }
+
+    .event-kind svg {
+      width: 19px;
+      height: 19px;
+    }
+
+    .audit-details {
+      color: var(--text);
+      white-space: normal;
+      min-width: 360px;
+    }
+
+    .audit-details span {
+      display: inline-block;
+      margin-right: 14px;
+    }
+
+    .token {
+      min-width: 190px;
+      text-align: center;
+    }
+
+    .chevron-cell {
+      width: 28px;
+      text-align: right;
+    }
+
+    .toast {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      z-index: 30;
+      max-width: min(360px, calc(100vw - 44px));
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: var(--shadow);
+      font-size: 13px;
+      font-weight: 650;
+      opacity: 0;
+      transform: translateY(8px);
+      pointer-events: none;
+      transition: opacity .18s ease, transform .18s ease;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .menu-popover {
+      position: fixed;
+      z-index: 45;
+      display: none;
+      min-width: 210px;
+      max-width: min(280px, calc(100vw - 24px));
+      padding: 6px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: var(--shadow);
+    }
+
+    .menu-popover.show {
+      display: block;
+    }
+
+    .menu-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      width: 100%;
+      padding: 9px 10px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      font: inherit;
+      font-size: 13px;
+      line-height: 1.25;
+    }
+
+    .menu-item:hover,
+    .menu-item:focus-visible {
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+      outline: none;
+    }
+
+    .menu-item.danger {
+      color: var(--red);
+    }
+
+    .menu-item[disabled] {
+      color: var(--muted);
+      cursor: not-allowed;
+    }
+
+    .menu-item span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .banner {
+      display: none;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 14px 16px;
+      margin-bottom: 18px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      font-size: 14px;
+    }
+
+    .banner.show {
+      display: flex;
+    }
+
+    .banner-warn {
+      background: rgba(234, 179, 8, .12);
+      border-color: rgba(234, 179, 8, .4);
+      color: var(--text);
+    }
+
+    .banner-error {
+      background: rgba(239, 68, 68, .12);
+      border-color: rgba(239, 68, 68, .45);
+      color: var(--text);
+    }
+
+    .banner-approval {
+      background: rgba(245, 158, 11, .15);
+      border-color: rgba(245, 158, 11, .48);
+      color: var(--text);
+    }
+
+    .banner-icon svg {
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      flex: none;
+    }
+
+    .banner-warn .banner-icon svg {
+      stroke: #b08400;
+    }
+
+    .banner-error .banner-icon svg {
+      stroke: #dc2626;
+    }
+
+    .banner-approval .banner-icon svg {
+      stroke: #d97706;
+    }
+
+    .banner-body {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .banner-body strong {
+      display: block;
+      font-weight: 750;
+    }
+
+    .banner-body p {
+      margin: 4px 0 0;
+      color: var(--muted);
+    }
+
+    .banner-list {
+      margin: 6px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .banner-list li {
+      margin-top: 3px;
+    }
+
+    .banner-list code,
+    .banner-body code {
+      background: rgba(127, 127, 127, .16);
+      padding: 1px 5px;
+      border-radius: 5px;
+      font-size: 12.5px;
+    }
+
+    .banner-action {
+      flex: none;
+      align-self: center;
+      border: 1px solid rgba(239, 68, 68, .5);
+      background: transparent;
+      color: var(--text);
+      font-weight: 650;
+      font-size: 13px;
+      padding: 7px 14px;
+      border-radius: 9px;
+      cursor: pointer;
+    }
+
+    .banner-action:hover {
+      background: rgba(239, 68, 68, .14);
+    }
+
+    .metric[data-high-risk-jump] {
+      cursor: pointer;
+    }
+
+    .metric[data-high-risk-jump]:hover {
+      border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+    }
+
+    .empty-state {
+      display: none;
+      min-height: 72px;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+    }
+
+    .empty-state.show {
+      display: block;
+    }
+
+    .approval-panel tbody {
+      min-height: 210px;
+    }
+
+    .grants-panel {
+      margin-bottom: 18px;
+    }
+
+    .grants-panel table {
+      min-width: 820px;
+    }
+
+    .grants-panel td:nth-child(3) {
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+
+    .flow-panel {
+      margin-bottom: 18px;
+    }
+
+    .flow-layout {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      padding: 16px;
+    }
+
+    .flow-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0 16px 14px;
+    }
+
+    .flow-legend span {
+      display: inline-flex;
+      min-height: 24px;
+      align-items: center;
+      gap: 7px;
+      padding: 0 9px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface-soft);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .flow-legend i {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      background: var(--blue);
+    }
+
+    .flow-legend .agent i { background: #7567e8; }
+    .flow-legend .auth i { background: #0b9f91; }
+    .flow-legend .target i { background: #1d73d4; }
+
+    .sankey-wrap {
+      position: relative;
+      min-height: 500px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, var(--surface-soft), var(--surface));
+      overflow: auto;
+    }
+
+    .sankey-wrap svg {
+      display: block;
+      width: max(100%, 1100px);
+      min-width: 1100px;
+      height: 500px;
+    }
+
+    .sankey-link {
+      fill: none;
+      cursor: pointer;
+      stroke-linecap: butt;
+      stroke-opacity: .30;
+      transition: stroke-opacity .15s ease, filter .15s ease;
+      pointer-events: stroke;
+    }
+
+    :root[data-theme="dark"] .sankey-link {
+      stroke-opacity: .32;
+    }
+
+    .sankey-link:hover {
+      stroke-opacity: .52;
+    }
+
+    .sankey-link.is-selected {
+      stroke-opacity: .68;
+    }
+
+    .sankey-link.is-muted,
+    .sankey-node.is-muted {
+      opacity: .28;
+    }
+
+    .sankey-node rect {
+      cursor: pointer;
+      stroke: var(--surface);
+      stroke: color-mix(in srgb, var(--surface) 72%, transparent);
+      stroke-width: 1;
+      shape-rendering: geometricPrecision;
+    }
+
+    .sankey-node.agent rect {
+      fill: #7567e8;
+    }
+
+    .sankey-node.auth rect {
+      fill: #0b9f91;
+    }
+
+    .sankey-node.target rect {
+      fill: #1d73d4;
+    }
+
+    .sankey-node.is-selected rect {
+      stroke: var(--text);
+      stroke-width: 1.5;
+      filter: drop-shadow(0 2px 7px rgba(29, 115, 212, .26));
+    }
+
+    .sankey-heading {
+      fill: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 18px;
+      font-weight: 850;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .sankey-heading.is-compact-heading {
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .sankey-label {
+      fill: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13.5px;
+      font-synthesis-weight: none;
+      font-weight: 400;
+      paint-order: normal;
+      pointer-events: none;
+      stroke: transparent;
+      stroke-linejoin: round;
+      stroke-opacity: 0;
+      stroke-width: 0;
+      transition: opacity .12s ease;
+    }
+
+    .sankey-value {
+      fill: var(--muted);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+      font-synthesis-weight: none;
+      font-weight: 400;
+      paint-order: normal;
+      pointer-events: none;
+      stroke: transparent;
+      stroke-linejoin: round;
+      stroke-opacity: 0;
+      stroke-width: 0;
+      transition: opacity .12s ease;
+    }
+
+    .sankey-label.is-compact-label {
+      font-size: 11px;
+    }
+
+    .sankey-label.is-secondary-label,
+    .sankey-value.is-secondary-label {
+      opacity: 0;
+    }
+
+    .sankey-node:hover .is-secondary-label,
+    .sankey-node:focus .is-secondary-label,
+    .sankey-node.is-selected .is-secondary-label {
+      opacity: 1;
+    }
+
+    .flow-empty {
+      display: none;
+      position: absolute;
+      inset: 0;
+      place-items: center;
+      padding: 28px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+    }
+
+    .flow-empty.show {
+      display: grid;
+    }
+
+    .flow-detail {
+      min-width: 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: auto;
+    }
+
+    .flow-drill {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface-soft);
+    }
+
+    .flow-drill-kicker {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .flow-drill strong {
+      display: block;
+      margin-top: 3px;
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .flow-drill p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .flow-detail table {
+      width: 100%;
+      min-width: 700px;
+      table-layout: fixed;
+    }
+
+    .flow-detail th,
+    .flow-detail td {
+      white-space: normal;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+
+    .flow-detail th:nth-child(1),
+    .flow-detail td:nth-child(1) {
+      width: 20%;
+    }
+
+    .flow-detail th:nth-child(2),
+    .flow-detail td:nth-child(2) {
+      width: 32%;
+    }
+
+    .flow-detail th:nth-child(3),
+    .flow-detail td:nth-child(3) {
+      width: 36%;
+    }
+
+    .flow-detail th:nth-child(4),
+    .flow-detail td:nth-child(4) {
+      width: 12%;
+      overflow-wrap: normal;
+      white-space: nowrap;
+    }
+
+    .flow-detail[data-flow-detail-width="medium"] table,
+    .flow-detail[data-flow-detail-width="narrow"] table,
+    .flow-detail[data-flow-detail-width="compact"] table {
+      min-width: 0;
+    }
+
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail[data-flow-detail-width="medium"] table,
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail[data-flow-detail-width="narrow"] table,
+    :root[data-embed="usage-flow"][data-flow-selected="true"] .flow-detail[data-flow-detail-width="compact"] table {
+      min-width: 0;
+    }
+
+    .flow-detail[data-flow-detail-width="medium"] .cell-sub,
+    .flow-detail[data-flow-detail-width="medium"] .flow-state,
+    .flow-detail[data-flow-detail-width="narrow"] .cell-sub,
+    .flow-detail[data-flow-detail-width="narrow"] .flow-state,
+    .flow-detail[data-flow-detail-width="compact"] .cell-sub,
+    .flow-detail[data-flow-detail-width="compact"] .flow-state {
+      display: none;
+    }
+
+    .flow-detail[data-flow-detail-width="narrow"] th:nth-child(1),
+    .flow-detail[data-flow-detail-width="narrow"] td:nth-child(1),
+    .flow-detail[data-flow-detail-width="compact"] th:nth-child(1),
+    .flow-detail[data-flow-detail-width="compact"] td:nth-child(1) {
+      display: none;
+    }
+
+    .flow-detail[data-flow-detail-width="narrow"] th:nth-child(2),
+    .flow-detail[data-flow-detail-width="narrow"] td:nth-child(2) {
+      width: 48%;
+    }
+
+    .flow-detail[data-flow-detail-width="narrow"] th:nth-child(3),
+    .flow-detail[data-flow-detail-width="narrow"] td:nth-child(3) {
+      width: 38%;
+    }
+
+    .flow-detail[data-flow-detail-width="narrow"] th:nth-child(4),
+    .flow-detail[data-flow-detail-width="narrow"] td:nth-child(4) {
+      width: 74px;
+    }
+
+    .flow-detail[data-flow-detail-width="compact"] th:nth-child(3),
+    .flow-detail[data-flow-detail-width="compact"] td:nth-child(3),
+    .flow-detail[data-flow-detail-width="compact"] th:nth-child(4),
+    .flow-detail[data-flow-detail-width="compact"] td:nth-child(4) {
+      display: none;
+    }
+
+    .flow-detail[data-flow-detail-width="compact"] th:nth-child(2),
+    .flow-detail[data-flow-detail-width="compact"] td:nth-child(2) {
+      width: 100%;
+    }
+
+    .flow-detail[data-flow-detail-width="compact"] th:nth-child(2)::after {
+      content: " / target";
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .flow-detail[data-flow-detail-width="compact"] td:nth-child(2)::after {
+      content: attr(data-compact-target);
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .flow-detail .agent-cell {
+      align-items: start;
+    }
+
+    .flow-state {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 5px;
+    }
+
+    .state-chip {
+      display: inline-flex;
+      min-height: 20px;
+      align-items: center;
+      padding: 0 6px;
+      border-radius: 5px;
+      background: var(--surface-soft);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    @media (max-width: 1180px) {
+      .app-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        display: none;
+      }
+
+      .mobile-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 850;
+      }
+
+      .topbar {
+        grid-template-columns: 1fr;
+        min-height: auto;
+        padding: 14px 18px;
+      }
+
+      .status-strip {
+        justify-content: space-between;
+      }
+
+      .top-actions {
+        justify-content: flex-start;
+        flex-wrap: wrap;
+      }
+
+      .search {
+        width: min(520px, 100%);
+      }
+
+      .metrics,
+      .panel-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .flow-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .panel-grid .panel {
+        min-width: 0;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .status-strip {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .divider {
+        display: none;
+      }
+
+      .content {
+        padding: 16px;
+      }
+
+      .metrics,
+      .panel-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .metric {
+        min-height: 104px;
+      }
+
+      .panel-head {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px;
+      }
+
+      .panel-head .pill-button {
+        width: 100%;
+      }
+
+      .search {
+        min-width: 100%;
+      }
+
+      .queue-button {
+        flex: 1 1 190px;
+      }
+
+      .theme-toggle {
+        flex: 0 0 42px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+    <!-- UI icons sourced from Lucide Static 1.17.0; GitHub mark sourced from Simple Icons 16.22.0. See THIRD_PARTY_NOTICES.md. -->
+    <symbol id="i-shield-lock" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+  <path d="m9 12 2 2 4-4" /></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" />
+  <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" />
+  <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" /></symbol>
+    <symbol id="i-clipboard" viewBox="0 0 24 24"><rect width="8" height="4" x="8" y="2" rx="1" ry="1" />
+  <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+  <path d="M12 11h4" />
+  <path d="M12 16h4" />
+  <path d="M8 11h.01" />
+  <path d="M8 16h.01" /></symbol>
+    <symbol id="i-bot" viewBox="0 0 24 24"><path d="M12 8V4H8" />
+  <rect width="16" height="12" x="4" y="8" rx="2" />
+  <path d="M2 14h2" />
+  <path d="M20 14h2" />
+  <path d="M15 13v2" />
+  <path d="M9 13v2" /></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" />
+  <circle cx="12" cy="12" r="3" /></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2" />
+  <line x1="8" x2="16" y1="21" y2="21" />
+  <line x1="12" x2="12" y1="17" y2="21" /></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><circle cx="12" cy="16" r="1" />
+  <rect x="3" y="10" width="18" height="12" rx="2" />
+  <path d="M7 10V7a5 5 0 0 1 10 0v3" /></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" />
+  <path d="M12 6v6l4 2" /></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+  <path d="M16 3.128a4 4 0 0 1 0 7.744" />
+  <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+  <circle cx="9" cy="7" r="4" /></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+  <path d="M12 8v4" />
+  <path d="M12 16h.01" /></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34" />
+  <circle cx="11" cy="11" r="8" /></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6" />
+  <path d="M10 14 21 3" />
+  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1" />
+  <circle cx="12" cy="5" r="1" />
+  <circle cx="12" cy="19" r="1" /></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z" /></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 15V3" />
+  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+  <path d="m7 10 5 5 5-5" /></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" />
+  <path d="m9 12 2 2 4-4" /></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m7 11 2-2-2-2" />
+  <path d="M11 13h4" />
+  <rect width="18" height="18" x="3" y="3" rx="2" ry="2" /></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" />
+  <path d="M12 16v-4" />
+  <path d="M12 8h.01" /></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401" /></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" />
+  <path d="M12 2v2" />
+  <path d="M12 20v2" />
+  <path d="m4.93 4.93 1.41 1.41" />
+  <path d="m17.66 17.66 1.41 1.41" />
+  <path d="M2 12h2" />
+  <path d="M20 12h2" />
+  <path d="m6.34 17.66-1.41 1.41" />
+  <path d="m19.07 4.93-1.41 1.41" /></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" /></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z" />
+  <path d="M12 22V12" />
+  <polyline points="3.29 7 12 12 20.71 7" />
+  <path d="m7.5 4.27 9 5.15" /></symbol>
+  </svg>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark"><svg><use href="#i-shield-lock"></use></svg></span>
+        <strong>s-gw</strong>
+      </div>
+
+      <nav class="nav" aria-label="Primary">
+        <button class="active" type="button" data-nav="overview"><svg><use href="#i-home"></use></svg><span>Overview</span></button>
+        <button type="button" data-nav="flow"><svg><use href="#i-users"></use></svg><span>Usage Flow</span></button>
+        <button type="button" data-nav="credentials"><svg><use href="#i-key"></use></svg><span>Credentials</span></button>
+        <button type="button" data-nav="requests"><svg><use href="#i-clipboard"></use></svg><span>Requests</span><span class="bubble">2</span></button>
+        <button type="button" data-nav="agents"><svg><use href="#i-bot"></use></svg><span>Agents</span></button>
+        <button type="button" data-nav="audit"><svg><use href="#i-alert"></use></svg><span>Audit</span></button>
+        <button type="button" data-nav="settings"><svg><use href="#i-settings"></use></svg><span>Settings</span></button>
+      </nav>
+
+      <div class="profile-card">
+        <button class="profile-button" type="button" data-menu="profile" aria-haspopup="menu">
+          <svg><use href="#i-monitor"></use></svg>
+          <span>Local profile</span>
+          <svg><use href="#i-chevron-down"></use></svg>
+        </button>
+        <div class="version"><span class="dot"></span><span>v1.2.3</span></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="status-strip">
+          <div class="mobile-brand">
+            <span class="brand-mark"><svg><use href="#i-shield-lock"></use></svg></span>
+            <span>s-gw</span>
+          </div>
+          <span class="status-item"><span class="dot"></span>Local daemon running <svg><use href="#i-monitor"></use></svg></span>
+          <span class="divider"></span>
+          <span class="status-item"><span class="dot"></span>macOS Keychain unlocked <svg><use href="#i-key"></use></svg></span>
+        </div>
+
+        <div class="top-actions">
+          <label class="search">
+            <svg><use href="#i-search"></use></svg>
+            <input type="search" data-search placeholder="Search..." aria-label="Search console rows">
+            <span class="kbd">Cmd K</span>
+          </label>
+          <button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <svg class="moon"><use href="#i-moon"></use></svg>
+            <svg class="sun"><use href="#i-sun"></use></svg>
+          </button>
+          <button class="pill-button queue-button" type="button" data-jump="#approvals">
+            <svg><use href="#i-users"></use></svg>
+            <span>Approve Queue</span>
+            <span class="queue-count">2</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="content">
+        <div class="banner banner-error" data-connection-banner role="alert">
+          <span class="banner-icon"><svg><use href="#i-info"></use></svg></span>
+          <div class="banner-body">
+            <strong data-connection-title>Can't reach the local daemon</strong>
+            <p data-connection-text>The console lost contact with <code>s-gw console</code>. Approvals and live state are paused.</p>
+          </div>
+          <button class="banner-action" type="button" data-connection-retry>Retry</button>
+        </div>
+
+        <div class="banner banner-warn" data-readiness-banner role="status">
+          <span class="banner-icon"><svg><use href="#i-key"></use></svg></span>
+          <div class="banner-body">
+            <strong data-readiness-title>s-gw is not ready yet</strong>
+            <ul class="banner-list" data-readiness-blockers></ul>
+          </div>
+        </div>
+
+        <div class="banner banner-approval" data-approval-alert role="alert">
+          <span class="banner-icon"><svg><use href="#i-clock"></use></svg></span>
+          <div class="banner-body">
+            <strong data-approval-alert-title>Approval needed now</strong>
+            <p data-approval-alert-text>An agent is waiting for permission to use a local credential.</p>
+          </div>
+          <button class="banner-action" type="button" data-jump="#approvals">Review</button>
+        </div>
+
+        <section class="metrics" aria-label="Summary">
+          <article class="metric" data-searchable="local secrets handles stored securely">
+            <span class="metric-icon"><svg><use href="#i-lock"></use></svg></span>
+            <div>
+              <div class="metric-label">Local secrets</div>
+              <div class="metric-value">28</div>
+              <div class="metric-note">Handles stored securely</div>
+            </div>
+          </article>
+          <article class="metric" data-searchable="pending approvals review">
+            <span class="metric-icon blue"><svg><use href="#i-clock"></use></svg></span>
+            <div>
+              <div class="metric-label">Pending approvals</div>
+              <div class="metric-value">2</div>
+              <div class="metric-note">Requires your review</div>
+            </div>
+          </article>
+          <article class="metric" data-searchable="active agents connected idle">
+            <span class="metric-icon"><svg><use href="#i-users"></use></svg></span>
+            <div>
+              <div class="metric-label">Active agents</div>
+              <div class="metric-value">3</div>
+              <div class="metric-note">Connected and idle</div>
+            </div>
+          </article>
+          <article class="metric" data-searchable="high risk findings attention" data-high-risk-jump>
+            <span class="metric-icon red"><svg><use href="#i-alert"></use></svg></span>
+            <div>
+              <div class="metric-label">High risk findings</div>
+              <div class="metric-value">1</div>
+              <div class="metric-note attention">Requires attention</div>
+            </div>
+          </article>
+        </section>
+
+        <section class="panel flow-panel" id="usage-flow">
+          <div class="panel-head">
+            <h2 class="panel-title"><svg><use href="#i-users"></use></svg>Agent credential flow</h2>
+            <span class="table-footer" data-flow-summary>0 requests mapped</span>
+          </div>
+          <div class="flow-legend" aria-label="Usage flow stages">
+            <span class="agent"><i></i>Agent</span>
+            <span class="auth"><i></i>Authentication type</span>
+            <span class="target"><i></i>Target type</span>
+          </div>
+          <div class="flow-drill" data-flow-drill>
+            <div>
+              <div class="flow-drill-kicker" data-flow-drill-kicker>All routes</div>
+              <strong data-flow-drill-title>All credential-use routes</strong>
+              <p data-flow-drill-detail>Grouped by agent, authentication type, and target type.</p>
+            </div>
+          </div>
+          <div class="flow-layout">
+            <div class="sankey-wrap">
+              <svg data-sankey role="img" aria-label="Agent to authentication type to target type flow"></svg>
+              <div class="flow-empty" data-flow-empty>No credential-use requests yet.</div>
+            </div>
+            <div class="flow-detail">
+              <button
+                type="button"
+                class="flow-resize-grip"
+                data-flow-resize-grip
+                role="separator"
+                aria-label="Resize details panel"
+                aria-orientation="vertical"
+                title="Resize details panel"
+              >
+                <span class="flow-resize-handle" aria-hidden="true"></span>
+              </button>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Agent</th>
+                    <th>Authentication type</th>
+                    <th>Target type</th>
+                    <th>Requests</th>
+                  </tr>
+                </thead>
+                <tbody data-flow-rows></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel-grid">
+          <article class="panel approval-panel" id="approvals">
+            <div class="panel-head">
+              <h1 class="panel-title">Pending approvals <span class="title-count">2</span></h1>
+              <button class="pill-button" type="button" data-menu="requests-panel" aria-haspopup="menu">
+                <span>View all requests</span>
+                <svg><use href="#i-external"></use></svg>
+              </button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Agent</th>
+                    <th>Requested command</th>
+                    <th>Target</th>
+                    <th>Handle</th>
+                    <th>Requested</th>
+                    <th>Risk</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr data-searchable="codex /usr/bin/ssh prod-bastion ed25519 private key medium">
+                    <td><span class="agent-cell"><span class="agent-badge">C</span><span>Codex<span class="cell-sub">v1.0.1</span></span></span></td>
+                    <td>/usr/bin/ssh</td>
+                    <td>prod-bastion<span class="cell-sub">10.0.1.12</span></td>
+                    <td>s-gw:private-key:<span class="cell-sub">ed25519:prod-bastion</span></td>
+                    <td>2m ago<span class="cell-sub">12:42:18</span></td>
+                    <td><span class="risk medium">Medium</span></td>
+                    <td><button class="row-menu" type="button" data-menu="request" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr data-searchable="codex /usr/bin/ssh prod-bastion rsa private key high">
+                    <td><span class="agent-cell"><span class="agent-badge">C</span><span>Codex<span class="cell-sub">v1.0.1</span></span></span></td>
+                    <td>/usr/bin/ssh</td>
+                    <td>prod-bastion<span class="cell-sub">10.0.1.12</span></td>
+                    <td>s-gw:private-key:<span class="cell-sub">rsa:prod-bastion</span></td>
+                    <td>1m ago<span class="cell-sub">12:43:02</span></td>
+                    <td><span class="risk high">High</span></td>
+                    <td><button class="row-menu" type="button" data-menu="request" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="empty-state" data-empty="approvals">No approvals match this search.</div>
+            <div class="table-footer">Showing 1-2 of 2</div>
+          </article>
+
+          <article class="panel" id="credentials-panel">
+            <div class="panel-head">
+              <h2 class="panel-title">Credential handles</h2>
+              <button class="pill-button" type="button" data-menu="credentials-panel" aria-haspopup="menu">
+                <span>View all credentials</span>
+                <svg><use href="#i-external"></use></svg>
+              </button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Provider</th>
+                    <th>Handle prefix</th>
+                    <th>Secrets</th>
+                    <th>Severity</th>
+                    <th>Last used</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr data-searchable="github s-gw:github low">
+                    <td><span class="provider-cell"><span class="provider-icon"><svg><use href="#i-github"></use></svg></span>GitHub</span></td>
+                    <td>s-gw:github</td>
+                    <td>6</td>
+                    <td><span class="risk low">Low</span></td>
+                    <td>2h ago<span class="cell-sub">10:21:33</span></td>
+                    <td><button class="row-menu" type="button" data-menu="credential" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr data-searchable="aws s-gw:aws medium">
+                    <td><span class="provider-cell"><span class="provider-icon text-mark">aws</span>AWS</span></td>
+                    <td>s-gw:aws</td>
+                    <td>9</td>
+                    <td><span class="risk medium">Medium</span></td>
+                    <td>15m ago<span class="cell-sub">12:29:04</span></td>
+                    <td><button class="row-menu" type="button" data-menu="credential" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr data-searchable="openai s-gw:openai low">
+                    <td><span class="provider-cell"><span class="provider-icon text-mark">AI</span>OpenAI</span></td>
+                    <td>s-gw:openai</td>
+                    <td>3</td>
+                    <td><span class="risk low">Low</span></td>
+                    <td>3h ago<span class="cell-sub">09:15:11</span></td>
+                    <td><button class="row-menu" type="button" data-menu="credential" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr data-searchable="ssh s-gw:private-key high">
+                    <td><span class="provider-cell"><span class="provider-icon"><svg><use href="#i-terminal"></use></svg></span>SSH</span></td>
+                    <td>s-gw:private-key</td>
+                    <td>10</td>
+                    <td><span class="risk high">High</span></td>
+                    <td>5m ago<span class="cell-sub">12:39:48</span></td>
+                    <td><button class="row-menu" type="button" data-menu="credential" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr data-searchable="generic s-gw:generic low">
+                    <td><span class="provider-cell"><span class="provider-icon"><svg><use href="#i-box"></use></svg></span>Generic</span></td>
+                    <td>s-gw:generic</td>
+                    <td>0</td>
+                    <td><span class="risk low">Low</span></td>
+                    <td>-</td>
+                    <td><button class="row-menu" type="button" data-menu="credential" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="empty-state" data-empty="credentials">No credential handles match this search.</div>
+            <div class="table-footer">Showing 1-5 of 5</div>
+          </article>
+        </section>
+
+        <section class="panel grants-panel" id="approval-grants">
+          <div class="panel-head">
+            <h2 class="panel-title"><svg><use href="#i-clock"></use></svg>Reusable approvals</h2>
+            <button class="pill-button" type="button" data-revoke-all-grants>
+              <span>Revoke all</span>
+            </button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>Scope</th>
+                  <th>Handle</th>
+                  <th>Mode</th>
+                  <th>Expires</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="empty-state" data-empty="grants">No reusable approvals are active.</div>
+          <div class="table-footer">Showing 0 of 0</div>
+        </section>
+
+        <section class="panel audit" id="audit">
+          <div class="panel-head">
+            <h2 class="panel-title"><svg><use href="#i-alert"></use></svg>Audit timeline</h2>
+            <div class="top-actions">
+              <button class="pill-button" type="button" data-menu="audit-filter" aria-haspopup="menu">
+                <svg><use href="#i-filter"></use></svg>
+                <span>All events</span>
+                <svg><use href="#i-chevron-down"></use></svg>
+              </button>
+              <button class="pill-button" type="button" data-download>
+                <svg><use href="#i-download"></use></svg>
+                <span>Download</span>
+              </button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Actor</th>
+                  <th>Event</th>
+                  <th>Details</th>
+                  <th></th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr data-searchable="codex approval requested /usr/bin/ssh prod-bastion ed25519">
+                  <td>12:43:02</td>
+                  <td><span class="actor"><span class="agent-badge">C</span><span>Codex (agent)<span class="cell-sub">192.168.1.42</span></span></span></td>
+                  <td><span class="event-kind"><svg><use href="#i-alert"></use></svg>Approval requested</span></td>
+                  <td class="audit-details"><span>Command: /usr/bin/ssh</span><span>Target: prod-bastion (10.0.1.12)</span><span>Handle: s-gw:private-key:rsa:prod-bastion</span><span>Purpose: connect</span></td>
+                  <td><code class="token">&lt;&lt;SGW_SECRET:8f2b...a1d4&gt;&gt;</code></td>
+                  <td class="chevron-cell"><svg><use href="#i-chevron"></use></svg></td>
+                </tr>
+                <tr data-searchable="codex approval requested /usr/bin/ssh prod-bastion ed25519">
+                  <td>12:42:18</td>
+                  <td><span class="actor"><span class="agent-badge">C</span><span>Codex (agent)<span class="cell-sub">192.168.1.42</span></span></span></td>
+                  <td><span class="event-kind"><svg><use href="#i-alert"></use></svg>Approval requested</span></td>
+                  <td class="audit-details"><span>Command: /usr/bin/ssh</span><span>Target: prod-bastion (10.0.1.12)</span><span>Handle: s-gw:private-key:ed25519:prod-bastion</span><span>Purpose: connect</span></td>
+                  <td><code class="token">&lt;&lt;SGW_SECRET:3c9e...7b21&gt;&gt;</code></td>
+                  <td class="chevron-cell"><svg><use href="#i-chevron"></use></svg></td>
+                </tr>
+                <tr data-searchable="you approved codex">
+                  <td>12:41:05</td>
+                  <td><span class="actor"><span class="provider-icon"><svg><use href="#i-users"></use></svg></span><span>You (user)<span class="cell-sub">macbook-pro.local</span></span></span></td>
+                  <td><span class="event-kind"><svg style="color:var(--green)"><use href="#i-check"></use></svg>Approved</span></td>
+                  <td class="audit-details"><span>Approved request for Codex (agent)</span><span>Handle: s-gw:private-key:ed25519:prod-bastion</span></td>
+                  <td><code class="token">&lt;&lt;SGW_SECRET:3c9e...7b21&gt;&gt;</code></td>
+                  <td class="chevron-cell"><svg><use href="#i-chevron"></use></svg></td>
+                </tr>
+                <tr data-searchable="codex secret accessed /usr/bin/ssh">
+                  <td>12:40:58</td>
+                  <td><span class="actor"><span class="agent-badge">C</span><span>Codex (agent)<span class="cell-sub">192.168.1.42</span></span></span></td>
+                  <td><span class="event-kind"><svg><use href="#i-terminal"></use></svg>Secret accessed</span></td>
+                  <td class="audit-details"><span>Accessed via /usr/bin/ssh</span><span>Handle: s-gw:private-key:ed25519:prod-bastion</span></td>
+                  <td><code class="token">&lt;&lt;SGW_SECRET:3c9e...7b21&gt;&gt;</code></td>
+                  <td class="chevron-cell"><svg><use href="#i-chevron"></use></svg></td>
+                </tr>
+                <tr data-searchable="system credential rotated rsa private key">
+                  <td>12:39:48</td>
+                  <td><span class="actor"><span class="provider-icon"><svg><use href="#i-settings"></use></svg></span><span>s-gw (system)</span></span></td>
+                  <td><span class="event-kind"><svg><use href="#i-info"></use></svg>Credential rotated</span></td>
+                  <td class="audit-details"><span>Handle: s-gw:private-key:rsa:prod-bastion</span><span>New version stored</span></td>
+                  <td><code class="token">&lt;&lt;SGW_SECRET:9a7d...c4f2&gt;&gt;</code></td>
+                  <td class="chevron-cell"><svg><use href="#i-chevron"></use></svg></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty-state" data-empty="audit">No audit events match this search.</div>
+          <div class="table-footer">Showing 1-5 of 256</div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" data-toast-box role="status" aria-live="polite"></div>
+  <div class="menu-popover" data-menu-popover role="menu" aria-hidden="true"></div>
+
+  <script>
+    (function () {
+      var root = document.documentElement;
+      var toggle = document.querySelector("[data-theme-toggle]");
+      var search = document.querySelector("[data-search]");
+      var toastBox = document.querySelector("[data-toast-box]");
+      var menuBox = document.querySelector("[data-menu-popover]");
+      var activeMenuActions = {};
+      var apiToken = window.SGW_CONSOLE_TOKEN || "";
+      var liveMode = Boolean(window.SGW_CONSOLE_LIVE && apiToken);
+      var currentState = null;
+      var usageFlowFilter = null;
+      var usageFlowCloseTimer = null;
+      var usageFlowDetailObserver = null;
+      var usageFlowWindowResizeBound = false;
+      var usageFlowResize = null;
+      // Requests with an approve/deny POST in flight. A credential gate must not
+      // fire a second decision on the same row mid-round-trip — a double-clicked
+      // approve would 409 ("already approved") and toast an error on a request
+      // that actually succeeded; an approve-then-deny race is worse.
+      var pendingActions = {};
+
+      function saveTheme(theme) {
+        try {
+          localStorage.setItem("sgw-theme", theme);
+        } catch (err) {
+          return;
+        }
+      }
+
+      function setTheme(theme, shouldSave) {
+        root.dataset.theme = theme;
+
+        if (toggle) {
+          var next = theme === "dark" ? "light" : "dark";
+          toggle.setAttribute("aria-label", "Switch to " + next + " mode");
+          toggle.title = "Switch to " + next + " mode";
+        }
+
+        if (shouldSave) {
+          saveTheme(theme);
+        }
+      }
+
+      function showToast(message) {
+        if (!toastBox) {
+          return;
+        }
+
+        toastBox.textContent = message;
+        toastBox.classList.add("show");
+        window.clearTimeout(showToast.timer);
+        showToast.timer = window.setTimeout(function () {
+          toastBox.classList.remove("show");
+        }, 1800);
+      }
+
+      function showMenu(button, items) {
+        if (!menuBox || !items.length) {
+          return;
+        }
+
+        activeMenuActions = {};
+        menuBox.innerHTML = items.map(function (item, index) {
+          var id = "m" + index;
+          activeMenuActions[id] = item.action || function () {};
+          return '<button class="menu-item' + (item.danger ? " danger" : "") + '" type="button" role="menuitem" data-menu-item="' + id + '"' +
+            (item.disabled ? " disabled" : "") + ">" +
+            escapeHtml(item.label) +
+            (item.sub ? "<span>" + escapeHtml(item.sub) + "</span>" : "") +
+            "</button>";
+        }).join("");
+        menuBox.classList.add("show");
+        menuBox.setAttribute("aria-hidden", "false");
+        positionMenu(button);
+      }
+
+      function hideMenu() {
+        if (!menuBox) {
+          return;
+        }
+
+        menuBox.classList.remove("show");
+        menuBox.setAttribute("aria-hidden", "true");
+      }
+
+      function positionMenu(button) {
+        if (!menuBox) {
+          return;
+        }
+
+        var rect = button.getBoundingClientRect();
+        var menuRect = menuBox.getBoundingClientRect();
+        var maxLeft = window.innerWidth - menuRect.width - 12;
+        var opensFromSidebar = Boolean(button.closest(".sidebar"));
+        var preferredLeft = opensFromSidebar && rect.right + menuRect.width + 20 <= window.innerWidth
+          ? rect.right + 8
+          : rect.right - menuRect.width;
+        var left = Math.max(12, Math.min(maxLeft, preferredLeft));
+        var top = rect.bottom + 8;
+        if (top + menuRect.height > window.innerHeight - 12) {
+          top = Math.max(12, rect.top - menuRect.height - 8);
+        }
+
+        menuBox.style.left = left + "px";
+        menuBox.style.top = top + "px";
+      }
+
+      function openMenuFor(button) {
+        var kind = button.dataset.menu;
+        if (kind === "profile") {
+          showMenu(button, profileMenuItems());
+          return;
+        }
+        if (kind === "credential") {
+          showMenu(button, credentialMenuItems(button));
+          return;
+        }
+        if (kind === "request") {
+          showMenu(button, requestMenuItems(button));
+          return;
+        }
+        if (kind === "audit-filter") {
+          showMenu(button, auditFilterItems());
+          return;
+        }
+        if (kind === "credentials-panel") {
+          showMenu(button, credentialsPanelItems());
+          return;
+        }
+        if (kind === "requests-panel") {
+          showMenu(button, requestsPanelItems());
+          return;
+        }
+        if (kind === "agents-nav") {
+          showMenu(button, agentMenuItems());
+          return;
+        }
+        if (kind === "settings-nav") {
+          showMenu(button, settingsMenuItems());
+        }
+      }
+
+      function apiJson(path, options) {
+        if (!liveMode) {
+          return Promise.reject(new Error("Console API is not available from the static file."));
+        }
+
+        var init = options || {};
+        init.headers = Object.assign({
+          "X-SGW-Console-Token": apiToken,
+          "Content-Type": "application/json"
+        }, init.headers || {});
+
+        return fetch(path, init).then(function (response) {
+          return response.json().catch(function () {
+            return {};
+          }).then(function (payload) {
+            if (!response.ok) {
+              throw new Error(payload.error || "Console API request failed.");
+            }
+
+            return payload;
+          });
+        });
+      }
+
+      function apiText(path) {
+        if (!liveMode) {
+          return Promise.reject(new Error("Console API is not available from the static file."));
+        }
+
+        return fetch(path, {
+          headers: {
+            "X-SGW-Console-Token": apiToken
+          }
+        }).then(function (response) {
+          if (!response.ok) {
+            throw new Error("Download failed.");
+          }
+
+          return response.text();
+        });
+      }
+
+      function loadState(message, quiet) {
+        if (!liveMode) {
+          renderUsageFlow(mockUsageFlowState());
+          updateSearch();
+          return Promise.resolve();
+        }
+
+        return apiJson("/api/state").then(function (state) {
+          currentState = state;
+          setConnectionError(false);
+          renderState(state);
+          updateSearch();
+          if (message) {
+            showToast(message);
+          }
+        }).catch(function (error) {
+          setConnectionError(true, error && error.message);
+          // Background polls show the persistent banner but skip the toast so a
+          // downed daemon doesn't fire an alert every refresh tick.
+          if (!quiet) {
+            showToast(error.message || "Lost contact with the local daemon");
+          }
+        });
+      }
+
+      function setConnectionError(failed, detail) {
+        var banner = document.querySelector("[data-connection-banner]");
+        if (!banner) {
+          return;
+        }
+        // Only meaningful in live mode; the static file never had a daemon to lose.
+        banner.classList.toggle("show", Boolean(failed) && liveMode);
+        if (failed && detail) {
+          var text = banner.querySelector("[data-connection-text]");
+          if (text) {
+            text.textContent = detail;
+          }
+        }
+      }
+
+      function renderState(state) {
+        renderReadiness(state);
+        renderApprovalAlert(state);
+        renderStatus(state);
+        renderMetrics(state);
+        renderUsageFlow(state);
+        renderApprovals(state);
+        renderCredentials(state);
+        renderApprovalGrants(state);
+        renderAudit(state);
+      }
+
+      function renderApprovalAlert(state) {
+        var banner = document.querySelector("[data-approval-alert]");
+        if (!banner) {
+          return;
+        }
+        var pending = state.pendingRequests || [];
+        banner.classList.toggle("show", pending.length > 0);
+        if (!pending.length) {
+          return;
+        }
+
+        var first = pending[0] || {};
+        var title = banner.querySelector("[data-approval-alert-title]");
+        var text = banner.querySelector("[data-approval-alert-text]");
+        var agent = requestAgentName(first);
+        var command = first.action && first.action.command ? shortPath(first.action.command) : "local command";
+        if (title) {
+          title.textContent = pending.length === 1 ? "Approval needed now" : pending.length + " approvals need review";
+        }
+        if (text) {
+          text.textContent = agent + " is waiting to run " + command + " with " + shortHandle(first.handle || "s-gw handle") + ". This only approves local credential use; host-agent command prompts are separate.";
+        }
+      }
+
+      function renderReadiness(state) {
+        var banner = document.querySelector("[data-readiness-banner]");
+        if (!banner) {
+          return;
+        }
+
+        // Older daemons that predate the readiness verdict omit the field; treat that
+        // as "no opinion" and keep the banner hidden rather than nagging falsely.
+        var hasVerdict = state && typeof state.ready === "boolean";
+        var ready = !hasVerdict || state.ready;
+        banner.classList.toggle("show", liveMode && hasVerdict && !ready);
+        if (ready) {
+          return;
+        }
+
+        var readiness = state.readiness || {};
+        var title = banner.querySelector("[data-readiness-title]");
+        if (title) {
+          title.textContent = readiness.summary || "s-gw is not ready yet";
+        }
+
+        var list = banner.querySelector("[data-readiness-blockers]");
+        if (list) {
+          var blockers = readiness.blockers && readiness.blockers.length
+            ? readiness.blockers
+            : ["Run s-gw setup to configure a local unlock source."];
+          list.innerHTML = blockers.map(function (line) {
+            return "<li>" + withCode(line) + "</li>";
+          }).join("");
+        }
+      }
+
+      // Render `like this` spans as <code> without trusting the daemon text as HTML.
+      function withCode(text) {
+        return escapeHtml(String(text)).replace(/`([^`]+)`/g, function (_match, inner) {
+          return "<code>" + inner + "</code>";
+        });
+      }
+
+      function renderStatus(state) {
+        var version = document.querySelector(".version span:last-child");
+        if (version) {
+          version.textContent = "v" + state.version;
+        }
+
+        var statusItems = document.querySelectorAll(".status-item");
+        if (statusItems[0]) {
+          statusItems[0].innerHTML = '<span class="dot"></span>Local daemon running <svg><use href="#i-monitor"></use></svg>';
+        }
+        if (statusItems[1]) {
+          var unlock = state.status && state.status.unlock ? state.status.unlock : {};
+          var label = unlock.activeSource === "macos-keychain" ? "macOS Keychain unlocked" :
+            unlock.activeSource === "env" ? "Env unlock active" : "Unlock required";
+          statusItems[1].innerHTML = '<span class="dot"></span>' + escapeHtml(label) + ' <svg><use href="#i-key"></use></svg>';
+        }
+      }
+
+      function renderMetrics(state) {
+        var metrics = state.metrics || {};
+        var cards = document.querySelectorAll(".metric");
+        setMetric(cards[0], "Local secrets", metrics.localSecrets || 0, "Handles stored securely");
+        setMetric(cards[1], "Pending approvals", metrics.pendingApprovals || 0, "Requires your review");
+        setMetric(cards[2], "Supported agents", metrics.activeAgents || 0, "Local MCP profiles");
+        setMetric(cards[3], "High risk findings", metrics.highRiskFindings || 0,
+          metrics.highRiskFindings ? "Requires attention" : "No high risk findings");
+
+        document.querySelectorAll(".queue-count, .bubble, .title-count").forEach(function (item) {
+          item.textContent = String(metrics.pendingApprovals || 0);
+        });
+      }
+
+      function setMetric(card, label, value, note) {
+        if (!card) {
+          return;
+        }
+
+        var labelNode = card.querySelector(".metric-label");
+        var valueNode = card.querySelector(".metric-value");
+        var noteNode = card.querySelector(".metric-note");
+        if (labelNode) {
+          labelNode.textContent = label;
+        }
+        if (valueNode) {
+          valueNode.textContent = String(value);
+        }
+        if (noteNode) {
+          noteNode.textContent = note;
+          noteNode.classList.toggle("attention", label === "High risk findings" && value > 0);
+        }
+      }
+
+      function renderUsageFlow(state) {
+        var flow = state.usageFlow || { nodes: [], links: [], rows: [], totalRequests: 0 };
+        var svg = document.querySelector("[data-sankey]");
+        var rowsBody = document.querySelector("[data-flow-rows]");
+        var empty = document.querySelector("[data-flow-empty]");
+        var summary = document.querySelector("[data-flow-summary]");
+        if (!svg || !rowsBody) {
+          return;
+        }
+
+        var allRows = flow.rows || [];
+        var filteredRows = allRows.filter(function (row) {
+          return flowRowMatchesFilter(row, usageFlowFilter);
+        });
+        var rows = filteredRows.slice(0, 12);
+        var nodes = flow.nodes || [];
+        var links = flow.links || [];
+        if (summary) {
+          summary.textContent = usageFlowFilter
+            ? rowsRequestCount(filteredRows) + " matching requests"
+            : (flow.totalRequests || 0) + " requests mapped";
+        }
+
+        if (empty) {
+          empty.classList.toggle("show", allRows.length === 0);
+        }
+        renderUsageFlowDrill(flow, filteredRows);
+        rowsBody.innerHTML = rows.map(function (row) {
+          var searchable = [row.agent, row.authType, row.targetType, row.credential, row.handle, row.action, row.command, row.target].join(" ");
+          return '<tr data-searchable="' + attr(searchable) + '">' +
+            '<td><span class="agent-cell"><span class="agent-badge">' + escapeHtml(row.agent.slice(0, 1) || "A") + '</span><span>' +
+            escapeHtml(row.agent) + '<span class="cell-sub">' + escapeHtml(timeAgo(row.lastSeen)) + '</span></span></span></td>' +
+            '<td data-compact-target="' + attr(row.targetType || "Other target") + '">' + escapeHtml(row.authType || "Unknown credential") + '<span class="cell-sub">' + escapeHtml(flowExamples(row.credentials, row.credential || row.handle)) + '</span></td>' +
+            '<td>' + escapeHtml(row.targetType || "Other target") + '<span class="cell-sub">' + escapeHtml(flowExamples(row.targets, row.target || row.action || row.command)) + '</span></td>' +
+            '<td>' + escapeHtml(String(row.count)) + flowStateMarkup(row.states) + '</td>' +
+            '</tr>';
+        }).join("");
+        syncUsageFlowDetailWidth();
+
+        var compactEmbed = isCompactUsageFlowEmbed();
+        var wrap = svg.closest(".sankey-wrap");
+        var viewportHeight = Math.max(1, Math.floor(window.innerHeight || document.documentElement.clientHeight || 300));
+        var containerWidth = wrap ? wrap.clientWidth : svg.getBoundingClientRect().width;
+        var containerHeight = compactEmbed ? viewportHeight : (wrap ? wrap.clientHeight : viewportHeight);
+        var maxColumn = sankeyMaxColumnSize(nodes);
+        var width = compactEmbed
+          ? Math.max(320, Math.floor(containerWidth || 360))
+          : Math.max(1280, Math.floor(containerWidth || 1280), Math.min(1700, 960 + (nodes.length || 1) * 10));
+        var height = compactEmbed
+          ? Math.max(260, Math.floor(containerHeight || 300))
+          : Math.max(640, Math.min(1800, 360 + maxColumn * 18 + links.length * 3));
+        svg.style.minWidth = width + "px";
+        svg.style.width = compactEmbed ? "100%" : "max(100%, " + width + "px)";
+        svg.style.height = height + "px";
+        svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+        try {
+          svg.innerHTML = d3SankeySvg(nodes, links, width, height);
+          svg.setAttribute("data-engine", "d3-sankey");
+          svg.removeAttribute("data-render-error");
+          updateUsageFlowSelection(svg);
+        } catch (error) {
+          console.error(error);
+          svg.innerHTML = sankeyErrorSvg(width, height, error);
+          svg.setAttribute("data-engine", "unavailable");
+          svg.setAttribute("data-render-error", error && error.message ? error.message : String(error));
+        }
+      }
+
+      function isCompactUsageFlowEmbed() {
+        return root.dataset.embed === "usage-flow" && root.dataset.embedDensity === "compact";
+      }
+
+      function renderUsageFlowDrill(flow, rows) {
+        root.dataset.flowSelected = usageFlowFilter ? "true" : "false";
+        if (!usageFlowFilter) {
+          delete root.dataset.flowClosing;
+        }
+        var box = document.querySelector("[data-flow-drill]");
+        if (!box) {
+          return;
+        }
+        var kicker = box.querySelector("[data-flow-drill-kicker]");
+        var title = box.querySelector("[data-flow-drill-title]");
+        var detail = box.querySelector("[data-flow-drill-detail]");
+        var total = rowsRequestCount(rows);
+        if (!usageFlowFilter) {
+          if (kicker) {
+            kicker.textContent = "All routes";
+          }
+          if (title) {
+            title.textContent = "All credential-use routes";
+          }
+          if (detail) {
+            detail.textContent = (flow.totalRequests || 0) + " requests across " + ((flow.rows || []).length) + " grouped agent/authentication/target routes.";
+          }
+          return;
+        }
+
+        if (kicker) {
+          kicker.textContent = usageFlowFilter.type === "link" ? "Selected link" : flowKindLabel(usageFlowFilter.kind);
+        }
+        if (title) {
+          title.textContent = usageFlowFilter.label || "Selected route";
+        }
+        if (detail) {
+          detail.textContent = total + " matching request" + (total === 1 ? "" : "s") + " across " + rows.length + " grouped route" + (rows.length === 1 ? "" : "s") + ".";
+        }
+      }
+
+      function rowsRequestCount(rows) {
+        return rows.reduce(function (sum, row) {
+          return sum + (Number(row.count) || 0);
+        }, 0);
+      }
+
+      function flowExamples(values, fallback) {
+        var list = Array.isArray(values) ? values.filter(Boolean) : [];
+        if (!list.length && fallback) {
+          list = [fallback];
+        }
+        if (!list.length) {
+          return "";
+        }
+        var shown = list.slice(0, 3);
+        var more = list.length > shown.length ? " +" + (list.length - shown.length) + " more" : "";
+        return shown.join(", ") + more;
+      }
+
+      function flowRowMatchesFilter(row, filter) {
+        if (!filter) {
+          return true;
+        }
+
+        if (filter.type === "node") {
+          return row.agentId === filter.id ||
+            row.authTypeId === filter.id ||
+            row.targetTypeId === filter.id;
+        }
+
+        if (filter.type === "link") {
+          return flowRowHasLink(row, filter.source, filter.target);
+        }
+
+        return true;
+      }
+
+      function flowRowHasLink(row, source, target) {
+        var pairs = [
+          [row.agentId, row.authTypeId],
+          [row.authTypeId, row.targetTypeId]
+        ];
+        return pairs.some(function (pair) {
+          return pair[0] === source && pair[1] === target;
+        });
+      }
+
+      function usageFlowNodeById(id) {
+        var flow = currentUsageFlow();
+        return (flow.nodes || []).find(function (node) {
+          return node.id === id;
+        }) || null;
+      }
+
+      function usageFlowLinkByPair(source, target) {
+        var flow = currentUsageFlow();
+        return (flow.links || []).find(function (link) {
+          return link.source === source && link.target === target;
+        }) || null;
+      }
+
+      function currentUsageFlow() {
+        if (currentState && currentState.usageFlow) {
+          return currentState.usageFlow;
+        }
+        return mockUsageFlowState().usageFlow;
+      }
+
+      function selectUsageFlowNode(id) {
+        var node = usageFlowNodeById(id);
+        if (!node) {
+          return;
+        }
+        cancelUsageFlowClose();
+        usageFlowFilter = {
+          type: "node",
+          id: id,
+          kind: node.kind,
+          label: node.label,
+          detail: node.detail || ""
+        };
+        renderUsageFlow(currentState || mockUsageFlowState());
+      }
+
+      function selectUsageFlowLink(source, target) {
+        var link = usageFlowLinkByPair(source, target);
+        var sourceNode = usageFlowNodeById(source);
+        var targetNode = usageFlowNodeById(target);
+        if (!link || !sourceNode || !targetNode) {
+          return;
+        }
+        cancelUsageFlowClose();
+        usageFlowFilter = {
+          type: "link",
+          source: source,
+          target: target,
+          label: sourceNode.label + " -> " + targetNode.label,
+          detail: flowCountLabel(link.value)
+        };
+        renderUsageFlow(currentState || mockUsageFlowState());
+      }
+
+      function clearUsageFlowFilter() {
+        if (!usageFlowFilter) {
+          cancelUsageFlowClose();
+          root.dataset.flowSelected = "false";
+          return;
+        }
+
+        if (root.dataset.embed === "usage-flow") {
+          if (root.dataset.flowClosing === "true") {
+            return;
+          }
+          root.dataset.flowClosing = "true";
+          usageFlowCloseTimer = window.setTimeout(function () {
+            usageFlowCloseTimer = null;
+            usageFlowFilter = null;
+            delete root.dataset.flowClosing;
+            renderUsageFlow(currentState || mockUsageFlowState());
+          }, 220);
+          return;
+        }
+
+        usageFlowFilter = null;
+        delete root.dataset.flowClosing;
+        renderUsageFlow(currentState || mockUsageFlowState());
+      }
+
+      function cancelUsageFlowClose() {
+        if (usageFlowCloseTimer) {
+          window.clearTimeout(usageFlowCloseTimer);
+          usageFlowCloseTimer = null;
+        }
+        delete root.dataset.flowClosing;
+      }
+
+      function dismissUsageFlowFilterForClick(target) {
+        if (!usageFlowFilter || !target || !target.closest) {
+          return;
+        }
+        if (target.closest(".flow-detail") || target.closest("[data-flow-drill]") || target.closest("[data-flow-resize-grip]")) {
+          return;
+        }
+        clearUsageFlowFilter();
+      }
+
+      function usageFlowDetailWidthRange() {
+        var max = Math.max(380, window.innerWidth - 24);
+        return {
+          min: Math.min(380, max),
+          max: max
+        };
+      }
+
+      function clampUsageFlowDetailWidth(width) {
+        var range = usageFlowDetailWidthRange();
+        return Math.max(range.min, Math.min(range.max, Math.round(width)));
+      }
+
+      function startUsageFlowDetailResize(event) {
+        var grip = event.target && event.target.closest ? event.target.closest("[data-flow-resize-grip]") : null;
+        if (!grip) {
+          return;
+        }
+        var detail = grip.closest(".flow-detail");
+        if (!detail) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        cancelUsageFlowClose();
+        usageFlowResize = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startWidth: detail.getBoundingClientRect().width,
+          detail: detail
+        };
+        root.dataset.flowResizing = "true";
+        detail.dataset.flowResizing = "true";
+        if (grip.setPointerCapture && event.pointerId !== undefined) {
+          try {
+            grip.setPointerCapture(event.pointerId);
+          } catch (err) {
+            // Synthetic pointer events in tests do not always have capture state.
+          }
+        }
+        window.addEventListener("pointermove", resizeUsageFlowDetail);
+        window.addEventListener("pointerup", finishUsageFlowDetailResize);
+        window.addEventListener("pointercancel", finishUsageFlowDetailResize);
+      }
+
+      function resizeUsageFlowDetailBy(delta) {
+        var detail = document.querySelector(".flow-detail");
+        if (!detail) {
+          return;
+        }
+        var width = detail.getBoundingClientRect().width;
+        detail.style.width = clampUsageFlowDetailWidth(width + delta) + "px";
+        syncUsageFlowDetailWidth();
+      }
+
+      function handleUsageFlowResizeKeydown(event) {
+        var grip = event.target && event.target.closest ? event.target.closest("[data-flow-resize-grip]") : null;
+        if (!grip) {
+          return;
+        }
+
+        var range = usageFlowDetailWidthRange();
+        var step = event.shiftKey ? 80 : 24;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          cancelUsageFlowClose();
+          resizeUsageFlowDetailBy(step);
+          return;
+        }
+        if (event.key === "ArrowRight") {
+          event.preventDefault();
+          cancelUsageFlowClose();
+          resizeUsageFlowDetailBy(-step);
+          return;
+        }
+        if (event.key === "Home") {
+          event.preventDefault();
+          cancelUsageFlowClose();
+          var detail = grip.closest(".flow-detail");
+          if (detail) {
+            detail.style.width = range.min + "px";
+            syncUsageFlowDetailWidth();
+          }
+          return;
+        }
+        if (event.key === "End") {
+          event.preventDefault();
+          cancelUsageFlowClose();
+          var endDetail = grip.closest(".flow-detail");
+          if (endDetail) {
+            endDetail.style.width = range.max + "px";
+            syncUsageFlowDetailWidth();
+          }
+        }
+      }
+
+      function resizeUsageFlowDetail(event) {
+        if (!usageFlowResize) {
+          return;
+        }
+        event.preventDefault();
+        var nextWidth = usageFlowResize.startWidth + usageFlowResize.startX - event.clientX;
+        usageFlowResize.detail.style.width = clampUsageFlowDetailWidth(nextWidth) + "px";
+        syncUsageFlowDetailWidth();
+      }
+
+      function finishUsageFlowDetailResize() {
+        if (usageFlowResize && usageFlowResize.detail) {
+          delete usageFlowResize.detail.dataset.flowResizing;
+        }
+        usageFlowResize = null;
+        delete root.dataset.flowResizing;
+        window.removeEventListener("pointermove", resizeUsageFlowDetail);
+        window.removeEventListener("pointerup", finishUsageFlowDetailResize);
+        window.removeEventListener("pointercancel", finishUsageFlowDetailResize);
+        syncUsageFlowDetailWidth();
+      }
+
+      function syncUsageFlowDetailWidth() {
+        var detail = document.querySelector(".flow-detail");
+        if (!detail) {
+          return;
+        }
+
+        if (detail.style.width) {
+          detail.style.width = clampUsageFlowDetailWidth(parseFloat(detail.style.width)) + "px";
+        }
+
+        var width = detail.getBoundingClientRect().width;
+        var tier = "wide";
+        if (width > 0 && width < 500) {
+          tier = "compact";
+        } else if (width > 0 && width < 620) {
+          tier = "narrow";
+        } else if (width > 0 && width < 820) {
+          tier = "medium";
+        }
+        detail.dataset.flowDetailWidth = tier;
+        updateUsageFlowResizeHandleState(detail);
+      }
+
+      function updateUsageFlowResizeHandleState(detail) {
+        var grip = detail.querySelector("[data-flow-resize-grip]");
+        if (!grip) {
+          return;
+        }
+        var range = usageFlowDetailWidthRange();
+        grip.setAttribute("aria-valuemin", String(range.min));
+        grip.setAttribute("aria-valuemax", String(range.max));
+        grip.setAttribute("aria-valuenow", String(Math.round(detail.getBoundingClientRect().width)));
+      }
+
+      function observeUsageFlowDetailWidth() {
+        var detail = document.querySelector(".flow-detail");
+        if (!detail) {
+          return;
+        }
+
+        if (window.ResizeObserver && !usageFlowDetailObserver) {
+          usageFlowDetailObserver = new ResizeObserver(syncUsageFlowDetailWidth);
+          usageFlowDetailObserver.observe(detail);
+        }
+        if (!window.ResizeObserver && !usageFlowWindowResizeBound) {
+          usageFlowWindowResizeBound = true;
+          window.addEventListener("resize", syncUsageFlowDetailWidth);
+        }
+        syncUsageFlowDetailWidth();
+      }
+
+      function updateUsageFlowSelection(svg) {
+        var hasFilter = Boolean(usageFlowFilter);
+        svg.querySelectorAll("[data-flow-node]").forEach(function (node) {
+          var selected = hasFilter && usageFlowFilter.type === "node" && node.dataset.flowNode === usageFlowFilter.id;
+          var related = hasFilter && flowFilterTouchesNode(node.dataset.flowNode);
+          node.classList.toggle("is-selected", Boolean(selected));
+          node.classList.toggle("is-muted", hasFilter && !related);
+        });
+        svg.querySelectorAll("[data-flow-link-source]").forEach(function (link) {
+          var selected = hasFilter && usageFlowFilter.type === "link" &&
+            link.dataset.flowLinkSource === usageFlowFilter.source &&
+            link.dataset.flowLinkTarget === usageFlowFilter.target;
+          var related = hasFilter && flowFilterTouchesLink(link.dataset.flowLinkSource, link.dataset.flowLinkTarget);
+          link.classList.toggle("is-selected", Boolean(selected));
+          link.classList.toggle("is-muted", hasFilter && !related);
+        });
+      }
+
+      function flowFilterTouchesNode(id) {
+        if (!usageFlowFilter || !id) {
+          return true;
+        }
+        if (usageFlowFilter.type === "node") {
+          return usageFlowFilter.id === id;
+        }
+        return usageFlowFilter.source === id || usageFlowFilter.target === id;
+      }
+
+      function flowFilterTouchesLink(source, target) {
+        if (!usageFlowFilter) {
+          return true;
+        }
+        if (usageFlowFilter.type === "link") {
+          return usageFlowFilter.source === source && usageFlowFilter.target === target;
+        }
+        return usageFlowFilter.id === source || usageFlowFilter.id === target;
+      }
+
+      function mockUsageFlowState() {
+        return {
+          usageFlow: {
+            totalRequests: 4,
+            nodes: [
+              { id: "agent:Codex", kind: "agent", label: "Codex", detail: "Local agent", count: 3 },
+              { id: "agent:Claude", kind: "agent", label: "Claude", detail: "Local agent", count: 1 },
+              { id: "auth:ssh-private-key", kind: "auth", label: "SSH private key", detail: "high risk / stored in macOS Keychain", count: 3 },
+              { id: "auth:github-token", kind: "auth", label: "GitHub token", detail: "low risk / stored locally", count: 1 },
+              { id: "target:ssh-server", kind: "target", label: "SSH server", detail: "prod-bastion", count: 3 },
+              { id: "target:github-repository", kind: "target", label: "GitHub repository", detail: "repo", count: 1 }
+            ],
+            links: [
+              { source: "agent:Codex", target: "auth:ssh-private-key", value: 2 },
+              { source: "agent:Claude", target: "auth:ssh-private-key", value: 1 },
+              { source: "agent:Codex", target: "auth:github-token", value: 1 },
+              { source: "auth:ssh-private-key", target: "target:ssh-server", value: 3 },
+              { source: "auth:github-token", target: "target:github-repository", value: 1 }
+            ],
+            rows: [
+              {
+                agentId: "agent:Codex",
+                agent: "Codex",
+                authTypeId: "auth:ssh-private-key",
+                authType: "SSH private key",
+                targetTypeId: "target:ssh-server",
+                targetType: "SSH server",
+                handle: "s-gw:private-key:prod-bastion",
+                credential: "Prod bastion key",
+                action: "ssh -> prod-bastion",
+                command: "ssh",
+                target: "prod-bastion",
+                handles: ["s-gw:private-key:prod-bastion"],
+                credentials: ["Prod bastion key"],
+                actions: ["ssh -> prod-bastion"],
+                targets: ["prod-bastion"],
+                count: 2,
+                lastSeen: new Date(Date.now() - 120000).toISOString(),
+                states: { pending: 1, approved: 0, executing: 0, executed: 1, denied: 0, failed: 0 }
+              },
+              {
+                agentId: "agent:Claude",
+                agent: "Claude",
+                authTypeId: "auth:ssh-private-key",
+                authType: "SSH private key",
+                targetTypeId: "target:ssh-server",
+                targetType: "SSH server",
+                handle: "s-gw:private-key:prod-bastion",
+                credential: "Prod bastion key",
+                action: "ssh -> prod-bastion",
+                command: "ssh",
+                target: "prod-bastion",
+                handles: ["s-gw:private-key:prod-bastion"],
+                credentials: ["Prod bastion key"],
+                actions: ["ssh -> prod-bastion"],
+                targets: ["prod-bastion"],
+                count: 1,
+                lastSeen: new Date(Date.now() - 360000).toISOString(),
+                states: { pending: 0, approved: 0, executing: 0, executed: 0, denied: 1, failed: 0 }
+              },
+              {
+                agentId: "agent:Codex",
+                agent: "Codex",
+                authTypeId: "auth:github-token",
+                authType: "GitHub token",
+                targetTypeId: "target:github-repository",
+                targetType: "GitHub repository",
+                handle: "s-gw:api-token:github",
+                credential: "GitHub API token",
+                action: "gh -> repo",
+                command: "gh",
+                target: "repo",
+                handles: ["s-gw:api-token:github"],
+                credentials: ["GitHub API token"],
+                actions: ["gh -> repo"],
+                targets: ["repo"],
+                count: 1,
+                lastSeen: new Date(Date.now() - 600000).toISOString(),
+                states: { pending: 0, approved: 0, executing: 0, executed: 1, denied: 0, failed: 0 }
+              }
+            ]
+          }
+        };
+      }
+
+      function d3SankeySvg(nodes, links, width, height) {
+        if (!nodes.length || !links.length) {
+          return "";
+        }
+        if (!window.d3 || typeof window.d3.sankey !== "function" || typeof window.d3.sankeyLinkHorizontal !== "function") {
+          throw new Error("d3-sankey renderer is not available.");
+        }
+
+        var nodeMap = {};
+        for (var i = 0; i < nodes.length; i++) {
+          nodeMap[nodes[i].id] = nodes[i];
+        }
+
+        var liveLinks = links.filter(function (link) {
+          return nodeMap[link.source] && nodeMap[link.target] && Number(link.value) > 0;
+        });
+        if (!liveLinks.length) {
+          return "";
+        }
+
+        var linkedNodeIds = new Set();
+        liveLinks.forEach(function (link) {
+          linkedNodeIds.add(link.source);
+          linkedNodeIds.add(link.target);
+        });
+
+        var graphNodes = nodes.filter(function (node) {
+          return linkedNodeIds.has(node.id);
+        }).map(function (node) {
+          return {
+            id: node.id,
+            label: node.label,
+            kind: node.kind,
+            detail: node.detail || "",
+            count: Number(node.count) || 0
+          };
+        });
+        var stages = sankeyStages(graphNodes);
+        graphNodes.sort(function (a, b) {
+          var rankDiff = sankeyKindRank(a.kind, stages) - sankeyKindRank(b.kind, stages);
+          if (rankDiff !== 0) {
+            return rankDiff;
+          }
+          return (b.count - a.count) || compareText(a.label, b.label);
+        });
+
+        var graphLinks = liveLinks.map(function (link) {
+          return {
+            source: link.source,
+            target: link.target,
+            value: Math.max(0.001, Number(link.value) || 0)
+          };
+        }).sort(function (a, b) {
+          return (b.value - a.value) || compareText(a.source + a.target, b.source + b.target);
+        });
+        if (!graphLinks.length) {
+          return "";
+        }
+
+        var compactEmbed = isCompactUsageFlowEmbed();
+        var margin = compactEmbed
+          ? { top: 44, right: 78, bottom: 16, left: 12 }
+          : { top: 58, right: 250, bottom: 34, left: 30 };
+        var graphWidth = Math.max(compactEmbed ? 180 : 320, width - margin.left - margin.right);
+        var availableHeight = Math.max(1, height - margin.top - margin.bottom);
+        var graphHeight = compactEmbed
+          ? availableHeight
+          : Math.max(280, availableHeight);
+        var largestColumn = sankeyMaxColumnSize(graphNodes);
+        var padding = compactEmbed
+          ? Math.max(3, Math.min(12, (graphHeight / Math.max(5, largestColumn + 1)) * 0.32))
+          : Math.max(4, Math.min(28, (graphHeight / Math.max(6, largestColumn + 1)) * 0.42));
+        var graph = { nodes: graphNodes, links: graphLinks };
+        window.d3.sankey()
+          .nodeId(function (node) { return node.id; })
+          .nodeAlign(function (node, columnCount) { return sankeyColumnAlign(node, columnCount, stages); })
+          .nodeSort(function (a, b) {
+            return (b.value - a.value) || compareText(a.label, b.label);
+          })
+          .linkSort(function (a, b) {
+            return (b.value - a.value) || compareText(a.target.label, b.target.label);
+          })
+          .nodeWidth(compactEmbed ? 10 : 18)
+          .nodePadding(padding)
+          .extent([[margin.left, margin.top], [margin.left + graphWidth, margin.top + graphHeight]])
+          .iterations(64)(graph);
+
+        var linkPath = window.d3.sankeyLinkHorizontal();
+        var headings = sankeyHeadings(graph.nodes, margin, graphWidth, stages);
+        var visibleLabels = visibleSankeyLabelIds(graph.nodes);
+        var defs = '<defs>' + graph.links.map(function (link, index) {
+          var id = "sankey-gradient-" + index;
+          link.gradientId = id;
+          return '<linearGradient id="' + id + '" gradientUnits="userSpaceOnUse" x1="' + num(link.source.x1) + '" y1="0" x2="' + num(link.target.x0) + '" y2="0">' +
+            '<stop offset="0%" stop-color="#7f91a6" stop-opacity=".92"></stop>' +
+            '<stop offset="100%" stop-color="#a3b1be" stop-opacity=".86"></stop>' +
+            '</linearGradient>';
+        }).join("") + '</defs>';
+        var flowMarkup = graph.links.slice().sort(function (a, b) {
+          return b.width - a.width;
+        }).map(function (link) {
+          var source = link.source;
+          var target = link.target;
+          var cls = "sankey-link from-" + attr(source.kind) + " to-" + attr(target.kind);
+          return '<path class="' + cls + '" d="' + attr(linkPath(link)) + '" stroke="url(#' + attr(link.gradientId) + ')" stroke-width="' + num(Math.max(2.5, link.width)) + '" ' +
+            'role="button" tabindex="0" data-flow-link-source="' + attr(source.id) + '" data-flow-link-target="' + attr(target.id) + '" aria-label="' + attr(sankeyAccessibleTitle(source, target, link.value)) + '">' +
+            '<title>' + escapeHtml(sankeyAccessibleTitle(source, target, link.value)) + '</title></path>';
+        }).join("");
+
+        var nodeMarkup = graph.nodes.map(function (node) {
+          var label = clipLabel(node.label || node.id, compactEmbed ? 16 : (node.kind === "auth" ? 42 : 34));
+          var detail = clipLabel(node.detail || flowCountLabel(Math.round(node.value || node.count || 0)), compactEmbed ? 18 : 42);
+          var labelOnRight = node.kind !== "target";
+          var labelX = labelOnRight ? node.x1 + (compactEmbed ? 5 : 9) : node.x0 - (compactEmbed ? 5 : 9);
+          var anchor = labelOnRight ? "start" : "end";
+          var labelY = node.y0 + (node.y1 - node.y0) / 2;
+          var labelClass = visibleLabels[node.id] ? "" : " is-secondary-label";
+          return '<g class="sankey-node ' + attr(node.kind) + '" role="button" tabindex="0" data-flow-node="' + attr(node.id) + '" aria-label="' + attr((node.label || node.id) + ", " + flowKindLabel(node.kind)) + '">' +
+            '<rect x="' + num(node.x0) + '" y="' + num(node.y0) + '" width="' + num(node.x1 - node.x0) + '" height="' + num(node.y1 - node.y0) + '" rx="2" ry="2" fill="' + attr(sankeyNodeColor(node)) + '"></rect>' +
+            '<text class="sankey-label' + (compactEmbed ? ' is-compact-label' : '') + labelClass + '" x="' + num(labelX) + '" y="' + num(labelY - (compactEmbed ? 1 : 3)) + '" text-anchor="' + anchor + '">' + escapeHtml(label) + '</text>' +
+            (compactEmbed ? '' : '<text class="sankey-value' + labelClass + '" x="' + num(labelX) + '" y="' + num(labelY + 14) + '" text-anchor="' + anchor + '">' + escapeHtml(detail) + '</text>') +
+            '<title>' + escapeHtml((node.label || node.id) + " / " + (node.detail || "") + " / " + flowCountLabel(Math.round(node.value || node.count || 0))) + '</title>' +
+            '</g>';
+        }).join("");
+
+        return defs + headings + '<g data-d3-sankey-renderer="true">' + flowMarkup + nodeMarkup + '</g>';
+      }
+
+      function sankeyHeadings(nodes, margin, graphWidth, stages) {
+        var compactEmbed = isCompactUsageFlowEmbed();
+        var byKind = {};
+        stages.forEach(function (kind) {
+          byKind[kind] = [];
+        });
+        nodes.forEach(function (node) {
+          if (byKind[node.kind]) {
+            byKind[node.kind].push(node);
+          }
+        });
+        return stages.map(function (kind) {
+          if (!byKind[kind].length) {
+            return "";
+          }
+          var x = margin.left + graphWidth;
+          byKind[kind].forEach(function (node) {
+            x = Math.min(x, node.x0);
+          });
+          var label = flowKindLabel(kind);
+          var cls = compactEmbed ? "sankey-heading is-compact-heading" : "sankey-heading";
+          var y = compactEmbed ? margin.top - 22 : margin.top - 28;
+          return '<text class="' + cls + '" x="' + num(Math.min(x, margin.left + graphWidth)) + '" y="' + num(y) + '">' + label + '</text>';
+        }).join("");
+      }
+
+      function sankeyColumnAlign(node, columnCount, stages) {
+        var last = Math.max(0, columnCount - 1);
+        var stageIndex = stages.indexOf(node.kind);
+        if (stageIndex >= 0) {
+          return Math.min(stageIndex, last);
+        }
+        return Math.min(last, Math.max(0, node.depth || 0));
+      }
+
+      function sankeyKindRank(kind, stages) {
+        var order = stages || ["agent", "auth", "target"];
+        var index = order.indexOf(kind);
+        if (index >= 0) {
+          return index;
+        }
+        return order.length;
+      }
+
+      function sankeyStages(nodes) {
+        var knownOrder = ["agent", "auth", "target"];
+        var seen = {};
+        nodes.forEach(function (node) {
+          seen[node.kind] = true;
+        });
+        var stages = knownOrder.filter(function (kind) {
+          return seen[kind];
+        });
+        return stages.length ? stages : knownOrder;
+      }
+
+      function visibleSankeyLabelIds(nodes) {
+        var byKind = {};
+        var visible = {};
+        var limits = {
+          agent: 6,
+          auth: 12,
+          target: 14
+        };
+        var minGap = {
+          agent: 26,
+          auth: 24,
+          target: 22
+        };
+
+        nodes.forEach(function (node) {
+          if (!byKind[node.kind]) {
+            byKind[node.kind] = [];
+          }
+          byKind[node.kind].push(node);
+        });
+
+        Object.keys(byKind).forEach(function (kind) {
+          var usedY = [];
+          var shown = 0;
+          byKind[kind].slice().sort(function (a, b) {
+            return (b.value - a.value) || compareText(a.label, b.label);
+          }).forEach(function (node) {
+            var force = usageFlowLabelIsForced(node.id);
+            if (!force && shown >= (limits[kind] || 8)) {
+              return;
+            }
+
+            var y = node.y0 + (node.y1 - node.y0) / 2;
+            var tooClose = usedY.some(function (existingY) {
+              return Math.abs(existingY - y) < (minGap[kind] || 22);
+            });
+            if (!force && tooClose) {
+              return;
+            }
+
+            visible[node.id] = true;
+            usedY.push(y);
+            shown++;
+          });
+        });
+
+        return visible;
+      }
+
+      function usageFlowLabelIsForced(id) {
+        if (!usageFlowFilter || !id) {
+          return false;
+        }
+        if (usageFlowFilter.type === "node") {
+          return usageFlowFilter.id === id;
+        }
+        if (usageFlowFilter.type === "link") {
+          return usageFlowFilter.source === id || usageFlowFilter.target === id;
+        }
+        return false;
+      }
+
+      function sankeyNodeColor(node) {
+        if (node.kind === "agent") {
+          return "#7567e8";
+        }
+        if (node.kind === "auth") {
+          return "#0b9f91";
+        }
+        if (node.kind === "target") {
+          return "#1d73d4";
+        }
+        return "#64748b";
+      }
+
+      function sankeyMaxColumnSize(nodes) {
+        var counts = {};
+        for (var i = 0; i < nodes.length; i++) {
+          var kind = nodes[i].kind || "other";
+          counts[kind] = (counts[kind] || 0) + 1;
+        }
+
+        var max = 1;
+        Object.keys(counts).forEach(function (key) {
+          max = Math.max(max, counts[key]);
+        });
+        return max;
+      }
+
+      function flowCountLabel(value) {
+        var count = Math.round(Number(value) || 0);
+        return count + " request" + (count === 1 ? "" : "s");
+      }
+
+      function flowKindLabel(kind) {
+        if (kind === "agent") {
+          return "Agent";
+        }
+        if (kind === "auth") {
+          return "Authentication type";
+        }
+        if (kind === "target") {
+          return "Target type";
+        }
+        return "Flow";
+      }
+
+      function sankeyAccessibleTitle(source, target, value) {
+        return source.label + " to " + target.label + ": " + flowCountLabel(value);
+      }
+
+      function compareText(a, b) {
+        return String(a || "").localeCompare(String(b || ""));
+      }
+
+      function sankeyErrorSvg(width, height, error) {
+        var message = error && error.message ? error.message : String(error || "");
+        var label = /d3-sankey renderer is not available/i.test(message)
+          ? "d3-sankey renderer unavailable."
+          : "Usage flow layout failed: " + message;
+        return '<text class="sankey-value" x="' + num(width / 2) + '" y="' + num(height / 2) + '" text-anchor="middle">' + escapeHtml(label) + '</text>';
+      }
+
+      function num(value) {
+        return Number(Number(value).toFixed(2)).toString();
+      }
+
+      function renderApprovals(state) {
+        var body = document.querySelector("#approvals tbody");
+        var footer = document.querySelector("#approvals .table-footer");
+        var wrap = body ? body.closest(".table-wrap") : null;
+        if (!body) {
+          return;
+        }
+
+        var handles = handleMap(state.handles || []);
+        var pending = state.pendingRequests || [];
+        body.innerHTML = pending.map(function (request) {
+          var handle = handles[request.handle] || {};
+          var severity = handle.severity || "medium";
+          var agent = requestAgentName(request);
+          var command = request.action ? request.action.command : "";
+          var commandView = commandMarkup(command);
+          var target = requestTarget(request);
+          var searchable = [agent, command, target, request.handle, severity, request.reason].join(" ");
+          return '<tr data-searchable="' + attr(searchable) + '">' +
+            '<td><span class="agent-cell"><span class="agent-badge">' + escapeHtml(agent.slice(0, 1) || "A") + '</span><span>' +
+            escapeHtml(agent) + '<span class="cell-sub">local</span></span></span></td>' +
+            '<td>' + commandView + '</td>' +
+            '<td>' + escapeHtml(target) + '<span class="cell-sub">' + escapeHtml(request.action && request.action.workingDir || "local host") + '</span></td>' +
+            '<td>' + handleMarkup(request.handle) + '</td>' +
+            '<td>' + escapeHtml(timeAgo(request.createdAt)) + '<span class="cell-sub">' + escapeHtml(clockTime(request.createdAt)) + '</span></td>' +
+            '<td><span class="risk ' + riskClass(severity) + '">' + escapeHtml(riskLabel(severity)) + '</span></td>' +
+            '<td><span class="action-group"><button class="action-button approve" type="button" title="Approve" aria-label="Approve request" data-approve="' + attr(request.id) + '"><svg><use href="#i-check"></use></svg></button>' +
+            '<button class="action-button deny" type="button" title="Deny request" aria-label="Deny request" data-deny="' + attr(request.id) + '"><svg><use href="#i-alert"></use></svg></button>' +
+            '<button class="row-menu" type="button" title="Request menu" aria-label="Open request menu" data-menu="request" aria-haspopup="menu"><svg><use href="#i-more"></use></svg></button></span></td>' +
+            '</tr>';
+        }).join("");
+
+        if (footer) {
+          footer.textContent = "Showing " + (pending.length ? "1-" + pending.length : "0") + " of " + pending.length;
+        }
+        if (wrap && pending.length === 0) {
+          wrap.scrollLeft = 0;
+        }
+      }
+
+      function renderCredentials(state) {
+        var body = document.querySelector(".panel-grid .panel:nth-child(2) tbody");
+        var footer = document.querySelector(".panel-grid .panel:nth-child(2) .table-footer");
+        if (!body) {
+          return;
+        }
+
+        var credentials = liveMode && state.handles ? state.handles : (state.credentials || []);
+        body.innerHTML = credentials.map(function (item) {
+          var liveHandle = Boolean(item.handle);
+          var provider = item.provider || item.backend || item.type || "";
+          var label = liveHandle ? item.name : item.label;
+          var handle = liveHandle ? item.handle : item.prefix;
+          var severity = item.severity || "low";
+          var detail = liveHandle ? ((item.type || "credential") + " / " + (item.backend || "local")) : String(item.secrets || 0);
+          var updatedAt = liveHandle ? item.updatedAt : item.lastUsed;
+          var searchable = [provider, label, handle, severity, item.source || "", item.ruleId || ""].join(" ");
+          return '<tr data-searchable="' + attr(searchable) + '" data-provider="' + attr(provider) + '" data-prefix="' + attr(handle) + '" data-handle="' + attr(handle) + '" data-label="' + attr(label || handle) + '">' +
+            '<td><span class="provider-cell">' + providerIcon(provider) + escapeHtml(providerLabel(provider)) + '</span></td>' +
+            '<td>' + handleMarkup(handle) + '</td>' +
+            '<td>' + escapeHtml(detail) + '<span class="cell-sub">' + escapeHtml(label || "") + '</span></td>' +
+            '<td><span class="risk ' + riskClass(severity) + '">' + escapeHtml(riskLabel(severity)) + '</span></td>' +
+            '<td>' + escapeHtml(timeAgo(updatedAt)) + '<span class="cell-sub">' + escapeHtml(clockTime(updatedAt)) + '</span></td>' +
+            '<td><button class="row-menu" type="button" data-menu="credential" aria-haspopup="menu" aria-label="Credential menu"><svg><use href="#i-more"></use></svg></button></td>' +
+            '</tr>';
+        }).join("");
+
+        if (footer) {
+          footer.textContent = "Showing " + (credentials.length ? "1-" + credentials.length : "0") + " of " + credentials.length;
+        }
+      }
+
+      function renderApprovalGrants(state) {
+        var body = document.querySelector("#approval-grants tbody");
+        var footer = document.querySelector("#approval-grants .table-footer");
+        var empty = document.querySelector('[data-empty="grants"]');
+        if (!body) {
+          return;
+        }
+
+        var grants = state.approvalGrants || [];
+        body.innerHTML = grants.map(function (grant) {
+          var agent = grantAgentLabel(grant);
+          var scope = grantScopeLabel(grant);
+          var mode = approvalModeLabel(grant.mode);
+          var expires = grant.expiresAt ? "Expires " + timeUntil(grant.expiresAt) : "No expiration";
+          var searchable = [agent, scope, grant.handle, mode, expires].join(" ");
+          return '<tr data-searchable="' + attr(searchable) + '">' +
+            '<td><span class="agent-cell"><span class="agent-badge">' + escapeHtml(agent.slice(0, 1) || "A") + '</span><span>' +
+            escapeHtml(agent) + '<span class="cell-sub">' + escapeHtml(timeAgo(grant.updatedAt)) + '</span></span></span></td>' +
+            '<td>' + escapeHtml(scope) + '</td>' +
+            '<td>' + handleMarkup(grant.handle) + '</td>' +
+            '<td>' + escapeHtml(mode) + '</td>' +
+            '<td>' + escapeHtml(expires) + '<span class="cell-sub">' + escapeHtml(grant.expiresAt ? clockTime(grant.expiresAt) : "Manual revoke") + '</span></td>' +
+            '<td><button class="action-button deny" type="button" title="Revoke" aria-label="Revoke reusable approval" data-revoke-grant="' + attr(grant.id) + '"><svg><use href="#i-alert"></use></svg></button></td>' +
+            '</tr>';
+        }).join("");
+
+        if (empty) {
+          empty.classList.toggle("show", grants.length === 0);
+        }
+        if (footer) {
+          footer.textContent = "Showing " + (grants.length ? "1-" + grants.length : "0") + " of " + grants.length;
+        }
+      }
+
+      function renderAudit(state) {
+        var body = document.querySelector(".audit tbody");
+        var footer = document.querySelector(".audit .table-footer");
+        if (!body) {
+          return;
+        }
+
+        var audit = (state.audit || []).slice(0, 100);
+        body.innerHTML = audit.map(function (event) {
+          var meta = auditMeta(event.type);
+          var searchable = [meta.label, event.type, event.message, event.handle, event.requestId].join(" ");
+          return '<tr data-searchable="' + attr(searchable) + '">' +
+            '<td>' + escapeHtml(clockTime(event.ts)) + '</td>' +
+            '<td>' + actorMarkup(meta.actor) + '</td>' +
+            '<td><span class="event-kind"><svg' + (meta.color ? ' style="color:' + meta.color + '"' : "") + '><use href="#' + meta.icon + '"></use></svg>' +
+            escapeHtml(meta.label) + '</span></td>' +
+            '<td class="audit-details">' + auditDetails(event) + '</td>' +
+            '<td>' + (event.handle ? '<code class="token">' + escapeHtml(tokenFor(event.handle)) + '</code>' : "") + '</td>' +
+            '<td class="chevron-cell"><svg><use href="#i-chevron"></use></svg></td>' +
+            '</tr>';
+        }).join("");
+
+        if (footer) {
+          footer.textContent = "Showing " + (audit.length ? "1-" + audit.length : "0") + " of " + (state.audit || []).length;
+        }
+      }
+
+      function updateSearch() {
+        var query = search ? search.value.trim().toLowerCase() : "";
+        var sections = [
+          { rows: document.querySelectorAll("#usage-flow tbody tr"), empty: null },
+          { rows: document.querySelectorAll("#approvals tbody tr"), empty: document.querySelector('[data-empty="approvals"]') },
+          { rows: document.querySelectorAll(".panel-grid .panel:nth-child(2) tbody tr"), empty: document.querySelector('[data-empty="credentials"]') },
+          { rows: document.querySelectorAll("#approval-grants tbody tr"), empty: document.querySelector('[data-empty="grants"]') },
+          { rows: document.querySelectorAll(".audit tbody tr"), empty: document.querySelector('[data-empty="audit"]') }
+        ];
+
+        for (var i = 0; i < sections.length; i++) {
+          var visible = 0;
+          for (var j = 0; j < sections[i].rows.length; j++) {
+            var row = sections[i].rows[j];
+            var haystack = (row.dataset.searchable || row.textContent).toLowerCase();
+            var match = !query || haystack.indexOf(query) !== -1;
+            row.classList.toggle("hidden-row", !match);
+            if (match) {
+              visible++;
+            }
+          }
+
+          if (sections[i].empty) {
+            sections[i].empty.classList.toggle("show", visible === 0);
+          }
+        }
+      }
+
+      function profileMenuItems() {
+        var storePath = currentState && currentState.status ? currentState.status.storePath : "";
+        return [
+          { label: "Refresh console", sub: liveMode ? "Reload local state" : "Refresh mock view", action: function () { loadState("Console refreshed"); } },
+          { label: "Copy store path", sub: storePath || "Live console only", disabled: !storePath, action: function () { copyText(storePath, "Store path copied"); } },
+          { label: "Switch theme", sub: root.dataset.theme === "dark" ? "Use light mode" : "Use dark mode", action: function () { setTheme(root.dataset.theme === "dark" ? "light" : "dark", true); showToast("Theme saved: " + root.dataset.theme); } }
+        ];
+      }
+
+      function credentialMenuItems(button) {
+        var row = button.closest("tr");
+        var prefix = row && (row.dataset.prefix || cellText(row, 1));
+        var provider = row && (row.dataset.provider || cellText(row, 0));
+        var handle = row && row.dataset.handle;
+        var label = row && row.dataset.label;
+        return [
+          { label: "Copy handle prefix", sub: prefix || "No prefix", disabled: !prefix, action: function () { copyText(prefix, "Handle prefix copied"); } },
+          { label: "Show matching credentials", sub: provider || prefix || "Filter table", action: function () { filterSearch(provider || prefix || "", "Credential rows filtered"); scrollToPanel("#credentials-panel"); } },
+          { label: "Find in audit", sub: prefix || provider || "Filter audit", action: function () { filterSearch(prefix || provider || "", "Audit filtered"); scrollToPanel("#audit"); } },
+          { label: "Delete credential", sub: label || handle || "Live handles only", danger: true, disabled: !handle || handle.indexOf("s-gw:") !== 0, action: function () { deleteCredential(handle, label || handle); } }
+        ];
+      }
+
+      function requestMenuItems(button) {
+        var row = button.closest("tr");
+        var handle = row ? cellText(row, 3) : "";
+        var command = row ? cellText(row, 1) : "";
+        return [
+          { label: "Copy handle", sub: handle || "No handle", disabled: !handle, action: function () { copyText(handle, "Request handle copied"); } },
+          { label: "Filter audit", sub: handle || command || "Request activity", action: function () { filterSearch(handle || command || "approval requested", "Audit filtered"); scrollToPanel("#audit"); } },
+          { label: "Focus queue", sub: "Pending approval list", action: function () { clearSearch(); scrollToPanel("#approvals", "Approval queue focused"); } }
+        ];
+      }
+
+      function auditFilterItems() {
+        return [
+          { label: "All events", sub: "Clear audit filter", action: function () { clearSearch(); scrollToPanel("#audit", "Showing all events"); } },
+          { label: "Approval requested", sub: "Pending request events", action: function () { filterSearch("approval requested", "Audit filtered"); scrollToPanel("#audit"); } },
+          { label: "Approved", sub: "User approval events", action: function () { filterSearch("approved", "Audit filtered"); scrollToPanel("#audit"); } },
+          { label: "Secret accessed", sub: "Execution events", action: function () { filterSearch("secret accessed", "Audit filtered"); scrollToPanel("#audit"); } },
+          { label: "Credential stored", sub: "Enrollment events", action: function () { filterSearch("credential stored", "Audit filtered"); scrollToPanel("#audit"); } }
+        ];
+      }
+
+      function credentialsPanelItems() {
+        return [
+          { label: "Show all credentials", sub: "Clear search and focus table", action: function () { clearSearch(); scrollToPanel("#credentials-panel", "Credential inventory focused"); } },
+          { label: "GitHub handles", sub: "Filter provider", action: function () { filterSearch("github", "Credentials filtered"); scrollToPanel("#credentials-panel"); } },
+          { label: "High risk handles", sub: "Filter severity", action: function () { filterSearch("high", "Credentials filtered"); scrollToPanel("#credentials-panel"); } }
+        ];
+      }
+
+      function requestsPanelItems() {
+        return [
+          { label: "Show pending requests", sub: "Focus approval queue", action: function () { clearSearch(); scrollToPanel("#approvals", "Approval queue focused"); } },
+          { label: "High risk requests", sub: "Filter pending queue", action: function () { filterSearch("high", "Requests filtered"); scrollToPanel("#approvals"); } },
+          { label: "Copy CLI command", sub: "s-gw requests --state pending", action: function () { copyText("s-gw requests --state pending", "CLI command copied"); } }
+        ];
+      }
+
+      function agentMenuItems() {
+        var count = currentState && currentState.agents ? currentState.agents.length : 0;
+        return [
+          { label: "Refresh agent status", sub: count ? count + " profiles available" : "Load local profiles", action: function () { loadState("Agent status refreshed"); } },
+          { label: "Copy list command", sub: "s-gw agent list", action: function () { copyText("s-gw agent list", "Agent command copied"); } },
+          { label: "Copy Codex snippet command", sub: "s-gw agent mcp-snippet codex", action: function () { copyText("s-gw agent mcp-snippet codex", "Snippet command copied"); } }
+        ];
+      }
+
+      function settingsMenuItems() {
+        var storePath = currentState && currentState.status ? currentState.status.storePath : "";
+        var grants = currentState && currentState.approvalGrants ? currentState.approvalGrants : [];
+        return [
+          { label: "Refresh console", sub: "Reload local state", action: function () { loadState("Console refreshed"); } },
+          { label: "Show reusable approvals", sub: grants.length + " active", action: function () { clearSearch(); scrollToPanel("#approval-grants", "Reusable approvals focused"); } },
+          { label: "Revoke reusable approvals", sub: grants.length ? grants.length + " active approvals" : "None active", danger: true, disabled: !grants.length, action: function () { revokeAllApprovalGrants(); } },
+          { label: "Copy console command", sub: "s-gw console", action: function () { copyText("s-gw console", "Console command copied"); } },
+          { label: "Copy store path", sub: storePath || "Live console only", disabled: !storePath, action: function () { copyText(storePath, "Store path copied"); } }
+        ];
+      }
+
+      function cellText(row, index) {
+        if (!row || !row.cells || !row.cells[index]) {
+          return "";
+        }
+
+        return row.cells[index].textContent.trim().replace(/\s+/g, " ");
+      }
+
+      function filterSearch(value, message) {
+        if (!search) {
+          return;
+        }
+
+        search.value = value || "";
+        updateSearch();
+        showToast(message || "Filtered");
+      }
+
+      function clearSearch() {
+        if (search) {
+          search.value = "";
+        }
+        updateSearch();
+      }
+
+      function scrollToPanel(selector, message) {
+        var panel = document.querySelector(selector);
+        if (panel) {
+          panel.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        if (message) {
+          showToast(message);
+        }
+      }
+
+      function copyText(text, message) {
+        if (!text) {
+          showToast("Nothing to copy");
+          return;
+        }
+
+        if (!navigator.clipboard) {
+          showToast("Clipboard is unavailable");
+          return;
+        }
+
+        navigator.clipboard.writeText(text).then(function () {
+          showToast(message || "Copied");
+        }).catch(function () {
+          showToast("Copy failed");
+        });
+      }
+
+      setTheme(root.dataset.theme === "dark" ? "dark" : "light", false);
+
+      if (toggle) {
+        toggle.addEventListener("click", function () {
+          setTheme(root.dataset.theme === "dark" ? "light" : "dark", true);
+          showToast("Theme saved: " + root.dataset.theme);
+        });
+      }
+
+      var retry = document.querySelector("[data-connection-retry]");
+      if (retry) {
+        retry.addEventListener("click", function () {
+          loadState("Reconnecting to local daemon");
+        });
+      }
+
+      if (search) {
+        search.addEventListener("input", updateSearch);
+        window.addEventListener("keydown", function (event) {
+          if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+            event.preventDefault();
+            search.focus();
+            search.select();
+          }
+        });
+      }
+
+      document.querySelectorAll("[data-nav]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          document.querySelectorAll("[data-nav]").forEach(function (item) {
+            item.classList.toggle("active", item === button);
+          });
+          var nav = button.dataset.nav;
+          if (nav === "overview") {
+            scrollToPanel(".content", "Overview focused");
+          } else if (nav === "flow") {
+            scrollToPanel("#usage-flow", "Usage flow focused");
+          } else if (nav === "credentials") {
+            scrollToPanel("#credentials-panel", "Credentials focused");
+          } else if (nav === "requests") {
+            scrollToPanel("#approvals", "Requests focused");
+          } else if (nav === "audit") {
+            scrollToPanel("#audit", "Audit focused");
+          } else if (nav === "agents") {
+            button.dataset.menu = "agents-nav";
+            openMenuFor(button);
+          } else if (nav === "settings") {
+            button.dataset.menu = "settings-nav";
+            openMenuFor(button);
+          }
+        });
+      });
+      var initialView = new URLSearchParams(window.location.search).get("view");
+      if (window.location.hash === "#usage-flow" || initialView === "usage-flow") {
+        var flowNav = document.querySelector('[data-nav="flow"]');
+        if (flowNav) {
+          flowNav.click();
+        }
+      }
+
+      document.addEventListener("pointerdown", function (event) {
+        startUsageFlowDetailResize(event);
+      });
+
+      document.addEventListener("keydown", function (event) {
+        handleUsageFlowResizeKeydown(event);
+      });
+
+      document.addEventListener("click", function (event) {
+        var target = event.target;
+        if (!target || !target.closest) {
+          return;
+        }
+
+        if (target.closest("[data-flow-resize-grip]")) {
+          return;
+        }
+
+        var flowNode = target.closest("[data-flow-node]");
+        if (flowNode) {
+          selectUsageFlowNode(flowNode.dataset.flowNode);
+          return;
+        }
+
+        var flowLink = target.closest("[data-flow-link-source]");
+        if (flowLink) {
+          selectUsageFlowLink(flowLink.dataset.flowLinkSource, flowLink.dataset.flowLinkTarget);
+          return;
+        }
+
+        dismissUsageFlowFilterForClick(target);
+
+        var menuItem = target.closest("[data-menu-item]");
+        if (menuItem && menuBox && menuBox.contains(menuItem)) {
+          var handler = activeMenuActions[menuItem.dataset.menuItem];
+          hideMenu();
+          if (handler) {
+            handler();
+          }
+          return;
+        }
+
+        var menuButton = target.closest("[data-menu]");
+        if (menuButton) {
+          event.preventDefault();
+          openMenuFor(menuButton);
+          return;
+        }
+
+        var toastButton = target.closest("[data-toast]");
+        if (toastButton) {
+          showToast(toastButton.dataset.toast);
+          return;
+        }
+
+        var highRiskMetric = target.closest("[data-high-risk-jump]");
+        if (highRiskMetric) {
+          filterSearch("high", "High-risk credentials focused");
+          scrollToPanel("#credentials-panel");
+          return;
+        }
+
+        var approve = target.closest("[data-approve]");
+        var deny = target.closest("[data-deny]");
+        if (approve) {
+          approveRequest(approve.dataset.approve);
+          return;
+        }
+
+        if (deny) {
+          denyRequest(deny.dataset.deny);
+          return;
+        }
+
+        var grant = target.closest("[data-revoke-grant]");
+        if (grant) {
+          revokeApprovalGrant(grant.dataset.revokeGrant);
+          return;
+        }
+
+        var allGrants = target.closest("[data-revoke-all-grants]");
+        if (allGrants) {
+          revokeAllApprovalGrants();
+          return;
+        }
+
+        if (!menuBox || !menuBox.contains(target)) {
+          hideMenu();
+        }
+      });
+
+      window.addEventListener("keydown", function (event) {
+        if (event.key === "Escape") {
+          hideMenu();
+          if (usageFlowFilter) {
+            clearUsageFlowFilter();
+          }
+          return;
+        }
+
+        if (event.key !== "Enter" && event.key !== " ") {
+          return;
+        }
+
+        var target = event.target;
+        if (!target || !target.closest) {
+          return;
+        }
+
+        var flowNode = target.closest("[data-flow-node]");
+        if (flowNode) {
+          event.preventDefault();
+          selectUsageFlowNode(flowNode.dataset.flowNode);
+          return;
+        }
+
+        var flowLink = target.closest("[data-flow-link-source]");
+        if (flowLink) {
+          event.preventDefault();
+          selectUsageFlowLink(flowLink.dataset.flowLinkSource, flowLink.dataset.flowLinkTarget);
+        }
+      });
+
+      document.querySelectorAll("[data-jump]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var target = document.querySelector(button.dataset.jump);
+          if (target) {
+            target.scrollIntoView({ behavior: "smooth", block: "start" });
+            showToast("Approval queue focused");
+          }
+        });
+      });
+
+      document.querySelectorAll("[data-download]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          if (liveMode) {
+            apiText("/api/audit.csv").then(function (csv) {
+              downloadCsv(csv);
+              showToast("Audit CSV downloaded");
+            }).catch(function (error) {
+              showToast(error.message || "Download failed");
+            });
+            return;
+          }
+
+          var rows = [
+            ["time", "actor", "event", "details"],
+            ["12:43:02", "Codex", "Approval requested", "s-gw:private-key:rsa:prod-bastion"],
+            ["12:41:05", "You", "Approved", "s-gw:private-key:ed25519:prod-bastion"]
+          ];
+          var csv = rows.map(function (row) {
+            return row.map(function (cell) {
+              return '"' + String(cell).replace(/"/g, '""') + '"';
+            }).join(",");
+          }).join("\n");
+          downloadCsv(csv);
+          showToast("Audit CSV downloaded");
+        });
+      });
+
+      function approveRequest(id) {
+        decideRequest(id, "approve", "approve", "Request approved", "Approval failed");
+      }
+
+      function denyRequest(id) {
+        decideRequest(id, "deny", "deny", "Request denied", "Deny failed");
+      }
+
+      function deleteCredential(handle, label) {
+        if (!handle || !liveMode) {
+          showToast("Launch with s-gw console to delete live credentials");
+          return;
+        }
+
+        var name = label || handle;
+        if (!window.confirm("Delete " + name + " from s-gw? Unfinished requests for this credential will fail.")) {
+          return;
+        }
+
+        apiJson("/api/secrets/" + encodeURIComponent(handle), { method: "DELETE" })
+          .then(function () {
+            return loadState("Credential deleted");
+          })
+          .catch(function (error) {
+            showToast(error.message || "Delete failed");
+          });
+      }
+
+      function revokeApprovalGrant(id) {
+        if (!id || !liveMode) {
+          showToast("Launch with s-gw console to revoke reusable approvals");
+          return;
+        }
+
+        apiJson("/api/approval/grants/" + encodeURIComponent(id), { method: "DELETE" })
+          .then(function () {
+            return loadState("Reusable approval revoked");
+          })
+          .catch(function (error) {
+            showToast(error.message || "Revoke failed");
+          });
+      }
+
+      function revokeAllApprovalGrants() {
+        var grants = currentState && currentState.approvalGrants ? currentState.approvalGrants : [];
+        if (!liveMode) {
+          showToast("Launch with s-gw console to revoke reusable approvals");
+          return;
+        }
+        if (!grants.length) {
+          showToast("No reusable approvals are active");
+          return;
+        }
+        if (!window.confirm("Revoke all reusable approvals? Future matching requests will ask again.")) {
+          return;
+        }
+
+        apiJson("/api/approval/grants", { method: "DELETE" })
+          .then(function () {
+            return loadState("Reusable approvals revoked");
+          })
+          .catch(function (error) {
+            showToast(error.message || "Revoke failed");
+          });
+      }
+
+      // One code path for both decisions so the in-flight guard and button
+      // locking can't diverge between approve and deny.
+      function decideRequest(id, endpoint, verb, okMessage, failMessage) {
+        if (!id || !liveMode) {
+          showToast("Launch with s-gw console to " + verb + " live requests");
+          return;
+        }
+
+        // Already approving/denying this row — ignore the extra click instead of
+        // firing a second decision that races the first.
+        if (pendingActions[id]) {
+          return;
+        }
+
+        pendingActions[id] = true;
+        setRowBusy(id, true);
+
+        apiJson("/api/requests/" + encodeURIComponent(id) + "/" + endpoint, { method: "POST", body: "{}" })
+          .then(function () {
+            return loadState(okMessage);
+          })
+          .catch(function (error) {
+            showToast(error.message || failMessage);
+          })
+          .then(function () {
+            delete pendingActions[id];
+            // loadState() re-renders the row from fresh state, so only re-enable
+            // when the buttons survived (e.g. the POST failed and the row stayed).
+            setRowBusy(id, false);
+          });
+      }
+
+      // Disable both decision buttons for a row while its action is in flight.
+      function setRowBusy(id, busy) {
+        var selector = '[data-approve="' + cssAttr(id) + '"], [data-deny="' + cssAttr(id) + '"]';
+        document.querySelectorAll(selector).forEach(function (button) {
+          button.disabled = busy;
+          button.classList.toggle("busy", busy);
+        });
+      }
+
+      // Escape a value for use inside a CSS attribute selector.
+      function cssAttr(value) {
+        return String(value).replace(/["\\]/g, "\\$&");
+      }
+
+      function downloadCsv(csv) {
+        var blob = new Blob([csv], { type: "text/csv" });
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement("a");
+        link.href = url;
+        link.download = "s-gw-audit.csv";
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function handleMap(handles) {
+        var out = {};
+        for (var i = 0; i < handles.length; i++) {
+          out[handles[i].handle] = handles[i];
+        }
+
+        return out;
+      }
+
+      function requestTarget(request) {
+        if (!request || !request.action) {
+          return "-";
+        }
+
+        var command = request.action.command || "";
+        if (request.action.workingDir) {
+          return request.action.workingDir;
+        }
+
+        var args = request.action.args || [];
+        if (args[0] === "-e") {
+          return commandBase(command) + " inline script";
+        }
+
+        for (var i = 0; i < args.length; i++) {
+          if (args[i] && args[i].charAt(0) !== "-") {
+            return args[i];
+          }
+        }
+
+        return args[0] || "local command";
+      }
+
+      function commandMarkup(command) {
+        var value = String(command || "");
+        var base = commandBase(value);
+        if (!value || value === base) {
+          return escapeHtml(base || "-");
+        }
+
+        return escapeHtml(base) + '<span class="cell-sub">' + escapeHtml(value) + '</span>';
+      }
+
+      function commandBase(command) {
+        var value = String(command || "");
+        var normalized = value.replace(/\\/g, "/");
+        var parts = normalized.split("/");
+        return parts[parts.length - 1] || value;
+      }
+
+      function shortPath(command) {
+        return commandBase(command) || "local command";
+      }
+
+      function agentName(reason) {
+        var text = String(reason || "").toLowerCase();
+        if (text.indexOf("codex") !== -1) {
+          return "Codex";
+        }
+        if (text.indexOf("claude") !== -1) {
+          return "Claude";
+        }
+        if (text.indexOf("cursor") !== -1) {
+          return "Cursor";
+        }
+
+        return "Local agent";
+      }
+
+      function requestAgentName(request) {
+        return request && request.agentName ? request.agentName : agentName(request && request.reason);
+      }
+
+      function handleMarkup(handle) {
+        var value = String(handle || "");
+        var parts = value.split(":");
+        if (parts.length < 3) {
+          return escapeHtml(value);
+        }
+
+        return escapeHtml(parts.slice(0, 2).join(":") + ":") +
+          '<span class="cell-sub">' + escapeHtml(parts.slice(2).join(":")) + '</span>';
+      }
+
+      function shortHandle(handle) {
+        var value = String(handle || "");
+        if (value.length <= 26) {
+          return value;
+        }
+        return value.slice(0, 15) + "..." + value.slice(-7);
+      }
+
+      function providerIcon(provider) {
+        if (provider === "github") {
+          return '<span class="provider-icon"><svg><use href="#i-github"></use></svg></span>';
+        }
+        if (provider === "aws") {
+          return '<span class="provider-icon text-mark">aws</span>';
+        }
+        if (provider === "openai") {
+          return '<span class="provider-icon text-mark">AI</span>';
+        }
+        if (provider === "ssh") {
+          return '<span class="provider-icon"><svg><use href="#i-terminal"></use></svg></span>';
+        }
+        if (provider === "macos-keychain" || provider === "keychain") {
+          return '<span class="provider-icon"><svg><use href="#i-key"></use></svg></span>';
+        }
+
+        return '<span class="provider-icon"><svg><use href="#i-box"></use></svg></span>';
+      }
+
+      function providerLabel(provider) {
+        var value = String(provider || "generic");
+        if (value === "onepassword") {
+          return "1Password";
+        }
+        if (value === "keychain" || value === "macos-keychain") {
+          return "macOS Keychain";
+        }
+        if (value === "api-token") {
+          return "API token";
+        }
+        return value.charAt(0).toUpperCase() + value.slice(1);
+      }
+
+      function auditMeta(type) {
+        if (type === "request.approved") {
+          return { label: "Approved", icon: "i-check", actor: "You", color: "var(--green)" };
+        }
+        if (type === "request.denied") {
+          return { label: "Denied", icon: "i-alert", actor: "You", color: "var(--red)" };
+        }
+        if (type === "request.executed") {
+          return { label: "Secret accessed", icon: "i-terminal", actor: "Agent" };
+        }
+        if (type === "request.created") {
+          return { label: "Approval requested", icon: "i-alert", actor: "Agent" };
+        }
+        if (type === "secret.added" || type === "secret.matched") {
+          return { label: "Credential stored", icon: "i-info", actor: "System" };
+        }
+        if (type === "request.failed") {
+          return { label: "Execution failed", icon: "i-alert", actor: "Agent", color: "var(--red)" };
+        }
+
+        return { label: type || "Event", icon: "i-info", actor: "System" };
+      }
+
+      function actorMarkup(actor) {
+        if (actor === "You") {
+          return '<span class="actor"><span class="provider-icon"><svg><use href="#i-users"></use></svg></span><span>You (user)<span class="cell-sub">local console</span></span></span>';
+        }
+        if (actor === "Agent") {
+          return '<span class="actor"><span class="agent-badge">A</span><span>Agent<span class="cell-sub">localhost</span></span></span>';
+        }
+
+        return '<span class="actor"><span class="provider-icon"><svg><use href="#i-settings"></use></svg></span><span>s-gw (system)</span></span>';
+      }
+
+      function auditDetails(event) {
+        var parts = [event.message];
+        if (event.handle) {
+          parts.push("Handle: " + event.handle);
+        }
+        if (event.requestId) {
+          parts.push("Request: " + event.requestId);
+        }
+
+        return parts.map(function (part) {
+          return "<span>" + escapeHtml(part) + "</span>";
+        }).join("");
+      }
+
+      function tokenFor(handle) {
+        var value = String(handle);
+        if (value.length <= 18) {
+          return "<<SGW_SECRET:" + value + ">>";
+        }
+
+        return "<<SGW_SECRET:" + value.slice(0, 8) + "..." + value.slice(-6) + ">>";
+      }
+
+      function riskClass(severity) {
+        return severity === "critical" ? "critical" : severity === "high" ? "high" :
+          severity === "medium" ? "medium" : "low";
+      }
+
+      function riskLabel(severity) {
+        var value = severity || "low";
+        return value.charAt(0).toUpperCase() + value.slice(1);
+      }
+
+      function grantAgentLabel(grant) {
+        if (grant && grant.agentScope === "any-agent") {
+          return "All agents";
+        }
+
+        return grant && grant.agentName ? grant.agentName : "This agent";
+      }
+
+      function grantScopeLabel(grant) {
+        return grant && grant.agentScope === "any-agent" ? "All agents" : "This agent";
+      }
+
+      function approvalModeLabel(mode) {
+        if (mode === "timed-session") {
+          return "Same action for time";
+        }
+        if (mode === "login-session") {
+          return "Same action for login";
+        }
+        if (mode === "always") {
+          return "Same action always";
+        }
+        return "One time";
+      }
+
+      function flowStateMarkup(states) {
+        if (!states) {
+          return "";
+        }
+
+        var order = ["pending", "approved", "executing", "executed", "denied", "failed"];
+        var parts = [];
+        for (var i = 0; i < order.length; i++) {
+          var state = order[i];
+          var count = states[state] || 0;
+          if (count > 0) {
+            parts.push('<span class="state-chip">' + escapeHtml(state) + " " + escapeHtml(String(count)) + '</span>');
+          }
+        }
+
+        return parts.length ? '<span class="flow-state">' + parts.join("") + '</span>' : "";
+      }
+
+      function clipLabel(value, max) {
+        var text = String(value || "");
+        if (text.length <= max) {
+          return text;
+        }
+
+        return text.slice(0, Math.max(1, max - 1)) + "...";
+      }
+
+      function timeAgo(iso) {
+        var date = iso ? new Date(iso) : null;
+        if (!date || Number.isNaN(date.getTime())) {
+          return "-";
+        }
+
+        var seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+        if (seconds < 60) {
+          return seconds + "s ago";
+        }
+        var minutes = Math.floor(seconds / 60);
+        if (minutes < 60) {
+          return minutes + "m ago";
+        }
+        var hours = Math.floor(minutes / 60);
+        if (hours < 24) {
+          return hours + "h ago";
+        }
+
+        return Math.floor(hours / 24) + "d ago";
+      }
+
+      function timeUntil(iso) {
+        var date = iso ? new Date(iso) : null;
+        if (!date || Number.isNaN(date.getTime())) {
+          return "unknown";
+        }
+
+        var seconds = Math.floor((date.getTime() - Date.now()) / 1000);
+        if (seconds <= 0) {
+          return "expired";
+        }
+        if (seconds < 60) {
+          return "in " + seconds + "s";
+        }
+        var minutes = Math.floor(seconds / 60);
+        if (minutes < 60) {
+          return "in " + minutes + "m";
+        }
+        var hours = Math.floor(minutes / 60);
+        if (hours < 24) {
+          return "in " + hours + "h";
+        }
+
+        return "in " + Math.floor(hours / 24) + "d";
+      }
+
+      function clockTime(iso) {
+        var date = iso ? new Date(iso) : null;
+        if (!date || Number.isNaN(date.getTime())) {
+          return "-";
+        }
+
+        return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      }
+
+      function escapeHtml(value) {
+        return String(value === undefined || value === null ? "" : value).replace(/[&<>"']/g, function (char) {
+          return {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;"
+          }[char];
+        });
+      }
+
+      function attr(value) {
+        return escapeHtml(value);
+      }
+
+      observeUsageFlowDetailWidth();
+      loadState();
+
+      // Quietly re-poll in live mode so readiness/connection banners self-heal
+      // (e.g. after the user runs `s-gw setup` or restarts the daemon elsewhere).
+      if (liveMode) {
+        setInterval(function () {
+          loadState(null, true);
+        }, 15000);
+      }
+    }());
+  </script>
+</body>
+</html>

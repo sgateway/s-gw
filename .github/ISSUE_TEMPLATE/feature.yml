@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a focused improvement to s-gw.
+title: ""
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or security problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Credential storage
+        - Approval and policy
+        - Agent integration
+        - Command or SSH execution
+        - macOS app or menu helper
+        - Windows preview client
+        - Local console
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security considerations
+      description: Note any change to trust boundaries, credential exposure, approval scope, or audit behavior.

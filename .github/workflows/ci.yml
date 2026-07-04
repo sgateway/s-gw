@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  quality:
+    name: TypeScript, tests, and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SGW_E2E_CHROME: /usr/bin/google-chrome
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 20
+          cache: npm
+      - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+      - run: npm ci --ignore-scripts
+      - run: npm run check:rust
+      - run: npm run check
+      - run: npm run build
+      - run: npm test
+      - run: npm audit --audit-level=high
+      - run: npm run package:dry-run
+
+  macos-native:
+    name: macOS native surfaces
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 20
+          cache: npm
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: npm ci --ignore-scripts
+      - run: cargo test --locked -p sgw-core
+      - run: npm run build:native
+      - run: npx vitest run tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
+
+  windows-preview:
+    name: Windows preview client
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 20
+          cache: npm
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: npm ci --ignore-scripts
+      - run: cargo test --locked -p sgw-core
+      - run: npm run check
+      - run: npm run build:windows-client
+      - run: npx vitest run tests/windows-client.test.ts tests/installers.test.ts
