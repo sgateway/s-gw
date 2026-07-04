@@ -82,6 +82,16 @@ const demoAgents = [
 
 export const sampleState: ConsoleState = {
   version: "0.1.0",
+  update: {
+    checked: true,
+    currentVersion: "0.1.0",
+    latestVersion: "0.1.0",
+    available: false,
+    releaseUrl: "https://github.com/sgateway/s-gw/releases/tag/v0.1.0",
+    prerelease: true,
+    publishedAt: null,
+    checkedAt: null
+  },
   ready: true,
   readiness: { ok: true, summary: "Ready", blockers: [] },
   status: {

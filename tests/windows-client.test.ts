@@ -31,6 +31,10 @@ describe("Windows client packaging", () => {
     expect(client).toContain("--app=$Url");
     expect(helper).toContain("NotifyIcon");
     expect(helper).toContain("Approve Queue");
+    expect(helper).toContain('Invoke-CliJson $args');
+    expect(helper).toContain('"update", "check"');
+    expect(helper).toContain("s-gw update available");
+    expect(helper).toContain("Check for Updates");
     expect(credential).toContain("CredReadW");
     expect(credential).toContain("CredWriteW");
     expect(credential).toContain("[Console]::In.ReadToEnd()");

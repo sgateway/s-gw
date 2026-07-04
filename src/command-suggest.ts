@@ -10,6 +10,7 @@ export const KNOWN_COMMANDS = [
   "start",
   "stop",
   "doctor",
+  "update check",
   "console",
   "help",
   "app open",

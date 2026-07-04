@@ -18,6 +18,8 @@ import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolv
 import { readinessForUnlock } from "./install.js";
 import { SecretStore } from "./store.js";
 import { unlockStatus } from "./unlock.js";
+import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
+import { CURRENT_VERSION } from "./version.js";
 import type {
   AuditEvent,
   ApprovalAgentScope,
@@ -32,7 +34,7 @@ import type {
   SecretType
 } from "./types.js";
 
-const version = "0.1.0";
+const version = CURRENT_VERSION;
 const maxBodyBytes = 1024 * 1024;
 
 export interface ConsoleServerOptions {
@@ -41,6 +43,7 @@ export interface ConsoleServerOptions {
   store?: SecretStore;
   token?: string;
   uiDir?: string;
+  updateChecker?: Pick<ReleaseChecker, "check" | "current">;
 }
 
 export interface RunningConsoleServer {
@@ -127,11 +130,15 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   const token = options.token || randomBytes(24).toString("base64url");
   const store = options.store || new SecretStore();
   const uiDir = options.uiDir || defaultUiDir();
+  const updateChecker = options.updateChecker || new ReleaseChecker();
 
   await store.init();
+  void updateChecker.check();
+  const updateTimer = setInterval(() => void updateChecker.check(true), UPDATE_CHECK_INTERVAL_MS);
+  updateTimer.unref();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, store, token, uiDir).catch((error) => {
+    handleRequest(req, res, store, token, uiDir, updateChecker).catch((error) => {
       sendError(res, error);
     });
   });
@@ -152,7 +159,10 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     url,
     token,
     server,
-    close: () => closeServer(server)
+    close: () => {
+      clearInterval(updateTimer);
+      return closeServer(server);
+    }
   };
 }
 
@@ -171,7 +181,8 @@ async function handleRequest(
   res: ServerResponse,
   store: SecretStore,
   token: string,
-  uiDir: string
+  uiDir: string,
+  updateChecker: Pick<ReleaseChecker, "check" | "current">
 ): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (url.pathname.startsWith("/api/")) {
@@ -179,7 +190,7 @@ async function handleRequest(
       throw new HttpError(403, "Missing or invalid local console token.");
     }
 
-    await handleApi(req, res, url, store);
+    await handleApi(req, res, url, store, updateChecker);
     return;
   }
 
@@ -196,7 +207,8 @@ async function handleApi(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
-  store: SecretStore
+  store: SecretStore,
+  updateChecker: Pick<ReleaseChecker, "check" | "current">
 ): Promise<void> {
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, { ok: true, name: "s-gw", version });
@@ -204,7 +216,7 @@ async function handleApi(
   }
 
   if (req.method === "GET" && url.pathname === "/api/state") {
-    sendJson(res, 200, await buildState(store));
+    sendJson(res, 200, await buildState(store, updateChecker.current()));
     return;
   }
 
@@ -402,7 +414,7 @@ async function handleApi(
   throw new HttpError(404, "Unknown console API route.");
 }
 
-async function buildState(store: SecretStore) {
+async function buildState(store: SecretStore, update: UpdateCheckResult | null) {
   const handles = await store.listHandles();
   const requests = await store.listRequests();
   const audit = await store.auditLog();
@@ -418,6 +430,7 @@ async function buildState(store: SecretStore) {
 
   return {
     version,
+    update,
     ready: readiness.ok,
     readiness,
     status: {

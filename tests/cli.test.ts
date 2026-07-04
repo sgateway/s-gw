@@ -23,6 +23,10 @@ describe("command suggestions", () => {
     expect(suggestCommands(["secrets", "list"])).toContain("secret list");
   });
 
+  it("maps an update typo to the release check", () => {
+    expect(suggestCommands(["updat", "check"])).toContain("update check");
+  });
+
   it("lists subcommands when the noun is right but the verb is missing", () => {
     const out = suggestCommands(["secret"]);
     expect(out).toContain("secret add");
@@ -59,6 +63,21 @@ describe("command suggestions", () => {
 });
 
 describe("CLI unknown-command behavior (end to end)", () => {
+  it("reports update status without requiring local store setup", () => {
+    const result = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "update", "check"], {
+      cwd: repoRoot,
+      env: { ...process.env, SGW_DISABLE_UPDATE_CHECK: "1" },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    }));
+
+    expect(result).toMatchObject({
+      checked: false,
+      currentVersion: "0.1.0",
+      available: false
+    });
+  });
+
   it("exits non-zero and prints a suggestion to stderr for a typo", () => {
     let stderr = "";
     let code = 0;

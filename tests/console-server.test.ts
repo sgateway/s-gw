@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
+import { ReleaseChecker } from "../src/update-check.js";
 
 let tmpHome = "";
 let running: RunningConsoleServer | undefined;
@@ -69,6 +70,31 @@ describe("local console server", () => {
     expect(codex.codeGuard.supported).toBe(true);
     expect(omnigent.mcp.supported).toBe(false);
     expect(omnigent.mcp.snippet).toBeNull();
+  });
+
+  it("publishes an available release to console clients", async () => {
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpHome, "update.json"),
+      currentVersion: "0.1.0",
+      enabled: true,
+      fetcher: async () => new Response(JSON.stringify([{
+        tag_name: "v0.1.1",
+        html_url: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
+        draft: false,
+        prerelease: true,
+        published_at: "2026-07-04T00:00:00.000Z"
+      }]), { status: 200 })
+    });
+    await checker.check(true);
+    running = await startConsoleServer({ port: 0, updateChecker: checker });
+
+    const state = await fetchJson("api/state");
+    expect(state.update).toMatchObject({
+      currentVersion: "0.1.0",
+      latestVersion: "0.1.1",
+      available: true,
+      prerelease: true
+    });
   });
 
   it("runs a secret-backed command through the HTTP console lifecycle", async () => {

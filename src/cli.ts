@@ -36,6 +36,7 @@ import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordRefe
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { SecretStore } from "./store.js";
 import { deleteKeychainPassphrase, setKeychainPassphrase, unlockStatus } from "./unlock.js";
+import { releaseChecker } from "./update-check.js";
 import type {
   ApprovalAgentScope,
   ApprovalMode,
@@ -67,6 +68,14 @@ async function main(): Promise<void> {
   if (first === "init") {
     await store.init();
     printJson({ ok: true, storePath: store.storePath });
+    return;
+  }
+
+  if (first === "update") {
+    if (second !== "check") {
+      throw new Error("Usage: s-gw update check [--force]");
+    }
+    printJson(await releaseChecker.check(hasFlag(parsed.flags, "force")));
     return;
   }
 
@@ -1670,6 +1679,7 @@ Commands:
   s-gw start [--port 8718] [--no-open-app]
   s-gw stop
   s-gw doctor
+  s-gw update check [--force]
   s-gw console [--host 127.0.0.1] [--port 8718] [--no-open]
   s-gw app app-path
   s-gw app open [--port 8718] [--console-url URL]
@@ -1726,7 +1736,24 @@ Commands:
 `);
 }
 
-main().catch((error) => {
+async function run(): Promise<void> {
+  await main();
+  await printUpdateNotice();
+}
+
+async function printUpdateNotice(): Promise<void> {
+  if (!process.stderr.isTTY || process.env.SGW_DISABLE_UPDATE_CHECK === "1") return;
+  const command = process.argv[2];
+  if (command !== "status" && command !== "doctor") return;
+
+  const update = await releaseChecker.check();
+  if (!update.available || !update.latestVersion || !update.releaseUrl) return;
+  process.stderr.write(
+    `\ns-gw ${update.latestVersion} is available. Run \`s-gw update check\` or visit ${update.releaseUrl}\n`
+  );
+}
+
+run().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`s-gw error: ${message}\n`);
   process.exitCode = 1;

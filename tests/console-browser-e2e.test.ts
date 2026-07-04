@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
+import { ReleaseChecker } from "../src/update-check.js";
 
 const CHROME_CANDIDATES = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -56,6 +57,36 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it("shows a release notification from the public update feed", async () => {
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpHome, "update.json"),
+      currentVersion: "0.1.0",
+      enabled: true,
+      fetcher: async () => new Response(JSON.stringify([{
+        tag_name: "v0.1.1",
+        html_url: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
+        draft: false,
+        prerelease: true,
+        published_at: "2026-07-04T00:00:00.000Z"
+      }]), { status: 200 })
+    });
+    await checker.check(true);
+    running = await startConsoleServer({ port: 0, updateChecker: checker });
+    const launched = await launchChrome(new URL("overview", running.url).toString());
+    cdp = launched.cdp;
+
+    await waitFor(
+      () => cdp!.eval<boolean>("Boolean(document.querySelector('[data-update-banner]'))"),
+      "update banner"
+    );
+    const banner = await cdp.eval<{ text: string; href: string }>(`(() => {
+      const root = document.querySelector('[data-update-banner]');
+      return { text: root.innerText, href: root.querySelector('a').href };
+    })()`);
+    expect(banner.text).toContain("s-gw 0.1.1 is available");
+    expect(banner.href).toBe("https://github.com/sgateway/s-gw/releases/tag/v0.1.1");
+  }, 45_000);
+
   it("opens actionable agent configuration and copies the MCP snippet", async () => {
     running = await startConsoleServer({ port: 0 });
     const launched = await launchChrome(new URL("agents", running.url).toString());

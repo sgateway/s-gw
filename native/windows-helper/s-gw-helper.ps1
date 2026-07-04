@@ -94,6 +94,32 @@ function Get-PendingRequests {
   }
 }
 
+function Refresh-UpdateStatus([switch]$Force) {
+  if (-not $Force -and ((Get-Date) - $script:LastUpdateCheck).TotalHours -lt 6) {
+    return
+  }
+
+  $script:LastUpdateCheck = Get-Date
+  try {
+    $args = @("update", "check")
+    if ($Force) {
+      $args += "--force"
+    }
+    $script:AvailableUpdate = Invoke-CliJson $args
+    if ($script:AvailableUpdate.available -eq $true -and $script:AvailableUpdate.latestVersion -ne $script:LastNotifiedVersion) {
+      $script:LastNotifiedVersion = [string]$script:AvailableUpdate.latestVersion
+      $script:Notify.ShowBalloonTip(
+        5000,
+        "s-gw update available",
+        "s-gw $($script:AvailableUpdate.latestVersion) is ready to download.",
+        [System.Windows.Forms.ToolTipIcon]::Info
+      )
+    }
+  } catch {
+    $script:AvailableUpdate = $null
+  }
+}
+
 function Add-MenuItem([System.Windows.Forms.ContextMenuStrip]$Menu, [string]$Text, [scriptblock]$Handler, [bool]$Enabled = $true) {
   $item = New-Object System.Windows.Forms.ToolStripMenuItem
   $item.Text = $Text
@@ -128,6 +154,7 @@ function Deny-FirstPending {
 }
 
 function Update-Menu {
+  Refresh-UpdateStatus
   $pending = Get-PendingRequests
   $count = $pending.Count
   $script:Menu.Items.Clear()
@@ -137,8 +164,14 @@ function Update-Menu {
   [void]$script:Menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
   Add-MenuItem $script:Menu "Open s-gw" { Start-Client } | Out-Null
+  if ($script:AvailableUpdate -and $script:AvailableUpdate.available -eq $true) {
+    Add-MenuItem $script:Menu "Update available: $($script:AvailableUpdate.latestVersion)" {
+      Start-Process ([string]$script:AvailableUpdate.releaseUrl) | Out-Null
+    } | Out-Null
+  }
   Add-MenuItem $script:Menu "Approve Queue" { Start-Client "approvals" } | Out-Null
   Add-MenuItem $script:Menu "Refresh" { $script:LastError = ""; Update-Menu } | Out-Null
+  Add-MenuItem $script:Menu "Check for Updates" { Refresh-UpdateStatus -Force; Update-Menu } | Out-Null
   Add-MenuItem $script:Menu "Approve oldest request" { Approve-FirstPending } ($count -gt 0) | Out-Null
   Add-MenuItem $script:Menu "Deny oldest request" { Deny-FirstPending } ($count -gt 0) | Out-Null
   [void]$script:Menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
@@ -161,6 +194,9 @@ $script:NodePath = Resolve-NodePath
 $script:BaseConsoleUrl = New-ConsoleUrl
 $script:LastError = ""
 $script:LastPendingCount = -1
+$script:LastUpdateCheck = [DateTime]::MinValue
+$script:LastNotifiedVersion = ""
+$script:AvailableUpdate = $null
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 $script:Menu = New-Object System.Windows.Forms.ContextMenuStrip

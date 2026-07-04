@@ -42,6 +42,7 @@ final class AppState {
   }
 
   @ObservationIgnored private var refreshTask: Task<Void, Never>?
+  @ObservationIgnored private var updateTask: Task<Void, Never>?
   @ObservationIgnored private let updateCheckInterval: TimeInterval = 6 * 60 * 60
   @ObservationIgnored private var seenPendingRequestIds = Set<String>()
 
@@ -127,12 +128,17 @@ final class AppState {
     }
     Task {
       await refresh()
-      await checkForUpdates()
     }
     refreshTask = Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(4))
         await self?.refreshQuietly()
+      }
+    }
+    updateTask = Task { [weak self] in
+      while !Task.isCancelled {
+        await self?.checkForUpdates()
+        try? await Task.sleep(for: .seconds(60 * 60))
       }
     }
     UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
@@ -141,6 +147,8 @@ final class AppState {
   func stop() {
     refreshTask?.cancel()
     refreshTask = nil
+    updateTask?.cancel()
+    updateTask = nil
   }
 
   func refreshQuietly() async {

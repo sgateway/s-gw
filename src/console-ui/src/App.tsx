@@ -390,6 +390,21 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
               <AlertDescription>{ctx.error}</AlertDescription>
             </Alert>
           ) : null}
+          {!nativeShell && state?.update?.available && state.update.latestVersion && state.update.releaseUrl ? (
+            <Alert data-update-banner className="m-4 mb-0 border-primary/35 bg-primary/5">
+              <Download className="h-4 w-4" />
+              <AlertTitle>s-gw {state.update.latestVersion} is available</AlertTitle>
+              <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
+                <span>Installed {state.version}. Review the release before upgrading.</span>
+                <Button asChild size="sm" variant="outline">
+                  <a href={state.update.releaseUrl} target="_blank" rel="noreferrer">
+                    View release
+                    <ExternalLink className="h-4 w-4" />
+                  </a>
+                </Button>
+              </AlertDescription>
+            </Alert>
+          ) : null}
           <ViewContent
             ctx={ctx}
             view={view}

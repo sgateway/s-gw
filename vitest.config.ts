@@ -4,6 +4,9 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
-    restoreMocks: true
+    restoreMocks: true,
+    env: {
+      SGW_DISABLE_UPDATE_CHECK: "1"
+    }
   }
 });

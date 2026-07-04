@@ -40,6 +40,18 @@ describe("React console source contracts", () => {
     expect(logo).toContain("@/assets/s-gw-64.png");
   });
 
+  it("shows available releases from the local update state", async () => {
+    const [app, types] = await Promise.all([
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
+      readFile(path.join(repoRoot, "src/console-ui/src/lib/types.ts"), "utf8")
+    ]);
+
+    expect(app).toContain("data-update-banner");
+    expect(app).toContain("state.update.latestVersion");
+    expect(app).toContain("state.update.releaseUrl");
+    expect(types).toContain("update: UpdateCheckResult | null");
+  });
+
   it("uses provider logos and normalized secure-storage names", async () => {
     const [app, providerIdentity, presentation] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),

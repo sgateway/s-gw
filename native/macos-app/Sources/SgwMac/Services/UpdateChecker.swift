@@ -78,7 +78,7 @@ actor UpdateChecker {
         let trimmed = repository.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.contains("/") else { return nil }
 
-        guard let url = URL(string: "https://api.github.com/repos/\(trimmed)/releases/latest") else {
+        guard let url = URL(string: "https://api.github.com/repos/\(trimmed)/releases?per_page=20") else {
             return nil
         }
 
@@ -93,7 +93,13 @@ actor UpdateChecker {
                 return nil
             }
 
-            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            let releases = try JSONDecoder().decode([GitHubRelease].self, from: data)
+            guard let release = releases
+                .filter({ !$0.draft })
+                .sorted(by: { Self.isNewer($0.tagName, than: $1.tagName) })
+                .first else {
+                return nil
+            }
             return releaseInfo(from: release)
         } catch {
             return nil
@@ -297,12 +303,14 @@ private struct GitHubRelease: Decodable {
     let htmlURL: String
     let body: String?
     let assets: [GitHubAsset]
+    let draft: Bool
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
         case htmlURL = "html_url"
         case body
         case assets
+        case draft
     }
 }
 

@@ -25,6 +25,7 @@ export interface UnlockStatus {
 
 export interface ConsoleState {
   version: string;
+  update: UpdateCheckResult | null;
   ready: boolean;
   readiness: Readiness;
   status: {
@@ -48,6 +49,18 @@ export interface ConsoleState {
   pendingRequests: RequestRecord[];
   audit: AuditEvent[];
   agents: AgentSummary[];
+}
+
+export interface UpdateCheckResult {
+  checked: boolean;
+  currentVersion: string;
+  latestVersion: string | null;
+  available: boolean;
+  releaseUrl: string | null;
+  prerelease: boolean;
+  publishedAt: string | null;
+  checkedAt: string | null;
+  error?: string;
 }
 
 export interface SecretPolicy {

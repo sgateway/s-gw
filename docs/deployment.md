@@ -352,7 +352,9 @@ Supported means s-gw has a documented standard MCP stdio path. Profiled means `s
 
 ## Upgrade
 
-The native macOS app can check a GitHub Releases feed from Settings or the `Check for Updates` menu command. The default release repository is `sgateway/s-gw`. Publish release notes on the GitHub release and attach an npm tarball asset such as `s-gw-0.1.1.tgz`; the app can download that asset, run `npm install -g`, restart the service/menu helper, and reopen s-gw. If no installable tarball is attached, the app still shows the release notes and opens the release page.
+All clients check the public `sgateway/s-gw` GitHub Releases feed at most once every six hours. Drafts are ignored; preview releases are included while s-gw is in preview. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The native macOS app also checks hourly while it is open, subject to the six-hour cache, and provides manual checks from Settings or the `Check for Updates` menu command.
+
+Publish release notes and attach an npm tarball asset such as `s-gw-0.1.1.tgz` with its `.sha256` file. The macOS app can verify and install that package, restart the service/menu helper, and reopen s-gw. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
 
 Upgrade the package:
 
