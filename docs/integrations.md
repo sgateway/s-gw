@@ -10,16 +10,16 @@ For installation, supported operating systems, and packaging channels, see [depl
 
 For the broader agent profile matrix, including OpenClaw, ZeptoClaw, Hermes, Windsurf, Gemini CLI, GitHub Copilot CLI, OpenHands, Antigravity, OpenCode, and OmniGent, see [agents.md](agents.md). You can also run `s-gw agent list` and `s-gw agent mcp-snippet <agent>` when the profile has a normal MCP surface.
 
-Build first:
+Install and initialize s-gw:
 
 ```bash
-cd /path/to/s-gw
-npm install
-npm run build
-npm link
+npm install -g @s-gw/s-gw
+s-gw setup
 ```
 
-Store a local unlock passphrase in the OS credential store before starting the MCP server:
+Contributors working from source can use `npm ci`, `npm run build`, and `npm link` from a repository checkout.
+
+If you skipped `s-gw setup`, store a local unlock passphrase in the OS credential store before starting the MCP server:
 
 ```bash
 read -rsp "s-gw passphrase: " SGW_UNLOCK

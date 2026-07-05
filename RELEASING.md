@@ -38,10 +38,12 @@ Do not describe the macOS DMG as a production download until the application, he
 ## Publish
 
 1. Create an annotated `vX.Y.Z` tag from a green `main` commit.
-2. Create a GitHub release using the matching changelog entry.
-3. Attach signed platform artifacts, the npm tarball, and `SHA256SUMS.txt`.
-4. Verify checksums from a clean download.
-5. Install the release on clean macOS and Windows test accounts.
-6. Confirm the update checker sees the release and opens the correct notes.
+2. Publish the public scoped package with `npm publish --access public`.
+3. Verify `npm view @s-gw/s-gw@X.Y.Z version` and install it in a clean npm prefix.
+4. Create a GitHub release using the matching changelog entry.
+5. Attach signed platform artifacts, the npm tarball, and `SHA256SUMS.txt`.
+6. Verify checksums from a clean download.
+7. Install the release on clean macOS and Windows test accounts.
+8. Confirm the update checker sees the release and opens the correct notes.
 
 If signing is not available, label installers as preview artifacts and state the signing and notarization limitations in the release notes.

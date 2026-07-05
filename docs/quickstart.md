@@ -1,17 +1,13 @@
 # Quick Start
 
-This guide builds s-gw from source and exercises its approval boundary with disposable data. It does not require a real credential.
+This guide installs s-gw from npm and exercises its approval boundary with disposable data. It does not require a real credential.
 
-Building from source requires Node.js 20 or newer and the Rust toolchain pinned by `rust-toolchain.toml`.
+The supported npm installation requires Node.js 20 or newer.
 
-## Build
+## Install
 
 ```bash
-git clone https://github.com/sgateway/s-gw.git
-cd s-gw
-npm ci
-npm run build
-npm link
+npm install -g @s-gw/s-gw
 ```
 
 For normal use, run `s-gw setup`. The demonstration below instead uses a temporary home and an environment-provided passphrase so it leaves the operating system credential store untouched.
@@ -102,3 +98,15 @@ unset SGW_HOME SGW_MASTER_PASSPHRASE HANDLE REQUEST REQUEST_ID
 - Use `s-gw agent mcp-snippet <agent>` to configure a supported client.
 - Read the [threat model](threat-model.md) before enrolling sensitive credentials.
 - Open the native app with `s-gw app open` or the fallback console with `s-gw console`.
+
+## Build From Source
+
+Contributors need the Rust toolchain pinned by `rust-toolchain.toml`. Building the native macOS surfaces also requires Swift.
+
+```bash
+git clone https://github.com/sgateway/s-gw.git
+cd s-gw
+npm ci
+npm run build
+npm link
+```
