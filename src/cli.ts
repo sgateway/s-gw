@@ -57,13 +57,19 @@ interface ParsedArgs {
 
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
-  const store = new SecretStore();
   const [first, second, third] = parsed.command;
 
   if (!first || first === "help" || first === "--help") {
     printHelp();
     return;
   }
+
+  if (first === "mcp") {
+    await import("./mcp-server.js");
+    return;
+  }
+
+  const store = new SecretStore();
 
   if (first === "init") {
     await store.init();
@@ -1686,6 +1692,7 @@ Commands:
   s-gw stop
   s-gw doctor
   s-gw update check [--force]
+  s-gw mcp
   s-gw console [--host 127.0.0.1] [--port 8718] [--no-open]
   s-gw app app-path
   s-gw app open [--port 8718] [--console-url URL]

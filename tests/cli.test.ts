@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { KNOWN_COMMANDS, suggestCommands, unknownCommandMessage } from "../src/command-suggest.js";
+import { CURRENT_VERSION } from "../src/version.js";
 
 const repoRoot = process.cwd();
 const tsxBin = path.join(repoRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
@@ -73,7 +74,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
 
     expect(result).toMatchObject({
       checked: false,
-      currentVersion: "0.1.0",
+      currentVersion: CURRENT_VERSION,
       available: false
     });
   });

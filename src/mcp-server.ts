@@ -6,11 +6,12 @@ import { executeApprovedRequest } from "./executor.js";
 import { buildEnvCommandAction, buildSshSessionAction, scanLocalFile, scanLocalText } from "./gateway.js";
 import { SecretStore } from "./store.js";
 import { defaultSshInjectEnv } from "./ssh.js";
+import { CURRENT_VERSION } from "./version.js";
 
 const store = new SecretStore();
 const server = new McpServer({
   name: "s-gw",
-  version: "0.1.0"
+  version: CURRENT_VERSION
 });
 
 function mcpAgentContext() {

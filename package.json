@@ -1,6 +1,7 @@
 {
   "name": "@s-gw/s-gw",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "mcpName": "io.github.sgateway/s-gw",
   "description": "Local credential control for AI coding agents.",
   "type": "module",
   "repository": {
@@ -28,6 +29,7 @@
     "LICENSE",
     "NOTICE",
     "TRADEMARKS.md",
+    "server.json",
     ".codex-plugin",
     ".mcp.json",
     "skills",
@@ -65,8 +67,12 @@
   },
   "keywords": [
     "mcp",
+    "mcp-server",
+    "model-context-protocol",
     "secrets",
+    "secrets-management",
     "credential-security",
+    "agent-security",
     "local-first",
     "ai-agents",
     "codex",
