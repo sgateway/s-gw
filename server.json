@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.sgateway/s-gw",
+  "title": "s-gw",
+  "description": "Keep credentials out of AI coding agents with local approvals, scoped injection, and audit trails.",
+  "websiteUrl": "https://s-gw.com",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/sgateway/s-gw/main/assets/icons/s-gw-128.png",
+      "mimeType": "image/png",
+      "sizes": ["128x128"]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/sgateway/s-gw",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@s-gw/s-gw",
+      "version": "0.1.1",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "-y"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

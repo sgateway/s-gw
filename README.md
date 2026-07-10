@@ -86,7 +86,7 @@ The agent never needs the unlock passphrase or raw credential. Approval is scope
 | Surface | Purpose |
 | --- | --- |
 | `s-gw` CLI | Setup, credential enrollment, approvals, policies, agent snippets, guard mode, and diagnostics. |
-| `s-gw-mcp` | Stdio MCP server for agent-facing handle discovery and request creation. |
+| `s-gw-mcp` / `s-gw mcp` | Stdio MCP server for agent-facing handle discovery and request creation. |
 | Native macOS app | Approval queue, credential inventory, policy rules, usage flow, activity, and audit review. |
 | Menu-bar helper | Fast visibility into pending approvals and local daemon status. |
 | Local web console | Browser-accessible fallback UI bound to `127.0.0.1`. |

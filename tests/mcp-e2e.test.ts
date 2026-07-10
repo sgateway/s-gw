@@ -29,6 +29,25 @@ afterEach(async () => {
 });
 
 describe("MCP end-to-end flow", () => {
+  it("starts through the primary CLI", async () => {
+    const transport = new StdioClientTransport({
+      command: tsxBin,
+      args: ["src/cli.ts", "mcp"],
+      cwd: repoRoot,
+      env: testEnv as Record<string, string>,
+      stderr: "pipe"
+    });
+    const client = new Client({ name: "codex-mcp-client", version: "0.0.1" });
+
+    await client.connect(transport);
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toContain("sgw_request_execution");
+    } finally {
+      await client.close();
+    }
+  });
+
   it("denies execution before approval and returns sanitized output after approval", async () => {
     runCli(["init"]);
     const addPayload = JSON.parse(

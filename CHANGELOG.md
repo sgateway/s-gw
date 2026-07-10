@@ -4,6 +4,17 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.1 - 2026-07-10
+
+### Added
+
+- Official MCP Registry metadata for discovery and one-command launch through npm.
+- `s-gw mcp` as a primary CLI entry point for the stdio MCP server.
+
+### Changed
+
+- MCP server version reporting now stays aligned with the package version.
+
 ## 0.1.0 - 2026-07-03
 
 ### Added
