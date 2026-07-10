@@ -3,6 +3,7 @@ name: Publish release
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,11 +32,14 @@ jobs:
       - run: npm run verify
 
       - name: Verify release version
+        if: github.event_name == 'release'
         run: |
           package_version="$(node -p "require('./package.json').version")"
           test "v${package_version}" = "${GITHUB_REF_NAME}"
 
-      - run: npm publish --access public
+      - name: Publish to npm
+        if: github.event_name == 'release'
+        run: npm publish --access public
 
       - name: Verify npm publication
         run: |
