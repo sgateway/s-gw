@@ -128,7 +128,10 @@ describe("platform installers", () => {
     ]);
     const assetJob = workflow.slice(workflow.indexOf("  release-assets:"));
 
-    expect(assetJob).toContain("runs-on: macos-14");
+    expect(assetJob).toContain("runs-on: macos-15");
+    expect(workflow).toContain("release_tag:");
+    expect(assetJob).toContain("inputs.release_tag != ''");
+    expect(assetJob).toContain("ref: ${{ env.RELEASE_TAG }}");
     expect(assetJob).toContain("npm run verify");
     expect(assetJob).toContain("npm run build:installers");
     expect(assetJob).toContain("first_tgz");
