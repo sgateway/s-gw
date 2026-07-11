@@ -150,8 +150,8 @@ describe("agent profiles", () => {
   });
 
   it("exposes profiles through the CLI", () => {
-    const tsxBin = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
-    const out = execFileSync(tsxBin, ["src/cli.ts", "agent", "mcp-snippet", "codex"], {
+    const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const out = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "mcp-snippet", "codex"], {
       cwd: process.cwd(),
       encoding: "utf8"
     });
@@ -160,7 +160,7 @@ describe("agent profiles", () => {
     expect(out).toContain("s-gw-mcp");
     expect(out).toContain('SGW_AGENT_NAME = "Codex"');
 
-    const planned = execFileSync(tsxBin, ["src/cli.ts", "agent", "show", "omnigent"], {
+    const planned = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "show", "omnigent"], {
       cwd: process.cwd(),
       encoding: "utf8"
     });
@@ -168,8 +168,8 @@ describe("agent profiles", () => {
   });
 
   it("exposes CodeGuard hardening plans through the CLI", () => {
-    const tsxBin = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
-    const codex = execFileSync(tsxBin, ["src/cli.ts", "agent", "codeguard-plan", "codex"], {
+    const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const codex = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "codeguard-plan", "codex"], {
       cwd: process.cwd(),
       encoding: "utf8"
     });

@@ -457,7 +457,7 @@ describe("agent integration installation", () => {
     expect(result[0].state).toBe("installed");
     expect(result[0].mcp.state).toBe("existing");
     expect(result[0].skill.state).toBe("installed");
-    expect(readFileSync(configPath, "utf8")).toContain(mcpPath);
+    expect(readFileSync(configPath, "utf8")).toContain(JSON.stringify(mcpPath));
   });
 
   it("writes the effective data home and an absolute MCP command", () => {
