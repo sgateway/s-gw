@@ -23,4 +23,19 @@ describe("native readiness UI contract", () => {
     expect(components).toContain('.accessibilityLabel("s-gw readiness")');
     expect(components).toContain('.accessibilityIdentifier("s-gw-readiness-run-setup")');
   });
+
+  it("offers managed agent install and uninstall actions with manual snippet fallback", async () => {
+    const [agents, appState, models] = await Promise.all([
+      readFile(path.join(appRoot, "Views/AgentsView.swift"), "utf8"),
+      readFile(path.join(appRoot, "App/AppState.swift"), "utf8"),
+      readFile(path.join(appRoot, "Models/Models.swift"), "utf8")
+    ]);
+
+    expect(agents).toContain('Label("Connect", systemImage: "link.badge.plus")');
+    expect(agents).toContain('Label("Disconnect", systemImage: "link.badge.minus")');
+    expect(agents).toContain("appState.copySnippet(for: agent)");
+    expect(appState).toContain('arguments: ["agent", "install", agent.id]');
+    expect(appState).toContain('arguments: ["agent", "uninstall", agent.id]');
+    expect(models).toContain("struct AgentIntegrationStatus");
+  });
 });

@@ -116,7 +116,7 @@ s-gw setup
 s-gw status
 ```
 
-`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, and starts the local UI surfaces available on the current platform.
+`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. It backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
 
 Add a credential from your terminal without placing the value in chat or a process argument:
 
@@ -169,6 +169,19 @@ s-gw agent mcp-snippet codex
 s-gw agent mcp-snippet claude-code
 s-gw agent mcp-snippet opencode
 ```
+
+Review or manage detected connections:
+
+```bash
+s-gw agent status
+s-gw agent install codex --dry-run
+s-gw agent install codex
+s-gw agent uninstall codex
+```
+
+Manual profiles and config formats without a safe merge path continue to use the generated snippet. npm installation itself never edits agent configuration.
+
+`s-gw setup` can safely manage detected Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI, OpenCode, and default-profile VS Code installations on macOS, Windows, and Linux. On Windows, it launches the packaged MCP server through `node.exe`, not an npm `.cmd` shim.
 
 For CLI agents, guard mode can replace credential-looking launch environment values with s-gw handles before the agent starts:
 

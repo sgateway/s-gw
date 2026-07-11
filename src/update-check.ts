@@ -34,6 +34,7 @@ interface ReleaseCheckerOptions {
   cachePath?: string;
   currentVersion?: string;
   endpoint?: string;
+  feedEndpoint?: string | null;
   enabled?: boolean;
   fetcher?: typeof fetch;
   now?: () => number;
@@ -58,6 +59,7 @@ export class ReleaseChecker {
   private readonly cachePath: string;
   private readonly currentVersion: string;
   private readonly endpoint: string;
+  private readonly feedEndpoint: string | null;
   private readonly enabled: boolean;
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
@@ -68,6 +70,9 @@ export class ReleaseChecker {
     this.cachePath = options.cachePath ?? path.join(getSgwHome(), "update-check.json");
     this.currentVersion = options.currentVersion ?? CURRENT_VERSION;
     this.endpoint = options.endpoint ?? `https://api.github.com/repos/${UPDATE_REPOSITORY}/releases?per_page=20`;
+    this.feedEndpoint = options.feedEndpoint === undefined
+      ? `https://github.com/${UPDATE_REPOSITORY}/releases.atom`
+      : options.feedEndpoint;
     this.enabled = options.enabled ?? process.env.SGW_DISABLE_UPDATE_CHECK !== "1";
     this.fetcher = options.fetcher ?? fetch;
     this.now = options.now ?? Date.now;
@@ -99,23 +104,7 @@ export class ReleaseChecker {
     }
 
     try {
-      const response = await this.fetcher(this.endpoint, {
-        headers: {
-          Accept: "application/vnd.github+json",
-          "User-Agent": "s-gw-updater"
-        },
-        signal: AbortSignal.timeout(5_000)
-      });
-      if (!response.ok) {
-        throw new Error(`GitHub release check returned HTTP ${response.status}.`);
-      }
-
-      const payload = await response.json();
-      if (!Array.isArray(payload)) {
-        throw new Error("GitHub release check returned an invalid response.");
-      }
-
-      const release = newestRelease(payload as GitHubRelease[]);
+      const release = await this.fetchLatestRelease();
       const checkedAt = new Date(this.now()).toISOString();
       const result: UpdateCheckResult = release ? {
         checked: true,
@@ -143,6 +132,39 @@ export class ReleaseChecker {
       };
       this.latest = result;
       return result;
+    }
+  }
+
+  private async fetchLatestRelease(): Promise<GitHubRelease | null> {
+    try {
+      const response = await this.fetcher(this.endpoint, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "s-gw-updater"
+        },
+        signal: AbortSignal.timeout(5_000)
+      });
+      if (!response.ok) throw new Error(`GitHub release check returned HTTP ${response.status}.`);
+      const payload = await response.json();
+      if (!Array.isArray(payload)) throw new Error("GitHub release check returned an invalid response.");
+      return newestRelease(payload as GitHubRelease[]);
+    } catch (apiError) {
+      if (!this.feedEndpoint) throw apiError;
+      try {
+        const response = await this.fetcher(this.feedEndpoint, {
+          headers: {
+            Accept: "application/atom+xml",
+            "User-Agent": "s-gw-updater"
+          },
+          signal: AbortSignal.timeout(5_000)
+        });
+        if (!response.ok) throw new Error(`GitHub release feed returned HTTP ${response.status}.`);
+        return releaseFromAtom(await response.text());
+      } catch (feedError) {
+        const apiMessage = apiError instanceof Error ? apiError.message : String(apiError);
+        const feedMessage = feedError instanceof Error ? feedError.message : String(feedError);
+        throw new Error(`${apiMessage} Atom fallback failed: ${feedMessage}`);
+      }
     }
   }
 
@@ -180,6 +202,35 @@ function newestRelease(releases: GitHubRelease[]): GitHubRelease | null {
     }
   }
   return newest;
+}
+
+function releaseFromAtom(xml: string): GitHubRelease | null {
+  const entry = xml.match(/<entry>([\s\S]*?)<\/entry>/i)?.[1];
+  if (!entry) return null;
+
+  const link = entry.match(/<link\b[^>]*\brel="alternate"[^>]*\bhref="([^"]+)"/i)?.[1];
+  const id = entry.match(/<id>([^<]+)<\/id>/i)?.[1];
+  const tagFromLink = link?.match(/\/releases\/tag\/([^/?#"]+)/i)?.[1];
+  const tagFromId = id?.split("/").at(-1);
+  const tag = decodeXml(tagFromLink || tagFromId || "").trim();
+  if (!tag) return null;
+
+  return {
+    tag_name: tag,
+    html_url: decodeXml(link || `https://github.com/${UPDATE_REPOSITORY}/releases/tag/${tag}`),
+    draft: false,
+    prerelease: cleanVersion(tag).includes("-"),
+    published_at: entry.match(/<updated>([^<]+)<\/updated>/i)?.[1] || null
+  };
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">");
 }
 
 function emptyResult(currentVersion: string): UpdateCheckResult {

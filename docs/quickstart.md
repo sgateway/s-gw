@@ -95,7 +95,8 @@ unset SGW_HOME SGW_MASTER_PASSPHRASE HANDLE REQUEST REQUEST_ID
 ## Next Steps
 
 - Run `s-gw setup` for a persistent local installation.
-- Use `s-gw agent mcp-snippet <agent>` to configure a supported client.
+- `s-gw setup` automatically connects detected agents with safe user-level config targets. Run `s-gw agent status` to review the result or `s-gw setup --no-agents` to skip it.
+- Use `s-gw agent mcp-snippet <agent>` for manual profiles and project-scoped configuration.
 - Read the [threat model](threat-model.md) before enrolling sensitive credentials.
 - Open the native app with `s-gw app open` or the fallback console with `s-gw console`.
 

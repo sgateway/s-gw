@@ -65,3 +65,53 @@ jobs:
         run: |
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish server.json
+
+  release-assets:
+    if: github.event_name == 'release' && github.repository == 'sgateway/s-gw'
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+      - run: npm ci --ignore-scripts
+
+      - name: Verify release asset version
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          test "v${package_version}" = "${GITHUB_REF_NAME}"
+
+      - run: npm run verify
+      - run: npm run build:installers
+
+      - name: Upload verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          bridge="dist/installers/0-s-gw-legacy-${package_version}.tgz"
+
+          for asset in dist/installers/*; do
+            gh release delete-asset "$GITHUB_REF_NAME" "$(basename "$asset")" --yes >/dev/null 2>&1 || true
+          done
+
+          for checksum in dist/installers/*.sha256 dist/installers/SHA256SUMS.txt; do
+            gh release upload "$GITHUB_REF_NAME" "$checksum"
+          done
+
+          gh release upload "$GITHUB_REF_NAME" "$bridge"
+          for asset in dist/installers/*; do
+            case "$asset" in
+              "$bridge"|*.sha256|*/SHA256SUMS.txt) continue ;;
+            esac
+            gh release upload "$GITHUB_REF_NAME" "$asset"
+          done
+
+          first_tgz="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '[.assets[] | select(.name | endswith(".tgz"))][0].name')"
+          test "$first_tgz" = "$(basename "$bridge")"

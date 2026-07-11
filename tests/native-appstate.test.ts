@@ -31,6 +31,7 @@ const sources = [
   "Sources/SgwMac/Services/CommandRegistry.swift",
   "Sources/SgwMac/Stores/StoreReader.swift",
   "Sources/SgwMac/Services/UpdateChecker.swift",
+  "Sources/SgwMac/Services/UpdateNotifier.swift",
   "Tests/AppStateGuardTests.swift"
 ].map((rel) => path.join(appRoot, rel));
 

@@ -104,7 +104,7 @@ Add to `~/.cursor/mcp.json`:
 
 ## OpenCode
 
-Add to `~/.config/opencode/opencode.json`, `opencode.json`, or the `.jsonc` variant your OpenCode install loads:
+`s-gw setup` safely merges this entry into `$OPENCODE_CONFIG_DIR` when set, otherwise the global `~/.config/opencode/opencode.jsonc` or `.json` file, and installs the packaged skill. Use this snippet only for project-specific configuration:
 
 ```jsonc
 {
@@ -124,7 +124,7 @@ Add to `~/.config/opencode/opencode.json`, `opencode.json`, or the `.jsonc` vari
 
 ## VS Code / GitHub Copilot Agent Mode
 
-Add `.vscode/mcp.json`:
+`s-gw setup` safely manages the default VS Code user profile and installs a personal skill. Named, portable, Insiders, and custom user-data profiles remain explicit. For a project-scoped server, add `.vscode/mcp.json`:
 
 ```json
 {

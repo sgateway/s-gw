@@ -13,12 +13,14 @@ import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { buildLegacyBridge } from "./build-legacy-bridge.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageInfo = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
 const version = packageInfo.version;
 const packedFile = `${packageInfo.name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`;
 const packageFile = `s-gw-${version}.tgz`;
+const legacyBridgeFile = `0-s-gw-legacy-${version}.tgz`;
 const outputDir = resolve(root, "dist/installers");
 const workDir = mkdtempSync(resolve(tmpdir(), "s-gw-installers-"));
 
@@ -41,8 +43,9 @@ try {
   const macArtifact = buildMacInstaller(packed);
   const windowsArtifact = buildWindowsInstaller(packed);
   copyFileSync(packed, resolve(outputDir, packageFile));
+  buildLegacyBridge(packed, resolve(outputDir, legacyBridgeFile), version);
 
-  const artifacts = [packageFile, basename(macArtifact), basename(windowsArtifact)];
+  const artifacts = [legacyBridgeFile, packageFile, basename(macArtifact), basename(windowsArtifact)];
   const checksumLines = artifacts.map((name) => `${sha256(resolve(outputDir, name))}  ${name}`);
   writeFileSync(resolve(outputDir, "SHA256SUMS.txt"), `${checksumLines.join("\n")}\n`);
 

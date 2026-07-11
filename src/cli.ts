@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { stdin } from "node:process";
+import { agentIntegrationStatus, installAgentIntegrations, uninstallAgentIntegrations } from "./agent-install.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { unknownCommandMessage } from "./command-suggest.js";
 import { startConsoleServer } from "./console-server.js";
@@ -29,10 +30,13 @@ import {
   packageHealth,
   startInstalledLaunchAgent,
   stopInstalledLaunchAgent,
+  stopMacApp,
+  stopWindowsSurfaces,
   uninstallConsoleLaunchAgent,
   uninstallMenuBarLaunchAgent
 } from "./install.js";
 import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "./onepassword.js";
+import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { SecretStore } from "./store.js";
 import { deleteKeychainPassphrase, setKeychainPassphrase, unlockStatus } from "./unlock.js";
@@ -78,11 +82,29 @@ async function main(): Promise<void> {
   }
 
   if (first === "update") {
-    if (second !== "check") {
-      throw new Error("Usage: s-gw update check [--force]");
+    if (second === "check") {
+      printJson(await releaseChecker.check(hasFlag(parsed.flags, "force")));
+      return;
     }
-    printJson(await releaseChecker.check(hasFlag(parsed.flags, "force")));
-    return;
+
+    const updateOptions = {
+      target: getFlag(parsed.flags, "package"),
+      npmPrefix: getFlag(parsed.flags, "npm-prefix")
+    };
+    if (second === "plan") {
+      printJson(await planPackageUpdate(updateOptions));
+      return;
+    }
+    if (second === "install") {
+      printJson(await installPackageUpdate({
+        ...updateOptions,
+        dryRun: hasFlag(parsed.flags, "dry-run"),
+        stopServices: () => stopLocalUpdateSurfaces(hasFlag(parsed.flags, "keep-app-running"))
+      }));
+      return;
+    }
+
+    throw new Error("Usage: s-gw update check [--force] | plan [--package PATH_OR_SPEC] | install [--package PATH_OR_SPEC] [--dry-run]");
   }
 
   if (first === "setup") {
@@ -331,7 +353,38 @@ async function main(): Promise<void> {
   }
 
   if (first === "agent" && second === "list") {
-    printJson(listAgentProfiles());
+    const integrationById = new Map(agentIntegrationStatus().map((item) => [item.agentId, item]));
+    printJson(listAgentProfiles().map((profile) => ({
+      ...profile,
+      integration: integrationById.get(profile.id)
+    })));
+    return;
+  }
+
+  if (first === "agent" && second === "status") {
+    printJson({ ok: true, results: agentIntegrationStatus({ agentIds: third ? [third] : undefined }) });
+    return;
+  }
+
+  if (first === "agent" && second === "install") {
+    const results = installAgentIntegrations({
+      agentIds: third ? [third] : undefined,
+      dryRun: hasFlag(parsed.flags, "dry-run")
+    });
+    const ok = results.every((result) => result.state !== "conflict");
+    printJson({ ok, results });
+    if (!ok) process.exitCode = 1;
+    return;
+  }
+
+  if (first === "agent" && second === "uninstall") {
+    const results = uninstallAgentIntegrations({
+      agentIds: third ? [third] : undefined,
+      dryRun: hasFlag(parsed.flags, "dry-run")
+    });
+    const ok = results.every((result) => result.state !== "conflict");
+    printJson({ ok, results });
+    if (!ok) process.exitCode = 1;
     return;
   }
 
@@ -534,6 +587,8 @@ const valueFlags = new Set([
   "min-severity",
   "mode",
   "name",
+  "npm-prefix",
+  "package",
   "pending-ttl-ms",
   "port",
   "priority",
@@ -929,6 +984,9 @@ async function handleSetupCommand(
   }
 
   const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+  const agents = hasFlag(flags, "no-agents")
+    ? { skipped: true, results: [] }
+    : { skipped: false, results: installAgentIntegrations() };
 
   printJson({
     ok: true,
@@ -939,9 +997,10 @@ async function handleSetupCommand(
     service,
     menuBar,
     windowsHelper,
+    agents,
     nextSteps: [
       "Open the native app with `s-gw app open`.",
-      "Run `s-gw agent mcp-snippet codex` or another known agent profile.",
+      "Run `s-gw agent status` to review detected agent connections or resolve any reported conflicts.",
       "Enroll secrets locally with `s-gw secret add-keychain --value-stdin` or scan files with `s-gw scan-file PATH`."
     ]
   });
@@ -970,9 +1029,29 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
 }
 
 async function handleStopCommand(): Promise<void> {
-  const service = launchAgentStatus("console").installed ? stopInstalledLaunchAgent("console") : launchAgentStatus("console");
-  const menuBar = launchAgentStatus("menubar").installed ? stopInstalledLaunchAgent("menubar") : launchAgentStatus("menubar");
+  const { service, menuBar } = stopBackgroundSurfaces();
   printJson({ ok: true, service, menuBar });
+}
+
+async function stopLocalUpdateSurfaces(keepAppRunning: boolean): Promise<void> {
+  stopBackgroundSurfaces();
+  if (process.platform === "darwin" && !keepAppRunning) {
+    stopMacApp();
+  } else if (process.platform === "win32") {
+    stopWindowsSurfaces();
+  }
+}
+
+function stopBackgroundSurfaces() {
+  const serviceBefore = launchAgentStatus("console");
+  const menuBarBefore = launchAgentStatus("menubar");
+  const service = process.platform === "darwin" && serviceBefore.installed
+    ? stopInstalledLaunchAgent("console")
+    : serviceBefore;
+  const menuBar = process.platform === "darwin" && menuBarBefore.installed
+    ? stopInstalledLaunchAgent("menubar")
+    : menuBarBefore;
+  return { service, menuBar };
 }
 
 async function handleServiceCommand(
@@ -1686,12 +1765,14 @@ function printHelp(): void {
 
 Commands:
   s-gw init
-  s-gw setup [--port 8718] [--passphrase-stdin] [--menubar-count pending|credentials|none] [--no-open-app] [--no-service] [--no-menubar]
+  s-gw setup [--port 8718] [--passphrase-stdin] [--menubar-count pending|credentials|none] [--no-open-app] [--no-service] [--no-menubar] [--no-agents]
   s-gw status
   s-gw start [--port 8718] [--no-open-app]
   s-gw stop
   s-gw doctor
   s-gw update check [--force]
+  s-gw update plan [--package PATH_OR_SPEC]
+  s-gw update install [--package PATH_OR_SPEC] [--dry-run]
   s-gw mcp
   s-gw console [--host 127.0.0.1] [--port 8718] [--no-open]
   s-gw app app-path
@@ -1735,6 +1816,9 @@ Commands:
   s-gw approval clear
   s-gw scan-file PATH [--preview] [--backend keychain|local]
   s-gw agent list
+  s-gw agent status [AGENT]
+  s-gw agent install [AGENT] [--dry-run]
+  s-gw agent uninstall [AGENT] [--dry-run]
   s-gw agent show AGENT [--command CMD] [--arg VALUE] [--env KEY=VALUE]
   s-gw agent codeguard-plan AGENT
   s-gw agent mcp-snippet AGENT [--command CMD] [--arg VALUE] [--env KEY=VALUE]

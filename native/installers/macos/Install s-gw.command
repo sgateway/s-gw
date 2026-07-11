@@ -20,18 +20,96 @@ command -v npm >/dev/null 2>&1 || fail "npm is required. Reinstall Node.js 20 or
 node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
 [[ "$node_major" -ge 20 ]] || fail "Node.js 20 or newer is required."
 
-print -- "Installing s-gw __VERSION__..."
-npm install --global "$package_path" || fail "npm could not install the package. Check your npm global-directory permissions."
+npm_prefix=$(npm prefix --global) || fail "npm did not report its global prefix."
+npm_root=$(npm root --global --prefix "$npm_prefix") || fail "npm did not report its global package directory."
+package_metadata=$(npm pack --dry-run --ignore-scripts --json -- "$package_path") || fail "The bundled package metadata could not be verified."
+package_identity=$(print -r -- "$package_metadata" | node -e '
+let data = "";
+process.stdin.on("data", chunk => data += chunk);
+process.stdin.on("end", () => {
+  const item = JSON.parse(data)[0];
+  process.stdout.write(`${item && item.name || ""}\t${item && item.version || ""}`);
+});
+') || fail "The bundled package metadata is invalid."
+package_name=${package_identity%%$'\t'*}
+package_version=${package_identity#*$'\t'}
+[[ "$package_name" == "@s-gw/s-gw" && -n "$package_version" ]] || fail "The bundled archive is not the scoped @s-gw/s-gw package."
+
+old_sgw=$(command -v s-gw || true)
+if [[ -z "$old_sgw" && -x "$npm_prefix/bin/s-gw" ]]; then
+  old_sgw="$npm_prefix/bin/s-gw"
+fi
+if [[ -n "$old_sgw" ]]; then
+  "$old_sgw" stop >/dev/null || fail "The existing s-gw services could not be stopped. Close s-gw and try again."
+  if [[ "${SGW_SKIP_APP_STOP:-0}" != "1" ]]; then
+    /usr/bin/osascript -e 'tell application id "com.s-gw.sgw.app" to quit' >/dev/null 2>&1 || true
+  fi
+fi
+
+legacy_root="$npm_root/s-gw"
+legacy_version=""
+rollback_dir=""
+rollback_path=""
+if [[ -f "$legacy_root/package.json" ]]; then
+  legacy_version=$(node -e '
+const pkg = require(process.argv[1]);
+if (pkg.name === "s-gw" && typeof pkg.version === "string") process.stdout.write(pkg.version);
+' "$legacy_root/package.json") || fail "The existing legacy package metadata could not be read."
+fi
+
+if [[ -n "$legacy_version" ]]; then
+  print -- "Migrating legacy s-gw $legacy_version to @s-gw/s-gw $package_version..."
+  rollback_dir=$(mktemp -d "${TMPDIR:-/tmp}/s-gw-rollback.XXXXXX") || fail "A rollback directory could not be created."
+  rollback_metadata=$(npm pack --ignore-scripts --json --pack-destination "$rollback_dir" -- "$legacy_root") || {
+    rm -rf "$rollback_dir"
+    fail "A rollback copy of legacy s-gw could not be created. The existing package was not removed."
+  }
+  rollback_file=$(print -r -- "$rollback_metadata" | node -e '
+let data = "";
+process.stdin.on("data", chunk => data += chunk);
+process.stdin.on("end", () => {
+  const item = JSON.parse(data)[0];
+  if (item && item.name === "s-gw" && item.version === process.argv[1] && item.filename) process.stdout.write(item.filename);
+});
+' "$legacy_version") || true
+  [[ -n "$rollback_file" && "$rollback_file" == "${rollback_file:t}" && -f "$rollback_dir/$rollback_file" ]] || {
+    rm -rf "$rollback_dir"
+    fail "The rollback copy of legacy s-gw could not be verified. The existing package was not removed."
+  }
+  rollback_path="$rollback_dir/$rollback_file"
+
+  npm uninstall --global --prefix "$npm_prefix" --ignore-scripts -- s-gw || {
+    rm -rf "$rollback_dir"
+    fail "npm could not remove the legacy s-gw package. The scoped package was not installed."
+  }
+  print -- "Legacy package removed. Existing data under ~/.s-gw was left in place."
+fi
+
+print -- "Installing @s-gw/s-gw $package_version..."
+if ! npm install --global --prefix "$npm_prefix" --ignore-scripts -- "$package_path"; then
+  if [[ -n "$rollback_path" && -f "$rollback_path" ]]; then
+    print -u2 -- "The scoped install failed. Restoring legacy s-gw $legacy_version from the local rollback copy..."
+    npm uninstall --global --prefix "$npm_prefix" --ignore-scripts -- @s-gw/s-gw >/dev/null 2>&1 || true
+    if npm install --global --prefix "$npm_prefix" --ignore-scripts -- "$rollback_path"; then
+      rm -rf "$rollback_dir"
+      fail "The new package could not be installed; legacy s-gw was restored. Your ~/.s-gw data was preserved."
+    fi
+    fail "The new package and automatic rollback both failed. Your ~/.s-gw data was preserved. Restore with: npm uninstall --global --prefix '$npm_prefix' @s-gw/s-gw && npm install --global --prefix '$npm_prefix' '$rollback_path'"
+  fi
+  fail "npm could not install the package. Check your npm global-directory permissions. Your ~/.s-gw data was preserved."
+fi
+
+[[ -z "$rollback_dir" ]] || rm -rf "$rollback_dir"
 
 sgw_bin=$(command -v s-gw || true)
 if [[ -z "$sgw_bin" ]]; then
-  candidate="$(npm prefix --global)/bin/s-gw"
+  candidate="$npm_prefix/bin/s-gw"
   [[ -x "$candidate" ]] && sgw_bin="$candidate"
 fi
 [[ -n "$sgw_bin" ]] || fail "s-gw was installed but its command is not on PATH."
 
-"$sgw_bin" setup --port 8718 || fail "Initial setup did not complete."
-print -- "s-gw __VERSION__ is installed."
+PATH="$npm_prefix/bin:$PATH" "$sgw_bin" setup --port 8718 || fail "Package installation completed, but setup did not. Run '$sgw_bin setup --port 8718' after closing this window."
+print -- "s-gw $package_version is installed. Existing ~/.s-gw data was preserved."
 
 if [[ -t 0 ]]; then
   read -k 1 "?Press any key to close."

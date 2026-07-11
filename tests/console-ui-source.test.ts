@@ -34,10 +34,27 @@ describe("React console source contracts", () => {
     expect(api).toContain("window.SGW_CONSOLE_TOKEN");
     expect(api).toContain("approveRequest");
     expect(api).toContain("denyRequest");
+    expect(api).toContain("installAgentIntegration");
+    expect(api).toContain("uninstallAgentIntegration");
+    expect(api).toContain("/api/agents/");
     expect(layout).toContain('sgw.dashboard.layout.v1');
     expect(layout).toContain("normalizeLayouts");
     expect(layout).toContain("panelIds");
     expect(logo).toContain("@/assets/s-gw-64.png");
+  });
+
+  it("shows real agent integration state and managed connection actions", async () => {
+    const [app, types] = await Promise.all([
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
+      readFile(path.join(repoRoot, "src/console-ui/src/lib/types.ts"), "utf8")
+    ]);
+
+    expect(app).toContain("agent.integration.state");
+    expect(app).toContain("data-agent-install={agent.id}");
+    expect(app).toContain("data-agent-uninstall={agent.id}");
+    expect(app).toContain("installAgentIntegration(agent.id)");
+    expect(app).toContain("uninstallAgentIntegration(agent.id)");
+    expect(types).toContain("interface AgentIntegrationStatus");
   });
 
   it("shows available releases from the local update state", async () => {

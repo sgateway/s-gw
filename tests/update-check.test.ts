@@ -55,6 +55,7 @@ describe("release update checks", () => {
     const checker = new ReleaseChecker({
       cachePath: path.join(tmpDir, "update.json"),
       enabled: true,
+      feedEndpoint: null,
       fetcher: async () => {
         throw new Error("offline");
       }
@@ -65,6 +66,46 @@ describe("release update checks", () => {
       available: false,
       error: "offline"
     });
+  });
+
+  it("falls back to the public Atom feed when the GitHub API is rate-limited", async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-atom-"));
+    const calls: string[] = [];
+    const api = "https://api.github.test/releases";
+    const atom = "https://github.test/releases.atom";
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpDir, "update.json"),
+      currentVersion: "0.1.0",
+      endpoint: api,
+      feedEndpoint: atom,
+      enabled: true,
+      fetcher: async (input) => {
+        const url = String(input);
+        calls.push(url);
+        if (url === api) return new Response("rate limited", { status: 403 });
+        return new Response(`<?xml version="1.0"?>
+          <feed>
+            <entry>
+              <id>tag:github.com,2008:Repository/1/v0.1.2</id>
+              <updated>2026-07-11T12:00:00Z</updated>
+              <link rel="alternate" type="text/html" href="https://github.com/sgateway/s-gw/releases/tag/v0.1.2"/>
+              <title>s-gw 0.1.2</title>
+            </entry>
+          </feed>`, { status: 200, headers: { "Content-Type": "application/atom+xml" } });
+      }
+    });
+
+    const result = await checker.check(true);
+    expect(result.error).toBeUndefined();
+    expect(result).toMatchObject({
+      checked: true,
+      currentVersion: "0.1.0",
+      latestVersion: "0.1.2",
+      available: true,
+      releaseUrl: "https://github.com/sgateway/s-gw/releases/tag/v0.1.2",
+      publishedAt: "2026-07-11T12:00:00Z"
+    });
+    expect(calls).toEqual([api, atom]);
   });
 
   it("compares tagged release versions numerically", () => {
@@ -89,9 +130,10 @@ describe("release update checks", () => {
     expect(cli).toContain('first === "update"');
     expect(cli).toContain("s-gw update check [--force]");
     expect(swiftChecker).toContain("/releases?per_page=20");
+    expect(swiftChecker).toContain("releases.atom");
     expect(swiftChecker).toContain(".filter({ !$0.draft })");
     expect(appState).toContain("private var updateTask");
-    expect(appState).toContain("Task.sleep(for: .seconds(60 * 60))");
+    expect(appState).toContain("updateRetryInterval: TimeInterval = 15 * 60");
   });
 });
 

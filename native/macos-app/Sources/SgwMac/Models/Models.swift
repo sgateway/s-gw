@@ -537,10 +537,33 @@ struct AgentProfile: Decodable, Identifiable, Hashable {
   var defenseClawConnector: String?
   var mcpStatus: String?
   var mcpConfigPaths: [String]?
+  var integration: AgentIntegrationStatus?
 
   var name: String { displayName }
   var status: String? { mcpStatus }
   var configPath: String? { mcpConfigPaths?.first }
+  var connectionState: String { integration?.state ?? (mcpStatus == "supported" ? "available" : "manual") }
+  var mcpConnected: Bool { integration?.mcp.state == "installed" || integration?.mcp.state == "existing" }
+  var canInstall: Bool {
+    integration?.detected == true && integration?.eligible == true && connectionState != "installed" && connectionState != "conflict"
+  }
+  var hasOwnedIntegration: Bool { integration?.mcp.owned == true || integration?.skill.owned == true }
+}
+
+struct AgentIntegrationStatus: Decodable, Hashable {
+  var detected: Bool
+  var eligible: Bool
+  var state: String
+  var mcp: AgentIntegrationResource
+  var skill: AgentIntegrationResource
+  var reason: String?
+}
+
+struct AgentIntegrationResource: Decodable, Hashable {
+  var state: String
+  var path: String?
+  var owned: Bool
+  var message: String?
 }
 
 struct NewSecretDraft {
