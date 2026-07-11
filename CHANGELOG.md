@@ -4,6 +4,8 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.2 - 2026-07-11
+
 ### Added
 
 - Safe, idempotent setup for detected agent MCP configurations and the packaged s-gw skill, with dry-run, status, backups, conflict handling, and scoped uninstall.
