@@ -586,9 +586,9 @@ export const agentProfiles: AgentProfile[] = [
       supported: true,
       status: "supported",
       snippet: "jsonc",
-      writeMode: "manual",
+      writeMode: "safe",
       configPaths: [`${home}/.config/opencode/opencode.json`, `${home}/.config/opencode/opencode.jsonc`, `${project}/opencode.json`, `${project}/opencode.jsonc`],
-      notes: ["OpenCode stores MCP servers under a top-level `mcp` map; local server commands are argv arrays."]
+      notes: ["s-gw safely merges the user-level JSONC `mcp` entry; project config can intentionally override it."]
     },
     skills: {
       supported: true,
@@ -601,7 +601,7 @@ export const agentProfiles: AgentProfile[] = [
         `${home}/.agents/skills`,
         "$OPENCODE_CONFIG_DIR/skills"
       ],
-      notes: ["DefenseClaw profiles these as discovery surfaces; s-gw does not install OpenCode skills yet."]
+      notes: ["s-gw installs its user-level skill under the active OpenCode config directory."]
     },
     plugins: {
       supported: true,
@@ -658,13 +658,13 @@ export const agentProfiles: AgentProfile[] = [
       status: "supported",
       snippet: "json",
       writeMode: "safe",
-      configPaths: [`${project}/.vscode/mcp.json`],
-      notes: ["VS Code is not a DefenseClaw built-in connector, but it supports workspace MCP server config."]
+      configPaths: ["VS Code default user profile mcp.json", `${project}/.vscode/mcp.json`],
+      notes: ["s-gw manages the default user profile; named, portable, and custom user-data profiles remain explicit."]
     },
     skills: {
-      supported: false,
-      configPaths: [],
-      notes: []
+      supported: true,
+      configPaths: [`${home}/.agents/skills`, `${home}/.copilot/skills`, `${project}/.agents/skills`, `${project}/.github/skills`],
+      notes: ["VS Code discovers personal Agent Skills from ~/.agents/skills and ~/.copilot/skills."]
     },
     plugins: {
       supported: false,
@@ -678,7 +678,7 @@ export const agentProfiles: AgentProfile[] = [
       events: [],
       notes: ["s-gw currently treats VS Code through MCP only."]
     },
-    limitations: []
+    limitations: ["Automatic registration targets only VS Code's default stable user profile."]
   }
 ];
 
@@ -738,6 +738,10 @@ export function renderAgentMcpSnippet(input: string, options: McpSnippetOptions 
 
   if (profile.id === "vscode") {
     return renderVSCodeJson(name, server);
+  }
+
+  if (profile.id === "copilot") {
+    return renderCopilotJson(name, server);
   }
 
   if (profile.id === "hermes") {
@@ -837,6 +841,22 @@ function renderVSCodeJson(name: string, server: ReturnType<typeof buildServerEnt
           command: server.command,
           args: server.args,
           env: server.env
+        }
+      }
+    },
+    null,
+    2
+  );
+}
+
+function renderCopilotJson(name: string, server: ReturnType<typeof buildServerEntry>): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        [name]: {
+          type: "local",
+          ...server,
+          tools: ["*"]
         }
       }
     },

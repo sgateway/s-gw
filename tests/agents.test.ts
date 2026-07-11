@@ -111,13 +111,26 @@ describe("agent profiles", () => {
     expect(opencode.mcp["s-gw"].type).toBe("local");
     expect(opencode.mcp["s-gw"].command).toEqual(["s-gw-mcp"]);
     expect(opencode.mcp["s-gw"].environment.SGW_AGENT_NAME).toBe("OpenCode");
+    expect(resolveAgentProfile("opencode").mcp.writeMode).toBe("safe");
     expect(vscode.servers["s-gw"].type).toBe("stdio");
     expect(vscode.servers["s-gw"].env.SGW_AGENT_NAME).toBe("VS Code / GitHub Copilot Agent Mode");
+    expect(resolveAgentProfile("vscode").skills.supported).toBe(true);
 
     const profile = resolveAgentProfile("opencode");
     expect(profile.defenseClawConnector).toBe("opencode");
     expect(profile.mcp.configPaths).toContain("~/.config/opencode/opencode.json");
     expect(profile.hooks?.kind).toBe("plugin");
+  });
+
+  it("renders the complete GitHub Copilot CLI local server shape", () => {
+    const copilot = JSON.parse(renderAgentMcpSnippet("copilot"));
+    const server = copilot.mcpServers["s-gw"];
+
+    expect(server.type).toBe("local");
+    expect(server.command).toBe("s-gw-mcp");
+    expect(server.args).toEqual([]);
+    expect(server.env.SGW_AGENT_NAME).toBe("GitHub Copilot CLI");
+    expect(server.tools).toEqual(["*"]);
   });
 
   it("profiles DefenseClaw's newer hook and policy connectors without overclaiming", () => {

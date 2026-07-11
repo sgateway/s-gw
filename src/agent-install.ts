@@ -19,7 +19,19 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  applyEdits,
+  createScanner,
+  findNodeAtLocation,
+  modify,
+  parse as parseJsonc,
+  parseTree,
+  printParseErrorCode,
+  SyntaxKind,
+  type ParseError
+} from "jsonc-parser";
 import { agentProfiles, renderAgentMcpSnippet, resolveAgentProfile, type AgentProfile } from "./agents.js";
+import { getPackageLayout } from "./install.js";
 
 export type AgentIntegrationState = "not-detected" | "manual" | "available" | "partial" | "installed" | "conflict";
 export type AgentResourceState = "unsupported" | "missing" | "installed" | "existing" | "conflict";
@@ -57,17 +69,20 @@ export interface AgentIntegrationOptions {
   agentIds?: string[];
   dryRun?: boolean;
   skillSourcePath?: string;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  mcpServerPath?: string;
 }
 
-type JsonContainer = "mcpServers";
+type JsonContainer = "mcpServers" | "mcp" | "servers";
 
 interface AgentAdapter {
   id: string;
   commands: string[];
-  configPath: (homeDir: string) => string;
-  configKind: "json" | "toml";
+  configPath: (homeDir: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string;
+  configKind: "json" | "jsonc" | "toml";
   jsonContainer?: JsonContainer;
-  skillPath?: (homeDir: string) => string;
+  skillPath?: (homeDir: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string;
 }
 
 interface OwnedResource {
@@ -92,7 +107,11 @@ interface WorkContext {
   homeDir: string;
   pathEnv: string;
   sgwHome: string;
+  env: NodeJS.ProcessEnv;
+  platform: NodeJS.Platform;
+  includeSystemApps: boolean;
   mcpCommand: string;
+  mcpArgs: string[];
   skillSourcePath: string;
   manifestPath: string;
   manifest: AgentManifest;
@@ -118,6 +137,59 @@ interface TomlSection {
 const managedStart = "# >>> s-gw managed MCP server";
 const managedEnd = "# <<< s-gw managed MCP server";
 
+function envPath(value: string | undefined, fallback: string): string {
+  const configured = value?.trim();
+  return path.resolve(configured || fallback);
+}
+
+function codexHome(homeDir: string, env: NodeJS.ProcessEnv): string {
+  return envPath(env.CODEX_HOME, path.join(homeDir, ".codex"));
+}
+
+function geminiHome(homeDir: string, env: NodeJS.ProcessEnv): string {
+  const root = envPath(env.GEMINI_CLI_HOME, homeDir);
+  return path.join(root, ".gemini");
+}
+
+function copilotHome(homeDir: string, env: NodeJS.ProcessEnv): string {
+  return envPath(env.COPILOT_HOME, path.join(homeDir, ".copilot"));
+}
+
+function openCodeConfigFile(dir: string): string {
+  const jsonc = path.join(dir, "opencode.jsonc");
+  if (existsSync(jsonc)) return jsonc;
+  const json = path.join(dir, "opencode.json");
+  return existsSync(json) ? json : jsonc;
+}
+
+function openCodeConfig(homeDir: string, env: NodeJS.ProcessEnv): string {
+  if (env.OPENCODE_CONFIG_DIR?.trim()) {
+    return openCodeConfigFile(envPath(env.OPENCODE_CONFIG_DIR, ""));
+  }
+  if (env.OPENCODE_CONFIG?.trim()) return envPath(env.OPENCODE_CONFIG, "");
+  const root = envPath(env.XDG_CONFIG_HOME, path.join(homeDir, ".config"));
+  return openCodeConfigFile(path.join(root, "opencode"));
+}
+
+function openCodeSkill(homeDir: string, env: NodeJS.ProcessEnv): string {
+  const root = env.OPENCODE_CONFIG_DIR?.trim()
+    ? envPath(env.OPENCODE_CONFIG_DIR, "")
+    : path.join(envPath(env.XDG_CONFIG_HOME, path.join(homeDir, ".config")), "opencode");
+  return path.join(root, "skills", "s-gw", "SKILL.md");
+}
+
+function vscodeConfig(homeDir: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
+  let userData: string;
+  if (platform === "win32") {
+    userData = envPath(env.APPDATA, path.join(homeDir, "AppData", "Roaming"));
+  } else if (platform === "darwin") {
+    userData = path.join(homeDir, "Library", "Application Support");
+  } else {
+    userData = envPath(env.XDG_CONFIG_HOME, path.join(homeDir, ".config"));
+  }
+  return path.join(userData, "Code", "User", "mcp.json");
+}
+
 const adapters: AgentAdapter[] = [
   {
     id: "claudecode",
@@ -130,9 +202,9 @@ const adapters: AgentAdapter[] = [
   {
     id: "codex",
     commands: ["codex"],
-    configPath: (homeDir) => path.join(homeDir, ".codex", "config.toml"),
+    configPath: (homeDir, env) => path.join(codexHome(homeDir, env), "config.toml"),
     configKind: "toml",
-    skillPath: (homeDir) => path.join(homeDir, ".codex", "skills", "s-gw", "SKILL.md")
+    skillPath: (homeDir, env) => path.join(codexHome(homeDir, env), "skills", "s-gw", "SKILL.md")
   },
   {
     id: "cursor",
@@ -145,18 +217,34 @@ const adapters: AgentAdapter[] = [
   {
     id: "geminicli",
     commands: ["gemini"],
-    configPath: (homeDir) => path.join(homeDir, ".gemini", "settings.json"),
+    configPath: (homeDir, env) => path.join(geminiHome(homeDir, env), "settings.json"),
     configKind: "json",
     jsonContainer: "mcpServers",
-    skillPath: (homeDir) => path.join(homeDir, ".gemini", "skills", "s-gw", "SKILL.md")
+    skillPath: (homeDir, env) => path.join(geminiHome(homeDir, env), "skills", "s-gw", "SKILL.md")
   },
   {
     id: "copilot",
     commands: ["copilot"],
-    configPath: (homeDir) => path.join(homeDir, ".copilot", "mcp-config.json"),
+    configPath: (homeDir, env) => path.join(copilotHome(homeDir, env), "mcp-config.json"),
     configKind: "json",
     jsonContainer: "mcpServers",
-    skillPath: (homeDir) => path.join(homeDir, ".copilot", "skills", "s-gw", "SKILL.md")
+    skillPath: (homeDir, env) => path.join(copilotHome(homeDir, env), "skills", "s-gw", "SKILL.md")
+  },
+  {
+    id: "opencode",
+    commands: ["opencode"],
+    configPath: (homeDir, env) => openCodeConfig(homeDir, env),
+    configKind: "jsonc",
+    jsonContainer: "mcp",
+    skillPath: (homeDir, env) => openCodeSkill(homeDir, env)
+  },
+  {
+    id: "vscode",
+    commands: ["code"],
+    configPath: (homeDir, env, platform) => vscodeConfig(homeDir, env, platform),
+    configKind: "jsonc",
+    jsonContainer: "servers",
+    skillPath: (homeDir) => path.join(homeDir, ".agents", "skills", "s-gw", "SKILL.md")
   }
 ];
 
@@ -255,9 +343,13 @@ export function uninstallAgentIntegrations(options: AgentIntegrationOptions = {}
 }
 
 function loadContext(options: AgentIntegrationOptions): WorkContext {
-  const homeDir = path.resolve(options.homeDir || process.env.HOME || process.env.USERPROFILE || os.homedir());
-  const pathEnv = options.pathEnv ?? process.env.PATH ?? "";
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const homeDir = path.resolve(options.homeDir || env.HOME || env.USERPROFILE || os.homedir());
+  const pathEnv = options.pathEnv ?? env.PATH ?? "";
   const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
+  const windowsMcp = platform === "win32";
+  const mcpServerPath = path.resolve(options.mcpServerPath || getPackageLayout().mcpPath);
   let manifest: AgentManifest = { version: 1, agents: {} };
   let manifestError: string | undefined;
   try {
@@ -268,8 +360,14 @@ function loadContext(options: AgentIntegrationOptions): WorkContext {
   return {
     homeDir,
     pathEnv,
-    sgwHome: path.resolve(options.sgwHome || process.env.SGW_HOME || path.join(homeDir, ".s-gw")),
-    mcpCommand: commandPath("s-gw-mcp", pathEnv) || "s-gw-mcp",
+    sgwHome: path.resolve(options.sgwHome || env.SGW_HOME || path.join(homeDir, ".s-gw")),
+    env,
+    platform,
+    includeSystemApps: !options.homeDir,
+    mcpCommand: windowsMcp
+      ? path.resolve(process.execPath)
+      : commandPath("s-gw-mcp", pathEnv, platform, env) || "s-gw-mcp",
+    mcpArgs: windowsMcp ? [mcpServerPath] : [],
     skillSourcePath: options.skillSourcePath || fileURLToPath(new URL("../skills/s-gw/SKILL.md", import.meta.url)),
     manifestPath,
     manifest,
@@ -360,9 +458,10 @@ function statusForProfile(profile: AgentProfile, ctx: WorkContext): AgentIntegra
 
 function detectProfile(profile: AgentProfile, adapter: AgentAdapter | undefined, ctx: WorkContext): boolean {
   const commands = adapter?.commands || commandNames[profile.id] || [];
-  if (commands.some((name) => commandExists(name, ctx.pathEnv))) return true;
+  if (commands.some((name) => commandExists(name, ctx))) return true;
+  if (desktopAppDetected(profile.id, ctx)) return true;
 
-  if (adapter && existsSync(adapter.configPath(ctx.homeDir))) return true;
+  if (adapter && existsSync(adapter.configPath(ctx.homeDir, ctx.env, ctx.platform))) return true;
 
   for (const configPath of profile.mcp.configPaths) {
     const resolved = resolveHomePath(configPath, ctx.homeDir);
@@ -371,22 +470,63 @@ function detectProfile(profile: AgentProfile, adapter: AgentAdapter | undefined,
   return false;
 }
 
-function commandExists(name: string, pathEnv: string): boolean {
-  return commandPath(name, pathEnv) !== undefined;
+function desktopAppDetected(agentId: string, ctx: WorkContext): boolean {
+  if (agentId !== "cursor" && agentId !== "opencode" && agentId !== "vscode") return false;
+  const appName = agentId === "cursor"
+    ? "Cursor"
+    : agentId === "opencode" ? "OpenCode" : "Visual Studio Code";
+  const candidates: string[] = [];
+
+  if (ctx.platform === "darwin") {
+    candidates.push(path.join(ctx.homeDir, "Applications", `${appName}.app`));
+    if (ctx.includeSystemApps) candidates.push(path.join("/Applications", `${appName}.app`));
+  } else if (ctx.platform === "win32") {
+    const local = envPath(ctx.env.LOCALAPPDATA, path.join(ctx.homeDir, "AppData", "Local"));
+    const folder = agentId === "cursor"
+      ? "cursor"
+      : agentId === "opencode" ? "OpenCode" : "Microsoft VS Code";
+    const executable = agentId === "cursor"
+      ? "Cursor.exe"
+      : agentId === "opencode" ? "OpenCode.exe" : "Code.exe";
+    candidates.push(path.join(local, "Programs", folder, executable));
+    if (agentId === "opencode") {
+      candidates.push(path.join(local, folder, executable));
+      const scoop = envPath(ctx.env.SCOOP, path.join(ctx.homeDir, "scoop"));
+      candidates.push(path.join(scoop, "apps", "opencode-desktop", "current", executable));
+      if (ctx.includeSystemApps && ctx.env.SCOOP_GLOBAL?.trim()) {
+        candidates.push(path.join(ctx.env.SCOOP_GLOBAL, "apps", "opencode-desktop", "current", executable));
+      }
+    }
+    if (ctx.includeSystemApps && ctx.env.ProgramFiles?.trim()) {
+      candidates.push(path.join(ctx.env.ProgramFiles, folder, executable));
+    }
+  }
+
+  return candidates.some((candidate) => existsSync(candidate));
 }
 
-function commandPath(name: string, pathEnv: string): string | undefined {
-  const suffixes = process.platform === "win32"
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
+function commandExists(name: string, ctx: WorkContext): boolean {
+  return commandPath(name, ctx.pathEnv, ctx.platform, ctx.env) !== undefined;
+}
+
+function commandPath(
+  name: string,
+  pathEnv: string,
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv
+): string | undefined {
+  const suffixes = platform === "win32"
+    ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
     : [""];
-  for (const dir of pathEnv.split(path.delimiter)) {
+  const delimiter = platform === "win32" ? ";" : path.delimiter;
+  for (const dir of pathEnv.split(delimiter)) {
     if (!dir) continue;
     for (const suffix of suffixes) {
-      const candidate = path.join(dir, process.platform === "win32" ? `${name}${suffix}` : name);
+      const candidate = path.join(dir, platform === "win32" ? `${name}${suffix}` : name);
       try {
         const info = statSync(candidate);
         if (!info.isFile()) continue;
-        if (process.platform === "win32" || (info.mode & 0o111) !== 0) return candidate;
+        if (platform === "win32" || (info.mode & 0o111) !== 0) return candidate;
       } catch {
         // PATH commonly contains stale directories.
       }
@@ -401,23 +541,23 @@ function mcpStatus(
   ctx: WorkContext,
   owned: OwnedResource | undefined
 ): AgentResourceStatus {
-  const configPath = adapter.configPath(ctx.homeDir);
-  if (owned && path.resolve(owned.path) !== path.resolve(configPath)) {
+  const configPath = adapter.configPath(ctx.homeDir, ctx.env, ctx.platform);
+  if (owned && !samePath(owned.path, configPath, ctx.platform)) {
     return { state: "conflict", path: configPath, owned: true, message: "The tracked MCP config path changed. Uninstall the old integration first." };
   }
 
-  if (adapter.configKind === "json") {
-    const info = inspectJsonConfig(configPath, adapter.jsonContainer || "mcpServers");
+  if (adapter.configKind !== "toml") {
+    const info = inspectJsonConfig(configPath, adapter.jsonContainer || "mcpServers", adapter.configKind);
     if (info.state === "conflict") {
       return { state: "conflict", path: configPath, owned: Boolean(owned), message: info.message };
     }
     if (!info.entry) {
-      if (!executableAvailable(ctx.mcpCommand, ctx.pathEnv)) {
+      if (!sgwCommandAvailable(ctx.mcpCommand, ctx.mcpArgs, ctx)) {
         return {
           state: "conflict",
           path: configPath,
           owned: Boolean(owned),
-          message: "s-gw-mcp is not available on PATH, so s-gw cannot write a working agent registration."
+          message: "The packaged s-gw MCP command is not available, so s-gw cannot write a working agent registration."
         };
       }
       return { state: "missing", path: configPath, owned: Boolean(owned) };
@@ -441,7 +581,16 @@ function mcpStatus(
     if (owned && owned.fingerprint !== fingerprintObject(expectedJsonEntry(profile, ctx))) {
       return { state: "missing", path: configPath, owned: true, message: "The s-gw-owned MCP entry needs to be refreshed." };
     }
-    if (!sgwServerEntryAvailable(info.entry, ctx.pathEnv)) {
+    const contractIssue = agentEntryContractIssue(profile.id, info.entry);
+    if (contractIssue) {
+      return {
+        state: "conflict",
+        path: configPath,
+        owned: Boolean(owned),
+        message: `${configPath} ${contractIssue} s-gw left it unchanged.`
+      };
+    }
+    if (!sgwServerEntryAvailable(info.entry, ctx)) {
       return {
         state: "conflict",
         path: configPath,
@@ -456,12 +605,12 @@ function mcpStatus(
   if (text.error) return { state: "conflict", path: configPath, owned: Boolean(owned), message: text.error };
   const section = findCodexSection(text.value || "");
   if (!section) {
-    if (!executableAvailable(ctx.mcpCommand, ctx.pathEnv)) {
+    if (!sgwCommandAvailable(ctx.mcpCommand, ctx.mcpArgs, ctx)) {
       return {
         state: "conflict",
         path: configPath,
         owned: Boolean(owned),
-        message: "s-gw-mcp is not available on PATH, so s-gw cannot write a working agent registration."
+        message: "The packaged s-gw MCP command is not available, so s-gw cannot write a working agent registration."
       };
     }
     return { state: "missing", path: configPath, owned: Boolean(owned) };
@@ -485,7 +634,7 @@ function mcpStatus(
   if (owned && owned.fingerprint !== fingerprintText(codexManagedBlock(profile, ctx))) {
     return { state: "missing", path: configPath, owned: true, message: "The s-gw-owned MCP block needs to be refreshed." };
   }
-  if (!sgwCommandAvailable(section.command, section.args, ctx.pathEnv)) {
+  if (!sgwCommandAvailable(section.command, section.args, ctx)) {
     return {
       state: "conflict",
       path: configPath,
@@ -498,8 +647,8 @@ function mcpStatus(
 
 function skillStatus(adapter: AgentAdapter, ctx: WorkContext, owned: OwnedResource | undefined): AgentResourceStatus {
   if (!adapter.skillPath) return { state: "unsupported", owned: false };
-  const skillPath = adapter.skillPath(ctx.homeDir);
-  if (owned && path.resolve(owned.path) !== path.resolve(skillPath)) {
+  const skillPath = adapter.skillPath(ctx.homeDir, ctx.env, ctx.platform);
+  if (owned && !samePath(owned.path, skillPath, ctx.platform)) {
     return { state: "conflict", path: skillPath, owned: true, message: "The tracked skill path changed. Uninstall the old integration first." };
   }
 
@@ -578,22 +727,27 @@ function installMcp(
   backups: string[],
   rollbacks: Array<{ path: string; existed: boolean; content?: Buffer; mode?: number }>
 ): OwnedResource {
-  const configPath = adapter.configPath(ctx.homeDir);
+  const configPath = adapter.configPath(ctx.homeDir, ctx.env, ctx.platform);
   rememberFile(configPath, rollbacks);
   const mode = currentMode(configPath, 0o600);
   if (existsSync(configPath)) backups.push(backupFile(configPath, ctx.homeDir, profile.id, "mcp"));
 
-  if (adapter.configKind === "json") {
-    const info = inspectJsonConfig(configPath, adapter.jsonContainer || "mcpServers");
+  if (adapter.configKind !== "toml") {
+    const info = inspectJsonConfig(configPath, adapter.jsonContainer || "mcpServers", adapter.configKind);
     if (info.state === "conflict") throw new Error(info.message);
     const doc = info.document || {};
     const container = adapter.jsonContainer || "mcpServers";
     const parentCreated = !(container in doc);
-    const servers = isPlainObject(doc[container]) ? doc[container] as Record<string, unknown> : {};
     const entry = expectedJsonEntry(profile, ctx);
-    servers["s-gw"] = entry;
-    doc[container] = servers;
-    atomicWrite(configPath, `${JSON.stringify(doc, null, 2)}\n`, mode);
+    if (adapter.configKind === "jsonc") {
+      const current = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+      atomicWrite(configPath, updateJsonc(current, [container, "s-gw"], entry), mode);
+    } else {
+      const servers = isPlainObject(doc[container]) ? doc[container] as Record<string, unknown> : {};
+      servers["s-gw"] = entry;
+      doc[container] = servers;
+      atomicWrite(configPath, `${JSON.stringify(doc, null, 2)}\n`, mode);
+    }
     return { path: configPath, kind: "json-entry", fingerprint: fingerprintObject(entry), parentCreated };
   }
 
@@ -619,7 +773,7 @@ function installSkill(
   backups: string[],
   rollbacks: Array<{ path: string; existed: boolean; content?: Buffer; mode?: number }>
 ): OwnedResource {
-  const skillPath = adapter.skillPath?.(ctx.homeDir);
+  const skillPath = adapter.skillPath?.(ctx.homeDir, ctx.env, ctx.platform);
   if (!skillPath) throw new Error("This agent does not expose a supported user-level skill directory.");
   rememberFile(skillPath, rollbacks);
   if (existsSync(skillPath)) backups.push(backupFile(skillPath, ctx.homeDir, adapter.id, "skill"));
@@ -633,8 +787,12 @@ function uninstallConflict(profile: AgentProfile, ctx: WorkContext, owned: Agent
   if (!adapter) return "The owned integration no longer has a supported installer adapter.";
 
   if (owned.mcp) {
-    if (adapter.configKind === "json") {
-      const info = inspectJsonConfig(owned.mcp.path, adapter.jsonContainer || "mcpServers");
+    if (adapter.configKind !== "toml") {
+      const info = inspectJsonConfig(
+        owned.mcp.path,
+        adapter.jsonContainer || "mcpServers",
+        adapter.configKind
+      );
       if (info.state === "conflict") return info.message;
       if (info.entry && fingerprintObject(info.entry) !== owned.mcp.fingerprint) {
         return `${owned.mcp.path} has changes inside the s-gw-owned MCP entry. It was not removed.`;
@@ -674,15 +832,21 @@ function uninstallOne(
     if (owned.mcp && existsSync(owned.mcp.path)) {
       rememberFile(owned.mcp.path, rollbacks);
       backups.push(backupFile(owned.mcp.path, ctx.homeDir, profile.id, "mcp-uninstall"));
-      if (adapter.configKind === "json") {
-        const info = inspectJsonConfig(owned.mcp.path, adapter.jsonContainer || "mcpServers");
-        const doc = info.document || {};
+      if (adapter.configKind !== "toml") {
         const container = adapter.jsonContainer || "mcpServers";
+        const info = inspectJsonConfig(owned.mcp.path, container, adapter.configKind);
+        const doc = info.document || {};
         const servers = isPlainObject(doc[container]) ? doc[container] as Record<string, unknown> : {};
-        delete servers["s-gw"];
-        if (Object.keys(servers).length === 0 && owned.mcp.parentCreated) delete doc[container];
-        else doc[container] = servers;
-        atomicWrite(owned.mcp.path, `${JSON.stringify(doc, null, 2)}\n`, currentMode(owned.mcp.path, 0o600));
+        if (adapter.configKind === "jsonc") {
+          const current = readFileSync(owned.mcp.path, "utf8");
+          const next = removeJsoncEntry(current, container);
+          atomicWrite(owned.mcp.path, next, currentMode(owned.mcp.path, 0o600));
+        } else {
+          delete servers["s-gw"];
+          if (Object.keys(servers).length === 0 && owned.mcp.parentCreated) delete doc[container];
+          else doc[container] = servers;
+          atomicWrite(owned.mcp.path, `${JSON.stringify(doc, null, 2)}\n`, currentMode(owned.mcp.path, 0o600));
+        }
       } else {
         const current = readFileSync(owned.mcp.path, "utf8");
         const section = findCodexSection(current);
@@ -719,19 +883,35 @@ function uninstallOne(
   return asResult(after, "uninstall", changed, false, backups);
 }
 
-function inspectJsonConfig(configPath: string, container: JsonContainer): JsonConfigInfo {
+function inspectJsonConfig(
+  configPath: string,
+  container: JsonContainer,
+  kind: "json" | "jsonc"
+): JsonConfigInfo {
   if (!existsSync(configPath)) return { state: "missing", document: {} };
   const current = readTextIfPresent(configPath);
   if (current.error) return { state: "conflict", message: current.error };
 
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(current.value || "{}");
-  } catch (error) {
-    return {
-      state: "conflict",
-      message: `${configPath} is not valid JSON (${error instanceof Error ? error.message : String(error)}). s-gw left it unchanged.`
-    };
+  if (kind === "jsonc") {
+    const errors: ParseError[] = [];
+    parsed = parseJsonc(current.value || "{}", errors, { allowTrailingComma: true });
+    if (errors.length > 0) {
+      const first = errors[0];
+      return {
+        state: "conflict",
+        message: `${configPath} is not valid JSONC (${printParseErrorCode(first.error)} at offset ${first.offset}). s-gw left it unchanged.`
+      };
+    }
+  } else {
+    try {
+      parsed = JSON.parse(current.value || "{}");
+    } catch (error) {
+      return {
+        state: "conflict",
+        message: `${configPath} is not valid JSON (${error instanceof Error ? error.message : String(error)}). s-gw left it unchanged.`
+      };
+    }
   }
   if (!isPlainObject(parsed)) return { state: "conflict", message: `${configPath} must contain a JSON object. s-gw left it unchanged.` };
 
@@ -747,12 +927,64 @@ function inspectJsonConfig(configPath: string, container: JsonContainer): JsonCo
   return { state: entry ? "existing" : "missing", document: parsed, entry: entry as Record<string, unknown> | undefined };
 }
 
+function updateJsonc(text: string, jsonPath: string[], value: unknown): string {
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const edits = modify(text, jsonPath, value, {
+    formattingOptions: { insertSpaces: true, tabSize: 2, eol }
+  });
+  const next = applyEdits(text, edits);
+  return next.endsWith(eol) ? next : `${next}${eol}`;
+}
+
+function removeJsoncEntry(text: string, container: JsonContainer): string {
+  const tree = parseTree(text, [], { allowTrailingComma: true });
+  const value = tree && findNodeAtLocation(tree, [container, "s-gw"]);
+  const property = value?.parent;
+  const parent = property?.parent;
+  if (!property || property.type !== "property" || !parent || parent.type !== "object") return text;
+
+  const siblings = parent.children || [];
+  const index = siblings.indexOf(property);
+  const nextProperty = siblings[index + 1];
+  const previousProperty = siblings[index - 1];
+  const afterEnd = nextProperty?.offset ?? parent.offset + parent.length - 1;
+  let comma = jsoncCommaOffset(text, property.offset + property.length, afterEnd);
+  if (comma === undefined && previousProperty) {
+    comma = jsoncCommaOffset(text, previousProperty.offset + previousProperty.length, property.offset);
+  }
+
+  const removals = [{ offset: property.offset, length: property.length }];
+  if (comma !== undefined) removals.push({ offset: comma, length: 1 });
+  removals.sort((left, right) => right.offset - left.offset);
+
+  let next = text;
+  for (const edit of removals) {
+    next = `${next.slice(0, edit.offset)}${next.slice(edit.offset + edit.length)}`;
+  }
+  return next;
+}
+
+function jsoncCommaOffset(text: string, start: number, end: number): number | undefined {
+  const scanner = createScanner(text, false);
+  let token = scanner.scan();
+  while (token !== SyntaxKind.EOF) {
+    const offset = scanner.getTokenOffset();
+    if (offset >= end) return undefined;
+    if (offset >= start && token === SyntaxKind.CommaToken) return offset;
+    token = scanner.scan();
+  }
+  return undefined;
+}
+
 function expectedJsonEntry(profile: AgentProfile, ctx: WorkContext): Record<string, unknown> {
+  const adapter = requiredAdapter(profile.id);
+  const container = adapter.jsonContainer || "mcpServers";
   const snippet = JSON.parse(renderAgentMcpSnippet(profile.id, {
     command: ctx.mcpCommand,
+    args: ctx.mcpArgs,
     env: { SGW_HOME: ctx.sgwHome }
   })) as Record<string, unknown>;
-  const servers = snippet.mcpServers;
+  const servers = snippet[container];
   if (!isPlainObject(servers) || !isPlainObject(servers["s-gw"])) {
     throw new Error(`The ${profile.displayName} MCP snippet is not a supported user-level JSON shape.`);
   }
@@ -762,6 +994,7 @@ function expectedJsonEntry(profile: AgentProfile, ctx: WorkContext): Record<stri
 function codexManagedBlock(profile: AgentProfile, ctx: WorkContext): string {
   return `${managedStart}\n${renderAgentMcpSnippet(profile.id, {
     command: ctx.mcpCommand,
+    args: ctx.mcpArgs,
     env: { SGW_HOME: ctx.sgwHome }
   })}\n${managedEnd}`;
 }
@@ -831,17 +1064,38 @@ function isSgwServerEntry(entry: Record<string, unknown>): boolean {
   return isSgwCommand(entry.command, args);
 }
 
-function sgwServerEntryAvailable(entry: Record<string, unknown>, pathEnv: string): boolean {
+function agentEntryContractIssue(agentId: string, entry: Record<string, unknown>): string | undefined {
+  if (agentId === "opencode") {
+    if (entry.type !== "local" || !Array.isArray(entry.command)) {
+      return "does not contain a valid OpenCode local MCP server entry.";
+    }
+    if (entry.enabled === false) return "has the s-gw MCP server disabled.";
+  }
+  if (agentId === "vscode" && entry.type !== "stdio") {
+    return "does not contain a valid VS Code stdio MCP server entry.";
+  }
+  if (agentId === "copilot") {
+    const tools = entry.tools;
+    const localType = entry.type === undefined || entry.type === "local" || entry.type === "stdio";
+    if (!localType || !Array.isArray(tools) || tools.length === 0 ||
+      !tools.every((tool) => typeof tool === "string")) {
+      return "does not contain a complete GitHub Copilot CLI local MCP server entry.";
+    }
+  }
+  return undefined;
+}
+
+function sgwServerEntryAvailable(entry: Record<string, unknown>, ctx: WorkContext): boolean {
   if (Array.isArray(entry.command)) {
     const command = entry.command.filter((item): item is string => typeof item === "string");
     return command.length === entry.command.length && command.length > 0 &&
-      sgwCommandAvailable(command[0], command.slice(1), pathEnv);
+      sgwCommandAvailable(command[0], command.slice(1), ctx);
   }
   if (typeof entry.command !== "string") return false;
   const args = Array.isArray(entry.args) && entry.args.every((item) => typeof item === "string")
     ? entry.args as string[]
     : [];
-  return sgwCommandAvailable(entry.command, args, pathEnv);
+  return sgwCommandAvailable(entry.command, args, ctx);
 }
 
 function isSgwCommand(command: string | undefined, args: string[]): boolean {
@@ -849,12 +1103,13 @@ function isSgwCommand(command: string | undefined, args: string[]): boolean {
   const base = path.basename(command).toLowerCase().replace(/\.cmd$|\.exe$/, "");
   if (base === "s-gw-mcp" || base === "secret-gateway-mcp") return args.length === 0;
   if (base !== "node" && base !== "nodejs") return false;
-  return args.length === 1 && /(?:^|[\\/])dist[\\/]mcp-server\.js$/.test(args[0]);
+  return args.length === 1 && /(?:^|[\\/])dist[\\/]mcp-server\.js$/i.test(args[0]);
 }
 
-function sgwCommandAvailable(command: string | undefined, args: string[], pathEnv: string): boolean {
+function sgwCommandAvailable(command: string | undefined, args: string[], ctx: WorkContext): boolean {
+  if (ctx.platform === "win32" && command && /\.(?:cmd|bat)$/i.test(command)) return false;
   if (!isSgwCommand(command, args) || !command) return false;
-  if (!executableAvailable(command, pathEnv)) return false;
+  if (!executableAvailable(command, ctx)) return false;
   const base = path.basename(command).toLowerCase().replace(/\.cmd$|\.exe$/, "");
   if (base === "node" || base === "nodejs") {
     return existsSync(args[0]) && statSync(args[0]).isFile();
@@ -862,16 +1117,23 @@ function sgwCommandAvailable(command: string | undefined, args: string[], pathEn
   return true;
 }
 
-function executableAvailable(command: string, pathEnv: string): boolean {
+function executableAvailable(command: string, ctx: WorkContext): boolean {
   if (!path.isAbsolute(command) && !command.includes("/") && !command.includes("\\")) {
-    return commandPath(command, pathEnv) !== undefined;
+    return commandPath(command, ctx.pathEnv, ctx.platform, ctx.env) !== undefined;
   }
   try {
     const info = statSync(command);
-    return info.isFile() && (process.platform === "win32" || (info.mode & 0o111) !== 0);
+    return info.isFile() && (ctx.platform === "win32" || (info.mode & 0o111) !== 0);
   } catch {
     return false;
   }
+}
+
+function samePath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  const resolvedLeft = path.resolve(left);
+  const resolvedRight = path.resolve(right);
+  if (platform === "win32") return resolvedLeft.toLowerCase() === resolvedRight.toLowerCase();
+  return resolvedLeft === resolvedRight;
 }
 
 function removeTomlSection(text: string, section: TomlSection): string {

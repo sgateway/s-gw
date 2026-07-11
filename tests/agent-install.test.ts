@@ -1,13 +1,16 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseJsonc } from "jsonc-parser";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
   uninstallAgentIntegrations
 } from "../src/agent-install.js";
+import { getPackageLayout } from "../src/install.js";
 
 const tmpDirs: string[] = [];
 
@@ -43,8 +46,26 @@ function opts(homeDir: string, pathEnv: string, agentIds?: string[]) {
     pathEnv,
     sgwHome: path.join(homeDir, ".s-gw"),
     agentIds,
+    env: {
+      HOME: homeDir,
+      USERPROFILE: homeDir,
+      APPDATA: path.join(homeDir, "AppData", "Roaming"),
+      XDG_CONFIG_HOME: path.join(homeDir, ".config"),
+      PATH: pathEnv,
+      PATHEXT: process.env.PATHEXT
+    },
     skillSourcePath: path.join(process.cwd(), "skills", "s-gw", "SKILL.md")
   };
+}
+
+function vscodeConfigPath(homeDir: string): string {
+  if (process.platform === "win32") {
+    return path.join(homeDir, "AppData", "Roaming", "Code", "User", "mcp.json");
+  }
+  if (process.platform === "darwin") {
+    return path.join(homeDir, "Library", "Application Support", "Code", "User", "mcp.json");
+  }
+  return path.join(homeDir, ".config", "Code", "User", "mcp.json");
 }
 
 describe("agent integration installation", () => {
@@ -72,7 +93,12 @@ describe("agent integration installation", () => {
     const claude = JSON.parse(readFileSync(claudeConfig, "utf8"));
     expect(claude.theme).toBe("dark");
     expect(claude.mcpServers.other.command).toBe("other-mcp");
-    expect(claude.mcpServers["s-gw"].command).toBe(path.join(binDir, process.platform === "win32" ? "s-gw-mcp.cmd" : "s-gw-mcp"));
+    if (process.platform === "win32") {
+      expect(claude.mcpServers["s-gw"].command).toBe(process.execPath);
+      expect(claude.mcpServers["s-gw"].args).toEqual([getPackageLayout().mcpPath]);
+    } else {
+      expect(claude.mcpServers["s-gw"].command).toBe(path.join(binDir, "s-gw-mcp"));
+    }
 
     const packagedSkill = readFileSync(path.join(process.cwd(), "skills", "s-gw", "SKILL.md"), "utf8");
     expect(readFileSync(path.join(homeDir, ".codex", "skills", "s-gw", "SKILL.md"), "utf8")).toBe(packagedSkill);
@@ -85,15 +111,346 @@ describe("agent integration installation", () => {
     expect(readdirSync(backupDir)).toHaveLength(backupCount);
   });
 
+  it("installs the complete GitHub Copilot CLI local server entry", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "copilot");
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["copilot"]));
+    const config = JSON.parse(readFileSync(path.join(homeDir, ".copilot", "mcp-config.json"), "utf8"));
+    const server = config.mcpServers["s-gw"];
+
+    expect(result[0]).toMatchObject({ state: "installed", changed: true });
+    expect(server.type).toBe("local");
+    if (process.platform === "win32") {
+      expect(server.command).toBe(process.execPath);
+      expect(server.args).toHaveLength(1);
+      expect(server.args[0]).toMatch(/[\\/]dist[\\/]mcp-server\.js$/);
+    } else {
+      expect(server.command).toBe(path.join(binDir, "s-gw-mcp"));
+      expect(server.args).toEqual([]);
+    }
+    expect(server.env.SGW_AGENT_NAME).toBe("GitHub Copilot CLI");
+    expect(server.tools).toEqual(["*"]);
+  });
+
+  it("does not accept an incomplete unowned GitHub Copilot CLI entry", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "copilot");
+    const configPath = path.join(homeDir, ".copilot", "mcp-config.json");
+    const command = process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp");
+    const args = process.platform === "win32" ? [getPackageLayout().mcpPath] : [];
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(configPath, `${JSON.stringify({ mcpServers: { "s-gw": { command, args } } }, null, 2)}\n`);
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["copilot"]));
+    expect(result[0]).toMatchObject({ state: "conflict", changed: false });
+    expect(result[0].reason).toMatch(/complete GitHub Copilot CLI/);
+    expect(existsSync(path.join(homeDir, ".copilot", "skills", "s-gw", "SKILL.md"))).toBe(false);
+  });
+
+  it("upgrades an unchanged Copilot entry owned by the earlier installer", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "copilot");
+    const configPath = path.join(homeDir, ".copilot", "mcp-config.json");
+    const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
+    const command = process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp");
+    const args = process.platform === "win32" ? [getPackageLayout().mcpPath] : [];
+    const env = {
+      SGW_HOME: path.join(homeDir, ".s-gw"),
+      SGW_AGENT_NAME: "GitHub Copilot CLI"
+    };
+    const oldEntry = { command, args, env };
+    const canonicalEntry = { args, command, env: { SGW_AGENT_NAME: env.SGW_AGENT_NAME, SGW_HOME: env.SGW_HOME } };
+    const fingerprint = createHash("sha256").update(JSON.stringify(canonicalEntry)).digest("hex");
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    mkdirSync(path.dirname(manifestPath), { recursive: true });
+    writeFileSync(configPath, `${JSON.stringify({ mcpServers: { "s-gw": oldEntry } }, null, 2)}\n`);
+    writeFileSync(manifestPath, `${JSON.stringify({
+      version: 1,
+      agents: {
+        copilot: {
+          mcp: { path: configPath, kind: "json-entry", fingerprint },
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      }
+    }, null, 2)}\n`);
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["copilot"]));
+    const updated = JSON.parse(readFileSync(configPath, "utf8")).mcpServers["s-gw"];
+    expect(result[0]).toMatchObject({ state: "installed", changed: true });
+    expect(updated.type).toBe("local");
+    expect(updated.tools).toEqual(["*"]);
+  });
+
+  it("accepts Copilot's stdio transport alias when tools are selected", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "copilot");
+    const configPath = path.join(homeDir, ".copilot", "mcp-config.json");
+    const command = process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp");
+    const args = process.platform === "win32" ? [getPackageLayout().mcpPath] : [];
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(configPath, `${JSON.stringify({
+      mcpServers: { "s-gw": { type: "stdio", command, args, tools: ["*"] } }
+    }, null, 2)}\n`);
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["copilot"]));
+    const unchanged = JSON.parse(readFileSync(configPath, "utf8")).mcpServers["s-gw"];
+    expect(result[0]).toMatchObject({ state: "installed", mcp: { state: "existing" } });
+    expect(unchanged.type).toBe("stdio");
+  });
+
+  it("installs and removes OpenCode without stripping JSONC comments", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(
+      configPath,
+      '{\n  // keep this user note\n  "$schema": "https://opencode.ai/config.json",\n  "mcp": {\n    "other": { "type": "local", "command": ["other-mcp"], },\n  },\n}\n'
+    );
+
+    const options = opts(homeDir, binDir, ["opencode"]);
+    const installed = installAgentIntegrations(options);
+    const afterInstall = readFileSync(configPath, "utf8");
+    const parsed = parseJsonc(afterInstall) as Record<string, any>;
+
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(afterInstall).toContain("// keep this user note");
+    expect(parsed.mcp.other.command).toEqual(["other-mcp"]);
+    expect(parsed.mcp["s-gw"]).toMatchObject({ type: "local", enabled: true });
+    expect(parsed.mcp["s-gw"].command[0]).toBe(
+      process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp")
+    );
+    expect(existsSync(path.join(homeDir, ".config", "opencode", "skills", "s-gw", "SKILL.md"))).toBe(true);
+
+    const backupCount = readdirSync(path.join(homeDir, ".s-gw", "backups", "agents")).length;
+    const second = installAgentIntegrations(options);
+    expect(second[0]).toMatchObject({ state: "installed", changed: false });
+    expect(readdirSync(path.join(homeDir, ".s-gw", "backups", "agents"))).toHaveLength(backupCount);
+
+    const removed = uninstallAgentIntegrations(options);
+    const afterRemove = readFileSync(configPath, "utf8");
+    const remaining = parseJsonc(afterRemove) as Record<string, any>;
+    expect(removed[0].changed).toBe(true);
+    expect(afterRemove).toContain("// keep this user note");
+    expect(remaining.mcp.other.command).toEqual(["other-mcp"]);
+    expect(remaining.mcp["s-gw"]).toBeUndefined();
+  });
+
+  it("installs and removes VS Code from the default user profile", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "code");
+    const configPath = vscodeConfigPath(homeDir);
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(
+      configPath,
+      '{\n  // default profile MCP servers\n  "servers": {\n    "other": { "type": "stdio", "command": "other-mcp", },\n  },\n}\n'
+    );
+
+    const options = opts(homeDir, binDir, ["vscode"]);
+    const installed = installAgentIntegrations(options);
+    const afterInstall = readFileSync(configPath, "utf8");
+    const parsed = parseJsonc(afterInstall) as Record<string, any>;
+
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(afterInstall).toContain("// default profile MCP servers");
+    expect(parsed.servers.other.command).toBe("other-mcp");
+    expect(parsed.servers["s-gw"].type).toBe("stdio");
+    expect(parsed.servers["s-gw"].command).toBe(
+      process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp")
+    );
+    expect(existsSync(path.join(homeDir, ".agents", "skills", "s-gw", "SKILL.md"))).toBe(true);
+
+    const second = installAgentIntegrations(options);
+    expect(second[0]).toMatchObject({ state: "installed", changed: false });
+
+    const removed = uninstallAgentIntegrations(options);
+    const afterRemove = readFileSync(configPath, "utf8");
+    const remaining = parseJsonc(afterRemove) as Record<string, any>;
+    expect(removed[0].changed).toBe(true);
+    expect(afterRemove).toContain("// default profile MCP servers");
+    expect(remaining.servers.other.command).toBe("other-mcp");
+    expect(remaining.servers["s-gw"]).toBeUndefined();
+    expect(existsSync(path.join(homeDir, ".agents", "skills", "s-gw", "SKILL.md"))).toBe(false);
+  });
+
+  it("does not accept a non-stdio VS Code MCP entry", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "code");
+    const configPath = vscodeConfigPath(homeDir);
+    const command = process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp");
+    const args = process.platform === "win32" ? [getPackageLayout().mcpPath] : [];
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ servers: { "s-gw": { type: "http", command, args } } }, null, 2)}\n`
+    );
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["vscode"]));
+    expect(result[0]).toMatchObject({ state: "conflict", changed: false });
+    expect(result[0].reason).toMatch(/valid VS Code stdio/);
+    expect(existsSync(path.join(homeDir, ".agents", "skills", "s-gw", "SKILL.md"))).toBe(false);
+  });
+
+  it("detects the macOS VS Code app when the code shell command is absent", () => {
+    if (process.platform !== "darwin") return;
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "unrelated-tool");
+    mkdirSync(path.join(homeDir, "Applications", "Visual Studio Code.app"), { recursive: true });
+    const options = opts(homeDir, binDir, ["vscode"]);
+
+    const status = agentIntegrationStatus(options);
+    expect(status[0]).toMatchObject({ detected: true, state: "available" });
+
+    const installed = installAgentIntegrations(options);
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(existsSync(vscodeConfigPath(homeDir))).toBe(true);
+  });
+
+  it("detects the macOS OpenCode app when its shell command is absent", () => {
+    if (process.platform !== "darwin") return;
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "unrelated-tool");
+    mkdirSync(path.join(homeDir, "Applications", "OpenCode.app"), { recursive: true });
+    const options = opts(homeDir, binDir, ["opencode"]);
+
+    const status = agentIntegrationStatus(options);
+    expect(status[0]).toMatchObject({ detected: true, state: "available" });
+
+    const installed = installAgentIntegrations(options);
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(existsSync(path.join(homeDir, ".config", "opencode", "opencode.jsonc"))).toBe(true);
+  });
+
+  it("removes only the owned OpenCode entry and preserves comments in its parent", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(configPath, '{\n  // keep schema\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+    const options = opts(homeDir, binDir, ["opencode"]);
+
+    installAgentIntegrations(options);
+    const installed = readFileSync(configPath, "utf8");
+    writeFileSync(configPath, installed.replace('"mcp": {', '"mcp": {\n    // keep this MCP note'));
+    uninstallAgentIntegrations(options);
+
+    const text = readFileSync(configPath, "utf8");
+    const parsed = parseJsonc(text) as Record<string, unknown>;
+    expect(text).toContain("// keep schema");
+    expect(text).toContain("// keep this MCP note");
+    expect(parsed.mcp).toEqual({});
+  });
+
+  it("does not remove a replacement entry from an s-gw-created OpenCode parent", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
+    const options = opts(homeDir, binDir, ["opencode"]);
+
+    installAgentIntegrations(options);
+    writeFileSync(
+      configPath,
+      '{\n  "mcp": {\n    "other": { "type": "local", "command": ["other-mcp"] }\n  }\n}\n'
+    );
+
+    const removed = uninstallAgentIntegrations(options);
+    const remaining = parseJsonc(readFileSync(configPath, "utf8")) as Record<string, any>;
+    expect(removed[0].changed).toBe(true);
+    expect(remaining.mcp.other.command).toEqual(["other-mcp"]);
+  });
+
+  it("honors OpenCode's custom config file", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configPath = path.join(homeDir, "custom", "my-opencode.jsonc");
+    const options = opts(homeDir, binDir, ["opencode"]);
+    options.env.OPENCODE_CONFIG = configPath;
+
+    const installed = installAgentIntegrations(options);
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(existsSync(configPath)).toBe(true);
+    expect(existsSync(path.join(homeDir, ".config", "opencode", "skills", "s-gw", "SKILL.md"))).toBe(true);
+    expect(existsSync(path.join(homeDir, ".config", "opencode", "opencode.jsonc"))).toBe(false);
+  });
+
+  it("uses OpenCode's higher-priority custom config directory", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const lowerPriority = path.join(homeDir, "custom", "my-opencode.jsonc");
+    const configDir = path.join(homeDir, "custom-opencode-dir");
+    const configPath = path.join(configDir, "opencode.json");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(configPath, '{ "theme": "dark" }\n');
+    const options = opts(homeDir, binDir, ["opencode"]);
+    options.env.OPENCODE_CONFIG = lowerPriority;
+    options.env.OPENCODE_CONFIG_DIR = configDir;
+
+    const installed = installAgentIntegrations(options);
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(config.theme).toBe("dark");
+    expect(config.mcp["s-gw"].type).toBe("local");
+    expect(existsSync(path.join(configDir, "skills", "s-gw", "SKILL.md"))).toBe(true);
+    expect(existsSync(lowerPriority)).toBe(false);
+  });
+
+  it("creates OpenCode config inside OPENCODE_CONFIG_DIR when used alone", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configDir = path.join(homeDir, "isolated-opencode");
+    const options = opts(homeDir, binDir, ["opencode"]);
+    options.env.OPENCODE_CONFIG_DIR = configDir;
+
+    const installed = installAgentIntegrations(options);
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(existsSync(path.join(configDir, "opencode.jsonc"))).toBe(true);
+    expect(existsSync(path.join(configDir, "skills", "s-gw", "SKILL.md"))).toBe(true);
+  });
+
+  it("refuses a disabled OpenCode MCP entry instead of reporting it connected", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
+    const command = process.platform === "win32"
+      ? [process.execPath, getPackageLayout().mcpPath]
+      : [path.join(binDir, "s-gw-mcp")];
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(configPath, `${JSON.stringify({
+      mcp: { "s-gw": { type: "local", command, enabled: false } }
+    }, null, 2)}\n`);
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["opencode"]));
+    expect(result[0]).toMatchObject({ state: "conflict", changed: false });
+    expect(result[0].reason).toMatch(/disabled/);
+    expect(existsSync(path.join(homeDir, ".config", "opencode", "skills", "s-gw", "SKILL.md"))).toBe(false);
+  });
+
+  it("refuses malformed OpenCode JSONC without a partial skill install", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "opencode");
+    const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileSync(configPath, '{ "mcp": { // unfinished\n');
+
+    const result = installAgentIntegrations(opts(homeDir, binDir, ["opencode"]));
+    expect(result[0]).toMatchObject({ state: "conflict", changed: false });
+    expect(result[0].reason).toMatch(/not valid JSONC/);
+    expect(readFileSync(configPath, "utf8")).toBe('{ "mcp": { // unfinished\n');
+    expect(existsSync(path.join(homeDir, ".config", "opencode", "skills", "s-gw", "SKILL.md"))).toBe(false);
+  });
+
   it("accepts an existing working absolute s-gw MCP command as already connected", () => {
     const homeDir = testHome();
     const binDir = fakeCommand(homeDir, "codex");
-    const mcpPath = path.join(binDir, process.platform === "win32" ? "s-gw-mcp.cmd" : "s-gw-mcp");
+    const mcpPath = process.platform === "win32" ? getPackageLayout().mcpPath : path.join(binDir, "s-gw-mcp");
+    const command = process.platform === "win32" ? process.execPath : mcpPath;
+    const args = process.platform === "win32" ? [mcpPath] : [];
     const configPath = path.join(homeDir, ".codex", "config.toml");
     mkdirSync(path.dirname(configPath), { recursive: true });
     writeFileSync(
       configPath,
-      `[mcp_servers.s-gw]\ncommand = ${JSON.stringify(mcpPath)}\nargs = []\nenv = { SGW_HOME = "/Users/example/.s-gw", SGW_AGENT_NAME = "Codex" }\n`
+      `[mcp_servers.s-gw]\ncommand = ${JSON.stringify(command)}\nargs = ${JSON.stringify(args)}\nenv = { SGW_HOME = "/Users/example/.s-gw", SGW_AGENT_NAME = "Codex" }\n`
     );
 
     const result = installAgentIntegrations(opts(homeDir, binDir, ["codex"]));
@@ -113,7 +470,8 @@ describe("agent integration installation", () => {
     const config = readFileSync(path.join(homeDir, ".codex", "config.toml"), "utf8");
     expect(updated[0]).toMatchObject({ changed: true, state: "installed" });
     expect(config).toContain(`SGW_HOME = ${JSON.stringify(sgwHome)}`);
-    expect(config).toContain(`command = ${JSON.stringify(path.join(binDir, process.platform === "win32" ? "s-gw-mcp.cmd" : "s-gw-mcp"))}`);
+    expect(config).toContain(`command = ${JSON.stringify(process.platform === "win32" ? process.execPath : path.join(binDir, "s-gw-mcp"))}`);
+    if (process.platform === "win32") expect(config).toContain(`args = ${JSON.stringify([getPackageLayout().mcpPath])}`);
     expect(config.match(/\[mcp_servers\.s-gw\]/g)).toHaveLength(1);
   });
 
@@ -217,6 +575,7 @@ describe("agent integration installation", () => {
   });
 
   it("preserves existing config file permissions across install and uninstall", () => {
+    if (process.platform === "win32") return;
     const homeDir = testHome();
     const binDir = fakeCommand(homeDir, "gemini");
     const configPath = path.join(homeDir, ".gemini", "settings.json");
@@ -374,7 +733,7 @@ describe("agent integration installation", () => {
   it("wires status, dry-run, install, and uninstall through the CLI", () => {
     const homeDir = testHome();
     const binDir = fakeCommand(homeDir, "codex");
-    const tsxBin = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+    const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
     const env = {
       ...process.env,
       HOME: homeDir,
@@ -384,15 +743,15 @@ describe("agent integration installation", () => {
       SGW_DISABLE_UPDATE_CHECK: "1"
     };
 
-    const dryRun = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "agent", "install", "codex", "--dry-run"], { cwd: process.cwd(), env, encoding: "utf8" }));
+    const dryRun = JSON.parse(execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "install", "codex", "--dry-run"], { cwd: process.cwd(), env, encoding: "utf8" }));
     expect(dryRun.results[0].plannedChanges).toContain("mcp");
     expect(existsSync(path.join(homeDir, ".codex", "config.toml"))).toBe(false);
 
-    execFileSync(tsxBin, ["src/cli.ts", "agent", "install", "codex"], { cwd: process.cwd(), env, encoding: "utf8" });
-    const status = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "agent", "status", "codex"], { cwd: process.cwd(), env, encoding: "utf8" }));
+    execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "install", "codex"], { cwd: process.cwd(), env, encoding: "utf8" });
+    const status = JSON.parse(execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "status", "codex"], { cwd: process.cwd(), env, encoding: "utf8" }));
     expect(status.results[0].state).toBe("installed");
 
-    execFileSync(tsxBin, ["src/cli.ts", "agent", "uninstall", "codex"], { cwd: process.cwd(), env, encoding: "utf8" });
+    execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "uninstall", "codex"], { cwd: process.cwd(), env, encoding: "utf8" });
     expect(readFileSync(path.join(homeDir, ".codex", "config.toml"), "utf8")).not.toContain("mcp_servers.s-gw");
 
     const conflictHome = testHome();
@@ -400,7 +759,7 @@ describe("agent integration installation", () => {
     const conflictConfig = path.join(conflictHome, ".codex", "config.toml");
     mkdirSync(path.dirname(conflictConfig), { recursive: true });
     writeFileSync(conflictConfig, '[mcp_servers.s-gw]\ncommand = "unrelated-tool"\n');
-    const conflict = spawnSync(tsxBin, ["src/cli.ts", "agent", "install", "codex"], {
+    const conflict = spawnSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "install", "codex"], {
       cwd: process.cwd(),
       env: {
         ...env,
@@ -409,21 +768,24 @@ describe("agent integration installation", () => {
         PATH: `${conflictBin}${path.delimiter}${process.env.PATH || ""}`,
         SGW_HOME: path.join(conflictHome, ".s-gw")
       },
-      encoding: "utf8",
-      shell: process.platform === "win32"
+      encoding: "utf8"
     });
     expect(conflict.status).toBe(1);
     expect(JSON.parse(conflict.stdout)).toMatchObject({ ok: false, results: [{ state: "conflict" }] });
   });
 
   it("setup connects detected agents unless --no-agents is set", () => {
-    const tsxBin = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+    const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
     const runSetup = (homeDir: string, extraArgs: string[]) => {
       const binDir = fakeCommand(homeDir, "codex");
+      fakeCommand(homeDir, "opencode");
+      fakeCommand(homeDir, "code");
       const env = {
         ...process.env,
         HOME: homeDir,
         USERPROFILE: homeDir,
+        APPDATA: path.join(homeDir, "AppData", "Roaming"),
+        XDG_CONFIG_HOME: path.join(homeDir, ".config"),
         PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
         SGW_HOME: path.join(homeDir, ".s-gw"),
         SGW_MASTER_PASSPHRASE: "test-only-passphrase",
@@ -431,8 +793,8 @@ describe("agent integration installation", () => {
         SGW_DISABLE_UPDATE_CHECK: "1"
       };
       return JSON.parse(execFileSync(
-        tsxBin,
-        ["src/cli.ts", "setup", "--no-service", "--no-menubar", "--no-open-app", ...extraArgs],
+        process.execPath,
+        [tsxCli, "src/cli.ts", "setup", "--no-service", "--no-menubar", "--no-open-app", ...extraArgs],
         { cwd: process.cwd(), env, encoding: "utf8" }
       ));
     };
@@ -441,11 +803,17 @@ describe("agent integration installation", () => {
     const setup = runSetup(autoHome, []);
     expect(setup.agents.skipped).toBe(false);
     expect(setup.agents.results.find((item: { agentId: string }) => item.agentId === "codex").state).toBe("installed");
+    expect(setup.agents.results.find((item: { agentId: string }) => item.agentId === "opencode").state).toBe("installed");
+    expect(setup.agents.results.find((item: { agentId: string }) => item.agentId === "vscode").state).toBe("installed");
     expect(existsSync(path.join(autoHome, ".codex", "config.toml"))).toBe(true);
+    expect(existsSync(path.join(autoHome, ".config", "opencode", "opencode.jsonc"))).toBe(true);
+    expect(existsSync(vscodeConfigPath(autoHome))).toBe(true);
 
     const skippedHome = testHome();
     const skipped = runSetup(skippedHome, ["--no-agents"]);
     expect(skipped.agents).toEqual({ skipped: true, results: [] });
     expect(existsSync(path.join(skippedHome, ".codex", "config.toml"))).toBe(false);
+    expect(existsSync(path.join(skippedHome, ".config", "opencode", "opencode.jsonc"))).toBe(false);
+    expect(existsSync(vscodeConfigPath(skippedHome))).toBe(false);
   });
 });

@@ -348,9 +348,9 @@ The current preview is developed primarily on macOS with the native Keychain hel
 | GitHub Copilot CLI | Supported | Local MCP server config | `~/.copilot/mcp-config.json`, `.github/mcp.json`, or `.mcp.json` |
 | OpenHands | Profiled | Local MCP server config plus optional hooks | `~/.openhands/mcp.json`, `~/.openhands/hooks.json` |
 | Antigravity | Profiled | Local MCP server config plus global hooks | `~/.gemini/config/mcp_config.json`, `./.agents/mcp_config.json`, `~/.gemini/config/hooks.json` |
-| OpenCode | Supported | Local MCP server config; plugin hook surface profiled | `~/.config/opencode/opencode.json`, `opencode.json`, `.jsonc` variants |
+| OpenCode | Supported | Managed user/config-directory JSONC MCP entry and user skill; plugin hook surface profiled | `~/.config/opencode/opencode.json`, `.jsonc` variant, or `$OPENCODE_CONFIG_DIR` |
 | OmniGent | Planned/profiled | Custom policy bridge, not normal MCP | `$OMNIGENT_CONFIG_HOME/config.yaml` or `~/.omnigent/config.yaml` |
-| VS Code + GitHub Copilot Agent Mode | Supported | Local stdio MCP server | `.vscode/mcp.json` or user MCP config |
+| VS Code + GitHub Copilot Agent Mode | Supported | Managed default user-profile stdio MCP server and personal skill | Default profile `mcp.json`; `.vscode/mcp.json` for explicit project scope |
 | Zed, JetBrains, other MCP clients | Not yet profiled | Likely possible through stdio MCP | Add after hands-on testing and docs. |
 
 Supported means s-gw has a documented standard MCP stdio path. Profiled means `s-gw agent list` and, when applicable, `s-gw agent mcp-snippet <agent>` know the likely local surfaces, but a hands-on client smoke test is still required before claiming full compatibility. Planned/profiled entries describe known integration shapes without emitting a normal MCP snippet. Automated end-to-end coverage uses the official MCP SDK client rather than every individual IDE UI.

@@ -24,9 +24,9 @@ s-gw agent uninstall codex
 
 `s-gw setup` detects installed agents and connects the profiles with safe user-level config targets. Use `s-gw setup --no-agents` when setup should initialize only the gateway. npm installation never changes agent configuration.
 
-Automatic registration currently covers Claude Code, Codex, Cursor, Gemini CLI, and GitHub Copilot CLI. It merges only the `s-gw` MCP entry, installs the packaged `s-gw` skill where the agent supports a user-level skill directory, preserves unrelated settings, and writes a `0600` backup before changing an existing file. Ownership is recorded in `~/.s-gw/agent-integrations.json`, so uninstall removes only content installed by s-gw.
+Automatic registration currently covers Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI, OpenCode, and the default VS Code user profile. It merges only the `s-gw` MCP entry, installs the packaged `s-gw` skill where the agent supports a user-level skill directory, preserves unrelated settings and JSONC comments, and writes a `0600` backup before changing an existing file. Ownership is recorded in `~/.s-gw/agent-integrations.json`, so uninstall removes only content installed by s-gw.
 
-Conflicting `s-gw` entries, malformed config, symlinks, and changed s-gw-owned content are refused without overwriting the file. One agent conflict does not stop setup for other detected agents. Profiled/manual agents and formats without a safe merge path, including OpenCode JSONC, remain snippet-only.
+Conflicting `s-gw` entries, malformed config, symlinks, and changed s-gw-owned content are refused without overwriting the file. One agent conflict does not stop setup for other detected agents. Profiled/manual agents and formats without a safe merge path remain snippet-only.
 
 Show one profile with an MCP snippet:
 
@@ -107,14 +107,16 @@ Status is intentionally strict. `Supported` means s-gw has a documented stdio MC
 | `copilot` | GitHub Copilot CLI | Supported | `~/.copilot/mcp-config.json`, `./.github/mcp.json`, `./.mcp.json` | Workspace config preferred. |
 | `openhands` | OpenHands | Profiled/manual | `~/.openhands/mcp.json` | Global MCP config; optional workspace hooks only when intentionally scoped. |
 | `antigravity` | Antigravity | Profiled/manual | `~/.gemini/config/mcp_config.json`, `./.agents/mcp_config.json` | MCP config is separate from global hook config. Alias: `agy`. |
-| `opencode` | OpenCode | Supported | `~/.config/opencode/opencode.json`, `opencode.json`, `.jsonc` variants | Top-level `mcp` map, not `mcpServers`. |
+| `opencode` | OpenCode | Supported | `~/.config/opencode/opencode.json`, `opencode.json`, `.jsonc` variants | Setup safely merges the active user/config-directory JSONC `mcp` entry and installs the user skill. |
 | `omnigent` | OmniGent | Planned/profiled | `$OMNIGENT_CONFIG_HOME/config.yaml`, `~/.omnigent/config.yaml` | DefenseClaw uses a custom policy bridge, not a normal MCP server entry. |
 
 The registry also includes this general MCP client profile:
 
 | Profile | Agent | Status | MCP config surface |
 | --- | --- | --- | --- |
-| `vscode` | VS Code / GitHub Copilot Agent Mode | Supported | `./.vscode/mcp.json` |
+| `vscode` | VS Code / GitHub Copilot Agent Mode | Supported | Default user-profile `mcp.json`, `./.vscode/mcp.json` |
+
+VS Code automatic registration intentionally targets only the default stable user profile. Named profiles, Insiders, portable installations, and custom `--user-data-dir` instances continue to use their own explicit MCP configuration.
 
 ## Project CodeGuard Layer
 

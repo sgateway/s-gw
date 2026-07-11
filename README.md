@@ -181,6 +181,8 @@ s-gw agent uninstall codex
 
 Manual profiles and config formats without a safe merge path continue to use the generated snippet. npm installation itself never edits agent configuration.
 
+`s-gw setup` can safely manage detected Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI, OpenCode, and default-profile VS Code installations on macOS, Windows, and Linux. On Windows, it launches the packaged MCP server through `node.exe`, not an npm `.cmd` shim.
+
 For CLI agents, guard mode can replace credential-looking launch environment values with s-gw handles before the agent starts:
 
 ```bash

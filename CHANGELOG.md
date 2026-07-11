@@ -16,6 +16,9 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 - Update checks fall back to GitHub's public Atom feed when the unauthenticated Releases API is rate-limited.
 - The updater accepts both per-file SHA-256 assets and `SHA256SUMS.txt`, and release automation uploads both formats.
 - Native upgrades use the migration-aware installer instead of invoking npm directly.
+- Windows agent registration launches the packaged server through `node.exe` instead of an npm `.cmd` shim and honors custom Codex, Gemini CLI, and Copilot homes.
+- GitHub Copilot CLI registrations include its required local-server tool allowlist.
+- OpenCode JSONC and the default VS Code user profile now support comment-preserving managed install and uninstall.
 
 ## 0.1.1 - 2026-07-10
 

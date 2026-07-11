@@ -78,4 +78,5 @@ jobs:
       - run: cargo test --locked -p sgw-core
       - run: npm run check
       - run: npm run build:windows-client
-      - run: npx vitest run tests/windows-client.test.ts tests/installers.test.ts
+      - run: npx tsc -p tsconfig.json
+      - run: npx vitest run tests/windows-client.test.ts tests/installers.test.ts tests/agents.test.ts tests/agent-install.test.ts tests/agent-install-windows.test.ts
