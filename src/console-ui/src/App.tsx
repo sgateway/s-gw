@@ -137,8 +137,10 @@ import {
   deleteSecret,
   denyRequest,
   fetchConsoleState,
+  installAgentIntegration,
   saveApprovalSettings,
-  setPolicyEnabled
+  setPolicyEnabled,
+  uninstallAgentIntegration
 } from "@/lib/api";
 import {
   DASHBOARD_LAYOUT_KEY,
@@ -715,7 +717,7 @@ function ViewContent({
     case "policies":
       return <PoliciesView state={ctx.state} onDone={() => void ctx.refresh()} search={search} />;
     case "agents":
-      return <AgentsView state={ctx.state} search={search} />;
+      return <AgentsView state={ctx.state} search={search} onDone={() => ctx.refresh(true)} />;
     case "activity":
       return <ActivityView state={ctx.state} search={search} setSearch={setSearch} />;
     case "audit":
@@ -1449,17 +1451,17 @@ function PolicyStatusControl({
   );
 }
 
-function AgentsView({ state, search }: { state: ConsoleState; search: string }) {
+function AgentsView({ state, search, onDone }: { state: ConsoleState; search: string; onDone: () => Promise<void> }) {
   const [selectedAgent, setSelectedAgent] = React.useState<AgentSummary | null>(null);
-  const rows = filterText(state.agents, search, (agent) => `${agent.name} ${agent.id} ${agent.status}`);
-  const mcpReady = state.agents.filter((agent) => agent.mcp.supported).length;
+  const rows = filterText(state.agents, search, (agent) => `${agent.name} ${agent.id} ${agent.status} ${agent.integration.state}`);
+  const connected = state.agents.filter((agent) => agent.integration.mcp.state === "installed" || agent.integration.mcp.state === "existing").length;
   const hookAware = state.agents.filter((agent) => agent.hooks.supported).length;
 
   return (
     <PageFrame title="Agents" description="Connect coding agents to s-gw, copy verified configuration, and inspect supported protection surfaces.">
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
         <Badge variant="outline">{state.agents.length} profiles</Badge>
-        <Badge variant="outline">{mcpReady} MCP-ready</Badge>
+        <Badge variant="outline">{connected} connected</Badge>
         <Badge variant="outline">{hookAware} hook-aware</Badge>
       </div>
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -1471,10 +1473,10 @@ function AgentsView({ state, search }: { state: ConsoleState; search: string }) 
                   <AgentIcon name={agent.name} className="h-9 w-9 shrink-0" />
                   <span className="truncate">{agent.name}</span>
                 </CardTitle>
-                <AgentSupportBadge status={agent.status} />
+                <AgentIntegrationBadge state={agent.integration.state} />
               </div>
               <CardDescription className="truncate font-mono text-xs">
-                {agent.mcp.configPaths[0] || "No MCP configuration path"}
+                {agent.integration.mcp.path || agent.mcp.configPaths[0] || "No MCP configuration path"}
               </CardDescription>
             </CardHeader>
             <CardContent className="mt-auto space-y-3">
@@ -1484,19 +1486,23 @@ function AgentsView({ state, search }: { state: ConsoleState; search: string }) 
                 {agent.skills.supported ? <Badge variant="secondary">Skills</Badge> : null}
               </div>
               <Button
-                variant={agent.mcp.supported ? "outline" : "ghost"}
+                variant={agent.integration.state === "conflict" ? "destructive" : "outline"}
                 size="sm"
                 className="w-full"
                 onClick={() => setSelectedAgent(agent)}
                 data-agent-mcp={agent.id}
               >
-                {agent.mcp.supported ? "MCP snippet" : "View integration status"}
+                {agent.integration.state === "installed" ? "Manage connection" : agent.integration.state === "manual" ? "Manual setup" : agent.integration.state === "conflict" ? "Review conflict" : "Connection details"}
               </Button>
             </CardContent>
           </Card>
         ))}
       </div>
-      <AgentConfigurationSheet agent={selectedAgent} onOpenChange={(open) => !open && setSelectedAgent(null)} />
+      <AgentConfigurationSheet
+        agent={selectedAgent}
+        onDone={onDone}
+        onOpenChange={(open) => !open && setSelectedAgent(null)}
+      />
     </PageFrame>
   );
 }
@@ -1506,13 +1512,22 @@ function AgentSupportBadge({ status }: { status: string }) {
   return <Badge variant={status === "supported" ? "outline" : "secondary"}>{label}</Badge>;
 }
 
+function AgentIntegrationBadge({ state }: { state: AgentSummary["integration"]["state"] }) {
+  const label = state === "not-detected" ? "Not detected" : titleCase(state);
+  const variant = state === "conflict" ? "destructive" : state === "installed" ? "outline" : "secondary";
+  return <Badge variant={variant}>{label}</Badge>;
+}
+
 function AgentConfigurationSheet({
   agent,
+  onDone,
   onOpenChange
 }: {
   agent: AgentSummary | null;
+  onDone: () => Promise<void>;
   onOpenChange: (open: boolean) => void;
 }) {
+  const [busy, setBusy] = React.useState(false);
   if (!agent) return null;
 
   const copy = async (value: string, label: string) => {
@@ -1524,6 +1539,29 @@ function AgentConfigurationSheet({
     }
   };
 
+  const updateConnection = async (action: "install" | "uninstall") => {
+    setBusy(true);
+    try {
+      const response = action === "install"
+        ? await installAgentIntegration(agent.id)
+        : await uninstallAgentIntegration(agent.id);
+      if (response.result.state === "conflict") {
+        toast.error(response.result.reason || `${agent.name} configuration has a conflict`);
+        return;
+      }
+      toast.success(action === "install" ? `${agent.name} connected` : `${agent.name} disconnected`);
+      await onDone();
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Agent connection update failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const canInstall = agent.integration.detected && agent.integration.eligible && agent.integration.state !== "installed" && agent.integration.state !== "conflict";
+  const canUninstall = agent.integration.mcp.owned || agent.integration.skill.owned;
+
   return (
     <Sheet open onOpenChange={onOpenChange}>
       <SheetContent
@@ -1534,7 +1572,7 @@ function AgentConfigurationSheet({
           <SheetTitle className="flex items-center gap-3">
             <AgentIcon name={agent.name} className="h-10 w-10" />
             <span>{agent.name}</span>
-            <AgentSupportBadge status={agent.status} />
+            <AgentIntegrationBadge state={agent.integration.state} />
           </SheetTitle>
           <SheetDescription>
             Configure s-gw locally for this agent. Raw credentials remain outside the agent configuration.
@@ -1542,8 +1580,39 @@ function AgentConfigurationSheet({
         </SheetHeader>
 
         <div className="space-y-6 px-4 pb-6">
+          <section className="space-y-3 rounded-md border bg-muted/20 p-4" data-agent-installation={agent.integration.state}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold">s-gw connection</h3>
+                <p className="text-xs text-muted-foreground">
+                  {agent.integration.detected ? "Agent detected on this computer." : "Agent was not detected on this computer."}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                {canInstall ? (
+                  <Button size="sm" disabled={busy} onClick={() => void updateConnection("install")} data-agent-install={agent.id}>
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                    Connect
+                  </Button>
+                ) : null}
+                {canUninstall ? (
+                  <Button variant="outline" size="sm" disabled={busy} onClick={() => void updateConnection("uninstall")} data-agent-uninstall={agent.id}>
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                    Disconnect
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+            <div className="grid gap-2 text-sm sm:grid-cols-2">
+              <AgentCapability label="MCP registration" value={titleCase(agent.integration.mcp.state)} />
+              <AgentCapability label="s-gw skill" value={titleCase(agent.integration.skill.state)} />
+            </div>
+            {agent.integration.reason ? <p className="text-xs text-amber-300">{agent.integration.reason}</p> : null}
+          </section>
+
           <section className="grid gap-2 text-sm sm:grid-cols-2">
             <AgentCapability label="MCP" value={agent.mcp.supported ? `${agent.mcp.format.toUpperCase()} · ${agent.mcp.writeMode}` : "Not available"} />
+            <AgentCapability label="Profile support" value={agent.status === "supported" ? "Supported" : titleCase(agent.status)} />
             <AgentCapability label="Guard mode" value="Available" />
             <AgentCapability label="Hooks" value={agent.hooks.supported ? `${agent.hooks.kind} · ${agent.hooks.events.length} events` : "Not available"} />
             <AgentCapability label="CodeGuard" value={agent.codeGuard.supported ? titleCase(agent.codeGuard.route) : "Not available"} />

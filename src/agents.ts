@@ -269,7 +269,7 @@ export const agentProfiles: AgentProfile[] = [
       supported: true,
       status: "supported",
       snippet: "json",
-      writeMode: "manual",
+      writeMode: "safe",
       // Claude Code reads MCP servers from `.mcp.json` (project scope, the shape this
       // snippet emits) or `~/.claude.json` via `claude mcp add` - NOT `settings.json`,
       // which only holds hooks/permissions/env.
@@ -444,7 +444,7 @@ export const agentProfiles: AgentProfile[] = [
     },
     skills: {
       supported: true,
-      configPaths: [`${project}/.gemini/skills`, `${project}/.agents/skills`],
+      configPaths: [`${project}/.gemini/skills`, `${project}/.agents/skills`, `${home}/.gemini/skills`],
       notes: []
     },
     plugins: {

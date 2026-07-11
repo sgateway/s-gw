@@ -15,7 +15,9 @@ describe("platform installers", () => {
 
     expect(pkg.name).toBe("@s-gw/s-gw");
     expect(pkg.publishConfig.access).toBe("public");
-    expect(pkg.scripts["build:installers"]).toBe("npm run build && node scripts/build-installers.mjs");
+    expect(pkg.scripts["build:installers"]).toContain("node scripts/build-installers.mjs");
+    expect(pkg.scripts["build:installers"]).toContain("npm run validate:release-assets");
+    expect(pkg.scripts["validate:release-assets"]).toBe("node scripts/validate-release-assets.mjs dist/installers");
     expect(pkg.scripts["build:rust-core"]).toBe("node scripts/build-rust-core.mjs");
     expect(pkg.files).toContain("dist");
     expect(pkg.files).toContain("!dist/installers");
@@ -28,6 +30,8 @@ describe("platform installers", () => {
     expect(builder).toContain("s-gw-${version}-windows.zip");
     expect(builder).toContain('const packageFile = `s-gw-${version}.tgz`');
     expect(builder).toContain("SHA256SUMS.txt");
+    const validator = await readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8");
+    expect(validator).toContain("validateReleaseDirectory");
   });
 
   it("ships runtime artifacts without development source or source maps", () => {
@@ -59,10 +63,38 @@ describe("platform installers", () => {
     const combined = `${mac}\n${windows}`;
 
     expect(mac).toContain('"$sgw_bin" setup --port 8718');
+    expect(mac).toContain('PATH="$npm_prefix/bin:$PATH" "$sgw_bin" setup');
     expect(windows).toContain('$setupArgs = @("setup", "--port", [string]$Port)');
     expect(combined).toContain("npm");
     expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");
     expect(combined).not.toContain("op read");
+  });
+
+  it("removes the legacy package before install and clears a partial scoped package only during rollback", async () => {
+    const [mac, windows] = await Promise.all([
+      readFile(path.join(root, "native/installers/macos/Install s-gw.command"), "utf8"),
+      readFile(path.join(root, "native/installers/windows/Install-s-gw.ps1"), "utf8")
+    ]);
+
+    for (const installer of [mac, windows]) {
+      expect(installer).toContain("pack --dry-run --ignore-scripts --json");
+      expect(installer).toContain("pack --ignore-scripts --json --pack-destination");
+      expect(installer).toContain("uninstall --global --prefix");
+      expect(installer).toContain("rollback");
+      expect(installer).toContain("~/.s-gw");
+      const restoreAt = installer.indexOf("Restoring legacy s-gw");
+      const scopedRemovalAt = installer.search(/uninstall[^\n]+@s-gw\/s-gw/);
+      expect(restoreAt).toBeGreaterThan(0);
+      expect(scopedRemovalAt).toBeGreaterThan(restoreAt);
+    }
+
+    expect(mac).toContain("-- s-gw");
+    expect(mac).toContain("item.version === process.argv[1]");
+    expect(windows).toContain('-- "s-gw"');
+    expect(windows).toContain("$rollbackMetadata.version -ne $legacyVersion");
+    if (process.platform === "darwin") {
+      execFileSync("zsh", ["-n", path.join(root, "native/installers/macos/Install s-gw.command")]);
+    }
   });
 
   it("resolves the Windows command from npm without requiring a restart", async () => {
@@ -86,5 +118,23 @@ describe("platform installers", () => {
       ].join("; ");
       execFileSync("powershell.exe", ["-NoProfile", "-Command", parseCommand], { stdio: "pipe" });
     }
+  });
+
+  it("builds and verifies updater assets independently from npm publishing", async () => {
+    const [workflow, builder, validator] = await Promise.all([
+      readFile(path.join(root, ".github/workflows/publish.yml"), "utf8"),
+      readFile(path.join(root, "scripts/build-installers.mjs"), "utf8"),
+      readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8")
+    ]);
+    const assetJob = workflow.slice(workflow.indexOf("  release-assets:"));
+
+    expect(assetJob).toContain("runs-on: macos-14");
+    expect(assetJob).toContain("npm run verify");
+    expect(assetJob).toContain("npm run build:installers");
+    expect(assetJob).toContain("first_tgz");
+    expect(assetJob).not.toContain("needs: publish");
+    expect(builder).toContain("buildLegacyBridge");
+    expect(builder).toContain("0-s-gw-legacy-${version}.tgz");
+    expect(validator).toContain('bridgeMetadata.name !== "s-gw"');
   });
 });

@@ -35,7 +35,7 @@ To build and install a tarball from a source checkout:
 
 ```bash
 npm run package:local
-npm install -g ./s-gw-s-gw-0.1.0.tgz
+npm install -g ./s-gw-s-gw-VERSION.tgz
 s-gw setup
 ```
 
@@ -249,9 +249,10 @@ The command rebuilds the native clients and console, then writes these files und
 - `s-gw-VERSION-macos.dmg`, containing the local npm package and a double-clickable setup command;
 - `s-gw-VERSION-windows.zip`, containing the local npm package plus PowerShell and CMD setup launchers;
 - `s-gw-VERSION.tgz`, used by both installers and the in-app updater;
+- `0-s-gw-legacy-VERSION.tgz`, a release-only unscoped bridge for the original `0.1.0` updater;
 - `SHA256SUMS.txt` and per-artifact `.sha256` files.
 
-The installer scripts require Node.js 20 or newer, install the bundled package globally, and run `s-gw setup`. They do not contain credentials or pre-seeded unlock material. The macOS DMG is not ready for public distribution until Developer ID signing and notarization are added. The Windows ZIP remains a preview until it is validated on Windows and replaced or supplemented by a signed installer format.
+The release build validates the scoped tarball, legacy bridge, and both generated checksum formats before upload. The bridge contains the same versioned code under the old unscoped package identity and is never published to npm. Checksum assets are uploaded first, followed by the bridge as the first `.tgz`, so the original `0.1.0` updater can upgrade in place without the scoped binary collision. That recovery release must be published as a normal, non-prerelease GitHub release because `0.1.0` reads the `/releases/latest` endpoint. Current updaters select the exact `s-gw-VERSION.tgz` asset instead. The installer scripts require Node.js 20 or newer, install the bundled package globally, and run `s-gw setup`. They do not contain credentials or pre-seeded unlock material. The macOS DMG is not ready for public distribution until Developer ID signing and notarization are added. The Windows ZIP remains a preview until it is validated on Windows and replaced or supplemented by a signed installer format.
 
 ## Data Locations
 
@@ -356,24 +357,32 @@ Supported means s-gw has a documented standard MCP stdio path. Profiled means `s
 
 ## Upgrade
 
-All clients check the public `sgateway/s-gw` GitHub Releases feed at most once every six hours. Drafts are ignored; preview releases are included while s-gw is in preview. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The native macOS app also checks hourly while it is open, subject to the six-hour cache, and provides manual checks from Settings or the `Check for Updates` menu command.
+The CLI and local console cache successful responses from the public `sgateway/s-gw` GitHub Releases feed for six hours. Drafts are ignored; preview releases are included while s-gw is in preview. If GitHub's unauthenticated Releases API is rate-limited, clients fall back to the repository's public Atom release feed; the macOS app then checks the deterministic package and checksum URLs before offering an upgrade. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The native macOS checker starts with the app, polls every 15 minutes, and skips the network until six hours after its last successful response. A failed request does not advance that timestamp, so it retries on the next 15-minute poll. The app sends one macOS notification per available version, falls back to its in-app banner when notification permission is unavailable, and provides manual checks from Settings or the `Check for Updates` menu command.
 
-Publish release notes and attach an npm tarball asset such as `s-gw-0.1.1.tgz` with its `.sha256` file. The macOS app can verify and install that package, restart the service/menu helper, and reopen s-gw. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
+The release workflow runs the full verification suite, then builds and uploads the scoped package, legacy bridge, platform installers, `SHA256SUMS.txt`, and per-file `.sha256` assets. It refuses to upload an update package whose identity or checksum cannot be verified. The macOS app accepts either checksum format, installs through the same package migration path as the CLI, refreshes the service/menu helper, and reopens s-gw. The original `0.1.0` app can take the legacy bridge on its next update check; once that fixed app is installed, later releases migrate it to the scoped package automatically. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
 
-Upgrade the npm package:
+Review the update plan, then install it:
 
 ```bash
-npm install -g @s-gw/s-gw@latest
-s-gw unlock status
-s-gw secret list
-s-gw service start
-s-gw menubar start
-s-gw app open
+s-gw update plan
+s-gw update install --dry-run
+s-gw update install
+s-gw setup
 ```
 
-The local ledger and Keychain item should persist across package upgrades.
+Use `--package PATH_OR_SPEC` with `plan` or `install` for a verified local tarball or a specific npm version. The installer checks the target package metadata before changing anything. If the legacy unscoped `s-gw` package is installed, it creates and verifies a temporary local rollback tarball, stops the running surfaces, removes only that legacy package, and then installs `@s-gw/s-gw`. A failed install prints a rollback command that points to the saved local tarball; it never suggests the unpublished `s-gw@0.1.0` registry package.
 
-For an offline upgrade, install the verified `s-gw-VERSION.tgz` asset from the matching GitHub release instead of the registry package.
+If the original `0.1.0` app cannot reach a release containing the legacy bridge, bootstrap that one upgrade with the current scoped CLI without installing it over the old command first:
+
+```bash
+npx --yes --package @s-gw/s-gw@latest s-gw update plan
+npx --yes --package @s-gw/s-gw@latest s-gw update install
+s-gw setup
+```
+
+The update path never removes `~/.s-gw`, the encrypted ledger, or the operating-system credential-store item. `s-gw setup` refreshes service and agent configuration after the package location changes.
+
+For an offline upgrade, verify the downloaded `s-gw-VERSION.tgz` with either checksum asset from the matching GitHub release, then pass its path with `--package`.
 
 ## Uninstall
 

@@ -3,6 +3,7 @@ import type {
   ApprovalAgentScope,
   ApprovalMode,
   ApprovalPolicyDecision,
+  AgentIntegrationMutation,
   ConsoleState,
   RequestRecord
 } from "@/lib/types";
@@ -119,6 +120,20 @@ export function revokeGrant(id: string) {
 
 export function clearGrants() {
   return apiJson("/api/approval/grants", { method: "DELETE" });
+}
+
+export function installAgentIntegration(agentId: string) {
+  return apiJson<AgentIntegrationMutation>(`/api/agents/${encodeURIComponent(agentId)}/install`, {
+    method: "POST",
+    body: {}
+  });
+}
+
+export function uninstallAgentIntegration(agentId: string) {
+  return apiJson<AgentIntegrationMutation>(`/api/agents/${encodeURIComponent(agentId)}/uninstall`, {
+    method: "POST",
+    body: {}
+  });
 }
 
 export function auditCsvUrl(): string {

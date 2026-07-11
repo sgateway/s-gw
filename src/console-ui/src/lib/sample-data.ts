@@ -464,6 +464,16 @@ function sampleAgent(id: string, name: string, format: string, configPath: strin
     name,
     status,
     aliases: [],
+    integration: {
+      agentId: id,
+      displayName: name,
+      detected: true,
+      eligible: status !== "manual",
+      state: status === "manual" ? "manual" : "installed",
+      mcp: { state: status === "manual" ? "unsupported" : "installed", owned: status !== "manual", path: configPath },
+      skill: { state: status === "manual" ? "unsupported" : "installed", owned: status !== "manual" },
+      plannedChanges: []
+    },
     mcp: {
       supported: status !== "manual",
       format,

@@ -25,7 +25,7 @@ struct AgentsView: View {
         VStack(alignment: .leading, spacing: 3) {
           Text("Agent Catalog")
             .font(.title3.weight(.semibold))
-          Text("MCP profiles and guard-mode launch targets.")
+          Text("Detected MCP connections, skills, and guard-mode launch targets.")
             .font(.caption)
             .foregroundStyle(.secondary)
         }
@@ -36,8 +36,8 @@ struct AgentsView: View {
       .padding([.horizontal, .top], 18)
 
       HStack(spacing: 10) {
-        miniMetric("Supported", count: appState.agents.filter { $0.status == "supported" }.count, color: SGWTheme.green)
-        miniMetric("Manual", count: appState.agents.filter { $0.status != "supported" }.count, color: SGWTheme.orange)
+        miniMetric("Connected", count: appState.agents.filter { $0.mcpConnected }.count, color: SGWTheme.green)
+        miniMetric("Needs setup", count: appState.agents.filter { !$0.mcpConnected }.count, color: SGWTheme.orange)
       }
       .padding(.horizontal, 18)
 
@@ -65,8 +65,8 @@ struct AgentsView: View {
             VStack(alignment: .leading, spacing: 12) {
               HStack {
                 StatePill(
-                  label: agent.status == "supported" ? "supported" : "profiled/manual",
-                  color: agent.status == "supported" ? SGWTheme.green : SGWTheme.orange
+                  label: agent.connectionState,
+                  color: agent.mcpConnected ? SGWTheme.green : SGWTheme.orange
                 )
                 if let connector = agent.defenseClawConnector, !connector.isEmpty {
                   StatePill(label: connector, color: SGWTheme.purple)
@@ -100,6 +100,22 @@ struct AgentsView: View {
           PanelCard("Actions", systemImage: "bolt") {
             VStack(alignment: .leading, spacing: 10) {
               HStack {
+                if agent.canInstall {
+                  Button {
+                    Task { await appState.installIntegration(for: agent) }
+                  } label: {
+                    Label("Connect", systemImage: "link.badge.plus")
+                  }
+                  .accessibilityIdentifier("agent-install-\(agent.id)")
+                }
+                if agent.hasOwnedIntegration {
+                  Button {
+                    Task { await appState.uninstallIntegration(for: agent) }
+                  } label: {
+                    Label("Disconnect", systemImage: "link.badge.minus")
+                  }
+                  .accessibilityIdentifier("agent-uninstall-\(agent.id)")
+                }
                 Button {
                   appState.copySnippet(for: agent)
                   appState.selectedPanel = .activity
@@ -120,7 +136,7 @@ struct AgentsView: View {
               }
               .controlSize(.small)
 
-              Text("Guard mode tokenizes credential-looking environment values before launching the agent. MCP snippets expose handle/request tools to the agent.")
+              Text(agent.connectionState == "manual" ? "Automatic registration is not safe for this profile. Review and apply the MCP snippet manually." : "s-gw backs up agent config before installing its MCP entry and packaged skill. Guard mode remains available for shell launches.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
@@ -128,9 +144,15 @@ struct AgentsView: View {
 
           PanelCard("Integration readiness", systemImage: "checklist.checked") {
             VStack(alignment: .leading, spacing: 9) {
-              readinessRow("MCP profile", ok: agent.status == "supported", detail: agent.status == "supported" ? "Ready to configure from snippet" : "Profiled, may need manual smoke testing")
+              readinessRow("MCP registration", ok: agent.mcpConnected, detail: agent.integration?.mcp.state ?? "Manual setup")
+              readinessRow("s-gw skill", ok: agent.integration?.skill.state == "installed" || agent.integration?.skill.state == "existing", detail: agent.integration?.skill.state ?? "Not managed")
               readinessRow("Guard launcher", ok: true, detail: "Available with `s-gw guard run \(agent.id)`")
               readinessRow("Approval queue", ok: appState.pendingRequests.isEmpty, detail: appState.pendingRequests.isEmpty ? "No pending agent requests" : "\(appState.pendingRequests.count) pending")
+              if let reason = agent.integration?.reason, !reason.isEmpty {
+                Text(reason)
+                  .font(.caption)
+                  .foregroundStyle(SGWTheme.orange)
+              }
             }
           }
         }
@@ -187,8 +209,8 @@ private struct AgentCatalogRow: View {
 
   var body: some View {
     HStack(spacing: 10) {
-      Image(systemName: agent.status == "supported" ? "checkmark.seal" : "person.crop.circle.badge.questionmark")
-        .foregroundStyle(agent.status == "supported" ? SGWTheme.green : SGWTheme.orange)
+      Image(systemName: agent.mcpConnected ? "checkmark.seal" : "person.crop.circle.badge.questionmark")
+        .foregroundStyle(agent.mcpConnected ? SGWTheme.green : SGWTheme.orange)
         .frame(width: 20)
       VStack(alignment: .leading, spacing: 3) {
         Text(agent.name)

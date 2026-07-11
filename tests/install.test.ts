@@ -42,6 +42,16 @@ describe("customer package layout", () => {
     expect(installSource).not.toContain("pkill");
     expect(appSource).toContain("writeProcessRecord");
     expect(appSource).toContain("s-gw-app.process.json");
+
+    const stopSource = installSource.slice(
+      installSource.indexOf("export function stopMacApp"),
+      installSource.indexOf("export function stopWindowsSurfaces")
+    );
+    expect(stopSource).toContain("runningApplicationsWithBundleIdentifier");
+    expect(stopSource).toContain("com.s-gw.sgw.app");
+    expect(stopSource).toContain("pids.push(Number(app.processIdentifier))");
+    expect(stopSource).not.toContain("valueForKey");
+    expect(stopSource).not.toContain("macAppBinaryPath");
   });
 
   it("reports install health without exposing unlock passphrases", () => {

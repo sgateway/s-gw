@@ -1,14 +1,18 @@
 import AppKit
 import Darwin
 import SwiftUI
+import UserNotifications
 
 @main
 struct SgwApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-  @State private var appState = AppState()
+  @State private var appState: AppState
   @AppStorage("showDockIcon") private var showDockIcon = true
 
   init() {
+    let state = AppState()
+    _appState = State(initialValue: state)
+
     let launchGuard = SgwLaunchGuard.shared
     guard launchGuard.isPrimary else {
       launchGuard.focusPrimaryInstance()
@@ -16,6 +20,7 @@ struct SgwApp: App {
     }
 
     SgwDistributedOpenBridge.shared.start()
+    state.start()
   }
 
   var body: some Scene {
@@ -24,7 +29,6 @@ struct SgwApp: App {
         .environment(appState)
         .frame(minWidth: 980, minHeight: 640)
         .background(OpenMainWindowListener().environment(appState))
-        .onAppear { appState.start() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
           Task {
             await appState.refresh()
@@ -150,7 +154,7 @@ private enum HelperDestination: String {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
   private var windowChromeObserver: NSObjectProtocol?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -158,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       "NSQuitAlwaysKeepsWindows": false,
       "showDockIcon": true
     ])
+    UNUserNotificationCenter.current().delegate = self
     applyActivationPolicy()
     windowChromeObserver = NotificationCenter.default.addObserver(
       forName: NSWindow.didBecomeKeyNotification,
@@ -194,6 +199,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       Self.openMainWindow()
     }
     return true
+  }
+
+  nonisolated func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    completionHandler([.banner, .list, .sound])
+  }
+
+  nonisolated func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    let releaseURL = response.notification.request.content.userInfo["releaseURL"] as? String
+    completionHandler()
+    Task { @MainActor in
+      _ = Self.openMainWindow()
+      if let releaseURL, let url = URL(string: releaseURL) {
+        NSWorkspace.shared.open(url)
+      }
+    }
   }
 
   func applyActivationPolicy() {

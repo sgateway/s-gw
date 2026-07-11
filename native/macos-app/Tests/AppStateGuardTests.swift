@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import UserNotifications
 
 // Standalone test driver for the native macOS app's AppState.
 //
@@ -27,6 +29,93 @@ private func fail(_ message: String) -> Never {
 
 private func check(_ cond: Bool, _ message: String) {
   if !cond { fail(message) }
+}
+
+private enum FakeUpdateFailure: Error {
+  case offline
+}
+
+private actor FakeUpdateChecker: UpdateChecking {
+  enum Step: Sendable {
+    case failure
+    case release(ReleaseInfo?)
+  }
+
+  private var steps: [Step]
+  private var checks = 0
+
+  init(_ steps: [Step]) {
+    self.steps = steps
+  }
+
+  func latestRelease(repository: String) async throws -> ReleaseInfo? {
+    checks += 1
+    let step = steps.isEmpty ? .release(nil) : steps.removeFirst()
+    switch step {
+    case .failure:
+      throw FakeUpdateFailure.offline
+    case .release(let release):
+      return release
+    }
+  }
+
+  func downloadAndInstall(
+    _ release: ReleaseInfo,
+    progress: @Sendable @escaping (UpdateState) -> Void
+  ) async -> String? {
+    "not used"
+  }
+
+  func checkCount() -> Int { checks }
+}
+
+@MainActor
+private final class FakeNotificationCenter: UpdateNotificationCenterClient {
+  var status: UNAuthorizationStatus
+  var authorizationResult: Bool
+  var authorizationRequests = 0
+  var requests: [UNNotificationRequest] = []
+
+  init(status: UNAuthorizationStatus, authorizationResult: Bool = false) {
+    self.status = status
+    self.authorizationResult = authorizationResult
+  }
+
+  func authorizationStatus() async -> UNAuthorizationStatus { status }
+
+  func requestAuthorization() async -> Bool {
+    authorizationRequests += 1
+    if authorizationResult { status = .authorized }
+    return authorizationResult
+  }
+
+  func add(_ request: UNNotificationRequest) async throws {
+    requests.append(request)
+  }
+}
+
+private func makeRelease(
+  _ version: String,
+  checksumName: String = "SHA256SUMS.txt",
+  installable: Bool = true
+) -> ReleaseInfo {
+  ReleaseInfo(
+    tag: "v\(version)",
+    version: version,
+    assetName: installable ? "s-gw-\(version).tgz" : "",
+    assetURL: installable ? "https://example.test/s-gw-\(version).tgz" : "",
+    checksumAssetName: installable ? checksumName : "",
+    checksumAssetURL: installable ? "https://example.test/\(checksumName)" : "",
+    htmlURL: "https://example.test/releases/v\(version)",
+    notes: ""
+  )
+}
+
+private func isolatedDefaults(_ name: String) -> UserDefaults {
+  let suite = "com.s-gw.tests.\(name).\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suite)!
+  defaults.removePersistentDomain(forName: suite)
+  return defaults
 }
 
 // A throwaway scratch dir for the fake CLI, its invocation log, and the FIFO it
@@ -150,6 +239,12 @@ struct AppStateGuardTests {
     await runGuardReleaseTest(scratch)
     await runReadinessDerivationTest()
     await runCommandOutputCaptureTest()
+    await runUpdateRetryTest()
+    await runIncompleteReleaseRetryTest()
+    await runUpdateNotificationTest()
+    await runDeniedNotificationFallbackTest()
+    runAtomFallbackParsingTest()
+    runChecksumManifestTest()
 
     print("ALL_NATIVE_TESTS_OK")
   }
@@ -260,6 +355,208 @@ struct AppStateGuardTests {
     let activityOutput = app.activity.records.first?.output ?? ""
     check(activityOutput.contains("Command completed successfully"),
           "silent success should get a useful activity message, got: \(activityOutput)")
+  }
+
+  @MainActor
+  static func runUpdateRetryTest() async {
+    let defaults = isolatedDefaults("update-retry")
+    let release = makeRelease("9.0.0")
+    let checker = FakeUpdateChecker([.failure, .release(release)])
+    let center = FakeNotificationCenter(status: .denied)
+    let notifier = UpdateNotifier(center: center, defaults: defaults)
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let app = AppState(
+      updater: checker,
+      updateNotifier: notifier,
+      defaults: defaults,
+      now: { now }
+    )
+
+    await app.checkForUpdates()
+    check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == 0,
+          "a failed fetch must not consume the successful-check interval")
+    check(await checker.checkCount() == 1, "the first update attempt should reach the checker")
+
+    await app.checkForUpdates()
+    check(await checker.checkCount() == 2,
+          "a second check after failure should retry without waiting six hours")
+    check(app.availableUpdate?.version == release.version,
+          "the retry should publish the newly available release")
+    check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == now.timeIntervalSince1970,
+          "the successful retry should persist its timestamp")
+  }
+
+  @MainActor
+  static func runIncompleteReleaseRetryTest() async {
+    let defaults = isolatedDefaults("update-assets-pending")
+    let incomplete = makeRelease("9.0.1", installable: false)
+    let complete = makeRelease("9.0.1")
+    let checker = FakeUpdateChecker([.release(incomplete), .release(complete)])
+    let center = FakeNotificationCenter(status: .authorized)
+    let notifier = UpdateNotifier(center: center, defaults: defaults)
+    let now = Date(timeIntervalSince1970: 1_800_000_100)
+    defaults.set(now.timeIntervalSince1970 - 60 * 60, forKey: UpdateChecker.lastCheckDefaultsKey)
+    let app = AppState(
+      updater: checker,
+      updateNotifier: notifier,
+      defaults: defaults,
+      now: { now }
+    )
+
+    await app.checkForUpdates(force: true)
+    check(app.availableUpdate == incomplete, "the published release should remain visible while assets upload")
+    check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == 0,
+          "a release missing its verified package must not consume the six-hour interval")
+    check(center.requests.isEmpty, "an incomplete release should not notify before it can be installed")
+
+    await app.checkForUpdates()
+    check(await checker.checkCount() == 2,
+          "an incomplete release should retry on the next polling cycle")
+    check(app.availableUpdate == complete, "the retry should pick up the completed release assets")
+    check(center.requests.count == 1, "the completed release should send exactly one notification")
+    check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == now.timeIntervalSince1970,
+          "the completed release should start the successful-check interval")
+  }
+
+  @MainActor
+  static func runUpdateNotificationTest() async {
+    let defaults = isolatedDefaults("update-notification")
+    let release = makeRelease("9.1.0")
+    let center = FakeNotificationCenter(status: .notDetermined, authorizationResult: true)
+    let notifier = UpdateNotifier(center: center, defaults: defaults)
+
+    let first = await notifier.notifyIfNeeded(for: release)
+    let second = await notifier.notifyIfNeeded(for: release)
+    check(first == .systemDelivered, "the first sighting of a version should send a system notification")
+    check(second == .alreadyDelivered, "the same version should not notify twice in one process")
+    check(center.requests.count == 1, "exactly one notification request expected for a version")
+    check(center.authorizationRequests == 1,
+          "notification permission should be requested only when an update first needs it")
+    check(center.requests.first?.identifier == "s-gw-update-9.1.0",
+          "the notification identifier should be stable per version")
+    check(defaults.string(forKey: UpdateNotifier.notifiedVersionDefaultsKey) == release.version,
+          "the notified version should be persisted")
+
+    let afterRestartCenter = FakeNotificationCenter(status: .authorized)
+    let afterRestart = UpdateNotifier(center: afterRestartCenter, defaults: defaults)
+    let persisted = await afterRestart.notifyIfNeeded(for: release)
+    check(persisted == .alreadyDelivered,
+          "the persisted version should suppress a duplicate after restart")
+    check(afterRestartCenter.requests.isEmpty,
+          "restart suppression should happen before notification delivery")
+
+    let next = await afterRestart.notifyIfNeeded(for: makeRelease("9.2.0"))
+    check(next == .systemDelivered, "a later version should produce a new notification")
+    check(afterRestartCenter.requests.count == 1,
+          "the later version should add exactly one new request")
+    let olderAgain = await afterRestart.notifyIfNeeded(for: release)
+    check(olderAgain == .alreadyDelivered,
+          "a version must stay deduplicated after another version was delivered")
+    check(afterRestartCenter.requests.count == 1,
+          "returning to an older release must not enqueue a duplicate")
+  }
+
+  @MainActor
+  static func runDeniedNotificationFallbackTest() async {
+    let defaults = isolatedDefaults("update-denied")
+    let release = makeRelease("9.3.0")
+    let checker = FakeUpdateChecker([.release(release)])
+    let center = FakeNotificationCenter(status: .denied)
+    let notifier = UpdateNotifier(center: center, defaults: defaults)
+    let app = AppState(updater: checker, updateNotifier: notifier, defaults: defaults)
+
+    await app.checkForUpdates()
+    check(app.availableUpdate == release, "denied notification permission must not hide the update banner")
+    check(!app.updateBannerDismissed, "the in-app update banner should start visible")
+    check(app.updateUsesInAppFallback, "the banner should identify itself as the notification fallback")
+    check(center.requests.isEmpty, "denied permission should not enqueue a system notification")
+    check(defaults.string(forKey: UpdateNotifier.notifiedVersionDefaultsKey) == nil,
+          "a denied notification must not be recorded as delivered")
+  }
+
+  static func runChecksumManifestTest() {
+    let asset = "s-gw-9.4.0.tgz"
+    let manifest = "SHA256SUMS.txt"
+    check(UpdateChecker.packageAssetName(
+      for: "v9.4.0",
+      assetNames: ["unrelated.tgz", asset]
+    ) == asset, "release selection should bind the package name to the release version")
+    check(UpdateChecker.packageAssetName(
+      for: "9.4.0",
+      assetNames: ["unrelated.tgz"]
+    ) == nil, "an unrelated tarball must not be selected for installation")
+    check(UpdateChecker.checksumAssetName(for: asset, assetNames: [manifest]) == manifest,
+          "SHA256SUMS.txt should be accepted when no per-file checksum is present")
+    check(UpdateChecker.checksumAssetName(for: asset, assetNames: ["SHA256SUMS"]) == "SHA256SUMS",
+          "the extensionless SHA256SUMS form should also be accepted")
+    check(UpdateChecker.checksumAssetName(
+      for: asset,
+      assetNames: [manifest, "\(asset).sha256"]
+    ) == "\(asset).sha256", "a matching per-file checksum should be preferred")
+    check(UpdateChecker.checksumAssetName(
+      for: asset,
+      assetNames: ["some-other-package.tgz.sha256"]
+    ) == nil, "an unrelated per-file checksum must not authorize this package")
+
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("sgw-checksum-\(UUID().uuidString).tgz")
+    let data = Data("verified package".utf8)
+    try! data.write(to: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+
+    do {
+      try UpdateChecker.verifyChecksum(
+        for: file,
+        assetName: asset,
+        checksumAssetName: manifest,
+        checksumText: "\(digest)  \(asset)\n"
+      )
+    } catch {
+      fail("the manifest entry matching the package should verify: \(error)")
+    }
+
+    do {
+      try UpdateChecker.verifyChecksum(
+        for: file,
+        assetName: asset,
+        checksumAssetName: manifest,
+        checksumText: "\(digest)  prefixed-\(asset)\n"
+      )
+      fail("a checksum for a different package name must not verify")
+    } catch {}
+
+    do {
+      try UpdateChecker.verifyChecksum(
+        for: file,
+        assetName: asset,
+        checksumAssetName: "\(asset).sha256",
+        checksumText: "\(digest)\n"
+      )
+    } catch {
+      fail("a raw digest should remain valid in an exact per-file checksum: \(error)")
+    }
+  }
+
+  static func runAtomFallbackParsingTest() {
+    let xml = """
+    <?xml version="1.0"?>
+    <feed>
+      <entry>
+        <id>tag:github.com,2008:Repository/1/v9.3.1</id>
+        <updated>2026-07-11T12:00:00Z</updated>
+        <link rel="alternate" type="text/html" href="https://github.com/sgateway/s-gw/releases/tag/v9.3.1"/>
+        <title>s-gw 9.3.1</title>
+      </entry>
+    </feed>
+    """
+    guard let release = UpdateChecker.releaseFromAtom(xml, repository: "sgateway/s-gw") else {
+      fail("the GitHub Atom fallback should parse the newest release entry")
+    }
+    check(release.version == "9.3.1", "Atom fallback should parse the release version")
+    check(release.assetName == "s-gw-9.3.1.tgz", "Atom fallback should bind the exact package name")
+    check(release.checksumAssetName == "s-gw-9.3.1.tgz.sha256",
+          "Atom fallback should prefer the exact per-file checksum")
   }
 
   static func statusPayload(ready: Bool, summary: String, blockers: [String],

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -88,7 +88,15 @@ describeBrowser("React local console (real headless Chrome)", () => {
   }, 45_000);
 
   it("opens actionable agent configuration and copies the MCP snippet", async () => {
-    running = await startConsoleServer({ port: 0 });
+    const binDir = path.join(tmpHome, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const codexPath = path.join(binDir, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(codexPath, 0o755);
+    const mcpPath = path.join(binDir, "s-gw-mcp");
+    writeFileSync(mcpPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(mcpPath, 0o755);
+    running = await startConsoleServer({ port: 0, agentHomeDir: tmpHome, agentPathEnv: binDir });
     const launched = await launchChrome(new URL("agents", running.url).toString());
     cdp = launched.cdp;
 
@@ -116,6 +124,22 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(detailText).toContain("[mcp_servers.s-gw]");
     expect(detailText).toContain("s-gw run codex");
     expect(detailText).toContain("CodeGuard integration");
+    expect(detailText).toContain("Connect");
+    await cdp.eval('document.querySelector(\'[data-agent-install="codex"]\').click()');
+    await waitFor(async () => {
+      const state = await api<{ agents: Array<{ id: string; integration: { state: string } }> }>("api/state");
+      return state.agents.find((agent) => agent.id === "codex")?.integration.state === "installed";
+    }, "Codex managed installation");
+    await waitFor(
+      () => cdp!.eval<boolean>('!document.querySelector(\'[data-agent-detail="codex"]\')'),
+      "Codex sheet closes after install"
+    );
+    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: actionPoint.x, y: actionPoint.y, button: "left", clickCount: 1 });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: actionPoint.x, y: actionPoint.y, button: "left", clickCount: 1 });
+    await waitFor(
+      () => cdp!.eval<boolean>('Boolean(document.querySelector(\'[data-agent-uninstall="codex"]\'))'),
+      "Codex managed uninstall action"
+    );
     await cdp.eval(`(() => {
       Object.defineProperty(navigator, 'clipboard', {
         configurable: true,

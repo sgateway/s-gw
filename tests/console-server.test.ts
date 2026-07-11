@@ -1,3 +1,4 @@
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -70,6 +71,56 @@ describe("local console server", () => {
     expect(codex.codeGuard.supported).toBe(true);
     expect(omnigent.mcp.supported).toBe(false);
     expect(omnigent.mcp.snippet).toBeNull();
+  });
+
+  it("installs and uninstalls a detected agent through the console API", async () => {
+    const binDir = path.join(tmpHome, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const commandPath = path.join(binDir, process.platform === "win32" ? "codex.cmd" : "codex");
+    writeFileSync(commandPath, process.platform === "win32" ? "@exit /b 0\r\n" : "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    if (process.platform !== "win32") chmodSync(commandPath, 0o755);
+    const mcpPath = path.join(binDir, process.platform === "win32" ? "s-gw-mcp.cmd" : "s-gw-mcp");
+    writeFileSync(mcpPath, process.platform === "win32" ? "@exit /b 0\r\n" : "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    if (process.platform !== "win32") chmodSync(mcpPath, 0o755);
+
+    running = await startConsoleServer({ port: 0, agentHomeDir: tmpHome, agentPathEnv: binDir });
+    const before = await fetchJson("api/state");
+    expect(before.metrics.activeAgents).toBe(0);
+    expect(before.agents.find((agent: { id: string }) => agent.id === "codex").integration).toMatchObject({
+      detected: true,
+      state: "available"
+    });
+
+    const connected = await fetchJson("api/agents/codex/install", { method: "POST", body: {} });
+    expect(connected.result).toMatchObject({ state: "installed", changed: true });
+    const configPath = path.join(tmpHome, ".codex", "config.toml");
+    expect(readFileSync(configPath, "utf8")).toContain("[mcp_servers.s-gw]");
+    expect(existsSync(path.join(tmpHome, ".codex", "skills", "s-gw", "SKILL.md"))).toBe(true);
+
+    const after = await fetchJson("api/state");
+    expect(after.metrics.activeAgents).toBe(1);
+    expect(after.agents.find((agent: { id: string }) => agent.id === "codex").integration.state).toBe("installed");
+
+    const disconnected = await fetchJson("api/agents/codex/uninstall", { method: "POST", body: {} });
+    expect(disconnected.result.changed).toBe(true);
+    expect(readFileSync(configPath, "utf8")).not.toContain("mcp_servers.s-gw");
+  });
+
+  it("keeps the console available when agent ownership metadata is malformed", async () => {
+    const manifestPath = path.join(tmpHome, ".s-gw", "agent-integrations.json");
+    mkdirSync(path.dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, "{ not valid json");
+
+    running = await startConsoleServer({ port: 0, agentHomeDir: tmpHome });
+    const state = await fetchJson("api/state");
+    expect(state.ready).toBeTypeOf("boolean");
+    expect(state.agents.find((agent: { id: string }) => agent.id === "codex").integration).toMatchObject({
+      state: "conflict"
+    });
+
+    const result = await fetchJson("api/agents/codex/install", { method: "POST", body: {} });
+    expect(result.result).toMatchObject({ state: "conflict", changed: false });
+    expect(readFileSync(manifestPath, "utf8")).toBe("{ not valid json");
   });
 
   it("publishes an available release to console clients", async () => {

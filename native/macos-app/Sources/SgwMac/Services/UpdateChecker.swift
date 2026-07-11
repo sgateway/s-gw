@@ -33,7 +33,6 @@ enum UpdateState: Equatable {
             return false
         }
     }
-
     var label: String {
         switch self {
         case .idle:
@@ -50,13 +49,22 @@ enum UpdateState: Equatable {
     }
 }
 
-actor UpdateChecker {
+protocol UpdateChecking: Sendable {
+    func latestRelease(repository: String) async throws -> ReleaseInfo?
+    func downloadAndInstall(
+        _ release: ReleaseInfo,
+        progress: @Sendable @escaping (UpdateState) -> Void
+    ) async -> String?
+}
+
+actor UpdateChecker: UpdateChecking {
     static let defaultRepository = "sgateway/s-gw"
     static let repositoryDefaultsKey = "updateRepository"
     static let lastCheckDefaultsKey = "lastUpdateCheckAt"
+    private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.2"
     }
 
     static func isNewer(_ candidate: String, than current: String) -> Bool {
@@ -74,12 +82,14 @@ actor UpdateChecker {
         return false
     }
 
-    func latestRelease(repository: String) async -> ReleaseInfo? {
+    func latestRelease(repository: String) async throws -> ReleaseInfo? {
         let trimmed = repository.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.contains("/") else { return nil }
+        guard !trimmed.isEmpty, trimmed.contains("/") else {
+            throw UpdateError.invalidRepository
+        }
 
         guard let url = URL(string: "https://api.github.com/repos/\(trimmed)/releases?per_page=20") else {
-            return nil
+            throw UpdateError.invalidRepository
         }
 
         var request = URLRequest(url: url)
@@ -90,9 +100,8 @@ actor UpdateChecker {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                return nil
+                throw UpdateError.releaseCheckFailed
             }
-
             let releases = try JSONDecoder().decode([GitHubRelease].self, from: data)
             guard let release = releases
                 .filter({ !$0.draft })
@@ -102,8 +111,123 @@ actor UpdateChecker {
             }
             return releaseInfo(from: release)
         } catch {
+            return try await latestReleaseFromAtom(repository: trimmed)
+        }
+    }
+
+    private func latestReleaseFromAtom(repository: String) async throws -> ReleaseInfo? {
+        guard let feedURL = URL(string: "https://github.com/\(repository)/releases.atom") else {
+            throw UpdateError.invalidRepository
+        }
+        var request = URLRequest(url: feedURL)
+        request.timeoutInterval = 20
+        request.setValue("application/atom+xml", forHTTPHeaderField: "Accept")
+        request.setValue("s-gw-updater", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw UpdateError.releaseCheckFailed
+        }
+        guard let parsed = Self.releaseFromAtom(String(decoding: data, as: UTF8.self), repository: repository) else {
+            throw UpdateError.invalidReleaseFeed
+        }
+        if !Self.isNewer(parsed.version, than: Self.currentVersion) {
+            return parsed
+        }
+
+        guard let packageURL = URL(string: parsed.assetURL), await assetExists(packageURL) else {
+            return Self.withoutInstallAssets(parsed)
+        }
+        if let checksumURL = URL(string: parsed.checksumAssetURL), await assetExists(checksumURL) {
+            return parsed
+        }
+
+        let manifestName = "SHA256SUMS.txt"
+        let manifestURLText = "https://github.com/\(repository)/releases/download/\(parsed.tag)/\(manifestName)"
+        if let manifestURL = URL(string: manifestURLText), await assetExists(manifestURL) {
+            return ReleaseInfo(
+                tag: parsed.tag,
+                version: parsed.version,
+                assetName: parsed.assetName,
+                assetURL: parsed.assetURL,
+                checksumAssetName: manifestName,
+                checksumAssetURL: manifestURLText,
+                htmlURL: parsed.htmlURL,
+                notes: parsed.notes
+            )
+        }
+        return Self.withoutInstallAssets(parsed)
+    }
+
+    private func assetExists(_ url: URL) async -> Bool {
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        request.setValue("s-gw-updater", forHTTPHeaderField: "User-Agent")
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            return (200..<300).contains(http.statusCode)
+        } catch {
+            return false
+        }
+    }
+
+    static func releaseFromAtom(_ xml: String, repository: String) -> ReleaseInfo? {
+        guard let entry = firstCapture(#"<entry>([\s\S]*?)</entry>"#, in: xml) else { return nil }
+        let link = firstCapture(#"<link\b[^>]*\brel="alternate"[^>]*\bhref="([^"]+)""#, in: entry)
+            .map(decodeXML)
+        let id = firstCapture(#"<id>([^<]+)</id>"#, in: entry).map(decodeXML)
+        let tag = link.flatMap { URL(string: $0)?.lastPathComponent.removingPercentEncoding }
+            ?? id?.split(separator: "/").last.map(String.init)
+            ?? ""
+        let version = parseVersion(tag)
+        guard !tag.isEmpty, !version.isEmpty else { return nil }
+
+        let packageName = "s-gw-\(version).tgz"
+        let downloadBase = "https://github.com/\(repository)/releases/download/\(tag)"
+        return ReleaseInfo(
+            tag: tag,
+            version: version,
+            assetName: packageName,
+            assetURL: "\(downloadBase)/\(packageName)",
+            checksumAssetName: "\(packageName).sha256",
+            checksumAssetURL: "\(downloadBase)/\(packageName).sha256",
+            htmlURL: link ?? "https://github.com/\(repository)/releases/tag/\(tag)",
+            notes: ""
+        )
+    }
+
+    private static func withoutInstallAssets(_ release: ReleaseInfo) -> ReleaseInfo {
+        ReleaseInfo(
+            tag: release.tag,
+            version: release.version,
+            assetName: "",
+            assetURL: "",
+            checksumAssetName: "",
+            checksumAssetURL: "",
+            htmlURL: release.htmlURL,
+            notes: release.notes
+        )
+    }
+
+    private static func firstCapture(_ pattern: String, in text: String) -> String? {
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: text) else {
             return nil
         }
+        return String(text[range])
+    }
+
+    private static func decodeXML(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
     }
 
     func downloadAndInstall(_ release: ReleaseInfo, progress: @Sendable @escaping (UpdateState) -> Void) async -> String? {
@@ -118,16 +242,24 @@ actor UpdateChecker {
 
         do {
             let downloadURL = try await downloadAsset(assetURL, named: release.assetName)
+            defer { try? FileManager.default.removeItem(at: downloadURL) }
             let checksumText = try await downloadTextAsset(checksumURL)
-            try verifyChecksum(for: downloadURL, assetName: release.assetName, checksumText: checksumText)
+            try Self.verifyChecksum(
+                for: downloadURL,
+                assetName: release.assetName,
+                checksumAssetName: release.checksumAssetName,
+                checksumText: checksumText
+            )
             progress(.installing)
 
-            let result = try await Self.runProcess(Self.npmCommand(), ["install", "-g", downloadURL.path])
-            if result.exitCode != 0 {
-                return result.output.isEmpty ? "npm install failed." : result.output
+            let result = await cli.run(arguments: [
+                "update", "install", "--package", downloadURL.path, "--keep-app-running"
+            ])
+            if !result.succeeded {
+                return result.output.isEmpty ? "s-gw update install failed." : result.output
             }
 
-            relaunchInstalledApp()
+            relaunchInstalledApp(cliPath: Self.installedCLIPath(from: result.output))
             return nil
         } catch {
             return error.localizedDescription
@@ -138,10 +270,12 @@ actor UpdateChecker {
         let version = Self.parseVersion(release.tagName)
         guard !version.isEmpty else { return nil }
 
-        let preferredAsset = release.assets.first { asset in
-            asset.name.lowercased().hasSuffix(".tgz")
-        } ?? release.assets.first { asset in
-            asset.name.lowercased().contains("s-gw")
+        let preferredName = Self.packageAssetName(
+            for: version,
+            assetNames: release.assets.map(\.name)
+        )
+        let preferredAsset = preferredName.flatMap { name in
+            release.assets.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
         }
         let checksumAsset = checksumAsset(for: preferredAsset, in: release.assets)
 
@@ -158,16 +292,12 @@ actor UpdateChecker {
     }
 
     private func checksumAsset(for package: GitHubAsset?, in assets: [GitHubAsset]) -> GitHubAsset? {
-        guard let package else {
-            return assets.first { $0.name.lowercased().hasSuffix(".sha256") }
-        }
-
-        let packageName = package.name.lowercased()
-        let packageBase = (packageName as NSString).deletingPathExtension
-        return assets.first { asset in
-            let name = asset.name.lowercased()
-            return name == "\(packageName).sha256" || name == "\(packageBase).sha256"
-        } ?? assets.first { $0.name.lowercased().hasSuffix(".sha256") }
+        guard let package else { return nil }
+        guard let name = Self.checksumAssetName(
+            for: package.name,
+            assetNames: assets.map(\.name)
+        ) else { return nil }
+        return assets.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
     }
 
     private func downloadAsset(_ url: URL, named assetName: String) async throws -> URL {
@@ -196,8 +326,39 @@ actor UpdateChecker {
         return String(decoding: data, as: UTF8.self)
     }
 
-    private func verifyChecksum(for fileURL: URL, assetName: String, checksumText: String) throws {
-        guard let expected = expectedSHA256(from: checksumText, assetName: assetName) else {
+    static func checksumAssetName(for packageName: String, assetNames: [String]) -> String? {
+        let lowerPackage = packageName.lowercased()
+        let packageBase = (lowerPackage as NSString).deletingPathExtension
+        let exactNames = ["\(lowerPackage).sha256", "\(packageBase).sha256"]
+
+        for expected in exactNames {
+            if let match = assetNames.first(where: { $0.lowercased() == expected }) {
+                return match
+            }
+        }
+
+        return assetNames.first {
+            let name = $0.lowercased()
+            return name == "sha256sums.txt" || name == "sha256sums"
+        }
+    }
+
+    static func packageAssetName(for version: String, assetNames: [String]) -> String? {
+        let expected = "s-gw-\(parseVersion(version)).tgz"
+        return assetNames.first { $0.caseInsensitiveCompare(expected) == .orderedSame }
+    }
+
+    static func verifyChecksum(
+        for fileURL: URL,
+        assetName: String,
+        checksumAssetName: String,
+        checksumText: String
+    ) throws {
+        guard let expected = expectedSHA256(
+            from: checksumText,
+            assetName: assetName,
+            checksumAssetName: checksumAssetName
+        ) else {
             throw UpdateError.missingChecksum
         }
 
@@ -208,31 +369,70 @@ actor UpdateChecker {
         }
     }
 
-    private func expectedSHA256(from text: String, assetName: String) -> String? {
-        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
-        let preferred = lines.first { $0.contains(assetName) }
-        let candidates = preferred.map { [$0] } ?? lines
-        for line in candidates {
-            for part in line.split(whereSeparator: \.isWhitespace) {
-                if part.count == 64 && part.allSatisfy({ $0.isHexDigit }) {
-                    return String(part)
-                }
+    static func expectedSHA256(
+        from text: String,
+        assetName: String,
+        checksumAssetName: String
+    ) -> String? {
+        let perFileChecksum = checksumAssetName.lowercased().hasSuffix(".sha256")
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let entry = parseChecksumLine(line), entry.fileName == assetName {
+                return entry.digest
+            }
+
+            if perFileChecksum, isSHA256(line) {
+                return line
             }
         }
         return nil
     }
 
-    private func relaunchInstalledApp() {
+    private static func parseChecksumLine(_ line: String) -> (digest: String, fileName: String)? {
+        if line.hasPrefix("SHA256 (") || line.hasPrefix("SHA256(") {
+            guard let close = line.firstIndex(of: ")"),
+                  let equals = line[close...].firstIndex(of: "=") else { return nil }
+            let open = line.firstIndex(of: "(")!
+            let nameStart = line.index(after: open)
+            let digestStart = line.index(after: equals)
+            let fileName = String(line[nameStart..<close])
+            let digest = line[digestStart...].trimmingCharacters(in: .whitespaces)
+            return isSHA256(digest) ? (digest, fileName) : nil
+        }
+
+        let fields = line.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+        guard fields.count == 2 else { return nil }
+        let digest = String(fields[0])
+        guard isSHA256(digest) else { return nil }
+
+        var fileName = String(fields[1]).trimmingCharacters(in: .whitespaces)
+        if fileName.hasPrefix("*") { fileName.removeFirst() }
+        if fileName.hasPrefix("./") { fileName.removeFirst(2) }
+        return (digest, fileName)
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy(\.isHexDigit)
+    }
+
+    private func relaunchInstalledApp(cliPath: String?) {
         let script = """
         sleep 1
-        /usr/bin/env s-gw service start >/dev/null 2>&1 || true
-        /usr/bin/env s-gw menubar install --start --count pending >/dev/null 2>&1 || true
-        /usr/bin/env s-gw app open >/dev/null 2>&1 || true
+        if [ -n "$SGW_UPDATE_CLI" ] && [ -x "$SGW_UPDATE_CLI" ]; then
+          "$SGW_UPDATE_CLI" setup --no-open-app >/dev/null 2>&1 || true
+          "$SGW_UPDATE_CLI" app open >/dev/null 2>&1 || true
+        else
+          PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw setup --no-open-app >/dev/null 2>&1 || true
+          PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw app open >/dev/null 2>&1 || true
+        fi
         """
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", script]
+        var environment = ProcessInfo.processInfo.environment
+        environment["SGW_UPDATE_CLI"] = cliPath ?? ""
+        process.environment = environment
         try? process.run()
 
         Task { @MainActor in
@@ -257,45 +457,17 @@ actor UpdateChecker {
             }
     }
 
-    private static func npmCommand() -> String {
-        let candidates = [
-            "/opt/homebrew/bin/npm",
-            "/usr/local/bin/npm",
-            "/usr/bin/npm"
-        ]
-
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return path
+    private static func installedCLIPath(from output: String) -> String? {
+        guard let data = output.data(using: .utf8),
+              let result = try? JSONDecoder().decode(PackageUpdateCommandResult.self, from: data) else {
+            return nil
         }
-
-        return "/usr/bin/env"
+        let path = URL(fileURLWithPath: result.installed.binDir)
+            .appendingPathComponent("s-gw")
+            .path
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
     }
 
-    private static func runProcess(_ executable: String, _ arguments: [String]) async throws -> ProcessResult {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = executable == "/usr/bin/env" ? ["npm"] + arguments : arguments
-
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: error)
-                return
-            }
-
-            DispatchQueue.global(qos: .utility).async {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: ProcessResult(exitCode: process.terminationStatus, output: output))
-            }
-        }
-    }
 }
 
 private struct GitHubRelease: Decodable {
@@ -324,22 +496,34 @@ private struct GitHubAsset: Decodable {
     }
 }
 
-private struct ProcessResult {
-    let exitCode: Int32
-    let output: String
+private struct PackageUpdateCommandResult: Decodable {
+    struct Installed: Decodable {
+        let binDir: String
+    }
+
+    let installed: Installed
 }
 
 private enum UpdateError: LocalizedError {
+    case invalidRepository
+    case releaseCheckFailed
+    case invalidReleaseFeed
     case downloadFailed
     case missingChecksum
     case checksumMismatch
 
     var errorDescription: String? {
         switch self {
+        case .invalidRepository:
+            return "The update repository must use owner/repo format."
+        case .releaseCheckFailed:
+            return "Could not check the GitHub release feed."
+        case .invalidReleaseFeed:
+            return "GitHub returned an invalid release feed."
         case .downloadFailed:
             return "Could not download the update asset."
         case .missingChecksum:
-            return "The release checksum file does not contain a SHA-256 digest."
+            return "The release checksum file does not contain a SHA-256 digest for this package."
         case .checksumMismatch:
             return "The downloaded package did not match the release checksum."
         }

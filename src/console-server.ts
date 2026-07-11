@@ -5,6 +5,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  agentIntegrationStatus,
+  installAgentIntegrations,
+  uninstallAgentIntegrations,
+  type AgentIntegrationOptions
+} from "./agent-install.js";
 import { executeApprovedRequest } from "./executor.js";
 import { requestAgentName } from "./agent-context.js";
 import {
@@ -44,6 +50,9 @@ export interface ConsoleServerOptions {
   token?: string;
   uiDir?: string;
   updateChecker?: Pick<ReleaseChecker, "check" | "current">;
+  agentHomeDir?: string;
+  agentPathEnv?: string;
+  agentSkillSourcePath?: string;
 }
 
 export interface RunningConsoleServer {
@@ -131,6 +140,11 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   const store = options.store || new SecretStore();
   const uiDir = options.uiDir || defaultUiDir();
   const updateChecker = options.updateChecker || new ReleaseChecker();
+  const agentOptions: AgentIntegrationOptions = {
+    homeDir: options.agentHomeDir,
+    pathEnv: options.agentPathEnv,
+    skillSourcePath: options.agentSkillSourcePath
+  };
 
   await store.init();
   void updateChecker.check();
@@ -138,7 +152,7 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   updateTimer.unref();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, store, token, uiDir, updateChecker).catch((error) => {
+    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions).catch((error) => {
       sendError(res, error);
     });
   });
@@ -182,7 +196,8 @@ async function handleRequest(
   store: SecretStore,
   token: string,
   uiDir: string,
-  updateChecker: Pick<ReleaseChecker, "check" | "current">
+  updateChecker: Pick<ReleaseChecker, "check" | "current">,
+  agentOptions: AgentIntegrationOptions
 ): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (url.pathname.startsWith("/api/")) {
@@ -190,7 +205,7 @@ async function handleRequest(
       throw new HttpError(403, "Missing or invalid local console token.");
     }
 
-    await handleApi(req, res, url, store, updateChecker);
+    await handleApi(req, res, url, store, updateChecker, agentOptions);
     return;
   }
 
@@ -208,7 +223,8 @@ async function handleApi(
   res: ServerResponse,
   url: URL,
   store: SecretStore,
-  updateChecker: Pick<ReleaseChecker, "check" | "current">
+  updateChecker: Pick<ReleaseChecker, "check" | "current">,
+  agentOptions: AgentIntegrationOptions
 ): Promise<void> {
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, { ok: true, name: "s-gw", version });
@@ -216,7 +232,22 @@ async function handleApi(
   }
 
   if (req.method === "GET" && url.pathname === "/api/state") {
-    sendJson(res, 200, await buildState(store, updateChecker.current()));
+    sendJson(res, 200, await buildState(store, updateChecker.current(), agentOptions));
+    return;
+  }
+
+  const agentMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/(install|uninstall)$/);
+  if (req.method === "POST" && agentMatch) {
+    const body = await readJson(req);
+    const options = {
+      ...agentOptions,
+      agentIds: [decodeURIComponent(agentMatch[1])],
+      dryRun: body.dryRun === true
+    };
+    const results = agentMatch[2] === "install"
+      ? installAgentIntegrations(options)
+      : uninstallAgentIntegrations(options);
+    sendJson(res, 200, { ok: results[0]?.state !== "conflict", result: results[0] });
     return;
   }
 
@@ -414,7 +445,7 @@ async function handleApi(
   throw new HttpError(404, "Unknown console API route.");
 }
 
-async function buildState(store: SecretStore, update: UpdateCheckResult | null) {
+async function buildState(store: SecretStore, update: UpdateCheckResult | null, agentOptions: AgentIntegrationOptions) {
   const handles = await store.listHandles();
   const requests = await store.listRequests();
   const audit = await store.auditLog();
@@ -424,6 +455,8 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null) 
   const pending = requests.filter((request) => request.state === "pending");
   const highRisk = handles.filter((handle) => handle.severity === "high" || handle.severity === "critical");
   const agents = listAgentProfiles();
+  const integrations = agentIntegrationStatus(agentOptions);
+  const integrationById = new Map(integrations.map((item) => [item.agentId, item]));
   const unlock = unlockStatus();
   const readiness = readinessForUnlock(unlock.activeSource !== "none");
   const usageFlow = buildUsageFlow(requests, handles);
@@ -441,7 +474,7 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null) 
     metrics: {
       localSecrets: handles.length,
       pendingApprovals: pending.length,
-      activeAgents: agents.length,
+      activeAgents: integrations.filter((item) => item.mcp.state === "installed" || item.mcp.state === "existing").length,
       highRiskFindings: highRisk.length
     },
     handles,
@@ -455,11 +488,13 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null) 
     audit: [...audit].reverse(),
     agents: agents.map((agent) => {
       const profile = resolveAgentProfile(agent.id);
+      const integration = integrationById.get(agent.id);
       return {
         id: agent.id,
         name: agent.displayName,
         status: agent.mcpStatus,
         aliases: profile.aliases,
+        integration,
         mcp: {
           supported: profile.mcp.supported,
           format: profile.mcp.snippet,

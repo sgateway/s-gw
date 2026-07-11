@@ -1,15 +1,15 @@
 import Foundation
 import Observation
 import SwiftUI
-import UserNotifications
 
 @MainActor
 @Observable
 final class AppState {
   let cli = CLIRunner()
   let store = StoreReader()
-  let updater = UpdateChecker()
   let activity = CommandActivityStore()
+  @ObservationIgnored let updater: any UpdateChecking
+  @ObservationIgnored let updateNotifier: UpdateNotifier
 
   var selectedPanel: PanelID = .overview
   var commandPalettePresented = false
@@ -35,16 +35,37 @@ final class AppState {
   var availableUpdate: ReleaseInfo?
   var updateState: UpdateState = .idle
   var updateBannerDismissed = false
-  var updateRepository = savedSgwUpdateRepository() {
+  var updateUsesInAppFallback = false
+  var updateRepository: String {
     didSet {
-      UserDefaults.standard.set(updateRepository, forKey: UpdateChecker.repositoryDefaultsKey)
+      defaults.set(updateRepository, forKey: UpdateChecker.repositoryDefaultsKey)
     }
   }
 
   @ObservationIgnored private var refreshTask: Task<Void, Never>?
   @ObservationIgnored private var updateTask: Task<Void, Never>?
-  @ObservationIgnored private let updateCheckInterval: TimeInterval = 6 * 60 * 60
+  @ObservationIgnored private let defaults: UserDefaults
+  @ObservationIgnored private let now: () -> Date
+  @ObservationIgnored private let updateCheckInterval: TimeInterval
+  @ObservationIgnored private let updateRetryInterval: TimeInterval
   @ObservationIgnored private var seenPendingRequestIds = Set<String>()
+
+  init(
+    updater: any UpdateChecking = UpdateChecker(),
+    updateNotifier: UpdateNotifier? = nil,
+    defaults: UserDefaults = .standard,
+    now: @escaping () -> Date = Date.init,
+    updateCheckInterval: TimeInterval = 6 * 60 * 60,
+    updateRetryInterval: TimeInterval = 15 * 60
+  ) {
+    self.updater = updater
+    self.updateNotifier = updateNotifier ?? UpdateNotifier(defaults: defaults)
+    self.defaults = defaults
+    self.now = now
+    self.updateCheckInterval = updateCheckInterval
+    self.updateRetryInterval = updateRetryInterval
+    updateRepository = savedSgwUpdateRepository(defaults: defaults)
+  }
 
   var pendingRequests: [RequestRecord] {
     requests.filter { $0.state == .pending }
@@ -138,10 +159,10 @@ final class AppState {
     updateTask = Task { [weak self] in
       while !Task.isCancelled {
         await self?.checkForUpdates()
-        try? await Task.sleep(for: .seconds(60 * 60))
+        let retryInterval = self?.updateRetryInterval ?? 15 * 60
+        try? await Task.sleep(for: .seconds(retryInterval))
       }
     }
-    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
   }
 
   func stop() {
@@ -546,6 +567,25 @@ final class AppState {
     }
   }
 
+  func installIntegration(for agent: AgentProfile) async {
+    await runCommand(
+      title: "Connect \(agent.name)",
+      category: "Agents",
+      arguments: ["agent", "install", agent.id],
+      sideEffects: ["Back up and update the agent's local MCP and skill configuration."],
+      suggestedNextAction: "Restart the agent if it is already running."
+    )
+  }
+
+  func uninstallIntegration(for agent: AgentProfile) async {
+    await runCommand(
+      title: "Disconnect \(agent.name)",
+      category: "Agents",
+      arguments: ["agent", "uninstall", agent.id],
+      sideEffects: ["Remove only configuration and skill files owned by s-gw."]
+    )
+  }
+
   @discardableResult
   func runCommand(_ definition: SgwCommandDefinition, refreshAfter: Bool = true) async -> CLIResult {
     await runCommand(
@@ -622,13 +662,25 @@ final class AppState {
     }
 
     updateState = .checking
-    let release = await updater.latestRelease(repository: repo)
-    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
-
-    guard let release else {
+    let release: ReleaseInfo?
+    do {
+      release = try await updater.latestRelease(repository: repo)
+    } catch {
       updateState = force ? .failed("Could not check for updates.") : .idle
       if force {
         operationMessage = "Could not check for updates."
+      }
+      return
+    }
+
+    guard let release else {
+      defaults.set(now().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
+      availableUpdate = nil
+      updateBannerDismissed = false
+      updateUsesInAppFallback = false
+      updateState = .idle
+      if force {
+        operationMessage = "s-gw is up to date"
       }
       return
     }
@@ -638,6 +690,18 @@ final class AppState {
         updateBannerDismissed = false
       }
       availableUpdate = release
+      if !release.canInstallPackage {
+        defaults.removeObject(forKey: UpdateChecker.lastCheckDefaultsKey)
+        updateUsesInAppFallback = false
+        updateState = .idle
+        if force {
+          operationMessage = "s-gw \(release.version) is published; its verified package is still being uploaded"
+        }
+        return
+      }
+      defaults.set(now().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
+      let notificationResult = await updateNotifier.notifyIfNeeded(for: release)
+      updateUsesInAppFallback = notificationResult == .inAppOnly
       updateState = .idle
       if force {
         operationMessage = "s-gw \(release.version) is available"
@@ -645,8 +709,10 @@ final class AppState {
       return
     }
 
+    defaults.set(now().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
     availableUpdate = nil
     updateBannerDismissed = false
+    updateUsesInAppFallback = false
     updateState = .idle
     if force {
       operationMessage = "s-gw is up to date"
@@ -685,11 +751,11 @@ final class AppState {
   }
 
   private func shouldCheckForUpdates() -> Bool {
-    let lastCheck = UserDefaults.standard.double(forKey: UpdateChecker.lastCheckDefaultsKey)
+    let lastCheck = defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey)
     if lastCheck <= 0 {
       return true
     }
-    return Date().timeIntervalSince1970 - lastCheck > updateCheckInterval
+    return now().timeIntervalSince1970 - lastCheck > updateCheckInterval
   }
 
 }
@@ -715,7 +781,7 @@ extension Notification.Name {
   static let sgwOpenMainWindow = Notification.Name("com.s-gw.sgw.openMainWindow")
 }
 
-private func savedSgwUpdateRepository() -> String {
-  let saved = UserDefaults.standard.string(forKey: UpdateChecker.repositoryDefaultsKey)
+private func savedSgwUpdateRepository(defaults: UserDefaults) -> String {
+  let saved = defaults.string(forKey: UpdateChecker.repositoryDefaultsKey)
   return saved ?? UpdateChecker.defaultRepository
 }

@@ -59,6 +59,11 @@ struct MainWindow: View {
         Text("Installed \(UpdateChecker.currentVersion)")
           .font(.caption)
           .foregroundStyle(.secondary)
+        if appState.updateUsesInAppFallback {
+          Text("System notification unavailable. This banner is your update notice.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
       }
       Spacer()
       Button("Release Notes") {

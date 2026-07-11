@@ -4,6 +4,19 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Added
+
+- Safe, idempotent setup for detected agent MCP configurations and the packaged s-gw skill, with dry-run, status, backups, conflict handling, and scoped uninstall.
+- A tested migration path from the legacy unscoped `s-gw` npm package to `@s-gw/s-gw`.
+- A release-only legacy bridge package so the original `0.1.0` desktop updater can install the fixed updater before the scoped-package migration.
+
+### Fixed
+
+- macOS update checks now continue for the app process lifetime, retry failed checks, and deliver one system notification per release.
+- Update checks fall back to GitHub's public Atom feed when the unauthenticated Releases API is rate-limited.
+- The updater accepts both per-file SHA-256 assets and `SHA256SUMS.txt`, and release automation uploads both formats.
+- Native upgrades use the migration-aware installer instead of invoking npm directly.
+
 ## 0.1.1 - 2026-07-10
 
 ### Added

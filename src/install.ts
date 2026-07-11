@@ -246,6 +246,74 @@ export function stopInstalledLaunchAgent(kind: "console" | "menubar"): LaunchAge
   return launchAgentStatus(kind);
 }
 
+export function stopMacApp(): MacAppProcessInfo | undefined {
+  requireMac("macOS app stop");
+  if (process.env.SGW_SKIP_APP_STOP === "1") return undefined;
+
+  const script = [
+    "ObjC.import('AppKit')",
+    "const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier('com.s-gw.sgw.app')",
+    "const pids = []",
+    "for (let i = 0; i < apps.count; i += 1) {",
+    "  const app = apps.objectAtIndex(i)",
+    "  pids.push(Number(app.processIdentifier))",
+    "  app.terminate",
+    "}",
+    "JSON.stringify(pids)"
+  ].join("\n");
+  const result = spawnSync("osascript", ["-l", "JavaScript", "-e", script], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || "Could not close the running s-gw macOS app.");
+  }
+
+  const parsed = JSON.parse(result.stdout.trim() || "[]") as unknown;
+  const pids = Array.isArray(parsed)
+    ? parsed.filter((pid): pid is number => Number.isInteger(pid) && pid > 0)
+    : [];
+  if (pids.length === 0) return undefined;
+  for (const pid of pids) waitForPidToExit(pid);
+  if (pids.some(isPidAlive)) {
+    throw new Error("The s-gw macOS app is still running. Close it and retry the update.");
+  }
+  return {
+    pid: pids[0],
+    source: "process-list",
+    alive: false,
+    bundleIdentifier: "com.s-gw.sgw.app",
+    otherPids: pids.slice(1)
+  };
+}
+
+export function stopWindowsSurfaces(): number[] {
+  requireWindows("Windows surface stop");
+  const script = [
+    "$stopped = @()",
+    "Get-CimInstance Win32_Process | ForEach-Object {",
+    "  $line = [string]$_.CommandLine",
+    "  $helper = $line -match '(?i)s-gw-(helper|client)\\.ps1'",
+    "  $console = $line -match '(?i)[\\\\/]dist[\\\\/]cli\\.js' -and $line -match '(?i)\\sconsole(?:\\s|$)' -and $line -match '(?i)s-gw'",
+    "  if ($_.ProcessId -ne $PID -and ($helper -or $console)) {",
+    "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
+    "    $stopped += [int]$_.ProcessId",
+    "  }",
+    "}",
+    "$stopped | ConvertTo-Json -Compress"
+  ].join("\n");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || "Could not stop the running s-gw Windows surfaces.");
+  }
+  if (!result.stdout.trim()) return [];
+  const parsed = JSON.parse(result.stdout) as number | number[];
+  return (Array.isArray(parsed) ? parsed : [parsed]).filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
 export function launchAgentStatus(kind: "console" | "menubar"): LaunchAgentStatus {
   const label = kind === "console" ? consoleLabel : menuBarLabel;
   const plistPath = launchAgentPath(label);
@@ -522,6 +590,14 @@ function isPidAlive(pid: number): boolean {
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function waitForPidToExit(pid: number): void {
+  const flag = new Int32Array(new SharedArrayBuffer(4));
+  for (let i = 0; i < 40; i += 1) {
+    if (!isPidAlive(pid)) return;
+    Atomics.wait(flag, 0, 0, 50);
   }
 }
 

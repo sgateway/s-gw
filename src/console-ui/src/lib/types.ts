@@ -134,6 +134,7 @@ export interface AgentSummary {
   name: string;
   status: string;
   aliases: string[];
+  integration: AgentIntegrationStatus;
   mcp: {
     supported: boolean;
     format: string;
@@ -160,6 +161,35 @@ export interface AgentSummary {
   };
   snippetCommand: string;
   guardCommand: string;
+}
+
+export interface AgentIntegrationStatus {
+  agentId: string;
+  displayName: string;
+  detected: boolean;
+  eligible: boolean;
+  state: "not-detected" | "manual" | "available" | "partial" | "installed" | "conflict";
+  mcp: AgentIntegrationResource;
+  skill: AgentIntegrationResource;
+  reason?: string;
+  plannedChanges: Array<"mcp" | "skill">;
+}
+
+export interface AgentIntegrationResource {
+  state: "unsupported" | "missing" | "installed" | "existing" | "conflict";
+  path?: string;
+  owned: boolean;
+  message?: string;
+}
+
+export interface AgentIntegrationMutation {
+  ok: boolean;
+  result: AgentIntegrationStatus & {
+    action: "install" | "uninstall";
+    changed: boolean;
+    dryRun: boolean;
+    backups: string[];
+  };
 }
 
 export interface AgentSurfaceSummary {
