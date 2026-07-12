@@ -53,6 +53,9 @@ final class HelperLaunchGuard {
   }
 
   static func lockPath() -> String {
+    if let override = ProcessInfo.processInfo.environment["SGW_MENU_BAR_LOCK_PATH"], !override.isEmpty {
+      return override
+    }
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
       ?? FileManager.default.temporaryDirectory
     let dir = base.appendingPathComponent("s-gw", isDirectory: true)
