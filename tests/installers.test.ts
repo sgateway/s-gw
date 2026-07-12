@@ -18,10 +18,15 @@ describe("platform installers", () => {
     expect(pkg.scripts["build:installers"]).toContain("node scripts/build-installers.mjs");
     expect(pkg.scripts["build:installers"]).toContain("npm run validate:release-assets");
     expect(pkg.scripts["validate:release-assets"]).toBe("node scripts/validate-release-assets.mjs dist/installers");
+    expect(pkg.scripts["validate:npm-package"]).toBe("node scripts/validate-npm-package.mjs");
     expect(pkg.scripts["build:rust-core"]).toBe("node scripts/build-rust-core.mjs");
     expect(pkg.files).toContain("dist");
     expect(pkg.files).toContain("!dist/installers");
+    expect(pkg.files).toContain("!dist/native/s-gw-core");
+    expect(pkg.files).toContain("!dist/native/s-gw-core.exe");
+    expect(pkg.files).toContain("!dist/native/s-gw-keychain-helper");
     expect(pkg.files).toContain("!dist/**/*.map");
+    expect(pkg.scripts.prepublishOnly).toBe("npm run validate:npm-package");
     expect(pkg.files).not.toContain("scripts");
     expect(pkg.files).not.toContain("native/macos-app/Sources");
     expect(pkg.files).not.toContain("native/menu-bar-helper/Sources");
@@ -45,11 +50,23 @@ describe("platform installers", () => {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"]
     });
-    const manifest = JSON.parse(raw)[0] as { files: Array<{ path: string }> };
+    const manifest = JSON.parse(raw)[0] as { files: Array<{ path: string; mode: number }> };
     const files = manifest.files.map((item) => item.path);
-    const coreName = process.platform === "win32" ? "dist/native/s-gw-core.exe" : "dist/native/s-gw-core";
+    const target = `${process.platform}-${process.arch}`;
+    const coreName = process.platform === "win32"
+      ? `dist/native/${target}/s-gw-core.exe`
+      : `dist/native/${target}/s-gw-core`;
 
     expect(files).toContain(coreName);
+    expect(files).not.toContain("dist/native/s-gw-core");
+    expect(files).not.toContain("dist/native/s-gw-core.exe");
+    if (process.platform === "darwin") {
+      expect(files).toContain(`dist/native/${target}/s-gw-keychain-helper`);
+      expect(files).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
+      expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
+    }
+    const nativeCore = manifest.files.find((item) => item.path === coreName);
+    expect((nativeCore?.mode || 0) & 0o111).not.toBe(0);
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);
@@ -139,5 +156,30 @@ describe("platform installers", () => {
     expect(builder).toContain("buildLegacyBridge");
     expect(builder).toContain("0-s-gw-legacy-${version}.tgz");
     expect(validator).toContain('bridgeMetadata.name !== "s-gw"');
+  });
+
+  it("publishes the native npm package on Apple Silicon and keeps Registry publishing on Linux", async () => {
+    const workflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
+    const npmJob = workflow.slice(
+      workflow.indexOf("  publish-npm:"),
+      workflow.indexOf("  publish-registry:")
+    );
+    const registryJob = workflow.slice(
+      workflow.indexOf("  publish-registry:"),
+      workflow.indexOf("  release-assets:")
+    );
+
+    expect(npmJob).toContain("runs-on: macos-15");
+    expect(npmJob).toContain("npm run validate:npm-package");
+    expect(npmJob).toContain("npm publish --access public --ignore-scripts");
+    expect(npmJob).toContain("-verify_arch arm64");
+    expect(npmJob).toContain('npm install --global --prefix "$prefix"');
+    expect(npmJob).toContain('"@s-gw/s-gw@${package_version}"');
+    expect(npmJob).toContain('s-gw-core" --version');
+    expect(npmJob).toContain('test ! -e "$package_root/dist/native/s-gw-core"');
+    expect(registryJob).toContain("needs: publish-npm");
+    expect(registryJob).toContain("runs-on: ubuntu-latest");
+    expect(registryJob).toContain("mcp-publisher_linux_amd64.tar.gz");
+    expect(registryJob).not.toContain("npm publish --access public");
   });
 });

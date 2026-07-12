@@ -1,12 +1,17 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const extension = process.platform === "win32" ? ".exe" : "";
+const target = `${process.platform}-${process.arch}`;
 const built = resolve(root, "target", "release", `sgw-core${extension}`);
-const output = resolve(root, "dist", "native", `s-gw-core${extension}`);
+const output = resolve(root, "dist", "native", target, `s-gw-core${extension}`);
+const legacyOutputs = [
+  resolve(root, "dist", "native", "s-gw-core"),
+  resolve(root, "dist", "native", "s-gw-core.exe")
+];
 
 const cargo = spawnSync("cargo", ["build", "--release", "--locked", "-p", "sgw-core"], {
   cwd: root,
@@ -28,6 +33,9 @@ if (!existsSync(built)) {
 }
 
 mkdirSync(dirname(output), { recursive: true });
+for (const legacyOutput of legacyOutputs) {
+  rmSync(legacyOutput, { force: true });
+}
 copyFileSync(built, output);
 chmodSync(output, 0o755);
 

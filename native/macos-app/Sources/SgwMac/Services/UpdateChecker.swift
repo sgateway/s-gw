@@ -64,22 +64,14 @@ actor UpdateChecker: UpdateChecking {
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.2"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.3"
     }
 
     static func isNewer(_ candidate: String, than current: String) -> Bool {
-        let left = versionParts(candidate)
-        let right = versionParts(current)
-        let count = max(left.count, right.count)
-
-        for index in 0..<count {
-            let a = index < left.count ? left[index] : 0
-            let b = index < right.count ? right[index] : 0
-            if a > b { return true }
-            if a < b { return false }
+        guard let left = semanticVersion(candidate), let right = semanticVersion(current) else {
+            return false
         }
-
-        return false
+        return compare(left, right) == .orderedDescending
     }
 
     func latestRelease(repository: String) async throws -> ReleaseInfo? {
@@ -105,6 +97,7 @@ actor UpdateChecker: UpdateChecking {
             let releases = try JSONDecoder().decode([GitHubRelease].self, from: data)
             guard let release = releases
                 .filter({ !$0.draft })
+                .filter({ Self.semanticVersion($0.tagName) != nil })
                 .sorted(by: { Self.isNewer($0.tagName, than: $1.tagName) })
                 .first else {
                 return nil
@@ -182,7 +175,7 @@ actor UpdateChecker: UpdateChecking {
             ?? id?.split(separator: "/").last.map(String.init)
             ?? ""
         let version = parseVersion(tag)
-        guard !tag.isEmpty, !version.isEmpty else { return nil }
+        guard !tag.isEmpty, semanticVersion(version) != nil else { return nil }
 
         let packageName = "s-gw-\(version).tgz"
         let downloadBase = "https://github.com/\(repository)/releases/download/\(tag)"
@@ -419,10 +412,12 @@ actor UpdateChecker: UpdateChecking {
         let script = """
         sleep 1
         if [ -n "$SGW_UPDATE_CLI" ] && [ -x "$SGW_UPDATE_CLI" ]; then
-          "$SGW_UPDATE_CLI" setup --no-open-app >/dev/null 2>&1 || true
+          "$SGW_UPDATE_CLI" setup --no-open-app >/dev/null 2>&1 || \
+            "$SGW_UPDATE_CLI" start --no-open-app >/dev/null 2>&1 || true
           "$SGW_UPDATE_CLI" app open >/dev/null 2>&1 || true
         else
-          PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw setup --no-open-app >/dev/null 2>&1 || true
+          PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw setup --no-open-app >/dev/null 2>&1 || \
+            PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw start --no-open-app >/dev/null 2>&1 || true
           PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw app open >/dev/null 2>&1 || true
         fi
         """
@@ -448,13 +443,93 @@ actor UpdateChecker: UpdateChecking {
         return cleaned
     }
 
-    private static func versionParts(_ version: String) -> [Int] {
-        parseVersion(version)
-            .split(separator: ".")
-            .map { part in
-                let digits = part.prefix { $0.isNumber }
-                return Int(digits) ?? 0
+    private static func semanticVersion(_ version: String) -> SemanticVersion? {
+        let cleaned = parseVersion(version)
+        let buildParts = cleaned.split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false)
+        guard buildParts.count <= 2 else { return nil }
+        if buildParts.count == 2 && !validIdentifiers(buildParts[1], rejectLeadingZeroes: false) {
+            return nil
+        }
+
+        let precedence = buildParts[0]
+        let prereleaseParts = precedence.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let core = prereleaseParts[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard core.count == 3, core.allSatisfy(validCoreIdentifier) else { return nil }
+
+        var prerelease: [String] = []
+        if prereleaseParts.count == 2 {
+            guard validIdentifiers(prereleaseParts[1], rejectLeadingZeroes: true) else { return nil }
+            prerelease = prereleaseParts[1].split(separator: ".").map(String.init)
+        }
+        return SemanticVersion(core: core.map(String.init), prerelease: prerelease)
+    }
+
+    private static func compare(_ left: SemanticVersion, _ right: SemanticVersion) -> ComparisonResult {
+        for index in 0..<3 {
+            let result = compareNumeric(left.core[index], right.core[index])
+            if result != .orderedSame { return result }
+        }
+
+        if left.prerelease.isEmpty || right.prerelease.isEmpty {
+            if left.prerelease.isEmpty == right.prerelease.isEmpty { return .orderedSame }
+            return left.prerelease.isEmpty ? .orderedDescending : .orderedAscending
+        }
+
+        let count = max(left.prerelease.count, right.prerelease.count)
+        for index in 0..<count {
+            guard index < left.prerelease.count else { return .orderedAscending }
+            guard index < right.prerelease.count else { return .orderedDescending }
+            let a = left.prerelease[index]
+            let b = right.prerelease[index]
+            let aNumeric = isNumeric(a)
+            let bNumeric = isNumeric(b)
+
+            if aNumeric && bNumeric {
+                let result = compareNumeric(a, b)
+                if result != .orderedSame { return result }
+                continue
             }
+            if aNumeric != bNumeric {
+                return aNumeric ? .orderedAscending : .orderedDescending
+            }
+            if a != b { return a < b ? .orderedAscending : .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    private static func compareNumeric(_ left: String, _ right: String) -> ComparisonResult {
+        if left.count != right.count {
+            return left.count < right.count ? .orderedAscending : .orderedDescending
+        }
+        if left == right { return .orderedSame }
+        return left < right ? .orderedAscending : .orderedDescending
+    }
+
+    private static func validCoreIdentifier(_ value: Substring) -> Bool {
+        isNumeric(value) && (value.count == 1 || value.first != "0")
+    }
+
+    private static func validIdentifiers(_ value: Substring, rejectLeadingZeroes: Bool) -> Bool {
+        let identifiers = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard !identifiers.isEmpty else { return false }
+        return identifiers.allSatisfy { identifier in
+            guard !identifier.isEmpty, identifier.utf8.allSatisfy(isSemVerByte) else { return false }
+            if rejectLeadingZeroes && isNumeric(identifier) && identifier.count > 1 && identifier.first == "0" {
+                return false
+            }
+            return true
+        }
+    }
+
+    private static func isNumeric<S: StringProtocol>(_ value: S) -> Bool {
+        !value.isEmpty && value.utf8.allSatisfy { $0 >= 48 && $0 <= 57 }
+    }
+
+    private static func isSemVerByte(_ value: UInt8) -> Bool {
+        (value >= 48 && value <= 57)
+            || (value >= 65 && value <= 90)
+            || (value >= 97 && value <= 122)
+            || value == 45
     }
 
     private static func installedCLIPath(from output: String) -> String? {
@@ -468,6 +543,11 @@ actor UpdateChecker: UpdateChecking {
         return FileManager.default.isExecutableFile(atPath: path) ? path : nil
     }
 
+}
+
+private struct SemanticVersion {
+    let core: [String]
+    let prerelease: [String]
 }
 
 private struct GitHubRelease: Decodable {

@@ -432,6 +432,239 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(tallPanel.contentHeight).toBeLessThanOrEqual(tallPanel.availableHeight + 1);
   }, 45_000);
 
+  it("keeps native-shell navigation and activity surfaces readable in light mode", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "browser light theme passphrase";
+    running = await startConsoleServer({ port: 0 });
+
+    const created = await api<{ handle: string }>("api/secrets", {
+      name: "react-light-theme",
+      type: "api-token",
+      value: "react-light-theme-secret-value-1234567890",
+      injectEnv: "SGW_REACT_LIGHT_THEME_TOKEN",
+      allowedCommands: [process.execPath]
+    });
+    await api("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "1"],
+      injectEnv: "SGW_REACT_LIGHT_THEME_TOKEN",
+      reason: "Codex light theme regression"
+    });
+
+    const launched = await launchChrome(new URL("overview?native-shell=1", running.url).toString());
+    cdp = launched.cdp;
+    await cdp.eval("localStorage.setItem('sgw.theme', 'light'); location.reload()");
+    await waitFor(
+      () => cdp!.eval<boolean>("document.documentElement.classList.contains('light') && Boolean(document.querySelector('[data-recent-activity-list]'))"),
+      "light overview"
+    );
+
+    const overviewTheme = await cdp.eval<{
+      navText: number[][];
+      recentBackground: number[];
+      recentHeadText: number[];
+      recentText: number[];
+      recentStatusText: number[];
+    }>(`(() => {
+      const channels = (value) => (value.match(/[\\d.]+/g) || []).slice(0, 3).map(Number);
+      const inactiveNav = [...document.querySelectorAll('.sgw-sidebar-nav-button')]
+        .filter((node) => node.getAttribute('data-active') !== 'true');
+      const recent = document.querySelector('.sgw-recent-event-list');
+      const row = document.querySelector('[data-overview-event-row]');
+      return {
+        navText: inactiveNav.map((node) => channels(getComputedStyle(node).color)),
+        recentBackground: channels(getComputedStyle(recent).backgroundColor),
+        recentHeadText: channels(getComputedStyle(document.querySelector('.sgw-recent-event-head')).color),
+        recentText: channels(getComputedStyle(row).color),
+        recentStatusText: channels(getComputedStyle(row.querySelector('.sgw-event-status')).color)
+      };
+    })()`);
+    expect(overviewTheme.navText.length).toBeGreaterThan(0);
+    expect(overviewTheme.navText.every((color) => Math.max(...color) < 100)).toBe(true);
+    expect(Math.min(...overviewTheme.recentBackground)).toBeGreaterThan(230);
+    expect(Math.max(...overviewTheme.recentHeadText)).toBeLessThan(100);
+    expect(Math.max(...overviewTheme.recentText)).toBeLessThan(100);
+    expect(Math.max(...overviewTheme.recentStatusText)).toBeLessThan(210);
+
+    await cdp.send("Page.navigate", { url: new URL("activity?native-shell=1", running.url).toString() });
+    await waitFor(
+      () => cdp!.eval<boolean>("document.documentElement.classList.contains('light') && Boolean(document.querySelector('[data-event-log-card] .sgw-event-flow-card'))"),
+      "light activity"
+    );
+    const activityTheme = await cdp.eval<{
+      cardBackground: number[];
+      detailBackground: number[];
+      detailCardBackground: number[];
+      detailTitle: number[];
+      queryBackground: number[];
+      rowText: number[];
+      rowStatusText: number[];
+    }>(`(() => {
+      const channels = (value) => (value.match(/[\\d.]+/g) || []).slice(0, 3).map(Number);
+      return {
+        cardBackground: channels(getComputedStyle(document.querySelector('[data-event-log-card]')).backgroundColor),
+        detailBackground: channels(getComputedStyle(document.querySelector('.sgw-event-detail-stage')).backgroundColor),
+        detailCardBackground: channels(getComputedStyle(document.querySelector('.sgw-event-flow-card')).backgroundColor),
+        detailTitle: channels(getComputedStyle(document.querySelector('.sgw-event-flow-title')).color),
+        queryBackground: channels(getComputedStyle(document.querySelector('.sgw-event-query')).backgroundColor),
+        rowText: channels(getComputedStyle(document.querySelector('[data-event-row]')).color),
+        rowStatusText: channels(getComputedStyle(document.querySelector('[data-event-row] .sgw-event-status')).color)
+      };
+    })()`);
+    expect(Math.min(...activityTheme.cardBackground)).toBeGreaterThan(230);
+    expect(Math.min(...activityTheme.detailBackground)).toBeGreaterThan(230);
+    expect(Math.min(...activityTheme.detailCardBackground)).toBeGreaterThan(230);
+    expect(Math.max(...activityTheme.detailTitle)).toBeLessThan(100);
+    expect(Math.min(...activityTheme.queryBackground)).toBeGreaterThan(230);
+    expect(Math.max(...activityTheme.rowText)).toBeLessThan(100);
+    expect(Math.max(...activityTheme.rowStatusText)).toBeLessThan(210);
+  }, 45_000);
+
+  it("uses a compact settings switcher and saves readable duration choices", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "browser settings passphrase";
+    running = await startConsoleServer({ port: 0 });
+
+    await api("api/approval", { mode: "per-transaction", durationMs: 42 * 60 * 1000 });
+    const created = await api<{ handle: string }>("api/secrets", {
+      name: "react-settings-grant",
+      type: "api-token",
+      value: "react-settings-secret-value-1234567890",
+      injectEnv: "SGW_REACT_SETTINGS_TOKEN",
+      allowedCommands: [process.execPath]
+    });
+    const request = await api<{ id: string }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "1"],
+      injectEnv: "SGW_REACT_SETTINGS_TOKEN",
+      reason: "Codex settings reusable grant",
+      agentName: "Codex"
+    });
+    await api(`api/requests/${request.id}/approve`, {
+      mode: "timed-session",
+      durationMs: 15 * 60 * 1000,
+      agentScope: "any-agent"
+    });
+
+    const launched = await launchChrome(new URL("settings?native-shell=1", running.url).toString());
+    cdp = launched.cdp;
+    await waitFor(
+      () => cdp!.eval<boolean>("Boolean(document.querySelector('[data-settings-panel=\"approvals\"]'))"),
+      "settings approval panel"
+    );
+
+    const desktop = await cdp.eval<{
+      durationDisabled: boolean;
+      nav: { bottom: number; height: number; left: number; width: number };
+      panel: { left: number; top: number; width: number };
+      rawMillisecondsVisible: boolean;
+      selected: string[];
+      tabTops: number[];
+      tabs: number;
+      warning: string;
+    }>(`(() => {
+      const nav = document.querySelector('[data-settings-nav]').getBoundingClientRect();
+      const panelNode = document.querySelector('[data-settings-panel="approvals"]');
+      const panel = panelNode.getBoundingClientRect();
+      const tabs = [...document.querySelectorAll('[data-settings-tab]')];
+      return {
+        durationDisabled: document.querySelector('[data-settings-duration]').disabled,
+        nav: { bottom: nav.bottom, height: nav.height, left: nav.left, width: nav.width },
+        panel: { left: panel.left, top: panel.top, width: panel.width },
+        rawMillisecondsVisible: document.body.innerText.includes(String(42 * 60 * 1000)),
+        selected: tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true').map((tab) => tab.getAttribute('data-settings-tab')),
+        tabTops: tabs.map((tab) => Math.round(tab.getBoundingClientRect().top)),
+        tabs: tabs.length,
+        warning: panelNode.querySelector('[data-slot="card-footer"]').innerText
+      };
+    })()`);
+    expect(desktop.tabs).toBe(3);
+    expect(new Set(desktop.tabTops).size).toBe(1);
+    expect(desktop.nav.height).toBeLessThan(100);
+    expect(desktop.panel.top).toBeGreaterThan(desktop.nav.bottom);
+    expect(Math.abs(desktop.panel.left - desktop.nav.left)).toBeLessThan(2);
+    expect(Math.abs(desktop.panel.width - desktop.nav.width)).toBeLessThan(2);
+    expect(desktop.durationDisabled).toBe(true);
+    expect(desktop.rawMillisecondsVisible).toBe(false);
+    expect(desktop.selected).toEqual(["approvals"]);
+    expect(desktop.warning).toContain("Saving clears 1 active reusable grant");
+
+    await clickElement(cdp, '[data-settings-tab="grants"]');
+    await waitFor(
+      () => cdp!.eval<boolean>("Boolean(document.querySelector('[data-settings-panel=\"grants\"]'))"),
+      "settings grants panel"
+    );
+    expect(await cdp.eval<string>("document.querySelector('[data-settings-tab=\"grants\"]').getAttribute('aria-selected')")).toBe("true");
+    const grantsText = await cdp.eval<string>("document.querySelector('[data-settings-panel=\"grants\"]').innerText");
+    expect(grantsText).toContain("1 active");
+    expect(grantsText).toContain("Reuse for a time window");
+
+    await clickElement(cdp, '[data-settings-tab="about"]');
+    await waitFor(
+      () => cdp!.eval<boolean>("Boolean(document.querySelector('[data-settings-panel=\"about\"]'))"),
+      "settings about panel"
+    );
+    expect(await cdp.eval<string>("document.querySelector('[data-settings-panel=\"about\"]').innerText")).toContain("Store location");
+
+    await clickElement(cdp, '[data-settings-tab="approvals"]');
+    await waitFor(
+      () => cdp!.eval<boolean>("Boolean(document.querySelector('[data-settings-panel=\"approvals\"]'))"),
+      "settings approval panel restored"
+    );
+    await chooseSelectOption(cdp, "[data-settings-mode]", "Reuse for a time window");
+    await waitFor(
+      () => cdp!.eval<boolean>("!document.querySelector('[data-settings-duration]').disabled"),
+      "settings duration enabled"
+    );
+    await chooseSelectOption(cdp, "[data-settings-duration]", "1 hour");
+    await chooseSelectOption(cdp, "[data-settings-duration]", "Current setting · 42 minutes");
+    expect(await cdp.eval<string>("document.querySelector('[data-settings-duration]').innerText.trim()")).toBe("Current setting · 42 minutes");
+    await chooseSelectOption(cdp, "[data-settings-duration]", "1 hour");
+    await chooseSelectOption(cdp, "[data-settings-mode]", "Reuse for this login session");
+    expect(await cdp.eval<boolean>("document.querySelector('[data-settings-duration]').disabled")).toBe(true);
+    expect(await cdp.eval<string>("document.querySelector('[data-settings-duration]').innerText.trim()")).toBe("1 hour");
+    await chooseSelectOption(cdp, "[data-settings-mode]", "Reuse for a time window");
+    expect(await cdp.eval<boolean>("document.querySelector('[data-settings-duration]').disabled")).toBe(false);
+    expect(await cdp.eval<string>("document.querySelector('[data-settings-duration]').innerText.trim()")).toBe("1 hour");
+
+    await clickElement(cdp, "[data-settings-save]");
+    await waitFor(async () => {
+      const saved = await api<{
+        approvalGrants: unknown[];
+        approvalSettings: { durationMs: number; mode: string };
+      }>("api/state");
+      return saved.approvalSettings.mode === "timed-session"
+        && saved.approvalSettings.durationMs === 60 * 60 * 1000
+        && saved.approvalGrants.length === 0;
+    }, "settings saved");
+
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390,
+      height: 844,
+      deviceScaleFactor: 1,
+      mobile: false
+    });
+    await waitFor(
+      () => cdp!.eval<boolean>("document.documentElement.clientWidth === 390"),
+      "settings mobile viewport"
+    );
+    const mobile = await cdp.eval<{ descriptionsHidden: boolean; navHeight: number; overflow: number; tabTops: number[] }>(`(() => {
+      const nav = document.querySelector('[data-settings-nav]');
+      const tabs = [...document.querySelectorAll('[data-settings-tab]')];
+      const descriptions = tabs.map((tab) => tab.querySelector('.text-xs'));
+      return {
+        descriptionsHidden: descriptions.every((node) => getComputedStyle(node).display === 'none'),
+        navHeight: nav.getBoundingClientRect().height,
+        overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        tabTops: tabs.map((tab) => Math.round(tab.getBoundingClientRect().top))
+      };
+    })()`);
+    expect(new Set(mobile.tabTops).size).toBe(1);
+    expect(mobile.navHeight).toBeLessThan(130);
+    expect(mobile.descriptionsHidden).toBe(true);
+    expect(mobile.overflow).toBeLessThanOrEqual(1);
+  }, 45_000);
+
   it("sorts, searches, and filters activity and audit columns", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "browser react passphrase";
     running = await startConsoleServer({ port: 0 });
@@ -759,6 +992,61 @@ async function api<T = unknown>(pathName: string, body?: unknown): Promise<T> {
     throw new Error((payload as { error?: string }).error || `HTTP ${response.status}`);
   }
   return payload as T;
+}
+
+async function clickElement(client: Cdp, selector: string): Promise<void> {
+  const point = await client.eval<{ x: number; y: number }>(`(() => {
+    const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`);
+  await client.send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: point.x,
+    y: point.y,
+    button: "left",
+    clickCount: 1
+  });
+  await client.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: point.x,
+    y: point.y,
+    button: "left",
+    clickCount: 1
+  });
+}
+
+async function chooseSelectOption(client: Cdp, triggerSelector: string, label: string): Promise<void> {
+  await clickElement(client, triggerSelector);
+
+  await waitFor(
+    () => client.eval<boolean>(`[...document.querySelectorAll('[role="option"]')]
+      .some((option) => option.textContent.trim() === ${JSON.stringify(label)})`),
+    `select option ${label}`
+  );
+  const optionPoint = await client.eval<{ x: number; y: number }>(`(() => {
+    const option = [...document.querySelectorAll('[role="option"]')]
+      .find((node) => node.textContent.trim() === ${JSON.stringify(label)});
+    const rect = option.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`);
+  await client.send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: optionPoint.x,
+    y: optionPoint.y,
+    button: "left",
+    clickCount: 1
+  });
+  await client.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: optionPoint.x,
+    y: optionPoint.y,
+    button: "left",
+    clickCount: 1
+  });
+  await waitFor(
+    () => client.eval<boolean>(`document.querySelector(${JSON.stringify(triggerSelector)}).innerText.trim() === ${JSON.stringify(label)}`),
+    `selected ${label}`
+  );
 }
 
 async function setEventSearch(client: Cdp, value: string): Promise<void> {

@@ -23,6 +23,29 @@ private func check(_ cond: Bool, _ message: String) {
   if !cond { fail(message) }
 }
 
+private final class FakeHelperUpdateRunner: @unchecked Sendable {
+  private let lock = NSLock()
+  private var results: [CliRunResult]
+
+  init(_ results: [CliRunResult]) {
+    self.results = results
+  }
+
+  func run() -> CliRunResult {
+    lock.lock()
+    defer { lock.unlock() }
+    if results.isEmpty { return CliRunResult(ok: false, stdout: nil, stderr: "no result") }
+    return results.removeFirst()
+  }
+}
+
+private func helperUpdateResult(_ version: String, available: Bool = true) -> CliRunResult {
+  let json = """
+  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"releaseUrl":"https://example.test/releases/v\(version)"}
+  """
+  return CliRunResult(ok: true, stdout: json, stderr: nil)
+}
+
 // Scratch dir holding the fake CLI, its invocation log, and the FIFO it blocks on.
 fileprivate struct Scratch {
   let dir: URL
@@ -132,6 +155,7 @@ struct DecisionGuardTests {
     runRouteAndSizingTest()
     runApprovalFlowTest()
     runLaunchLockTest(scratch)
+    await runPersistentUpdateMonitorTest()
 
     print("ALL_MENUBAR_TESTS_OK")
   }
@@ -241,6 +265,57 @@ struct DecisionGuardTests {
     let pendingSize = HelperPopoverMetrics.size(for: idle)
     check(pendingSize.width == 400 && pendingSize.height == 500,
           "pending popover should expand to 400x500")
+  }
+
+  @MainActor
+  static func runPersistentUpdateMonitorTest() async {
+    let suite = "com.s-gw.tests.helper-updates.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defer { defaults.removePersistentDomain(forName: suite) }
+    var notified: [String] = []
+    let firstRunner = FakeHelperUpdateRunner([
+      helperUpdateResult("9.1.0"),
+      helperUpdateResult("9.1.0")
+    ])
+    let first = UpdateMonitor(
+      defaults: defaults,
+      runCheck: { firstRunner.run() },
+      notify: { update in notified.append(update.version); return true }
+    )
+
+    await first.checkNow()
+    await first.checkNow()
+    check(notified == ["9.1.0"], "the helper should notify once per available version")
+
+    let afterRestartRunner = FakeHelperUpdateRunner([
+      helperUpdateResult("9.1.0"),
+      helperUpdateResult("9.2.0")
+    ])
+    let afterRestart = UpdateMonitor(
+      defaults: defaults,
+      runCheck: { afterRestartRunner.run() },
+      notify: { update in notified.append(update.version); return true }
+    )
+    await afterRestart.checkNow()
+    await afterRestart.checkNow()
+    check(notified == ["9.1.0", "9.2.0"],
+          "persisted update history should suppress a duplicate after helper restart")
+
+    let retryRunner = FakeHelperUpdateRunner([
+      CliRunResult(ok: false, stdout: nil, stderr: "offline"),
+      CliRunResult(ok: true, stdout: "not-json", stderr: nil),
+      helperUpdateResult("9.3.0")
+    ])
+    let retry = UpdateMonitor(
+      defaults: defaults,
+      runCheck: { retryRunner.run() },
+      notify: { update in notified.append(update.version); return true }
+    )
+    await retry.checkNow()
+    await retry.checkNow()
+    await retry.checkNow()
+    check(notified.last == "9.3.0", "failed and invalid checks must retry without consuming a version")
   }
 
   static func runApprovalFlowTest() {

@@ -212,7 +212,201 @@ describe("scoped package migration", () => {
     await rm(path.dirname(rollbackTarget || ""), { recursive: true, force: true });
     const uninstall = calls.find((args) => args[0] === "uninstall");
     expect(uninstall?.at(-1)).toBe("s-gw");
-    expect(calls.some((args) => args[0] === "uninstall" && args.includes("@s-gw/s-gw"))).toBe(false);
+    expect(calls.some((args) => args[0] === "uninstall" && args.includes("@s-gw/s-gw"))).toBe(true);
+  });
+
+  it("restores the legacy package before restarting services when post-remove inspection fails", async () => {
+    const tmp = await tempDir("sgw-package-post-remove-");
+    const prefix = path.join(tmp, "prefix");
+    let listCalls = 0;
+    const calls: string[][] = [];
+    const runNpm = async (args: string[]): Promise<NpmCommandResult> => {
+      calls.push(args);
+      if (args[0] === "root") return ok(path.join(prefix, "lib", "node_modules"));
+      if (args[0] === "list") {
+        listCalls += 1;
+        if (listCalls === 1) {
+          return ok(JSON.stringify({ dependencies: { "s-gw": { version: "0.1.0" } } }));
+        }
+        return { status: 1, stdout: "", stderr: "simulated post-remove inspection failure" };
+      }
+      if (args[0] === "pack" && args.includes("--dry-run")) {
+        return ok(JSON.stringify([{ name: "@s-gw/s-gw", version: CURRENT_VERSION }]));
+      }
+      if (args[0] === "pack") {
+        const backupDir = args[args.indexOf("--pack-destination") + 1];
+        await writeFile(path.join(backupDir, "s-gw-0.1.0.tgz"), "rollback copy");
+        return ok(JSON.stringify([{ name: "s-gw", version: "0.1.0", filename: "s-gw-0.1.0.tgz" }]));
+      }
+      if (args[0] === "uninstall") return ok("");
+      if (args[0] === "install") {
+        const packageRoot = path.join(prefix, "lib", "node_modules", "s-gw");
+        await mkdir(path.join(packageRoot, "dist"), { recursive: true });
+        await writeFile(path.join(packageRoot, "package.json"), JSON.stringify({ name: "s-gw", version: "0.1.0" }));
+        await writeFile(path.join(packageRoot, "dist", "cli.js"), "restored CLI");
+        return ok("");
+      }
+      return ok("");
+    };
+    let restarted = 0;
+
+    let thrown: unknown;
+    try {
+      await installPackageUpdate({
+        npmPrefix: prefix,
+        runNpm,
+        stopServices: async () => undefined,
+        restartServices: async () => { restarted += 1; }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(PackageUpdateError);
+    expect(thrown).toMatchObject({ phase: "inspect" });
+    expect((thrown as PackageUpdateError).message).toContain("simulated post-remove inspection failure");
+    expect((thrown as PackageUpdateError).message).toContain("previous s-gw@0.1.0 package was restored");
+    expect((thrown as PackageUpdateError).recoveryCommands).toEqual([]);
+    const restore = calls.find((args) => args[0] === "install");
+    const rollbackTarget = restore?.at(-1) || "";
+    expect(rollbackTarget).toContain("sgw-legacy-rollback-");
+    await expect(readFile(rollbackTarget, "utf8")).rejects.toThrow();
+    expect(restarted).toBe(1);
+  });
+
+  it("never suggests setup when missing data still needs to be restored", async () => {
+    const tmp = await tempDir("sgw-package-missing-data-");
+    const prefix = path.join(tmp, "prefix");
+    const sgwHome = path.join(tmp, "home");
+    await mkdir(sgwHome, { recursive: true });
+    await writeFile(path.join(sgwHome, "store.json"), "existing data");
+    let listCalls = 0;
+    const runNpm = async (args: string[]): Promise<NpmCommandResult> => {
+      if (args[0] === "root") return ok(path.join(prefix, "lib", "node_modules"));
+      if (args[0] === "list") {
+        listCalls += 1;
+        if (listCalls === 1) return ok(JSON.stringify({ dependencies: { "s-gw": { version: "0.1.0" } } }));
+        if (listCalls === 2) return ok(JSON.stringify({ dependencies: {} }));
+        return ok(JSON.stringify({ dependencies: { "@s-gw/s-gw": { version: CURRENT_VERSION } } }));
+      }
+      if (args[0] === "pack" && args.includes("--dry-run")) {
+        return ok(JSON.stringify([{ name: "@s-gw/s-gw", version: CURRENT_VERSION }]));
+      }
+      if (args[0] === "pack") {
+        const backupDir = args[args.indexOf("--pack-destination") + 1];
+        await writeFile(path.join(backupDir, "s-gw-0.1.0.tgz"), "rollback copy");
+        return ok(JSON.stringify([{ name: "s-gw", version: "0.1.0", filename: "s-gw-0.1.0.tgz" }]));
+      }
+      if (args[0] === "uninstall") return ok("");
+      if (args[0] === "install" && args.at(-1) === `@s-gw/s-gw@${CURRENT_VERSION}`) {
+        await rm(sgwHome, { recursive: true, force: true });
+        return ok("");
+      }
+      if (args[0] === "install") {
+        return { status: 1, stdout: "", stderr: "simulated rollback failure" };
+      }
+      return ok("");
+    };
+    let restarted = 0;
+
+    let thrown: unknown;
+    try {
+      await installPackageUpdate({
+        npmPrefix: prefix,
+        sgwHome,
+        runNpm,
+        stopServices: async () => undefined,
+        restartServices: async () => { restarted += 1; }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({ phase: "verify-data" });
+    expect((thrown as Error).message).toContain("Do not run setup until the data is restored");
+    expect((thrown as Error).message).toContain("Services remain stopped");
+    expect((thrown as Error).message).toContain("Automatic rollback failed");
+    expect((thrown as PackageUpdateError).recoveryCommands).toHaveLength(2);
+    expect((thrown as PackageUpdateError).recoveryCommands.join("\n")).not.toContain("s-gw setup");
+    expect((thrown as PackageUpdateError).recoveryCommands.join("\n")).not.toContain("s-gw start");
+    expect(restarted).toBe(0);
+    const rollbackTarget = (thrown as PackageUpdateError).recoveryCommands[1]
+      .split(" -- ").at(-1)?.replace(/^'|'$/g, "");
+    await rm(path.dirname(rollbackTarget || ""), { recursive: true, force: true });
+  });
+
+  it("restarts services after stop, rollback preparation, and install failures", async () => {
+    const scenarios = ["stop", "backup", "install"] as const;
+
+    for (const scenario of scenarios) {
+      const tmp = await tempDir(`sgw-package-restart-${scenario}-`);
+      const prefix = path.join(tmp, "prefix");
+      let restarted = 0;
+      const runNpm = async (args: string[]): Promise<NpmCommandResult> => {
+        if (args[0] === "root") return ok(path.join(prefix, "lib", "node_modules"));
+        if (args[0] === "list") {
+          const dependencies = scenario === "backup" ? { "s-gw": { version: "0.1.0" } } : {};
+          return ok(JSON.stringify({ dependencies }));
+        }
+        if (args[0] === "pack" && args.includes("--dry-run")) {
+          return ok(JSON.stringify([{ name: "@s-gw/s-gw", version: CURRENT_VERSION }]));
+        }
+        if (args[0] === "pack") {
+          return { status: 1, stdout: "", stderr: "simulated backup failure" };
+        }
+        if (args[0] === "install") {
+          return { status: 1, stdout: "", stderr: "simulated install failure" };
+        }
+        return ok("");
+      };
+
+      await expect(installPackageUpdate({
+        npmPrefix: prefix,
+        runNpm,
+        stopServices: async () => {
+          if (scenario === "stop") throw new Error("simulated partial stop failure");
+        },
+        restartServices: async () => { restarted += 1; }
+      })).rejects.toBeInstanceOf(PackageUpdateError);
+      expect(restarted, scenario).toBe(1);
+    }
+  });
+
+  it("preserves the update failure when restarting services also fails", async () => {
+    const prefix = "/tmp/sgw-restart-failure";
+    const runNpm = async (args: string[]): Promise<NpmCommandResult> => {
+      if (args[0] === "root") return ok(`${prefix}/lib/node_modules`);
+      if (args[0] === "list") return ok(JSON.stringify({ dependencies: {} }));
+      if (args[0] === "pack") return ok(JSON.stringify([{ name: "@s-gw/s-gw", version: CURRENT_VERSION }]));
+      if (args[0] === "install") return { status: 1, stdout: "", stderr: "original install failure" };
+      return ok("");
+    };
+
+    let thrown: unknown;
+    try {
+      await installPackageUpdate({
+        npmPrefix: prefix,
+        runNpm,
+        stopServices: async () => undefined,
+        restartServices: async () => { throw new Error("restart also failed"); }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({ phase: "install-scoped" });
+    expect((thrown as Error).message).toContain("original install failure");
+    expect((thrown as Error).message).toContain("restart also failed");
+    expect((thrown as PackageUpdateError).recoveryCommands).toContain("s-gw start --no-open-app");
+  });
+
+  it("wires CLI update failures back to the previously loaded local services", async () => {
+    const cli = await readFile(path.join(process.cwd(), "src", "cli.ts"), "utf8");
+    expect(cli).toContain("restartServices: services.restart");
+    expect(cli).toContain('restartLaunchAgent("console", serviceWasLoaded');
+    expect(cli).toContain('restartLaunchAgent("menubar", menuBarWasLoaded');
+    expect(cli).toContain("verifyRestoredLaunchAgents(serviceWasLoaded, menuBarWasLoaded");
+    expect(cli).toContain("await restartWindowsSurfaces(windowsStopped)");
   });
 
   it("refuses an unrelated target before removing the legacy package", async () => {

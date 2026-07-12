@@ -107,6 +107,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     )
   }()
 
+  private lazy var updateMonitor: UpdateMonitor = {
+    let node = nodePath
+    let cli = cliPath
+    let root = repoRoot
+    let environment = ProcessInfo.processInfo.environment
+    let args = UpdateMonitor.command
+    return UpdateMonitor(
+      runCheck: {
+        runSgwCli(
+          node: node,
+          cli: cli,
+          repoRoot: root,
+          args: args,
+          environment: environment
+        )
+      },
+      notify: { [weak self] update in
+        guard let self else { return false }
+        return await self.sendUpdateNotification(update)
+      }
+    )
+  }()
+
   override init() {
     let env = ProcessInfo.processInfo.environment
     let cwd = FileManager.default.currentDirectoryPath
@@ -157,6 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     installDistributedObservers()
     requestNotificationPermission()
     refreshState()
+    updateMonitor.start()
 
     timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
       guard let delegate = self else { return }
@@ -172,6 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
   func applicationWillTerminate(_ notification: Notification) {
     timer?.invalidate()
+    updateMonitor.stop()
     removeOutsideClickMonitor()
     DistributedNotificationCenter.default().removeObserver(self)
     HelperLaunchGuard.shared.release()
@@ -463,11 +488,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     ))
   }
 
+  private func sendUpdateNotification(_ update: HelperUpdate) async -> Bool {
+    guard notificationsEnabled else { return false }
+    let center = UNUserNotificationCenter.current()
+    var status = await center.notificationSettings().authorizationStatus
+    if status == .notDetermined {
+      guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else {
+        return false
+      }
+      status = await center.notificationSettings().authorizationStatus
+    }
+    guard status == .authorized || status == .provisional else {
+      return false
+    }
+
+    let content = UNMutableNotificationContent()
+    content.title = "s-gw \(update.version) is available"
+    content.body = "Open s-gw to review and upgrade."
+    content.sound = .default
+    content.userInfo = ["releaseURL": update.releaseURL.absoluteString]
+
+    do {
+      try await center.add(UNNotificationRequest(
+        identifier: "s-gw-update-\(update.version)",
+        content: content,
+        trigger: nil
+      ))
+      return true
+    } catch {
+      return false
+    }
+  }
+
   nonisolated func userNotificationCenter(
     _ center: UNUserNotificationCenter,
     willPresent notification: UNNotification,
     withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
   ) {
     completionHandler([.banner, .sound])
+  }
+
+  nonisolated func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    let releaseURL = response.notification.request.content.userInfo["releaseURL"] as? String
+    completionHandler()
+    guard let releaseURL, let url = URL(string: releaseURL) else { return }
+    Task { @MainActor in
+      NSWorkspace.shared.open(url)
+    }
   }
 }

@@ -33,6 +33,9 @@
   --chart-3: #2b9cff;
   --chart-4: #58e6ad;
   --chart-5: #f4c76a;
+  --status-success: #56e6ad;
+  --status-pending: #f0c243;
+  --status-failure: #ff5f6d;
   --sidebar: #050910;
   --sidebar-foreground: #edf6ff;
   --sidebar-primary: #3eb7ff;
@@ -65,6 +68,9 @@
   --border: rgb(7 17 28 / 0.12);
   --input: rgb(7 17 28 / 0.13);
   --ring: #0eb981;
+  --status-success: #087a55;
+  --status-pending: #976400;
+  --status-failure: #c72c3e;
   --sidebar: #f5fbff;
   --sidebar-foreground: #0b1825;
   --sidebar-primary: #0b78c8;
@@ -382,15 +388,15 @@
 }
 
 .sgw-activity-status-dot.is-success {
-  background: #56e6ad;
+  background: var(--status-success);
 }
 
 .sgw-activity-status-dot.is-pending {
-  background: #f4b64f;
+  background: var(--status-pending);
 }
 
 .sgw-activity-status-dot.is-failure {
-  background: #ff665e;
+  background: var(--status-failure);
 }
 
 .sgw-activity-flow-row.is-compact {
@@ -462,10 +468,10 @@
 
 .sgw-event-log-card {
   overflow: hidden;
-  border: 1px solid rgb(213 235 255 / 0.1);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
-  background: #131a23;
-  box-shadow: 0 20px 52px rgb(0 0 0 / 0.32), 0 1px 0 rgb(255 255 255 / 0.035) inset;
+  background: var(--card);
+  box-shadow: 0 20px 52px rgb(0 0 0 / 0.16), 0 1px 0 color-mix(in oklab, var(--foreground) 4%, transparent) inset;
 }
 
 .sgw-event-log-toolbar {
@@ -481,9 +487,9 @@
   flex: 0 0 auto;
   align-items: center;
   gap: 0.12rem;
-  border: 1px solid rgb(255 255 255 / 0.15);
+  border: 1px solid var(--input);
   border-radius: 0.5rem;
-  background: rgb(0 0 0 / 0.24);
+  background: var(--background);
   padding: 0.15rem;
 }
 
@@ -492,7 +498,7 @@
   border: 0;
   border-radius: 0.34rem;
   background: transparent;
-  color: rgb(255 255 255 / 0.52);
+  color: var(--muted-foreground);
   font: inherit;
   font-size: 0.78rem;
   font-weight: 500;
@@ -500,9 +506,9 @@
 }
 
 .sgw-event-mode-toggle button.is-active {
-  background: rgb(137 154 217 / 0.22);
-  color: rgb(255 255 255 / 0.92);
-  box-shadow: 0 0 0 1px rgb(100 158 245 / 0.2) inset;
+  background: var(--accent);
+  color: var(--accent-foreground);
+  box-shadow: 0 0 0 1px var(--border) inset;
 }
 
 .sgw-event-query {
@@ -511,11 +517,11 @@
   flex: 1 1 24rem;
   align-items: center;
   gap: 0.5rem;
-  border: 1px solid rgb(255 255 255 / 0.16);
+  border: 1px solid var(--input);
   border-radius: 0.5rem;
-  background: rgb(0 0 0 / 0.22);
+  background: var(--background);
   padding: 0 0.75rem;
-  color: rgb(255 255 255 / 0.45);
+  color: var(--muted-foreground);
 }
 
 .sgw-event-query-input {
@@ -529,12 +535,12 @@
 }
 
 .sgw-event-filter-button {
-  color: #649ef5;
+  color: var(--sidebar-primary);
   font-weight: 700;
 }
 
 .sgw-event-filter-button[aria-expanded="true"] {
-  background: rgb(100 158 245 / 0.12);
+  background: var(--accent);
 }
 
 .sgw-event-filter-row {
@@ -546,34 +552,34 @@
 
 .sgw-event-filter-select {
   width: 12rem;
-  border-color: rgb(255 255 255 / 0.16);
-  background: rgb(0 0 0 / 0.22);
+  border-color: var(--input);
+  background: var(--background);
 }
 
 .sgw-event-filter-input {
   width: min(22rem, 100%);
-  border-color: rgb(255 255 255 / 0.16);
-  background: rgb(0 0 0 / 0.22);
+  border-color: var(--input);
+  background: var(--background);
 }
 
 .sgw-event-range {
   width: 10.5rem;
   border-width: 2px;
-  border-color: rgb(126 134 143 / 0.95);
-  background: #373c42;
+  border-color: color-mix(in oklab, var(--foreground) 38%, transparent);
+  background: var(--secondary);
 }
 
 .sgw-event-count {
   flex: 0 0 auto;
-  color: rgb(255 255 255 / 0.72);
+  color: var(--muted-foreground);
   font-size: 0.82rem;
 }
 
 .sgw-event-export {
   margin-left: auto;
   border-width: 2px;
-  border-color: #649ef5;
-  color: #649ef5;
+  border-color: var(--sidebar-primary);
+  color: var(--sidebar-primary);
   font-weight: 700;
 }
 
@@ -591,8 +597,8 @@
   align-items: center;
   gap: 0.38rem;
   border-radius: 999px;
-  background: #384452;
-  color: rgb(255 255 255 / 0.82);
+  background: var(--secondary);
+  color: var(--secondary-foreground);
   font-size: 0.72rem;
   font-weight: 700;
   padding: 0.25rem 0.62rem;
@@ -605,7 +611,7 @@
   justify-content: center;
   border: 0;
   background: transparent;
-  color: #649ef5;
+  color: var(--sidebar-primary);
   font: inherit;
   font-weight: 700;
   padding: 0;
@@ -613,7 +619,7 @@
 
 .sgw-event-column-filter-chip {
   max-width: min(24rem, 100%);
-  background: #273b55;
+  background: var(--accent);
 }
 
 .sgw-event-table-wrap {
@@ -631,8 +637,8 @@
 
 .sgw-event-table [data-slot="table-head"] {
   height: 2.75rem;
-  border-bottom: 2px solid rgb(255 255 255 / 0.68);
-  color: rgb(255 255 255 / 0.86);
+  border-bottom: 2px solid color-mix(in oklab, var(--foreground) 58%, transparent);
+  color: var(--foreground);
   font-size: 0.74rem;
   font-weight: 800;
 }
@@ -653,16 +659,16 @@
 
 .sgw-event-sort-button svg {
   flex: 0 0 auto;
-  color: rgb(255 255 255 / 0.36);
+  color: var(--muted-foreground);
   transition: color 120ms ease, transform 120ms ease;
 }
 
 .sgw-event-sort-button.is-active {
-  color: #cfe4ff;
+  color: var(--foreground);
 }
 
 .sgw-event-sort-button.is-active svg {
-  color: #649ef5;
+  color: var(--sidebar-primary);
 }
 
 .sgw-event-sort-button svg.is-desc {
@@ -671,13 +677,13 @@
 
 .sgw-event-row {
   cursor: pointer;
-  border-color: rgb(255 255 255 / 0.18);
-  color: rgb(255 255 255 / 0.72);
+  border-color: var(--border);
+  color: color-mix(in oklab, var(--foreground) 82%, transparent);
 }
 
 .sgw-event-row:hover,
 .sgw-event-row[aria-expanded="true"] {
-  background: rgb(255 255 255 / 0.025);
+  background: color-mix(in oklab, var(--muted) 72%, transparent);
 }
 
 .sgw-event-row [data-slot="table-cell"] {
@@ -724,7 +730,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.36rem;
-  color: rgb(255 255 255 / 0.76);
+  color: var(--foreground);
   font-size: 0.78rem;
 }
 
@@ -736,15 +742,15 @@
 }
 
 .sgw-event-status.is-success {
-  color: #56e6ad;
+  color: var(--status-success);
 }
 
 .sgw-event-status.is-pending {
-  color: #f0c243;
+  color: var(--status-pending);
 }
 
 .sgw-event-status.is-failure {
-  color: #ff5f6d;
+  color: var(--status-failure);
 }
 
 .sgw-event-expanded-row,
@@ -760,7 +766,7 @@
 .sgw-event-detail-stage {
   min-height: 13.8rem;
   overflow: hidden;
-  background: #090d0e;
+  background: var(--background);
   padding: 1.6rem 1.15rem;
 }
 
@@ -778,10 +784,10 @@
   align-content: start;
   justify-items: center;
   gap: 0.34rem;
-  border: 1px solid rgb(213 235 255 / 0.055);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: #131c26;
-  box-shadow: 0 12px 26px rgb(0 0 0 / 0.28);
+  background: var(--card);
+  box-shadow: 0 12px 26px rgb(0 0 0 / 0.14);
   padding: 0.92rem 0.72rem 0.82rem;
   text-align: center;
 }
@@ -830,7 +836,7 @@
 .sgw-event-flow-title {
   max-width: 100%;
   overflow: hidden;
-  color: rgb(255 255 255 / 0.86);
+  color: var(--foreground);
   font-size: 0.72rem;
   font-weight: 800;
   text-overflow: ellipsis;
@@ -840,7 +846,7 @@
 .sgw-event-flow-subtitle {
   max-width: 100%;
   overflow: hidden;
-  color: rgb(255 255 255 / 0.5);
+  color: var(--muted-foreground);
   font-size: 0.66rem;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -858,13 +864,13 @@
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 0.3rem;
-  color: rgb(255 255 255 / 0.62);
+  color: var(--muted-foreground);
   font-size: 0.65rem;
   line-height: 1.35;
 }
 
 .sgw-event-flow-line span {
-  color: rgb(255 255 255 / 0.88);
+  color: var(--foreground);
   font-weight: 800;
 }
 
@@ -889,12 +895,12 @@
 }
 
 .sgw-event-flow-link.is-failure span {
-  border-color: #b83e4c;
+  border-color: var(--status-failure);
   border-top-style: dashed;
 }
 
 .sgw-event-flow-link.is-pending span {
-  border-color: #f0c243;
+  border-color: var(--status-pending);
 }
 
 .sgw-event-detail-stage.is-compact {
@@ -950,15 +956,15 @@
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  color: rgb(255 255 255 / 0.58);
+  color: var(--muted-foreground);
   font-size: 0.72rem;
 }
 
 .sgw-recent-event-list {
-  border: 1px solid rgb(213 235 255 / 0.1);
+  border: 1px solid var(--border);
   border-radius: 0.62rem;
-  background: #131a23;
-  box-shadow: 0 12px 30px rgb(0 0 0 / 0.22), 0 1px 0 rgb(255 255 255 / 0.03) inset;
+  background: var(--card);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 0.12), 0 1px 0 color-mix(in oklab, var(--foreground) 3%, transparent) inset;
 }
 
 .sgw-recent-event-table {
@@ -976,16 +982,16 @@
 
 .sgw-recent-event-head {
   height: 2.35rem;
-  border-bottom: 2px solid rgb(255 255 255 / 0.62);
-  color: rgb(255 255 255 / 0.86);
+  border-bottom: 2px solid color-mix(in oklab, var(--foreground) 54%, transparent);
+  color: var(--foreground);
   font-size: 0.68rem;
   font-weight: 800;
 }
 
 .sgw-recent-event-row {
   height: 44px;
-  border-bottom: 1px solid rgb(255 255 255 / 0.18);
-  color: rgb(255 255 255 / 0.72);
+  border-bottom: 1px solid var(--border);
+  color: color-mix(in oklab, var(--foreground) 82%, transparent);
   font-size: 0.72rem;
 }
 
@@ -1219,15 +1225,15 @@
 }
 
 .sgw-sidebar-titlebar-trigger:hover {
-  border-color: rgb(213 235 255 / 0.12);
-  background: rgb(213 235 255 / 0.055);
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-accent);
 }
 
 .sgw-sidebar-expand-button {
   height: 2.5rem;
   width: 2.5rem;
-  border: 1px solid rgb(213 235 255 / 0.11);
-  background: rgb(213 235 255 / 0.035);
+  border: 1px solid var(--sidebar-border);
+  background: color-mix(in oklab, var(--sidebar-accent) 60%, transparent);
   box-shadow: none;
 }
 
@@ -1238,22 +1244,21 @@
 }
 
 .sgw-sidebar-nav-button {
-  border-color: rgb(213 235 255 / 0.105);
-  background: rgb(213 235 255 / 0.035);
-  color: rgb(237 246 255 / 0.86);
+  border-color: var(--sidebar-border);
+  background: color-mix(in oklab, var(--sidebar-accent) 60%, transparent);
+  color: color-mix(in oklab, var(--sidebar-foreground) 86%, transparent);
   box-shadow: none;
 }
 
 .sgw-sidebar-nav-button:hover {
-  border-color: rgb(213 235 255 / 0.16);
-  background: rgb(213 235 255 / 0.058);
-  color: rgb(247 251 255 / 0.96);
+  border-color: color-mix(in oklab, var(--sidebar-border) 82%, var(--sidebar-foreground));
+  background: var(--sidebar-accent);
+  color: var(--sidebar-accent-foreground);
 }
 
 .sgw-sidebar-nav-button[data-active="true"] {
-  border-color: rgb(213 235 255 / 0.17);
-  background:
-    linear-gradient(180deg, rgb(213 235 255 / 0.08), rgb(213 235 255 / 0.045));
+  border-color: color-mix(in oklab, var(--sidebar-border) 82%, var(--sidebar-primary));
+  background: var(--sidebar-accent);
   color: var(--sidebar-foreground);
 }
 
@@ -1362,7 +1367,7 @@
 }
 
 [data-slot="table-header"] {
-  background: rgb(255 255 255 / 0.035);
+  background: color-mix(in oklab, var(--foreground) 3.5%, transparent);
 }
 
 .sankey-wrap {
@@ -1430,6 +1435,13 @@
 .light [data-slot="input"] {
   border-color: rgb(7 17 28 / 0.12);
   background: rgb(255 255 255 / 0.66);
+}
+
+.light [data-slot="button"][data-variant="outline"]:hover,
+.light [data-slot="button"][data-variant="secondary"]:hover,
+.light [data-slot="button"][data-variant="ghost"]:hover,
+.light [data-slot="select-trigger"]:hover {
+  background: var(--muted);
 }
 
 .light .sankey-wrap {

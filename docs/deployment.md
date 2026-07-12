@@ -20,14 +20,14 @@ Raw credentials stay in the local encrypted ledger and are decrypted only inside
 
 ### npm Registry
 
-The public npm package is the recommended installation path for individual users. It installs the `s-gw`, `sgw`, `s-gw-mcp`, and `secret-gateway-mcp` commands.
+The public npm package is the recommended installation path for individual users. It installs the `s-gw`, `sgw`, `s-gw-mcp`, and `secret-gateway-mcp` commands. Releases are built on macOS arm64 so Apple Silicon users also receive the native app, menu helper, Keychain helper, and matching Rust core. Linux and Windows use the TypeScript execution path when the package has no matching native core. Intel Macs must build the native Keychain and desktop surfaces from source; packaged arm64-only helpers are rejected before launch.
 
 ```bash
 npm install -g @s-gw/s-gw
 s-gw setup
 ```
 
-For most macOS users, this is the complete first run. `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI.
+For Apple Silicon Mac users, this is the complete first run. `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI.
 
 ### Local Tarball Or Source
 
@@ -357,7 +357,7 @@ Supported means s-gw has a documented standard MCP stdio path. Profiled means `s
 
 ## Upgrade
 
-The CLI and local console cache successful responses from the public `sgateway/s-gw` GitHub Releases feed for six hours. Drafts are ignored; preview releases are included while s-gw is in preview. If GitHub's unauthenticated Releases API is rate-limited, clients fall back to the repository's public Atom release feed; the macOS app then checks the deterministic package and checksum URLs before offering an upgrade. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The native macOS checker starts with the app, polls every 15 minutes, and skips the network until six hours after its last successful response. A failed request does not advance that timestamp, so it retries on the next 15-minute poll. The app sends one macOS notification per available version, falls back to its in-app banner when notification permission is unavailable, and provides manual checks from Settings or the `Check for Updates` menu command.
+The CLI and local console cache successful responses from the public `sgateway/s-gw` GitHub Releases feed for six hours. Drafts are ignored; preview releases are included while s-gw is in preview. If GitHub's unauthenticated Releases API is rate-limited, clients fall back to the repository's public Atom release feed; the macOS app then checks the deterministic package and checksum URLs before offering an upgrade. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The login-started macOS menu helper checks immediately and every 15 minutes, while the main app performs one startup check and supports manual checks. Both skip the network until six hours after the last successful response. A failed request does not advance that timestamp, so the helper retries on its next poll. The helper sends one macOS notification per available version and opens the matching release when clicked; the main app retains its in-app banner when notification permission is unavailable.
 
 The release workflow runs the full verification suite, then builds and uploads the scoped package, legacy bridge, platform installers, `SHA256SUMS.txt`, and per-file `.sha256` assets. It refuses to upload an update package whose identity or checksum cannot be verified. The macOS app accepts either checksum format, installs through the same package migration path as the CLI, refreshes the service/menu helper, and reopens s-gw. The original `0.1.0` app can take the legacy bridge on its next update check; once that fixed app is installed, later releases migrate it to the scoped package automatically. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
 
@@ -370,7 +370,7 @@ s-gw update install
 s-gw setup
 ```
 
-Use `--package PATH_OR_SPEC` with `plan` or `install` for a verified local tarball or a specific npm version. The installer checks the target package metadata before changing anything. If the legacy unscoped `s-gw` package is installed, it creates and verifies a temporary local rollback tarball, stops the running surfaces, removes only that legacy package, and then installs `@s-gw/s-gw`. A failed install prints a rollback command that points to the saved local tarball; it never suggests the unpublished `s-gw@0.1.0` registry package.
+Use `--package PATH_OR_SPEC` with `plan` or `install` for a verified local tarball or a specific npm version. The installer checks the target package metadata before changing anything. If the legacy unscoped `s-gw` package is installed, it creates and verifies a temporary local rollback tarball, stops the running surfaces, removes only that legacy package, and then installs `@s-gw/s-gw`. A failed migration restores and verifies that rollback before restarting previously running surfaces. If automatic rollback fails, the error retains commands pointing to the saved local tarball; it never suggests the unpublished `s-gw@0.1.0` registry package. If the existing data directory disappears, services stay stopped and setup is withheld until the user restores the backup.
 
 If the original `0.1.0` app cannot reach a release containing the legacy bridge, bootstrap that one upgrade with the current scoped CLI without installing it over the old command first:
 
@@ -414,12 +414,15 @@ Before publishing a build:
 
 ```bash
 npm run verify
+npm run validate:npm-package
 npm pack
 ```
 
 For macOS production packages, also verify:
 
-- native helper exists at `dist/native/s-gw-keychain-helper`;
+- native helper exists at `dist/native/darwin-arm64/s-gw-keychain-helper`;
+- Rust core exists at `dist/native/darwin-arm64/s-gw-core`;
+- all four native executables report `arm64` through `lipo -verify_arch`;
 - native macOS app exists at `dist/s-gw.app`;
 - `s-gw unlock status` reports `provider: "native-helper"`;
 - real Keychain + MCP e2e passes with no `SGW_MASTER_PASSPHRASE`;
@@ -442,18 +445,18 @@ For Windows preview packages, also verify:
 
 ## What The Package Contains
 
-The current npm/tarball package contains:
+The public npm package contains:
 
 - `s-gw` CLI and `s-gw-mcp` stdio MCP server;
 - compiled TypeScript under `dist`;
-- compiled Rust execution core at `dist/native/s-gw-core` or `s-gw-core.exe`;
-- native macOS Keychain helper at `dist/native/s-gw-keychain-helper`;
+- compiled Rust execution core at `dist/native/darwin-arm64/s-gw-core`;
+- native macOS Keychain helper at `dist/native/darwin-arm64/s-gw-keychain-helper`;
 - native macOS management app at `dist/s-gw.app`;
 - native macOS menu-bar helper app at `dist/s-gw Menu Bar.app`;
 - local console HTML/CSS/JS assets under `docs/ui`;
 - integration docs and agent profile docs;
 
-It intentionally does not contain native application source files, source maps, credentials, user policy files, npm build caches, SwiftPM `.build` caches, or any pre-seeded Keychain material.
+Native executable paths are scoped by platform and architecture. A source build writes its runner and helper under `dist/native/<platform>-<architecture>/`; automatic execution ignores binaries for other targets and uses the TypeScript path when no matching core exists. The package intentionally does not contain native application source files, source maps, credentials, user policy files, npm build caches, SwiftPM `.build` caches, or any pre-seeded Keychain material.
 
 ## Reference Docs
 

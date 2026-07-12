@@ -164,7 +164,7 @@ function ensureNativeCredentialStore(info: KeychainInfo): void {
   }
 
   if ((info.provider !== "native-helper" && info.provider !== "windows-helper") || !info.helperPath) {
-    throw new Error("OS credential-store secret storage requires the native s-gw helper. Run `npm run build:native`.");
+    throw missingCredentialStoreError();
   }
 }
 
@@ -220,9 +220,10 @@ function findNativeHelper(): string | undefined {
   }
 
   const here = path.dirname(fileURLToPath(import.meta.url));
+  const nativeTarget = `${process.platform}-${process.arch}`;
   const candidates = [
-    path.resolve(here, "native", nativeHelperName),
-    path.resolve(process.cwd(), "dist", "native", nativeHelperName)
+    path.resolve(here, "native", nativeTarget, nativeHelperName),
+    path.resolve(process.cwd(), "dist", "native", nativeTarget, nativeHelperName)
   ];
 
   return candidates.find((candidate) => existsSync(candidate));
@@ -263,7 +264,7 @@ function runKeychainGet(info: KeychainInfo): string {
     return runWindowsCredentialHelper(info.helperPath, ["get", "-Service", info.service, "-Account", info.account]);
   }
 
-  throw new Error("No local OS credential-store provider is available. Run `npm run build:native`.");
+  throw missingCredentialStoreError();
 }
 
 function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw local unlock passphrase"): void {
@@ -297,7 +298,7 @@ function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw lo
     return;
   }
 
-  throw new Error("No local OS credential-store provider is available. Run `npm run build:native`.");
+  throw missingCredentialStoreError();
 }
 
 function runKeychainDelete(info: KeychainInfo): void {
@@ -316,7 +317,17 @@ function runKeychainDelete(info: KeychainInfo): void {
     return;
   }
 
-  throw new Error("No local OS credential-store provider is available. Run `npm run build:native`.");
+  throw missingCredentialStoreError();
+}
+
+function missingCredentialStoreError(): Error {
+  if (process.platform === "darwin") {
+    return new Error(
+      `No compatible macOS Keychain helper is available for darwin-${process.arch}. ` +
+      "Public npm and DMG releases currently include Apple Silicon native surfaces; Intel Macs must build them from source."
+    );
+  }
+  return new Error("No local OS credential-store provider is available. Run `npm run build:native`.");
 }
 
 function runNativeHelper(helperPath: string, args: string[], input?: string): string {

@@ -4,6 +4,27 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.3 - 2026-07-11
+
+### Added
+
+- Persistent update checks and notifications in the login-started macOS menu helper, including release links and durable per-version deduplication.
+- Platform-and-architecture-scoped native executable paths with package validation for the Apple Silicon npm release.
+
+### Changed
+
+- Settings now use clear section cards and plain-language approval duration choices instead of the previous compact tab switcher and raw millisecond field.
+- The public npm package includes the Apple Silicon native app, menu helper, Keychain helper, and Rust execution core; other targets use the TypeScript execution path when no matching core is present.
+
+### Fixed
+
+- Light mode now applies consistently to activity tables, dashboard widgets, menus, dialogs, settings, status text, and code panels.
+- TypeScript and Swift update comparisons now follow SemVer precedence, so stable releases outrank their prereleases and invalid tags are ignored.
+- Failed package updates restore previously running console and menu services after safe-to-recover failures, without masking the original update error if restart also fails. A missing-data guard keeps services stopped until backup restoration.
+- Legacy package migration retains verified rollback instructions when inspection fails after removal.
+- Concurrent agent installs and uninstalls are serialized so ownership-manifest entries cannot overwrite each other.
+- Automatic execution rejects incompatible native binaries before launch and safely falls back to TypeScript; explicitly required Rust execution still fails closed.
+
 ## 0.1.2 - 2026-07-11
 
 ### Added

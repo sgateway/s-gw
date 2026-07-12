@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { assertActionAllowed, type SecretStore } from "./store.js";
@@ -45,7 +45,24 @@ async function runEnvCommand(
   const engine = executionEngine(options.engine);
   const coreBinary = options.coreBinary || rustCoreBinary();
   if (engine !== "typescript" && existsSync(coreBinary)) {
-    return runRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets);
+    if (!nativeCoreIsCompatible(coreBinary)) {
+      if (engine === "rust") {
+        throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
+      }
+      return runTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets);
+    }
+
+    try {
+      return await runRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets);
+    } catch (error) {
+      if (engine === "auto" && isNativeLaunchError(error)) {
+        return runTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets);
+      }
+      if (engine === "rust" && isNativeLaunchError(error)) {
+        throw new Error(`Rust execution core could not be launched: ${coreBinary}. ${errorMessage(error)}`);
+      }
+      throw error;
+    }
   }
   if (engine === "rust") {
     throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
@@ -160,7 +177,95 @@ function executionEngine(override?: ExecutionOptions["engine"]): "auto" | "rust"
 
 function rustCoreBinary(): string {
   const extension = process.platform === "win32" ? ".exe" : "";
-  return fileURLToPath(new URL(`../dist/native/s-gw-core${extension}`, import.meta.url));
+  return fileURLToPath(new URL(
+    `../dist/native/${process.platform}-${process.arch}/s-gw-core${extension}`,
+    import.meta.url
+  ));
+}
+
+function nativeCoreIsCompatible(coreBinary: string): boolean {
+  try {
+    if (process.platform !== "win32") accessSync(coreBinary, constants.X_OK);
+    const header = readFileSync(coreBinary).subarray(0, 4096);
+    if (header[0] === 0x23 && header[1] === 0x21) return true;
+    if (process.platform === "darwin") return compatibleMachO(header);
+    if (process.platform === "win32") return compatiblePe(header);
+    return compatibleElf(header);
+  } catch {
+    return false;
+  }
+}
+
+function compatibleElf(header: Buffer): boolean {
+  if (header.length < 20 || !header.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+    return false;
+  }
+  const littleEndian = header[5] === 1;
+  if (!littleEndian && header[5] !== 2) return false;
+  const machine = littleEndian ? header.readUInt16LE(18) : header.readUInt16BE(18);
+  const expected: Partial<Record<NodeJS.Architecture, number>> = {
+    arm: 40,
+    arm64: 183,
+    ia32: 3,
+    x64: 62
+  };
+  return expected[process.arch] === machine;
+}
+
+function compatibleMachO(header: Buffer): boolean {
+  if (header.length < 8) return false;
+  const magic = header.subarray(0, 4).toString("hex");
+  const thinLittle = magic === "cefaedfe" || magic === "cffaedfe";
+  const thinBig = magic === "feedface" || magic === "feedfacf";
+  if (thinLittle || thinBig) {
+    const cpu = thinLittle ? header.readUInt32LE(4) : header.readUInt32BE(4);
+    return cpu === machCpuType();
+  }
+
+  const fatBig = magic === "cafebabe" || magic === "cafebabf";
+  const fatLittle = magic === "bebafeca" || magic === "bfbafeca";
+  if (!fatBig && !fatLittle) return false;
+  const read32 = fatLittle
+    ? (offset: number) => header.readUInt32LE(offset)
+    : (offset: number) => header.readUInt32BE(offset);
+  const count = read32(4);
+  const entrySize = magic === "cafebabf" || magic === "bfbafeca" ? 32 : 20;
+  if (count > 64 || header.length < 8 + count * entrySize) return false;
+  for (let index = 0; index < count; index += 1) {
+    if (read32(8 + index * entrySize) === machCpuType()) return true;
+  }
+  return false;
+}
+
+function machCpuType(): number {
+  if (process.arch === "arm64") return 0x0100000c;
+  if (process.arch === "x64") return 0x01000007;
+  if (process.arch === "arm") return 12;
+  if (process.arch === "ia32") return 7;
+  return -1;
+}
+
+function compatiblePe(header: Buffer): boolean {
+  if (header.length < 64 || header[0] !== 0x4d || header[1] !== 0x5a) return false;
+  const offset = header.readUInt32LE(0x3c);
+  if (offset + 6 > header.length || header.subarray(offset, offset + 4).toString("hex") !== "50450000") {
+    return false;
+  }
+  const expected: Partial<Record<NodeJS.Architecture, number>> = {
+    arm64: 0xaa64,
+    ia32: 0x014c,
+    x64: 0x8664
+  };
+  return header.readUInt16LE(offset + 4) === expected[process.arch];
+}
+
+function isNativeLaunchError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EACCES" || code === "ENOENT" || code === "ENOEXEC";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function buildCoreEnv(): NodeJS.ProcessEnv {

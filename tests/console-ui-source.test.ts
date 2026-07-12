@@ -122,6 +122,27 @@ describe("React console source contracts", () => {
     expect(app).not.toContain("PolicyEnabledStatus");
   });
 
+  it("keeps settings sections compact and approval durations readable", async () => {
+    const [app, tabs] = await Promise.all([
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
+      readFile(path.join(repoRoot, "src/console-ui/src/components/ui/tabs.tsx"), "utf8")
+    ]);
+
+    expect(app).toContain("data-settings-nav");
+    expect(app).toContain('data-settings-tab="approvals"');
+    expect(app).toContain('data-settings-tab="grants"');
+    expect(app).toContain('data-settings-tab="about"');
+    expect(app).toContain("Reusable duration");
+    expect(app).toContain('{ value: 15 * 60 * 1000, label: "15 minutes" }');
+    expect(app).toContain('{ value: 60 * 60 * 1000, label: "1 hour" }');
+    expect(app).toContain("Saving clears ${state.approvalGrants.length} active reusable");
+    expect(app).not.toContain('placeholder="Duration ms"');
+    expect(tabs).toContain("data-[orientation=horizontal]:flex-col");
+    expect(tabs).toContain("data-[state=active]:bg-background");
+    expect(tabs).not.toContain("data-horizontal:");
+    expect(tabs).not.toContain("data-active:");
+  });
+
   it("makes agent integration cards actionable", async () => {
     const [app, server] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),

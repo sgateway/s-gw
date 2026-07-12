@@ -14,15 +14,13 @@ permissions:
   contents: read
 
 jobs:
-  publish:
-    if: github.repository == 'sgateway/s-gw' && (github.event_name == 'release' || inputs.release_tag == '')
-    runs-on: ubuntu-latest
+  publish-npm:
+    if: github.repository == 'sgateway/s-gw' && github.event_name == 'release'
+    runs-on: macos-15
     environment: npm
     permissions:
       contents: read
       id-token: write
-    env:
-      SGW_E2E_CHROME: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -37,14 +35,71 @@ jobs:
       - run: npm run verify
 
       - name: Verify release version
-        if: github.event_name == 'release'
         run: |
           package_version="$(node -p "require('./package.json').version")"
           test "v${package_version}" = "${GITHUB_REF_NAME}"
 
+      - name: Validate native npm package
+        run: |
+          npm run validate:npm-package
+          for binary in \
+            dist/native/darwin-arm64/s-gw-core \
+            dist/native/darwin-arm64/s-gw-keychain-helper \
+            dist/s-gw.app/Contents/MacOS/s-gw \
+            "dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper"; do
+            lipo "$binary" -verify_arch arm64
+          done
+
       - name: Publish to npm
-        if: github.event_name == 'release'
-        run: npm publish --access public
+        run: npm publish --access public --ignore-scripts
+
+      - name: Verify published npm package
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          prefix="${RUNNER_TEMP}/s-gw-npm-${package_version}"
+          installed=0
+          for _ in 1 2 3 4 5 6; do
+            rm -rf "$prefix"
+            if npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
+              installed=1
+              break
+            fi
+            sleep 10
+          done
+          test "$installed" = 1
+
+          package_root="$prefix/lib/node_modules/@s-gw/s-gw"
+          test -x "$prefix/bin/s-gw"
+          test -x "$package_root/dist/native/darwin-arm64/s-gw-core"
+          test -x "$package_root/dist/native/darwin-arm64/s-gw-keychain-helper"
+          test -x "$package_root/dist/s-gw.app/Contents/MacOS/s-gw"
+          test -x "$package_root/dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper"
+          test ! -e "$package_root/dist/native/s-gw-core"
+          test ! -e "$package_root/dist/native/s-gw-core.exe"
+          test ! -e "$package_root/dist/native/s-gw-keychain-helper"
+          test "$("$package_root/dist/native/darwin-arm64/s-gw-core" --version)" = "sgw-core ${package_version}"
+          "$prefix/bin/s-gw" help >/dev/null
+          lipo "$package_root/dist/native/darwin-arm64/s-gw-core" -verify_arch arm64
+
+  publish-registry:
+    needs: publish-npm
+    if: >-
+      always() &&
+      github.repository == 'sgateway/s-gw' &&
+      (github.event_name == 'release' || inputs.release_tag == '') &&
+      (github.event_name != 'release' || needs.publish-npm.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
       - name: Verify npm publication
         run: |

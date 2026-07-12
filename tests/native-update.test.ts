@@ -5,14 +5,21 @@ import { describe, expect, it } from "vitest";
 const root = process.cwd();
 
 describe("native macOS update lifecycle", () => {
-  it("starts polling with the app process instead of a visible window", async () => {
-    const app = await readFile(
-      path.join(root, "native/macos-app/Sources/SgwMac/App/SgwApp.swift"),
-      "utf8"
-    );
+  it("keeps recurring update polling in the login-started menu helper", async () => {
+    const [app, state, helper, install] = await Promise.all([
+      readFile(path.join(root, "native/macos-app/Sources/SgwMac/App/SgwApp.swift"), "utf8"),
+      readFile(path.join(root, "native/macos-app/Sources/SgwMac/App/AppState.swift"), "utf8"),
+      readFile(path.join(root, "native/menu-bar-helper/Sources/UpdateMonitor.swift"), "utf8"),
+      readFile(path.join(root, "src/install.ts"), "utf8")
+    ]);
 
     expect(app).toContain("state.start()\n  }");
     expect(app).not.toContain(".onAppear { appState.start() }");
+    expect(state).not.toContain("private var updateTask");
+    expect(helper).toContain("final class UpdateMonitor");
+    expect(helper).toContain("pollInterval: TimeInterval = 15 * 60");
+    expect(helper).toContain('["update", "check"]');
+    expect(install).toContain("runAtLoad: true");
   });
 
   it("delivers foreground system notifications and keeps an in-app fallback", async () => {
@@ -45,11 +52,12 @@ describe("native macOS update lifecycle", () => {
     const persistedCheck = updateMethod.indexOf("UpdateChecker.lastCheckDefaultsKey");
     expect(persistedCheck).toBeGreaterThan(failedFetch);
     expect(updateMethod).toContain("if !release.canInstallPackage");
-    expect(state).toContain("updateRetryInterval: TimeInterval = 15 * 60");
+    expect(state).not.toContain("updateRetryInterval");
     expect(checker).toContain('"sha256sums.txt"');
     expect(checker).toContain("entry.fileName == assetName");
     expect(checker).toContain('"update", "install", "--package", downloadURL.path');
     expect(checker).toContain("s-gw setup --no-open-app");
+    expect(checker).toContain("s-gw start --no-open-app");
     expect(checker).not.toContain('npmCommand()');
   });
 });

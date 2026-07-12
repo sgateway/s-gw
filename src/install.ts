@@ -88,15 +88,29 @@ export interface WindowsOpenResult {
   pid?: number;
 }
 
+export interface WindowsStoppedSurfaces {
+  pids: number[];
+  console: boolean;
+  helper: boolean;
+  client: boolean;
+}
+
+export interface WindowsRestartResult {
+  console?: WindowsOpenResult;
+  helper?: WindowsOpenResult;
+  client?: WindowsOpenResult;
+}
+
 export function getPackageLayout(): PackageLayout {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const packageRoot = path.basename(here) === "dist" ? path.dirname(here) : path.dirname(here);
+  const nativeTarget = `${process.platform}-${process.arch}`;
 
   return {
     packageRoot,
     cliPath: path.join(packageRoot, "dist", "cli.js"),
     mcpPath: path.join(packageRoot, "dist", "mcp-server.js"),
-    keychainHelperPath: path.join(packageRoot, "dist", "native", "s-gw-keychain-helper"),
+    keychainHelperPath: path.join(packageRoot, "dist", "native", nativeTarget, "s-gw-keychain-helper"),
     macAppPath: path.join(packageRoot, "dist", "s-gw.app"),
     macAppBinaryPath: path.join(packageRoot, "dist", "s-gw.app", "Contents", "MacOS", "s-gw"),
     menuBarAppPath: path.join(packageRoot, "dist", "s-gw Menu Bar.app"),
@@ -287,17 +301,19 @@ export function stopMacApp(): MacAppProcessInfo | undefined {
   };
 }
 
-export function stopWindowsSurfaces(): number[] {
+export function stopWindowsSurfaces(): WindowsStoppedSurfaces {
   requireWindows("Windows surface stop");
   const script = [
     "$stopped = @()",
     "Get-CimInstance Win32_Process | ForEach-Object {",
     "  $line = [string]$_.CommandLine",
-    "  $helper = $line -match '(?i)s-gw-(helper|client)\\.ps1'",
+    "  $helper = $line -match '(?i)s-gw-helper\\.ps1'",
+    "  $client = $line -match '(?i)s-gw-client\\.ps1'",
     "  $console = $line -match '(?i)[\\\\/]dist[\\\\/]cli\\.js' -and $line -match '(?i)\\sconsole(?:\\s|$)' -and $line -match '(?i)s-gw'",
-    "  if ($_.ProcessId -ne $PID -and ($helper -or $console)) {",
+    "  if ($_.ProcessId -ne $PID -and ($helper -or $client -or $console)) {",
+    "    $kind = if ($helper) { 'helper' } elseif ($client) { 'client' } else { 'console' }",
     "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
-    "    $stopped += [int]$_.ProcessId",
+    "    $stopped += [PSCustomObject]@{ pid = [int]$_.ProcessId; kind = $kind }",
     "  }",
     "}",
     "$stopped | ConvertTo-Json -Compress"
@@ -309,9 +325,104 @@ export function stopWindowsSurfaces(): number[] {
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || "Could not stop the running s-gw Windows surfaces.");
   }
-  if (!result.stdout.trim()) return [];
-  const parsed = JSON.parse(result.stdout) as number | number[];
-  return (Array.isArray(parsed) ? parsed : [parsed]).filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (!result.stdout.trim()) return { pids: [], console: false, helper: false, client: false };
+  const parsed = JSON.parse(result.stdout) as unknown;
+  const entries = (Array.isArray(parsed) ? parsed : [parsed]).filter((entry): entry is { pid: number; kind: string } => {
+    if (!entry || typeof entry !== "object") return false;
+    const item = entry as { pid?: unknown; kind?: unknown };
+    return typeof item.pid === "number" && Number.isInteger(item.pid) && item.pid > 0 && typeof item.kind === "string";
+  });
+  return {
+    pids: entries.map((entry) => entry.pid),
+    console: entries.some((entry) => entry.kind === "console"),
+    helper: entries.some((entry) => entry.kind === "helper"),
+    client: entries.some((entry) => entry.kind === "client")
+  };
+}
+
+export function startWindowsConsole(options: MenuBarOptions = {}): WindowsOpenResult {
+  requireWindows("Windows console start");
+  const layout = getPackageLayout();
+  const port = options.port || 8718;
+  const url = options.consoleUrl || consoleUrl(port);
+  const child = spawn(process.execPath, [
+    layout.cliPath,
+    "console",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--no-open"
+  ], {
+    detached: true,
+    env: windowsEnvironment(url),
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+  return {
+    scriptPath: layout.cliPath,
+    launcherPath: process.execPath,
+    consoleUrl: url,
+    pid: child.pid
+  };
+}
+
+export async function restartWindowsSurfaces(
+  stopped: WindowsStoppedSurfaces,
+  options: MenuBarOptions = {}
+): Promise<WindowsRestartResult> {
+  requireWindows("Windows surface restart");
+  const result: WindowsRestartResult = {};
+  const failures: string[] = [];
+  try {
+    if (stopped.client) {
+      result.client = openWindowsClient(options);
+    } else if (stopped.console) {
+      result.console = startWindowsConsole(options);
+    }
+  } catch (error) {
+    failures.push(`console/client: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (stopped.helper) {
+    try {
+      result.helper = openWindowsHelper(options);
+    } catch (error) {
+      failures.push(`helper: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if ((stopped.console || stopped.client) && (result.console || result.client)) {
+    try {
+      await waitForWindowsConsole(options.consoleUrl || consoleUrl(options.port || 8718));
+    } catch (error) {
+      failures.push(`console health: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (result.helper) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (!result.helper.pid || !isPidAlive(result.helper.pid)) {
+      failures.push("helper: process exited during startup");
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(failures.join("; "));
+  }
+  return result;
+}
+
+async function waitForWindowsConsole(url: string): Promise<void> {
+  const healthUrl = new URL("/api/health", url).toString();
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(500) });
+      if (response.ok) return;
+    } catch {
+      // The restored process can take a moment to bind after npm finishes.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`s-gw console did not become healthy at ${healthUrl}`);
 }
 
 export function launchAgentStatus(kind: "console" | "menubar"): LaunchAgentStatus {
@@ -843,6 +954,7 @@ function assertMenuBarExists(): void {
   if (!existsSync(layout.menuBarAppPath) || !existsSync(layout.menuBarBinaryPath)) {
     throw new Error(`Menu-bar helper is missing. Expected app bundle at ${layout.menuBarAppPath}`);
   }
+  assertMacExecutableCompatible(layout.menuBarBinaryPath, "menu-bar helper");
 }
 
 function assertMacAppExists(): void {
@@ -850,6 +962,21 @@ function assertMacAppExists(): void {
   if (!existsSync(layout.macAppPath) || !existsSync(layout.macAppBinaryPath)) {
     throw new Error(`macOS app is missing. Expected app bundle at ${layout.macAppPath}`);
   }
+  assertMacExecutableCompatible(layout.macAppBinaryPath, "macOS app");
+}
+
+function assertMacExecutableCompatible(binaryPath: string, label: string): void {
+  if (process.platform !== "darwin") return;
+  const arch = process.arch === "x64" ? "x86_64" : process.arch;
+  const check = spawnSync("/usr/bin/lipo", [binaryPath, "-verify_arch", arch], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (check.status === 0) return;
+  throw new Error(
+    `The packaged ${label} is not compatible with darwin-${process.arch}. ` +
+    "Public npm and DMG releases currently include Apple Silicon native surfaces; Intel Macs must build them from source."
+  );
 }
 
 function assertWindowsClientExists(): void {

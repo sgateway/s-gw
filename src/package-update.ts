@@ -34,6 +34,7 @@ export interface PackageInstallOptions extends PackageUpdateOptions {
   dryRun?: boolean;
   servicesAlreadyStopped?: boolean;
   stopServices?: () => Promise<void>;
+  restartServices?: () => Promise<void>;
 }
 
 export interface InstalledNpmPackage {
@@ -99,6 +100,7 @@ interface PreparedRollback {
 export class PackageUpdateError extends Error {
   readonly phase: string;
   readonly recoveryCommands: string[];
+  readonly summary: string;
 
   constructor(message: string, phase: string, recoveryCommands: string[] = []) {
     const recovery = recoveryCommands.length > 0
@@ -108,6 +110,7 @@ export class PackageUpdateError extends Error {
     this.name = "PackageUpdateError";
     this.phase = phase;
     this.recoveryCommands = recoveryCommands;
+    this.summary = message;
   }
 }
 
@@ -212,83 +215,119 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
     );
   }
 
-  if (options.stopServices) {
-    try {
-      await options.stopServices();
-    } catch (error) {
-      throw new PackageUpdateError(
-        `Could not stop s-gw cleanly: ${errorMessage(error)}`,
-        "stop-services",
-        ["s-gw stop"]
-      );
-    }
-  }
-
   const npm = npmContext(options);
   const dataExisted = await pathExists(plan.dataHome);
   let removedLegacy = false;
   let rollback: PreparedRollback | null = null;
+  let stopAttempted = false;
 
-  if (plan.installed.legacy) {
-    rollback = await prepareLegacyRollback(plan, npm);
-    const removed = await npm.run(uninstallArgs(plan.installed.npmPrefix, LEGACY_PACKAGE_NAME));
-    if (removed.status !== 0) {
-      await discardRollback(rollback);
-      throw npmFailure(
-        `Could not remove legacy ${LEGACY_PACKAGE_NAME}@${plan.installed.legacy.version}. The scoped package was not installed.`,
-        "remove-legacy",
-        removed,
-        []
-      );
+  try {
+    if (options.stopServices) {
+      stopAttempted = true;
+      try {
+        await options.stopServices();
+      } catch (error) {
+        throw new PackageUpdateError(
+          `Could not stop s-gw cleanly: ${errorMessage(error)}`,
+          "stop-services"
+        );
+      }
     }
-    removedLegacy = true;
 
-    const afterRemove = await inspectGlobalSgwInstall(options);
-    if (afterRemove.legacy) {
-      await discardRollback(rollback);
+    if (plan.installed.legacy) {
+      rollback = await prepareLegacyRollback(plan, npm);
+      const removed = await npm.run(uninstallArgs(plan.installed.npmPrefix, LEGACY_PACKAGE_NAME));
+      if (removed.status !== 0) {
+        await discardRollback(rollback);
+        rollback = null;
+        throw npmFailure(
+          `Could not remove legacy ${LEGACY_PACKAGE_NAME}@${plan.installed.legacy.version}. The scoped package was not installed.`,
+          "remove-legacy",
+          removed,
+          []
+        );
+      }
+      removedLegacy = true;
+
+      const afterRemove = await inspectGlobalSgwInstall(options);
+      if (afterRemove.legacy) {
+        throw new PackageUpdateError(
+          `npm still reports ${LEGACY_PACKAGE_NAME}@${afterRemove.legacy.version} under ${afterRemove.npmPrefix}. The scoped package was not installed.`,
+          "remove-legacy",
+          recoveryFor(plan, rollback)
+        );
+      }
+    }
+
+    const installed = await npm.run(installArgs(plan.installed.npmPrefix, plan.target.installSpec));
+    if (installed.status !== 0) {
+      const message = removedLegacy
+        ? `Could not install ${plan.target.name}@${plan.target.version} after removing the legacy package. Your s-gw data at ${plan.dataHome} was not intentionally changed.`
+        : `Could not install ${plan.target.name}@${plan.target.version}.`;
+      throw npmFailure(message, "install-scoped", installed, recoveryFor(plan, rollback));
+    }
+
+    const finalInstall = await inspectGlobalSgwInstall(options);
+    if (!finalInstall.scoped || finalInstall.legacy || finalInstall.scoped.version !== plan.target.version) {
       throw new PackageUpdateError(
-        `npm still reports ${LEGACY_PACKAGE_NAME}@${afterRemove.legacy.version} under ${afterRemove.npmPrefix}. The scoped package was not installed.`,
-        "remove-legacy",
-        []
+        `npm completed, but the global package state is invalid: expected scoped=${plan.target.version}, found scoped=${finalInstall.scoped?.version || "missing"}, legacy=${finalInstall.legacy?.version || "absent"}.`,
+        "verify-install",
+        recoveryFor(plan, rollback)
       );
     }
+
+    const dataHomePreserved = !dataExisted || await pathExists(plan.dataHome);
+    if (!dataHomePreserved) {
+      throw new PackageUpdateError(
+        `The package installed, but the existing s-gw data directory is no longer present at ${plan.dataHome}. Do not run setup until the data is restored from backup. Services remain stopped to avoid initializing an empty store.`,
+        "verify-data",
+        recoveryFor(plan, rollback, false)
+      );
+    }
+
+    await discardRollback(rollback);
+
+    return {
+      changed: true,
+      dryRun: false,
+      plan,
+      installed: finalInstall,
+      dataHomePreserved,
+      nextCommands: plan.nextCommands
+    };
+  } catch (error) {
+    let failure = packageUpdateFailure(error, plan, rollback, removedLegacy);
+    if (removedLegacy && rollback) {
+      try {
+        await restoreLegacyPackage(plan, rollback, npm);
+        await discardRollback(rollback);
+        rollback = null;
+        removedLegacy = false;
+        failure = new PackageUpdateError(
+          `${failure.summary}\nThe previous ${LEGACY_PACKAGE_NAME}@${plan.installed.legacy?.version} package was restored before services restarted.`,
+          failure.phase
+        );
+      } catch (rollbackError) {
+        failure = new PackageUpdateError(
+          `${failure.summary}\nAutomatic rollback failed: ${errorMessage(rollbackError)}`,
+          failure.phase,
+          recoveryFor(plan, rollback, failure.phase !== "verify-data")
+        );
+      }
+    }
+    if (stopAttempted && options.restartServices && failure.phase !== "verify-data") {
+      try {
+        await options.restartServices();
+      } catch (restartError) {
+        failure = new PackageUpdateError(
+          `${failure.summary}\nCould not restart the stopped s-gw services: ${errorMessage(restartError)}`,
+          failure.phase,
+          uniqueCommands([...failure.recoveryCommands, "s-gw start --no-open-app"])
+        );
+      }
+    }
+    throw failure;
   }
-
-  const installed = await npm.run(installArgs(plan.installed.npmPrefix, plan.target.installSpec));
-  if (installed.status !== 0) {
-    const message = removedLegacy
-      ? `Could not install ${plan.target.name}@${plan.target.version} after removing the legacy package. Your s-gw data at ${plan.dataHome} was not intentionally changed.`
-      : `Could not install ${plan.target.name}@${plan.target.version}.`;
-    throw npmFailure(message, "install-scoped", installed, recoveryFor(plan, rollback));
-  }
-
-  const finalInstall = await inspectGlobalSgwInstall(options);
-  if (!finalInstall.scoped || finalInstall.legacy || finalInstall.scoped.version !== plan.target.version) {
-    throw new PackageUpdateError(
-      `npm completed, but the global package state is invalid: expected scoped=${plan.target.version}, found scoped=${finalInstall.scoped?.version || "missing"}, legacy=${finalInstall.legacy?.version || "absent"}.`,
-      "verify-install",
-      recoveryFor(plan, rollback)
-    );
-  }
-
-  const dataHomePreserved = !dataExisted || await pathExists(plan.dataHome);
-  if (!dataHomePreserved) {
-    throw new PackageUpdateError(
-      `The package installed, but the existing s-gw data directory is no longer present at ${plan.dataHome}. Do not run setup until the data is restored from backup.`,
-      "verify-data"
-    );
-  }
-
-  await discardRollback(rollback);
-
-  return {
-    changed: true,
-    dryRun: false,
-    plan,
-    installed: finalInstall,
-    dataHomePreserved,
-    nextCommands: plan.nextCommands
-  };
 }
 
 export function selectReleasePackageAssets(
@@ -565,13 +604,78 @@ function npmOutput(result: NpmCommandResult): string {
   return (result.stderr.trim() || result.stdout.trim()).split(/\r?\n/).slice(-8).join("\n");
 }
 
-function recoveryFor(plan: PackageUpdatePlan, rollback: PreparedRollback | null): string[] {
+function recoveryFor(
+  plan: PackageUpdatePlan,
+  rollback: PreparedRollback | null,
+  includeSetup = true
+): string[] {
   if (!rollback || !plan.installed.legacy) return [];
-  return [
+  const commands = [
     commandText("npm", uninstallArgs(plan.installed.npmPrefix, SCOPED_PACKAGE_NAME)),
-    commandText("npm", installArgs(plan.installed.npmPrefix, rollback.target)),
-    "s-gw setup"
+    commandText("npm", installArgs(plan.installed.npmPrefix, rollback.target))
   ];
+  if (includeSetup) commands.push("s-gw setup");
+  return commands;
+}
+
+function packageUpdateFailure(
+  error: unknown,
+  plan: PackageUpdatePlan,
+  rollback: PreparedRollback | null,
+  removedLegacy: boolean
+): PackageUpdateError {
+  const failure = error instanceof PackageUpdateError
+    ? error
+    : new PackageUpdateError(errorMessage(error), "install");
+  if (!removedLegacy) return failure;
+
+  const recoveryCommands = uniqueCommands([
+    ...failure.recoveryCommands,
+    ...recoveryFor(plan, rollback, failure.phase !== "verify-data")
+  ]);
+  if (recoveryCommands.length === failure.recoveryCommands.length) return failure;
+  return new PackageUpdateError(failure.summary, failure.phase, recoveryCommands);
+}
+
+async function restoreLegacyPackage(
+  plan: PackageUpdatePlan,
+  rollback: PreparedRollback,
+  npm: { run: (args: string[]) => Promise<NpmCommandResult> }
+): Promise<void> {
+  const removedScoped = await npm.run(uninstallArgs(plan.installed.npmPrefix, SCOPED_PACKAGE_NAME));
+  if (removedScoped.status !== 0) {
+    throw new Error(npmOutput(removedScoped) || `Could not remove ${SCOPED_PACKAGE_NAME}.`);
+  }
+
+  const restored = await npm.run(installArgs(plan.installed.npmPrefix, rollback.target));
+  if (restored.status !== 0) {
+    throw new Error(npmOutput(restored) || `Could not restore ${LEGACY_PACKAGE_NAME}.`);
+  }
+
+  const expected = plan.installed.legacy;
+  if (!expected) throw new Error("Legacy package metadata is unavailable after rollback.");
+  try {
+    const manifest = JSON.parse(await readFile(path.join(expected.packageRoot, "package.json"), "utf8")) as {
+      name?: unknown;
+      version?: unknown;
+    };
+    if (manifest.name !== LEGACY_PACKAGE_NAME || manifest.version !== expected.version) {
+      throw new Error("restored package identity does not match the previous installation");
+    }
+    if (!await pathExists(path.join(expected.packageRoot, "dist", "cli.js"))) {
+      throw new Error("restored package is missing dist/cli.js");
+    }
+    const scopedRoot = path.join(plan.installed.npmRoot, ...SCOPED_PACKAGE_NAME.split("/"));
+    if (await pathExists(path.join(scopedRoot, "package.json"))) {
+      throw new Error(`restored package still conflicts with ${SCOPED_PACKAGE_NAME}`);
+    }
+  } catch (error) {
+    throw new Error(`Could not verify the restored ${LEGACY_PACKAGE_NAME}@${expected.version}: ${errorMessage(error)}`);
+  }
+}
+
+function uniqueCommands(commands: string[]): string[] {
+  return [...new Set(commands)];
 }
 
 async function prepareLegacyRollback(

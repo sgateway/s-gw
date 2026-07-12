@@ -21,7 +21,9 @@ describe("customer package layout", () => {
 
     expect(layout.cliPath).toMatch(/dist\/cli\.js$/);
     expect(layout.mcpPath).toMatch(/dist\/mcp-server\.js$/);
-    expect(layout.keychainHelperPath).toMatch(/dist\/native\/s-gw-keychain-helper$/);
+    expect(layout.keychainHelperPath).toBe(
+      path.join(layout.packageRoot, "dist", "native", `${process.platform}-${process.arch}`, "s-gw-keychain-helper")
+    );
     expect(layout.macAppPath).toContain("s-gw.app");
     expect(layout.macAppBinaryPath).toContain("s-gw.app/Contents/MacOS/s-gw");
     expect(layout.menuBarAppPath).toContain("s-gw Menu Bar.app");
@@ -52,6 +54,9 @@ describe("customer package layout", () => {
     expect(stopSource).toContain("pids.push(Number(app.processIdentifier))");
     expect(stopSource).not.toContain("valueForKey");
     expect(stopSource).not.toContain("macAppBinaryPath");
+    expect(installSource).toContain("assertMacExecutableCompatible");
+    expect(installSource).toContain('"-verify_arch", arch');
+    expect(installSource).toContain("Intel Macs must build them from source");
   });
 
   it("reports install health without exposing unlock passphrases", () => {

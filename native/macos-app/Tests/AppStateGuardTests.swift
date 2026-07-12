@@ -243,6 +243,7 @@ struct AppStateGuardTests {
     await runIncompleteReleaseRetryTest()
     await runUpdateNotificationTest()
     await runDeniedNotificationFallbackTest()
+    runSemVerComparisonTest()
     runAtomFallbackParsingTest()
     runChecksumManifestTest()
 
@@ -536,6 +537,21 @@ struct AppStateGuardTests {
     } catch {
       fail("a raw digest should remain valid in an exact per-file checksum: \(error)")
     }
+  }
+
+  static func runSemVerComparisonTest() {
+    check(!UpdateChecker.isNewer("0.2.0-preview.1", than: "0.2.0"),
+          "a preview must not outrank its stable release")
+    check(UpdateChecker.isNewer("0.2.0", than: "0.2.0-preview.1"),
+          "preview users must receive the stable release")
+    check(UpdateChecker.isNewer("0.2.0-preview.10", than: "0.2.0-preview.2"),
+          "numeric prerelease identifiers must compare numerically")
+    check(UpdateChecker.isNewer("0.2.0-beta", than: "0.2.0-alpha"),
+          "text prerelease identifiers must compare lexically")
+    check(!UpdateChecker.isNewer("0.2.0-1", than: "0.2.0-alpha"),
+          "numeric prerelease identifiers must sort before text identifiers")
+    check(!UpdateChecker.isNewer("0.2.0+build.2", than: "0.2.0+build.1"),
+          "build metadata must not affect precedence")
   }
 
   static func runAtomFallbackParsingTest() {
