@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import SwiftUI
-import UserNotifications
+@preconcurrency import UserNotifications
 
 extension Notification.Name {
   static let sgwShowMenuHelper = Notification.Name("com.s-gw.sgw.showMenuHelper")
