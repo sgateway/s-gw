@@ -932,7 +932,7 @@ async function launchChrome(url: string): Promise<{ cdp: Cdp; approvePostCount: 
   );
 
   const wsUrl = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout waiting for DevTools endpoint")), 15_000);
+    const timer = setTimeout(() => reject(new Error("timeout waiting for DevTools endpoint")), 30_000);
     let buf = "";
     chrome!.stderr?.on("data", (chunk: Buffer) => {
       buf += chunk.toString();
