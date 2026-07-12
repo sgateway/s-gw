@@ -99,25 +99,34 @@ async function runRustEnvCommand(
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal }));
   });
-  child.stdin.end(JSON.stringify({
-    version: 1,
-    requestId: request.id,
-    handle: request.handle,
-    command: request.action.command,
-    args: request.action.args,
-    injectEnv: request.action.injectEnv,
-    secretValue,
-    env: extraSecrets.map((item) => ({
-      handle: item.handle,
-      injectEnv: item.injectEnv,
-      value: item.value
-    })),
-    workingDir: request.action.workingDir,
-    timeoutMs: request.action.timeoutMs,
-    maxOutputBytes: maxOutput
-  }));
+  const input = new Promise<void>((resolve, reject) => {
+    child.stdin.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPIPE") {
+        resolve();
+        return;
+      }
+      reject(error);
+    });
+    child.stdin.end(JSON.stringify({
+      version: 1,
+      requestId: request.id,
+      handle: request.handle,
+      command: request.action.command,
+      args: request.action.args,
+      injectEnv: request.action.injectEnv,
+      secretValue,
+      env: extraSecrets.map((item) => ({
+        handle: item.handle,
+        injectEnv: item.injectEnv,
+        value: item.value
+      })),
+      workingDir: request.action.workingDir,
+      timeoutMs: request.action.timeoutMs,
+      maxOutputBytes: maxOutput
+    }), resolve);
+  });
 
-  const status = await completion;
+  const [status] = await Promise.all([completion, input]);
   if (status.code !== 0) {
     throw new Error(stderr.trim() || `Rust execution core exited ${status.code ?? status.signal ?? "unexpectedly"}.`);
   }
