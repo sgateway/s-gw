@@ -30,6 +30,11 @@ interface UpdateCache {
   result: UpdateCheckResult;
 }
 
+interface SemanticVersion {
+  core: [string, string, string];
+  prerelease: string[];
+}
+
 interface ReleaseCheckerOptions {
   cachePath?: string;
   currentVersion?: string;
@@ -41,18 +46,10 @@ interface ReleaseCheckerOptions {
 }
 
 export function isNewerVersion(candidate: string, current: string): boolean {
-  const left = versionParts(candidate);
-  const right = versionParts(current);
-  const count = Math.max(left.length, right.length);
-
-  for (let index = 0; index < count; index += 1) {
-    const a = left[index] ?? 0;
-    const b = right[index] ?? 0;
-    if (a > b) return true;
-    if (a < b) return false;
-  }
-
-  return false;
+  const left = parseSemanticVersion(candidate);
+  const right = parseSemanticVersion(current);
+  if (!left || !right) return false;
+  return compareSemanticVersions(left, right) > 0;
 }
 
 export class ReleaseChecker {
@@ -196,7 +193,7 @@ export const releaseChecker = new ReleaseChecker();
 function newestRelease(releases: GitHubRelease[]): GitHubRelease | null {
   let newest: GitHubRelease | null = null;
   for (const release of releases) {
-    if (release.draft || !cleanVersion(release.tag_name)) continue;
+    if (release.draft || !parseSemanticVersion(release.tag_name)) continue;
     if (!newest || isNewerVersion(release.tag_name, newest.tag_name)) {
       newest = release;
     }
@@ -213,13 +210,14 @@ function releaseFromAtom(xml: string): GitHubRelease | null {
   const tagFromLink = link?.match(/\/releases\/tag\/([^/?#"]+)/i)?.[1];
   const tagFromId = id?.split("/").at(-1);
   const tag = decodeXml(tagFromLink || tagFromId || "").trim();
-  if (!tag) return null;
+  const parsed = parseSemanticVersion(tag);
+  if (!parsed) return null;
 
   return {
     tag_name: tag,
     html_url: decodeXml(link || `https://github.com/${UPDATE_REPOSITORY}/releases/tag/${tag}`),
     draft: false,
-    prerelease: cleanVersion(tag).includes("-"),
+    prerelease: parsed.prerelease.length > 0,
     published_at: entry.match(/<updated>([^<]+)<\/updated>/i)?.[1] || null
   };
 }
@@ -250,11 +248,60 @@ function cleanVersion(version: string): string {
   return version.trim().replace(/^v/i, "");
 }
 
-function versionParts(version: string): number[] {
-  return cleanVersion(version).split(".").map((part) => {
-    const match = part.match(/^\d+/);
-    return match ? Number(match[0]) : 0;
-  });
+function parseSemanticVersion(version: string): SemanticVersion | null {
+  const match = cleanVersion(version).match(
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+  );
+  if (!match) return null;
+
+  const prerelease = match[4]?.split(".") ?? [];
+  if (prerelease.some((identifier) => /^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith("0"))) {
+    return null;
+  }
+
+  return {
+    core: [match[1], match[2], match[3]],
+    prerelease
+  };
+}
+
+function compareSemanticVersions(left: SemanticVersion, right: SemanticVersion): number {
+  for (let index = 0; index < left.core.length; index += 1) {
+    const compared = compareNumericIdentifier(left.core[index], right.core[index]);
+    if (compared !== 0) return compared;
+  }
+
+  if (left.prerelease.length === 0 || right.prerelease.length === 0) {
+    if (left.prerelease.length === right.prerelease.length) return 0;
+    return left.prerelease.length === 0 ? 1 : -1;
+  }
+
+  const count = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < count; index += 1) {
+    const a = left.prerelease[index];
+    const b = right.prerelease[index];
+    if (a === undefined || b === undefined) {
+      if (a === b) return 0;
+      return a === undefined ? -1 : 1;
+    }
+
+    const aNumeric = /^\d+$/.test(a);
+    const bNumeric = /^\d+$/.test(b);
+    if (aNumeric && bNumeric) {
+      const compared = compareNumericIdentifier(a, b);
+      if (compared !== 0) return compared;
+      continue;
+    }
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    if (a !== b) return a < b ? -1 : 1;
+  }
+  return 0;
+}
+
+function compareNumericIdentifier(left: string, right: string): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 }
 
 function cacheIsFresh(result: UpdateCheckResult, now: number): boolean {

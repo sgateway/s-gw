@@ -170,6 +170,90 @@ describe("Rust execution core", () => {
     expect(summary.stdout).toContain(tokenForHandle(record.handle));
     expect(summary.stdout).not.toContain(secret);
   });
+
+  it("falls back before launch when automatic mode finds an incompatible core", async () => {
+    const incompatibleCore = path.join(tmpHome, process.platform === "win32" ? "foreign-core.exe" : "foreign-core");
+    await writeFile(incompatibleCore, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]), { mode: 0o700 });
+    await chmod(incompatibleCore, 0o700);
+
+    const store = new SecretStore();
+    const secret = "incompatible-core-secret-value-123456789";
+    const record = await addCredential(store, "incompatible core", secret);
+    const request = await createRequest(
+      store,
+      record.handle,
+      "SGW_INCOMPATIBLE_CORE",
+      "console.log(process.env.SGW_INCOMPATIBLE_CORE)"
+    );
+    await store.approveRequest(request.id);
+
+    const summary = await executeApprovedRequest(store, request.id, {
+      engine: "auto",
+      coreBinary: incompatibleCore
+    });
+    expect(summary.exitCode).toBe(0);
+    expect(summary.stdout).toContain(tokenForHandle(record.handle));
+    expect(summary.stdout).not.toContain(secret);
+  });
+
+  it("fails closed when an incompatible core is explicitly required", async () => {
+    const incompatibleCore = path.join(tmpHome, process.platform === "win32" ? "required-foreign.exe" : "required-foreign");
+    await writeFile(incompatibleCore, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]), { mode: 0o700 });
+    await chmod(incompatibleCore, 0o700);
+
+    const store = new SecretStore();
+    const record = await addCredential(store, "required incompatible core", "required-incompatible-secret-value-123456789");
+    const request = await createRequest(store, record.handle, "SGW_REQUIRED_CORE", "console.log('must-not-run')");
+    await store.approveRequest(request.id);
+
+    await expect(executeApprovedRequest(store, request.id, {
+      engine: "rust",
+      coreBinary: incompatibleCore
+    })).rejects.toThrow(/not compatible|could not be launched/i);
+    expect((await store.getRequest(request.id)).state).toBe("failed");
+  });
+
+  it("falls back only when an automatic core cannot be launched", async () => {
+    if (process.platform === "win32") return;
+    const brokenCore = path.join(tmpHome, "missing-interpreter-core");
+    await writeFile(brokenCore, "#!/definitely/missing/s-gw-interpreter\n", { mode: 0o700 });
+    await chmod(brokenCore, 0o700);
+
+    const store = new SecretStore();
+    const record = await addCredential(store, "launch fallback", "launch-fallback-secret-value-123456789");
+    const request = await createRequest(
+      store,
+      record.handle,
+      "SGW_LAUNCH_FALLBACK",
+      "console.log(process.env.SGW_LAUNCH_FALLBACK)"
+    );
+    await store.approveRequest(request.id);
+
+    const summary = await executeApprovedRequest(store, request.id, {
+      engine: "auto",
+      coreBinary: brokenCore
+    });
+    expect(summary.stdout).toContain(tokenForHandle(record.handle));
+    expect(summary.stdout).not.toContain("launch-fallback-secret-value");
+  });
+
+  it("does not retry an already launched core failure through TypeScript", async () => {
+    if (process.platform === "win32") return;
+    const failingCore = path.join(tmpHome, "failing-core");
+    await writeFile(failingCore, "#!/bin/sh\necho 'core rejected request' >&2\nexit 23\n", { mode: 0o700 });
+    await chmod(failingCore, 0o700);
+
+    const store = new SecretStore();
+    const record = await addCredential(store, "no retry", "no-retry-secret-value-123456789");
+    const request = await createRequest(store, record.handle, "SGW_NO_RETRY", "console.log('must-not-run')");
+    await store.approveRequest(request.id);
+
+    await expect(executeApprovedRequest(store, request.id, {
+      engine: "auto",
+      coreBinary: failingCore
+    })).rejects.toThrow("core rejected request");
+    expect((await store.getRequest(request.id)).state).toBe("failed");
+  });
 });
 
 async function addCredential(store: SecretStore, name: string, value: string) {

@@ -28,7 +28,7 @@ unset SGW_UNLOCK
 s-gw unlock status
 ```
 
-For automation, `SGW_MASTER_PASSPHRASE` still works as a fallback. Keep real passphrases in a local user environment or OS credential store, not in project-scoped MCP files. On macOS, the normal path uses the bundled native helper at `dist/native/s-gw-keychain-helper`; on Windows preview builds it uses `dist\windows\s-gw-credential.ps1`. Both helpers receive new passphrases on stdin.
+For automation, `SGW_MASTER_PASSPHRASE` still works as a fallback. Keep real passphrases in a local user environment or OS credential store, not in project-scoped MCP files. On Apple Silicon Macs, the normal path uses the bundled native helper at `dist/native/darwin-arm64/s-gw-keychain-helper`; on Windows preview builds it uses `dist\windows\s-gw-credential.ps1`. Both helpers receive new passphrases on stdin.
 
 ## Guarded Launch
 

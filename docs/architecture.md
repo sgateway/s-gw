@@ -48,7 +48,7 @@ The approval broker claims the request, validates the handle policy again, and r
 
 The Rust runner clears the child environment, restores a small allowlist of ordinary process variables, injects only approved credential bindings, enforces the timeout, captures bounded stdout and stderr, replaces known values with handles, and returns a proof-bound result. The broker rejects malformed responses, raw credential output, or an invalid proof before updating the request record.
 
-Owned SSH sessions use the TypeScript execution path. Platform-native packages include the Rust runner and select it automatically for approved environment commands. A Windows preview assembled on macOS uses the TypeScript compatibility path because it cannot contain a Windows-native runner; Windows builds include `sgw-core.exe`. `SGW_EXECUTION_ENGINE=rust` can require the compiled runner, while `SGW_EXECUTION_ENGINE=typescript` selects the compatibility path explicitly.
+Owned SSH sessions use the TypeScript execution path. Native runners live under `dist/native/<platform>-<architecture>/`, and automatic mode only selects the current target. The public npm package includes the macOS arm64 runner; Linux, Windows, and other architectures use the TypeScript compatibility path when their target directory is absent. Native Windows source builds produce `dist/native/win32-x64/s-gw-core.exe`. `SGW_EXECUTION_ENGINE=rust` requires a compatible compiled runner, while `SGW_EXECUTION_ENGINE=typescript` selects the compatibility path explicitly.
 
 ### User Interfaces
 

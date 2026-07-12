@@ -1,6 +1,6 @@
 {
   "name": "@s-gw/s-gw",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "mcpName": "io.github.sgateway/s-gw",
   "description": "Local credential control for AI coding agents.",
   "type": "module",
@@ -36,6 +36,10 @@
     "!dist/assets/icons/s-gw-*.png",
     "!dist/assets/icons/AppIcon.icns",
     "!dist/installers",
+    "!dist/native/s-gw-core",
+    "!dist/native/s-gw-core.exe",
+    "!dist/native/s-gw-keychain-helper",
+    "!dist/native/sgw-keychain-helper",
     "!dist/**/*.map",
     "!docs/ui/local-console*.png",
     "!assets/icons/s-gw-source.png",
@@ -58,12 +62,14 @@
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.console.json --noEmit",
     "package:local": "npm run verify && npm pack",
     "package:dry-run": "npm pack --dry-run",
+    "validate:npm-package": "node scripts/validate-npm-package.mjs",
     "validate:release-assets": "node scripts/validate-release-assets.mjs dist/installers",
     "check:rust": "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -p sgw-core",
     "pretest": "npm run build:rust-core",
     "test": "vitest run",
     "test:watch": "vitest",
     "verify": "npm run build && npm run check:rust && npm test && npm audit && npm run package:dry-run",
+    "prepublishOnly": "npm run validate:npm-package",
     "prepack": "npm run build"
   },
   "keywords": [

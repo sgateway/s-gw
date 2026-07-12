@@ -104,7 +104,7 @@ s-gw status
 
 To build from source, use a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
 
-Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path; use the source steps below for development and contribution work.
+Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path. It includes the native app, menu helper, Keychain helper, and Rust core for Apple Silicon Macs; Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; the npm package and DMG reject their arm64-only helpers with a clear compatibility error.
 
 ```bash
 git clone https://github.com/sgateway/s-gw.git
@@ -206,11 +206,12 @@ The model can complete the task without receiving the raw access key.
 
 | Platform | Status | Credential store | User interface |
 | --- | --- | --- | --- |
-| macOS 14+ | Primary development platform | Keychain | Native app, menu helper, local web console |
+| macOS 14+ on Apple Silicon | Primary development platform | Keychain | Native app, menu helper, local web console |
+| macOS 14+ on Intel | Build-from-source candidate; not QA-tested | Source-built Keychain helper | Source-built native surfaces or local web console |
 | Windows 10/11 | Preview | Credential Manager | PowerShell client, tray helper, local web console |
 | Linux | Experimental CLI | Environment-provided unlock material | Local web console |
 
-Preview installers are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The macOS DMG is ad-hoc signed and unnotarized, and the Windows package is unsigned preview software. Build the same artifacts locally with `npm run build:installers`.
+Preview installers are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The Apple Silicon macOS DMG is ad-hoc signed and unnotarized, and the Windows package is unsigned preview software. Build the same artifacts locally with `npm run build:installers`.
 
 ## Security Model
 

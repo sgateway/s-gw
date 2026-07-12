@@ -43,11 +43,9 @@ final class AppState {
   }
 
   @ObservationIgnored private var refreshTask: Task<Void, Never>?
-  @ObservationIgnored private var updateTask: Task<Void, Never>?
   @ObservationIgnored private let defaults: UserDefaults
   @ObservationIgnored private let now: () -> Date
   @ObservationIgnored private let updateCheckInterval: TimeInterval
-  @ObservationIgnored private let updateRetryInterval: TimeInterval
   @ObservationIgnored private var seenPendingRequestIds = Set<String>()
 
   init(
@@ -55,15 +53,13 @@ final class AppState {
     updateNotifier: UpdateNotifier? = nil,
     defaults: UserDefaults = .standard,
     now: @escaping () -> Date = Date.init,
-    updateCheckInterval: TimeInterval = 6 * 60 * 60,
-    updateRetryInterval: TimeInterval = 15 * 60
+    updateCheckInterval: TimeInterval = 6 * 60 * 60
   ) {
     self.updater = updater
     self.updateNotifier = updateNotifier ?? UpdateNotifier(defaults: defaults)
     self.defaults = defaults
     self.now = now
     self.updateCheckInterval = updateCheckInterval
-    self.updateRetryInterval = updateRetryInterval
     updateRepository = savedSgwUpdateRepository(defaults: defaults)
   }
 
@@ -150,17 +146,13 @@ final class AppState {
     Task {
       await refresh()
     }
+    Task {
+      await checkForUpdates()
+    }
     refreshTask = Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(4))
         await self?.refreshQuietly()
-      }
-    }
-    updateTask = Task { [weak self] in
-      while !Task.isCancelled {
-        await self?.checkForUpdates()
-        let retryInterval = self?.updateRetryInterval ?? 15 * 60
-        try? await Task.sleep(for: .seconds(retryInterval))
       }
     }
   }
@@ -168,8 +160,6 @@ final class AppState {
   func stop() {
     refreshTask?.cancel()
     refreshTask = nil
-    updateTask?.cancel()
-    updateTask = nil
   }
 
   func refreshQuietly() async {

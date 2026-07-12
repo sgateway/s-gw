@@ -28,10 +28,12 @@ import {
   openWindowsClient,
   openWindowsHelper,
   packageHealth,
+  restartWindowsSurfaces,
   startInstalledLaunchAgent,
   stopInstalledLaunchAgent,
   stopMacApp,
   stopWindowsSurfaces,
+  type WindowsStoppedSurfaces,
   uninstallConsoleLaunchAgent,
   uninstallMenuBarLaunchAgent
 } from "./install.js";
@@ -96,10 +98,12 @@ async function main(): Promise<void> {
       return;
     }
     if (second === "install") {
+      const services = updateServiceLifecycle(hasFlag(parsed.flags, "keep-app-running"));
       printJson(await installPackageUpdate({
         ...updateOptions,
         dryRun: hasFlag(parsed.flags, "dry-run"),
-        stopServices: () => stopLocalUpdateSurfaces(hasFlag(parsed.flags, "keep-app-running"))
+        stopServices: services.stop,
+        restartServices: services.restart
       }));
       return;
     }
@@ -1033,12 +1037,78 @@ async function handleStopCommand(): Promise<void> {
   printJson({ ok: true, service, menuBar });
 }
 
-async function stopLocalUpdateSurfaces(keepAppRunning: boolean): Promise<void> {
-  stopBackgroundSurfaces();
-  if (process.platform === "darwin" && !keepAppRunning) {
-    stopMacApp();
-  } else if (process.platform === "win32") {
-    stopWindowsSurfaces();
+function updateServiceLifecycle(keepAppRunning: boolean): {
+  stop: () => Promise<void>;
+  restart: () => Promise<void>;
+} {
+  const serviceWasLoaded = process.platform === "darwin" && launchAgentStatus("console").loaded;
+  const menuBarWasLoaded = process.platform === "darwin" && launchAgentStatus("menubar").loaded;
+  let macAppWasRunning = false;
+  let windowsStopped: WindowsStoppedSurfaces | undefined;
+
+  return {
+    stop: async () => {
+      stopBackgroundSurfaces();
+      if (process.platform === "darwin" && !keepAppRunning) {
+        macAppWasRunning = Boolean(stopMacApp());
+      } else if (process.platform === "win32") {
+        windowsStopped = stopWindowsSurfaces();
+      }
+    },
+    restart: async () => {
+      const failures: string[] = [];
+      if (process.platform === "darwin") {
+        restartLaunchAgent("console", serviceWasLoaded, failures);
+        restartLaunchAgent("menubar", menuBarWasLoaded, failures);
+        await verifyRestoredLaunchAgents(serviceWasLoaded, menuBarWasLoaded, failures);
+        if (macAppWasRunning) {
+          try {
+            openMacApp();
+          } catch (error) {
+            failures.push(`app: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      } else if (process.platform === "win32" && windowsStopped) {
+        try {
+          await restartWindowsSurfaces(windowsStopped);
+        } catch (error) {
+          failures.push(`Windows surfaces: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      if (failures.length > 0) {
+        throw new Error(failures.join("; "));
+      }
+    }
+  };
+}
+
+async function verifyRestoredLaunchAgents(
+  serviceWasLoaded: boolean,
+  menuBarWasLoaded: boolean,
+  failures: string[]
+): Promise<void> {
+  if (!serviceWasLoaded && !menuBarWasLoaded) return;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const serviceReady = !serviceWasLoaded || launchAgentStatus("console").loaded;
+    const menuReady = !menuBarWasLoaded || launchAgentStatus("menubar").loaded;
+    if (serviceReady && menuReady) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (serviceWasLoaded && !launchAgentStatus("console").loaded) failures.push("console: did not remain loaded");
+  if (menuBarWasLoaded && !launchAgentStatus("menubar").loaded) failures.push("menubar: did not remain loaded");
+}
+
+function restartLaunchAgent(
+  kind: "console" | "menubar",
+  wasLoaded: boolean,
+  failures: string[]
+): void {
+  if (!wasLoaded) return;
+  try {
+    startInstalledLaunchAgent(kind);
+  } catch (error) {
+    failures.push(`${kind}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 

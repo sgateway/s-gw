@@ -5,8 +5,12 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = resolve(root, "native/macos-keychain/SgwKeychain.swift");
-const output = resolve(root, "dist/native/s-gw-keychain-helper");
-const legacyOutput = resolve(root, "dist/native/sgw-keychain-helper");
+const target = `${process.platform}-${process.arch}`;
+const output = resolve(root, "dist/native", target, "s-gw-keychain-helper");
+const legacyOutputs = [
+  resolve(root, "dist/native/s-gw-keychain-helper"),
+  resolve(root, "dist/native/sgw-keychain-helper")
+];
 
 if (process.platform !== "darwin") {
   console.log("Skipping native Keychain helper build on non-macOS platform.");
@@ -30,7 +34,9 @@ if (swiftVersion.status !== 0) {
 }
 
 mkdirSync(dirname(output), { recursive: true });
-rmSync(legacyOutput, { force: true });
+for (const legacyOutput of legacyOutputs) {
+  rmSync(legacyOutput, { force: true });
+}
 
 const result = spawnSync("swiftc", [source, "-O", "-o", output], {
   encoding: "utf8",

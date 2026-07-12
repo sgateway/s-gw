@@ -111,8 +111,37 @@ describe("release update checks", () => {
   it("compares tagged release versions numerically", () => {
     expect(isNewerVersion("v0.10.0", "0.9.9")).toBe(true);
     expect(isNewerVersion("v0.1.1-preview.1", "0.1.0")).toBe(true);
+    expect(isNewerVersion("0.2.0-preview.1", "0.2.0")).toBe(false);
+    expect(isNewerVersion("0.2.0", "0.2.0-preview.1")).toBe(true);
+    expect(isNewerVersion("0.2.0-preview.10", "0.2.0-preview.2")).toBe(true);
+    expect(isNewerVersion("0.2.0-preview.2", "0.2.0-preview.10")).toBe(false);
+    expect(isNewerVersion("0.2.0-beta", "0.2.0-alpha")).toBe(true);
+    expect(isNewerVersion("0.2.0-1", "0.2.0-alpha")).toBe(false);
+    expect(isNewerVersion("0.2.0-preview", "0.2.0-preview.1")).toBe(false);
+    expect(isNewerVersion("0.2.0+build.2", "0.2.0+build.1")).toBe(false);
     expect(isNewerVersion("v0.1.0", "0.1.0")).toBe(false);
     expect(isNewerVersion("v0.0.9", "0.1.0")).toBe(false);
+    expect(isNewerVersion("not-a-version", "0.1.0")).toBe(false);
+  });
+
+  it("offers the stable release to users running its preview", async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-stable-"));
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpDir, "update.json"),
+      currentVersion: "0.2.0-preview.1",
+      enabled: true,
+      fetcher: async () => new Response(JSON.stringify([
+        release("v0.2.0-preview.2", { prerelease: true }),
+        release("v0.2.0"),
+        release("not-a-version")
+      ]), { status: 200 })
+    });
+
+    await expect(checker.check(true)).resolves.toMatchObject({
+      available: true,
+      latestVersion: "0.2.0",
+      prerelease: false
+    });
   });
 
   it("keeps the updater version aligned with the package", async () => {
@@ -132,8 +161,13 @@ describe("release update checks", () => {
     expect(swiftChecker).toContain("/releases?per_page=20");
     expect(swiftChecker).toContain("releases.atom");
     expect(swiftChecker).toContain(".filter({ !$0.draft })");
-    expect(appState).toContain("private var updateTask");
-    expect(appState).toContain("updateRetryInterval: TimeInterval = 15 * 60");
+    const helper = await readFile(
+      path.join(process.cwd(), "native/menu-bar-helper/Sources/UpdateMonitor.swift"),
+      "utf8"
+    );
+    expect(appState).not.toContain("private var updateTask");
+    expect(helper).toContain("update check");
+    expect(helper).toContain("15 * 60");
   });
 });
 

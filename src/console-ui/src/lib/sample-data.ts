@@ -104,7 +104,7 @@ export const sampleState: ConsoleState = {
         service: "com.s-gw.sgw.secret",
         account: "local",
         provider: "macOS Keychain",
-        helperPath: "dist/native/s-gw-keychain-helper",
+        helperPath: "dist/native/darwin-arm64/s-gw-keychain-helper",
         configured: true
       }
     }

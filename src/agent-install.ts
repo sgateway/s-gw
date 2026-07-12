@@ -103,6 +103,18 @@ interface AgentManifest {
   agents: Record<string, AgentOwnership>;
 }
 
+interface AgentIntegrationLockOwner {
+  pid: number;
+  startedAt: number;
+  token: string;
+}
+
+interface AgentIntegrationLockState {
+  markerPath?: string;
+  owner?: AgentIntegrationLockOwner;
+  modifiedAt: number;
+}
+
 interface WorkContext {
   homeDir: string;
   pathEnv: string;
@@ -136,6 +148,9 @@ interface TomlSection {
 
 const managedStart = "# >>> s-gw managed MCP server";
 const managedEnd = "# <<< s-gw managed MCP server";
+const agentLockTimeoutMs = 35_000;
+const staleAgentLockMs = 30_000;
+const agentLockPollMs = 25;
 
 function envPath(value: string | undefined, fallback: string): string {
   const configured = value?.trim();
@@ -272,6 +287,11 @@ export function agentIntegrationStatus(options: AgentIntegrationOptions = {}): A
 }
 
 export function installAgentIntegrations(options: AgentIntegrationOptions = {}): AgentIntegrationResult[] {
+  if (options.dryRun) return installAgentIntegrationsUnlocked(options);
+  return withAgentIntegrationLock(options, () => installAgentIntegrationsUnlocked(options));
+}
+
+function installAgentIntegrationsUnlocked(options: AgentIntegrationOptions): AgentIntegrationResult[] {
   const ctx = loadContext(options);
   const explicit = Boolean(options.agentIds?.length);
   const profiles = selectedProfiles(options.agentIds);
@@ -307,6 +327,11 @@ export function installAgentIntegrations(options: AgentIntegrationOptions = {}):
 }
 
 export function uninstallAgentIntegrations(options: AgentIntegrationOptions = {}): AgentIntegrationResult[] {
+  if (options.dryRun) return uninstallAgentIntegrationsUnlocked(options);
+  return withAgentIntegrationLock(options, () => uninstallAgentIntegrationsUnlocked(options));
+}
+
+function uninstallAgentIntegrationsUnlocked(options: AgentIntegrationOptions): AgentIntegrationResult[] {
   const ctx = loadContext(options);
   const ids = options.agentIds?.length
     ? options.agentIds
@@ -345,7 +370,7 @@ export function uninstallAgentIntegrations(options: AgentIntegrationOptions = {}
 function loadContext(options: AgentIntegrationOptions): WorkContext {
   const env = options.env || process.env;
   const platform = options.platform || process.platform;
-  const homeDir = path.resolve(options.homeDir || env.HOME || env.USERPROFILE || os.homedir());
+  const homeDir = integrationHome(options);
   const pathEnv = options.pathEnv ?? env.PATH ?? "";
   const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
   const windowsMcp = platform === "win32";
@@ -373,6 +398,183 @@ function loadContext(options: AgentIntegrationOptions): WorkContext {
     manifest,
     manifestError
   };
+}
+
+function integrationHome(options: AgentIntegrationOptions): string {
+  const env = options.env || process.env;
+  return path.resolve(options.homeDir || env.HOME || env.USERPROFILE || os.homedir());
+}
+
+function withAgentIntegrationLock<T>(options: AgentIntegrationOptions, body: () => T): T {
+  const homeDir = integrationHome(options);
+  mkdirSync(homeDir, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(homeDir, ".s-gw-agent-integrations.lock");
+  const owner: AgentIntegrationLockOwner = {
+    pid: process.pid,
+    startedAt: Date.now(),
+    token: randomUUID()
+  };
+  const markerName = agentLockMarkerName(owner.token);
+  const started = Date.now();
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+
+  while (!publishAgentIntegrationLock(lockPath, markerName, owner)) {
+    if (Date.now() - started >= agentLockTimeoutMs) {
+      throw new Error(`Timed out waiting for the agent integration lock at ${lockPath}. Another install or uninstall may still be running.`);
+    }
+    if (removeAbandonedAgentLock(lockPath)) continue;
+    Atomics.wait(waiter, 0, 0, agentLockPollMs);
+  }
+
+  try {
+    return body();
+  } finally {
+    releaseAgentIntegrationLock(lockPath, markerName);
+  }
+}
+
+function publishAgentIntegrationLock(
+  lockPath: string,
+  markerName: string,
+  owner: AgentIntegrationLockOwner
+): boolean {
+  const tmpPath = `${lockPath}.tmp-${process.pid}-${owner.token}`;
+  const markerPath = path.join(tmpPath, markerName);
+  let markerFd: number | undefined;
+  try {
+    mkdirSync(tmpPath, { mode: 0o700 });
+    markerFd = openSync(markerPath, "wx", 0o600);
+    writeFileSync(markerFd, `${JSON.stringify(owner)}\n`);
+    fsyncSync(markerFd);
+    closeSync(markerFd);
+    markerFd = undefined;
+
+    try {
+      renameSync(tmpPath, lockPath);
+      return true;
+    } catch (error) {
+      if (isNodeError(error) && (error.code === "EEXIST" || error.code === "ENOTEMPTY")) return false;
+      if (process.platform === "win32" && isNodeError(error) && (error.code === "EPERM" || error.code === "EACCES")) {
+        return false;
+      }
+      if (isNodeError(error) && (error.code === "EPERM" || error.code === "EACCES") && existsSync(lockPath)) return false;
+      throw error;
+    }
+  } finally {
+    if (markerFd !== undefined) closeSync(markerFd);
+    tryUnlink(markerPath);
+    tryRmdir(tmpPath);
+  }
+}
+
+function inspectAgentIntegrationLock(lockPath: string): AgentIntegrationLockState {
+  const lockInfo = lstatSync(lockPath);
+  if (lockInfo.isSymbolicLink() || !lockInfo.isDirectory()) {
+    throw new Error(`${lockPath} is not a regular directory. s-gw refuses to remove it.`);
+  }
+
+  const entries = readdirSync(lockPath);
+  if (entries.length === 0) return { modifiedAt: lockInfo.mtimeMs };
+  if (entries.length > 1) {
+    throw new Error(`${lockPath} contains unexpected files. s-gw refuses to remove it.`);
+  }
+
+  const markerName = entries[0];
+  const markerPath = path.join(lockPath, markerName);
+  const markerInfo = lstatSync(markerPath);
+  if (markerInfo.isSymbolicLink() || !markerInfo.isFile()) {
+    throw new Error(`${markerPath} is not a regular file. s-gw refuses to remove it.`);
+  }
+
+  const parsed = readAgentLockOwner(readFileSync(markerPath, "utf8"));
+  const owner = parsed && markerName === agentLockMarkerName(parsed.token) ? parsed : undefined;
+  return {
+    markerPath,
+    owner,
+    modifiedAt: Math.max(lockInfo.mtimeMs, markerInfo.mtimeMs)
+  };
+}
+
+function removeAbandonedAgentLock(lockPath: string): boolean {
+  let state: AgentIntegrationLockState;
+  try {
+    state = inspectAgentIntegrationLock(lockPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return true;
+    throw error;
+  }
+
+  if (state.owner) {
+    if (state.owner.pid === process.pid) {
+      throw new Error(`The current process already owns the agent integration lock at ${lockPath}.`);
+    }
+    if (processIsAlive(state.owner.pid)) return false;
+  } else if (Date.now() - state.modifiedAt <= staleAgentLockMs) {
+    return false;
+  }
+
+  // The marker name belongs to this generation, so an old cleaner cannot unlink a replacement.
+  if (state.markerPath) tryUnlink(state.markerPath);
+  return tryRmdir(lockPath);
+}
+
+function readAgentLockOwner(contents: string): AgentIntegrationLockOwner | undefined {
+  try {
+    const value = JSON.parse(contents) as Partial<AgentIntegrationLockOwner>;
+    if (!Number.isSafeInteger(value.pid) || (value.pid || 0) <= 0) return undefined;
+    if (!Number.isFinite(value.startedAt) || (value.startedAt || 0) <= 0) return undefined;
+    if (typeof value.token !== "string" || !value.token) return undefined;
+    return value as AgentIntegrationLockOwner;
+  } catch {
+    return undefined;
+  }
+}
+
+function agentLockMarkerName(token: string): string {
+  return `owner-${token}.json`;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isNodeError(error) && error.code === "EPERM";
+  }
+}
+
+function releaseAgentIntegrationLock(lockPath: string, markerName: string): void {
+  tryUnlink(path.join(lockPath, markerName));
+  tryRmdir(lockPath);
+}
+
+function tryUnlink(filePath: string): void {
+  try {
+    unlinkSync(filePath);
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+  }
+}
+
+function tryRmdir(dirPath: string): boolean {
+  try {
+    rmdirSync(dirPath);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return true;
+    if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+    try {
+      if (readdirSync(dirPath).length > 0) return false;
+    } catch (readError) {
+      if (isNodeError(readError) && readError.code === "ENOENT") return true;
+      throw readError;
+    }
+    throw error;
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 function selectedProfiles(ids?: string[]): AgentProfile[] {

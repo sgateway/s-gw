@@ -16,6 +16,7 @@ import {
   FileKey2,
   Gauge,
   GripHorizontal,
+  Info,
   KeyRound,
   LayoutDashboard,
   ListChecks,
@@ -60,7 +61,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import {
   Command,
@@ -254,7 +255,7 @@ function App() {
         <ConsoleProvider>
           {(ctx) => <EmbeddedSurface ctx={ctx} compact={embedView.compact} />}
         </ConsoleProvider>
-        <Toaster richColors />
+        <Toaster richColors theme={theme === "light" ? "light" : "dark"} />
       </TooltipProvider>
     );
   }
@@ -265,7 +266,7 @@ function App() {
         <ConsoleProvider>
           {(ctx) => <MenubarSurface ctx={ctx} />}
         </ConsoleProvider>
-        <Toaster richColors />
+        <Toaster richColors theme={theme === "light" ? "light" : "dark"} />
       </TooltipProvider>
     );
   }
@@ -275,7 +276,7 @@ function App() {
       <ConsoleProvider>
         {(ctx) => <ConsoleShell ctx={ctx} theme={theme} setTheme={setTheme} />}
       </ConsoleProvider>
-      <Toaster richColors />
+      <Toaster richColors theme={theme === "light" ? "light" : "dark"} />
     </TooltipProvider>
   );
 }
@@ -723,7 +724,7 @@ function ViewContent({
     case "audit":
       return <AuditLogView state={ctx.state} search={search} setSearch={setSearch} />;
     case "settings":
-      return <SettingsView state={ctx.state} onDone={() => void ctx.refresh()} />;
+      return <SettingsView state={ctx.state} onDone={() => ctx.refresh()} />;
     default:
       return (
         <OverviewDashboard
@@ -913,7 +914,7 @@ function PendingApprovalsPanel({ state, setApproval, setView }: { state: Console
     <div className="flex h-full flex-col justify-between gap-3">
       <div>
         <div className="text-4xl font-semibold">{state.metrics.pendingApprovals}</div>
-        <div className="mt-1 text-sm text-amber-300">{state.metrics.pendingApprovals ? "Approval needed" : "No pending approvals"}</div>
+        <div className="mt-1 text-sm text-amber-700 dark:text-amber-300">{state.metrics.pendingApprovals ? "Approval needed" : "No pending approvals"}</div>
       </div>
       {first ? (
         <div className="rounded-md border bg-muted/25 p-3 text-sm">
@@ -1435,8 +1436,8 @@ function PolicyStatusControl({
       data-policy-status
       className={cn(
         "inline-flex min-w-[92px] items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium outline-none transition-colors",
-        "hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-wait disabled:opacity-65",
-        enabled ? "text-emerald-300" : "text-muted-foreground hover:text-foreground"
+        "hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-wait disabled:opacity-65",
+        enabled ? "text-emerald-700 dark:text-emerald-300" : "text-muted-foreground hover:text-foreground"
       )}
     >
       {busy ? (
@@ -1607,7 +1608,7 @@ function AgentConfigurationSheet({
               <AgentCapability label="MCP registration" value={titleCase(agent.integration.mcp.state)} />
               <AgentCapability label="s-gw skill" value={titleCase(agent.integration.skill.state)} />
             </div>
-            {agent.integration.reason ? <p className="text-xs text-amber-300">{agent.integration.reason}</p> : null}
+            {agent.integration.reason ? <p className="text-xs text-amber-700 dark:text-amber-300">{agent.integration.reason}</p> : null}
           </section>
 
           <section className="grid gap-2 text-sm sm:grid-cols-2">
@@ -1630,7 +1631,7 @@ function AgentConfigurationSheet({
                   Copy snippet
                 </Button>
               </div>
-              <pre className="max-h-64 overflow-auto rounded-md border bg-black/25 p-3 font-mono text-xs leading-5 text-foreground"><code>{agent.mcp.snippet}</code></pre>
+              <pre className="max-h-64 overflow-auto rounded-md border bg-muted/70 p-3 font-mono text-xs leading-5 text-foreground"><code>{agent.mcp.snippet}</code></pre>
               <AgentPathList label="Configuration paths" paths={agent.mcp.configPaths} />
               {agent.mcp.notes.map((note) => <p key={note} className="text-xs text-muted-foreground">{note}</p>)}
               <CopyCommand value={agent.snippetCommand} label="Generate from CLI" onCopy={copy} />
@@ -1718,7 +1719,7 @@ function CopyCommand({
   onCopy: (value: string, label: string) => Promise<void>;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded-md border bg-black/20 p-2">
+    <div className="flex items-center gap-2 rounded-md border bg-muted/60 p-2">
       <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre font-mono text-xs">{value}</code>
       <Button variant="ghost" size="icon-sm" onClick={() => void onCopy(value, label)} aria-label={`Copy ${label.toLowerCase()}`}>
         <Copy className="h-4 w-4" />
@@ -2115,8 +2116,8 @@ function renderEventColumn(row: EventLogRow, column: EventColumnId, mode: "activ
 }
 
 function eventColumnClassName(column: EventColumnId): string {
-  if (column === "eventId") return "font-mono text-xs text-muted-foreground";
-  if (column === "timestamp") return "text-muted-foreground";
+  if (column === "eventId") return "max-w-[180px] truncate font-mono text-xs text-muted-foreground";
+  if (column === "timestamp") return "whitespace-nowrap text-muted-foreground";
   if (column === "ruleName") return "max-w-[240px] truncate";
   return "max-w-[220px] truncate";
 }
@@ -2193,96 +2194,310 @@ function EmptyEventRows({ message }: { message: string }) {
   return <div className="py-8 text-center text-sm text-muted-foreground">{message}</div>;
 }
 
-function SettingsView({ state, onDone }: { state: ConsoleState; onDone: () => void }) {
+const approvalModePresentation: Record<ApprovalMode, { label: string; detail: string }> = {
+  "per-transaction": {
+    label: "Ask every time",
+    detail: "Require approval for each credential operation."
+  },
+  "timed-session": {
+    label: "Reuse for a time window",
+    detail: "Reuse a matching approval for a limited period."
+  },
+  "login-session": {
+    label: "Reuse for this login session",
+    detail: "Reuse a matching approval until you sign out."
+  },
+  always: {
+    label: "Reuse until revoked",
+    detail: "Keep a matching approval active until you clear it."
+  }
+};
+
+const commonApprovalDurations = [
+  { value: 15 * 60 * 1000, label: "15 minutes" },
+  { value: 60 * 60 * 1000, label: "1 hour" },
+  { value: 8 * 60 * 60 * 1000, label: "8 hours" },
+  { value: 24 * 60 * 60 * 1000, label: "1 day" },
+  { value: 7 * 24 * 60 * 60 * 1000, label: "7 days" },
+  { value: 30 * 24 * 60 * 60 * 1000, label: "30 days" }
+];
+
+function approvalDurationChoices(savedMs: number): Array<{ value: number; label: string }> {
+  if (commonApprovalDurations.some((choice) => choice.value === savedMs)) {
+    return commonApprovalDurations;
+  }
+  return [{ value: savedMs, label: `Current setting · ${durationLabel(savedMs)}` }, ...commonApprovalDurations];
+}
+
+function SettingsView({ state, onDone }: { state: ConsoleState; onDone: () => Promise<void> }) {
   const [mode, setMode] = React.useState<ApprovalMode>(state.approvalSettings.mode);
-  const [durationMs, setDurationMs] = React.useState(String(state.approvalSettings.durationMs));
+  const [durationMs, setDurationMs] = React.useState(state.approvalSettings.durationMs);
+  const [saving, setSaving] = React.useState(false);
+  const [clearing, setClearing] = React.useState(false);
+  const durationChoices = approvalDurationChoices(state.approvalSettings.durationMs);
+  const durationEnabled = mode === "timed-session";
+  const isDirty = mode !== state.approvalSettings.mode || durationMs !== state.approvalSettings.durationMs;
+  const versionLabel = state.version.startsWith("v") ? state.version : `v${state.version}`;
+
+  const saveSettings = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await saveApprovalSettings({ mode, durationMs });
+      toast.success("Approval settings updated");
+      await onDone();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not update approval settings");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clearReusableGrants = async () => {
+    if (clearing) return;
+    setClearing(true);
+    try {
+      await clearGrants();
+      toast.success("Reusable approvals cleared");
+      await onDone();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not clear reusable approvals");
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <PageFrame title="Settings" description="Approval behavior, reusable grants, and local console preferences.">
-      <Tabs defaultValue="approvals">
-        <TabsList>
-          <TabsTrigger value="approvals">Approvals</TabsTrigger>
-          <TabsTrigger value="grants">Reusable grants</TabsTrigger>
-          <TabsTrigger value="about">About</TabsTrigger>
+      <Tabs defaultValue="approvals" className="max-w-5xl gap-4">
+        <TabsList
+          aria-label="Settings sections"
+          data-settings-nav
+          className="grid h-auto! w-full grid-cols-3 items-stretch gap-2 rounded-xl border bg-card/70 p-2"
+        >
+          <TabsTrigger
+            value="approvals"
+            data-settings-tab="approvals"
+            className="h-auto min-h-14 flex-col gap-1.5 whitespace-normal px-2 py-2 text-center shadow-none after:hidden sm:min-h-16 sm:flex-row sm:justify-start sm:gap-3 sm:px-3 sm:text-left data-[state=active]:border-primary/50 data-[state=active]:bg-primary/10"
+          >
+            <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary sm:size-8">
+              <ShieldCheck className="size-4" aria-hidden="true" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-medium leading-tight text-foreground">Approval defaults</span>
+              <span className="mt-1 hidden text-xs font-normal leading-tight text-muted-foreground md:block">
+                Set default request behavior
+              </span>
+            </span>
+          </TabsTrigger>
+          <TabsTrigger
+            value="grants"
+            data-settings-tab="grants"
+            className="h-auto min-h-14 flex-col gap-1.5 whitespace-normal px-2 py-2 text-center shadow-none after:hidden sm:min-h-16 sm:flex-row sm:justify-start sm:gap-3 sm:px-3 sm:text-left data-[state=active]:border-primary/50 data-[state=active]:bg-primary/10"
+          >
+            <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary sm:size-8">
+              <Clock3 className="size-4" aria-hidden="true" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-medium leading-tight text-foreground">Reusable grants</span>
+              <span className="mt-1 hidden text-xs font-normal leading-tight text-muted-foreground md:block">
+                Review reusable access
+              </span>
+            </span>
+          </TabsTrigger>
+          <TabsTrigger
+            value="about"
+            data-settings-tab="about"
+            className="h-auto min-h-14 flex-col gap-1.5 whitespace-normal px-2 py-2 text-center shadow-none after:hidden sm:min-h-16 sm:flex-row sm:justify-start sm:gap-3 sm:px-3 sm:text-left data-[state=active]:border-primary/50 data-[state=active]:bg-primary/10"
+          >
+            <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary sm:size-8">
+              <Info className="size-4" aria-hidden="true" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-medium leading-tight text-foreground">About</span>
+              <span className="mt-1 hidden text-xs font-normal leading-tight text-muted-foreground md:block">
+                Version and local storage
+              </span>
+            </span>
+          </TabsTrigger>
         </TabsList>
-        <TabsContent value="approvals" className="mt-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Default approval mode</CardTitle>
+        <TabsContent value="approvals" className="m-0">
+          <Card data-settings-panel="approvals">
+            <CardHeader className="border-b">
+              <CardTitle>Default approval behavior</CardTitle>
               <CardDescription>Each approval is still scoped by handle, action, agent, and target context.</CardDescription>
             </CardHeader>
-            <CardContent className="grid gap-4 md:grid-cols-3">
-              <Select value={mode} onValueChange={(value) => setMode(value as ApprovalMode)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="per-transaction">Approve per transaction</SelectItem>
-                  <SelectItem value="timed-session">Approve same session for time</SelectItem>
-                  <SelectItem value="login-session">Approve current login session</SelectItem>
-                  <SelectItem value="always">Approve matching action always</SelectItem>
-                </SelectContent>
-              </Select>
-              <Input value={durationMs} onChange={(event) => setDurationMs(event.target.value)} placeholder="Duration ms" />
-              <Button
-                onClick={async () => {
-                  await saveApprovalSettings({ mode, durationMs: Number(durationMs) || 15 * 60 * 1000 });
-                  toast.success("Approval settings updated");
-                  onDone();
-                }}
-              >
-                Save approval settings
-              </Button>
+            <CardContent className="grid gap-6 md:grid-cols-2">
+              <div className="space-y-2">
+                <label htmlFor="approval-mode" className="text-sm font-medium">Approval mode</label>
+                <Select value={mode} onValueChange={(value) => setMode(value as ApprovalMode)}>
+                  <SelectTrigger
+                    id="approval-mode"
+                    data-settings-mode
+                    aria-describedby="approval-mode-help"
+                    className="h-10 w-full"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(Object.keys(approvalModePresentation) as ApprovalMode[]).map((value) => (
+                      <SelectItem key={value} value={value}>{approvalModePresentation[value].label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p id="approval-mode-help" className="text-xs leading-relaxed text-muted-foreground">
+                  {approvalModePresentation[mode].detail}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="approval-duration" className="text-sm font-medium">Reusable duration</label>
+                <Select
+                  value={String(durationMs)}
+                  onValueChange={(value) => setDurationMs(Number(value))}
+                  disabled={!durationEnabled}
+                >
+                  <SelectTrigger
+                    id="approval-duration"
+                    data-settings-duration
+                    aria-describedby="approval-duration-help"
+                    className="h-10 w-full"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {durationChoices.map((choice) => (
+                      <SelectItem key={choice.value} value={String(choice.value)}>{choice.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p id="approval-duration-help" className="text-xs leading-relaxed text-muted-foreground">
+                  {durationEnabled
+                    ? "Matching approvals expire after this window."
+                    : "Available when approval mode uses a time window."}
+                </p>
+              </div>
             </CardContent>
+            <CardFooter className="flex-col items-stretch justify-between gap-3 sm:flex-row sm:items-center">
+              <div className="flex items-start gap-2 text-xs text-muted-foreground">
+                {state.approvalGrants.length > 0 ? (
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+                ) : null}
+                <p>
+                  {state.approvalGrants.length > 0
+                    ? `Saving clears ${state.approvalGrants.length} active reusable ${state.approvalGrants.length === 1 ? "grant" : "grants"}, so matching requests ask again.`
+                    : "Changes apply to new approvals."}
+                </p>
+              </div>
+              <Button
+                data-settings-save
+                className="w-full sm:w-auto"
+                disabled={!isDirty || saving}
+                onClick={() => void saveSettings()}
+              >
+                {saving ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
+                Save changes
+              </Button>
+            </CardFooter>
           </Card>
         </TabsContent>
-        <TabsContent value="grants" className="mt-4">
-          <DataCard>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Handle</TableHead>
-                  <TableHead>Mode</TableHead>
-                  <TableHead>Agent</TableHead>
-                  <TableHead>Expires</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {state.approvalGrants.map((grant) => (
-                  <TableRow key={grant.id}>
-                    <TableCell className="font-mono text-xs">{shortHandle(grant.handle)}</TableCell>
-                    <TableCell>{grant.mode}</TableCell>
-                    <TableCell>
-                      {grant.agentName ? (
-                        <span className="flex items-center gap-2">
-                          <AgentIcon name={grant.agentName} className="h-6 w-6" />
-                          <span>{grant.agentName}</span>
-                        </span>
-                      ) : "Any agent"}
-                    </TableCell>
-                    <TableCell>{grant.expiresAt ? relativeTime(grant.expiresAt) : "No expiry"}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            <Button
-              variant="destructive"
-              className="mt-4"
-              onClick={async () => {
-                await clearGrants();
-                toast.success("Reusable approvals cleared");
-                onDone();
-              }}
-            >
-              Clear reusable approvals
-            </Button>
-          </DataCard>
-        </TabsContent>
-        <TabsContent value="about" className="mt-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>s-gw {state.version}</CardTitle>
-              <CardDescription>Local credential gateway for AI coding agents.</CardDescription>
+        <TabsContent value="grants" className="m-0">
+          <Card data-settings-panel="grants">
+            <CardHeader className="border-b">
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <CardTitle>Reusable grants</CardTitle>
+                  <CardDescription>Approvals that can be reused without prompting again.</CardDescription>
+                </div>
+                <Badge variant="secondary">{state.approvalGrants.length} active</Badge>
+              </div>
             </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              Store: <span className="font-mono">{state.status.storePath}</span>
+            <CardContent className="p-0">
+              {state.approvalGrants.length === 0 ? (
+                <div data-settings-grants-empty className="grid min-h-56 place-items-center px-6 py-10 text-center">
+                  <div>
+                    <span className="mx-auto grid size-10 place-items-center rounded-full bg-muted text-muted-foreground">
+                      <Clock3 className="size-5" aria-hidden="true" />
+                    </span>
+                    <h3 className="mt-3 font-medium">No reusable grants</h3>
+                    <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+                      Time-window, login-session, and until-revoked approvals will appear here.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <Table className="min-w-[640px]">
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Handle</TableHead>
+                        <TableHead>Mode</TableHead>
+                        <TableHead>Agent</TableHead>
+                        <TableHead>Expires</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {state.approvalGrants.map((grant) => (
+                        <TableRow key={grant.id}>
+                          <TableCell className="font-mono text-xs">{shortHandle(grant.handle)}</TableCell>
+                          <TableCell>{approvalModePresentation[grant.mode].label}</TableCell>
+                          <TableCell>
+                            {grant.agentName ? (
+                              <span className="flex items-center gap-2">
+                                <AgentIcon name={grant.agentName} className="h-6 w-6" />
+                                <span>{grant.agentName}</span>
+                              </span>
+                            ) : "Any agent"}
+                          </TableCell>
+                          <TableCell>{grant.expiresAt ? relativeTime(grant.expiresAt) : "No expiry"}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </CardContent>
+            {state.approvalGrants.length > 0 ? (
+              <CardFooter className="flex-col items-stretch justify-between gap-3 sm:flex-row sm:items-center">
+                <p className="text-xs text-muted-foreground">Clearing grants makes matching requests ask for approval again.</p>
+                <Button
+                  variant="destructive"
+                  className="w-full sm:w-auto"
+                  disabled={clearing}
+                  onClick={() => void clearReusableGrants()}
+                >
+                  {clearing ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Trash2 className="size-4" aria-hidden="true" />}
+                  Clear all grants
+                </Button>
+              </CardFooter>
+            ) : null}
+          </Card>
+        </TabsContent>
+        <TabsContent value="about" className="m-0">
+          <Card data-settings-panel="about">
+            <CardHeader className="border-b">
+              <div className="flex items-center gap-3">
+                <SgwLogo showText={false} />
+                <div>
+                  <CardTitle>s-gw</CardTitle>
+                  <CardDescription>Local credential gateway for AI coding agents.</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <dl className="divide-y overflow-hidden rounded-lg border">
+                <div className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+                  <dt className="text-sm text-muted-foreground">Version</dt>
+                  <dd className="text-sm font-medium">{versionLabel}</dd>
+                </div>
+                <div className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
+                  <dt className="shrink-0 text-sm text-muted-foreground">Store location</dt>
+                  <dd className="break-all font-mono text-xs sm:text-right">{state.status.storePath}</dd>
+                </div>
+                <div className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+                  <dt className="text-sm text-muted-foreground">Control plane</dt>
+                  <dd className="text-sm font-medium">Runs locally</dd>
+                </div>
+              </dl>
             </CardContent>
           </Card>
         </TabsContent>

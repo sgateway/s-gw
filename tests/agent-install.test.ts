@@ -1,6 +1,6 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseJsonc } from "jsonc-parser";
@@ -66,6 +66,24 @@ function vscodeConfigPath(homeDir: string): string {
     return path.join(homeDir, "Library", "Application Support", "Code", "User", "mcp.json");
   }
   return path.join(homeDir, ".config", "Code", "User", "mcp.json");
+}
+
+function runAgentCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number; stderr: string; stdout: string }> {
+  const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [tsxCli, "src/cli.ts", ...args], {
+      cwd: process.cwd(),
+      env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.on("close", (code) => resolve({ status: code ?? 1, stdout, stderr }));
+  });
 }
 
 describe("agent integration installation", () => {
@@ -773,6 +791,100 @@ describe("agent integration installation", () => {
     expect(conflict.status).toBe(1);
     expect(JSON.parse(conflict.stdout)).toMatchObject({ ok: false, results: [{ state: "conflict" }] });
   });
+
+  it("recovers an agent integration lock left by a dead process", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    const lockPath = path.join(homeDir, ".s-gw-agent-integrations.lock");
+    const deadProcess = spawnSync(process.execPath, ["-e", ""]);
+    expect(deadProcess.status).toBe(0);
+    const owner = {
+      pid: deadProcess.pid,
+      startedAt: Date.now(),
+      token: "abandoned-test-lock"
+    };
+    mkdirSync(lockPath, { mode: 0o700 });
+    writeFileSync(path.join(lockPath, `owner-${owner.token}.json`), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+
+    const installed = installAgentIntegrations(opts(homeDir, binDir, ["codex"]));
+
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("recovers stale agent integration lock metadata", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    const lockPath = path.join(homeDir, ".s-gw-agent-integrations.lock");
+    const markerPath = path.join(lockPath, "owner-unfinished.json");
+    mkdirSync(lockPath, { mode: 0o700 });
+    writeFileSync(markerPath, "unfinished owner metadata", { mode: 0o600 });
+    const stale = new Date(Date.now() - 60_000);
+    utimesSync(markerPath, stale, stale);
+    utimesSync(lockPath, stale, stale);
+
+    const installed = installAgentIntegrations(opts(homeDir, binDir, ["codex"]));
+
+    expect(installed[0]).toMatchObject({ state: "installed", changed: true });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("serializes concurrent stale recovery installs and uninstalls without losing ownership", async () => {
+    const agentIds = ["codex", "claudecode", "cursor", "geminicli"];
+    const commands = ["codex", "claude", "cursor", "gemini"];
+
+    for (let round = 0; round < 3; round += 1) {
+      const homeDir = testHome();
+      let binDir = "";
+      for (const command of commands) binDir = fakeCommand(homeDir, command);
+      const env = {
+        ...process.env,
+        HOME: homeDir,
+        USERPROFILE: homeDir,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
+        SGW_HOME: path.join(homeDir, ".s-gw"),
+        SGW_DISABLE_UPDATE_CHECK: "1"
+      };
+      const deadProcess = spawnSync(process.execPath, ["-e", ""]);
+      expect(deadProcess.status).toBe(0);
+      const lockPath = path.join(homeDir, ".s-gw-agent-integrations.lock");
+      const owner = {
+        pid: deadProcess.pid,
+        startedAt: Date.now(),
+        token: `concurrent-dead-owner-${round}`
+      };
+      mkdirSync(lockPath, { mode: 0o700 });
+      writeFileSync(path.join(lockPath, `owner-${owner.token}.json`), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+
+      const staleCandidate = `${lockPath}.tmp-${deadProcess.pid}-stale-recovery-${round}`;
+      mkdirSync(staleCandidate, { mode: 0o700 });
+      const staleMarker = path.join(staleCandidate, "owner-stale-recovery.json");
+      writeFileSync(staleMarker, "unfinished owner metadata", { mode: 0o600 });
+      const stale = new Date(Date.now() - 60_000);
+      utimesSync(staleMarker, stale, stale);
+      utimesSync(staleCandidate, stale, stale);
+
+      const installed = await Promise.all(
+        agentIds.map((agentId) => runAgentCli(["agent", "install", agentId], env))
+      );
+      expect(installed.every((result) => result.status === 0), installed.map((item) => item.stderr).join("\n")).toBe(true);
+
+      const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      expect(Object.keys(manifest.agents).sort()).toEqual([...agentIds].sort());
+      expect(agentIntegrationStatus(opts(homeDir, binDir, agentIds)).every((item) => item.state === "installed")).toBe(true);
+
+      const removed = await Promise.all(
+        agentIds.map((agentId) => runAgentCli(["agent", "uninstall", agentId], env))
+      );
+      expect(removed.every((result) => result.status === 0), removed.map((item) => item.stderr).join("\n")).toBe(true);
+      expect(JSON.parse(readFileSync(manifestPath, "utf8")).agents).toEqual({});
+      const afterRemoval = agentIntegrationStatus(opts(homeDir, binDir, agentIds));
+      expect(afterRemoval.every((item) => item.mcp.state === "missing" && item.skill.state === "missing")).toBe(true);
+      expect(existsSync(lockPath)).toBe(false);
+      expect(existsSync(staleCandidate)).toBe(true);
+    }
+  }, 45_000);
 
   it("setup connects detected agents unless --no-agents is set", () => {
     const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
