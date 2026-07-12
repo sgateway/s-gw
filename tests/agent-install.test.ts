@@ -902,7 +902,9 @@ describe("agent integration installation", () => {
         SGW_HOME: path.join(homeDir, ".s-gw"),
         SGW_MASTER_PASSPHRASE: "test-only-passphrase",
         SGW_DISABLE_KEYCHAIN: "1",
-        SGW_DISABLE_UPDATE_CHECK: "1"
+        SGW_DISABLE_UPDATE_CHECK: "1",
+        SGW_APPLICATIONS_DIR: path.join(homeDir, "Applications"),
+        SGW_SKIP_MAC_APP_CLI_REGISTRATION: "1"
       };
       return JSON.parse(execFileSync(
         process.execPath,
