@@ -151,6 +151,15 @@ describe("menu-bar helper approval surface contract", () => {
     expect(source).toContain('userInfo: ["view": route.rawValue]');
     expect(source).toContain("let openApp: (HelperRoute) -> Void");
   });
+
+  it("uses actor-safe async notification APIs", () => {
+    const source = helperSource();
+
+    expect(source).toContain("try? await UNUserNotificationCenter.current().requestAuthorization");
+    expect(source).toContain("await center.notificationSettings().authorizationStatus");
+    expect(source).not.toMatch(/requestAuthorization\(options: \[\.alert, \.sound\]\) \{/);
+    expect(source).not.toContain("withCheckedContinuation");
+  });
 });
 
 describeNative("menu-bar helper DecisionController (real Swift source)", () => {

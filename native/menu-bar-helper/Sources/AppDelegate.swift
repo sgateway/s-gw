@@ -471,7 +471,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func requestNotificationPermission() {
-    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    guard notificationsEnabled else { return }
+    Task {
+      _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+    }
   }
 
   private func sendNotification(title: String, body: String) {
@@ -521,11 +524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func notificationAuthorizationStatus(_ center: UNUserNotificationCenter) async -> UNAuthorizationStatus {
-    await withCheckedContinuation { continuation in
-      center.getNotificationSettings { settings in
-        continuation.resume(returning: settings.authorizationStatus)
-      }
-    }
+    await center.notificationSettings().authorizationStatus
   }
 
   nonisolated func userNotificationCenter(

@@ -4,6 +4,12 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.6 - 2026-07-12
+
+### Fixed
+
+- The macOS menu helper now requests and reads notification authorization through actor-safe async APIs instead of crashing when UserNotifications calls a main-actor completion handler on its own queue.
+
 ## 0.1.5 - 2026-07-12
 
 ### Fixed
