@@ -4,6 +4,14 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.5 - 2026-07-12
+
+### Fixed
+
+- The macOS app now shows its native recovery screen when the local console service is stopped instead of opening a blank white web view.
+- The embedded console retries transient startup failures and uses a dark loading background while the local service becomes available.
+- macOS setup tests now install into isolated temporary folders without changing the user's Applications folder or app preferences.
+
 ## 0.1.4 - 2026-07-12
 
 ### Added

@@ -7,7 +7,7 @@ struct MainWindow: View {
   var body: some View {
     @Bindable var state = appState
     ZStack {
-      if let url = appState.consoleURL() {
+      if appState.daemonRunning, let url = appState.consoleURL() {
         ConsoleWebAppView(url: url)
           .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {

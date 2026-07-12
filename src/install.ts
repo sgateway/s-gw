@@ -542,14 +542,16 @@ export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppI
 
   const applicationsDir = path.resolve(options.applicationsDir || macApplicationsDirectory());
   const appPath = path.join(applicationsDir, "s-gw.app");
+  const registerCliPath = options.registerCliPath !== false
+    && process.env.SGW_SKIP_MAC_APP_CLI_REGISTRATION !== "1";
   if (path.resolve(sourcePath) === path.resolve(appPath)) {
-    if (options.registerCliPath !== false) registerMacAppCliPath(layout.cliPath);
+    if (registerCliPath) registerMacAppCliPath(layout.cliPath);
     return { appPath, sourcePath, changed: false };
   }
 
   mkdirSync(applicationsDir, { recursive: true });
   if (sameMacAppBundle(sourcePath, appPath)) {
-    if (options.registerCliPath !== false) registerMacAppCliPath(layout.cliPath);
+    if (registerCliPath) registerMacAppCliPath(layout.cliPath);
     return { appPath, sourcePath, changed: false };
   }
 
@@ -585,7 +587,7 @@ export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppI
     throw new Error(`Could not install s-gw in ${applicationsDir}: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  if (options.registerCliPath !== false) registerMacAppCliPath(layout.cliPath);
+  if (registerCliPath) registerMacAppCliPath(layout.cliPath);
   return { appPath, sourcePath, changed: true };
 }
 

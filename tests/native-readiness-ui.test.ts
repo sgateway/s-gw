@@ -38,4 +38,17 @@ describe("native readiness UI contract", () => {
     expect(appState).toContain('arguments: ["agent", "uninstall", agent.id]');
     expect(models).toContain("struct AgentIntegrationStatus");
   });
+
+  it("shows native recovery UI while the console is stopped and retries transient web failures", async () => {
+    const [mainWindow, consoleWebApp] = await Promise.all([
+      readFile(path.join(appRoot, "Views/MainWindow.swift"), "utf8"),
+      readFile(path.join(appRoot, "Views/ConsoleWebAppView.swift"), "utf8")
+    ]);
+
+    expect(mainWindow).toContain("if appState.daemonRunning, let url = appState.consoleURL()");
+    expect(mainWindow).toContain("SetupView()");
+    expect(consoleWebApp).toContain("webView.navigationDelegate = context.coordinator");
+    expect(consoleWebApp).toContain("didFailProvisionalNavigation");
+    expect(consoleWebApp).toContain("try await Task.sleep(for: .milliseconds(500))");
+  });
 });
