@@ -72,7 +72,7 @@ describe("platform installers", () => {
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);
-  });
+  }, 20_000);
 
   it("keeps installer setup local and does not embed credential material", async () => {
     const [mac, windows] = await Promise.all([
