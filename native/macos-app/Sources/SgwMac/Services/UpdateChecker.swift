@@ -64,7 +64,7 @@ actor UpdateChecker: UpdateChecking {
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.3"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.4"
     }
 
     static func isNewer(_ candidate: String, than current: String) -> Bool {
@@ -252,7 +252,7 @@ actor UpdateChecker: UpdateChecking {
                 return result.output.isEmpty ? "s-gw update install failed." : result.output
             }
 
-            relaunchInstalledApp(cliPath: Self.installedCLIPath(from: result.output))
+            try relaunchInstalledApp(cliPath: Self.installedCLIPath(from: result.output))
             return nil
         } catch {
             return error.localizedDescription
@@ -408,27 +408,61 @@ actor UpdateChecker: UpdateChecking {
         value.count == 64 && value.allSatisfy(\.isHexDigit)
     }
 
-    private func relaunchInstalledApp(cliPath: String?) {
+    private func relaunchInstalledApp(cliPath: String?) throws {
         let script = """
-        sleep 1
-        if [ -n "$SGW_UPDATE_CLI" ] && [ -x "$SGW_UPDATE_CLI" ]; then
-          "$SGW_UPDATE_CLI" setup --no-open-app >/dev/null 2>&1 || \
-            "$SGW_UPDATE_CLI" start --no-open-app >/dev/null 2>&1 || true
-          "$SGW_UPDATE_CLI" app open >/dev/null 2>&1 || true
-        else
-          PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw setup --no-open-app >/dev/null 2>&1 || \
-            PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw start --no-open-app >/dev/null 2>&1 || true
-          PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw app open >/dev/null 2>&1 || true
+        attempt=0
+        while kill -0 "$SGW_UPDATE_OLD_PID" >/dev/null 2>&1 && [ "$attempt" -lt 120 ]; do
+          sleep 0.1
+          attempt=$((attempt + 1))
+        done
+        if kill -0 "$SGW_UPDATE_OLD_PID" >/dev/null 2>&1; then
+          echo "Timed out waiting for the previous s-gw app to exit."
+          exit 1
         fi
+
+        run_sgw() {
+          if [ -n "$SGW_UPDATE_CLI" ] && [ -x "$SGW_UPDATE_CLI" ]; then
+            "$SGW_UPDATE_CLI" "$@"
+          else
+            PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" /usr/bin/env s-gw "$@"
+          fi
+        }
+
+        run_sgw setup --no-open-app --no-agents || exit 1
+        attempt=0
+        while [ "$attempt" -lt 20 ]; do
+          if run_sgw app open; then
+            exit 0
+          fi
+          sleep 0.25
+          attempt=$((attempt + 1))
+        done
+        echo "The updated s-gw app could not be reopened."
+        exit 1
         """
 
+        let logDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".s-gw/logs", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+        let logURL = logDirectory.appendingPathComponent("update-relaunch.log")
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            _ = FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
+        let logHandle = try FileHandle(forWritingTo: logURL)
+        try logHandle.seekToEnd()
+        defer { try? logHandle.close() }
+
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", script]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+        process.arguments = ["/bin/sh", "-c", script]
         var environment = ProcessInfo.processInfo.environment
         environment["SGW_UPDATE_CLI"] = cliPath ?? ""
+        environment["SGW_UPDATE_OLD_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         process.environment = environment
-        try? process.run()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+        try process.run()
 
         Task { @MainActor in
             NSApp.terminate(nil)

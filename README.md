@@ -116,7 +116,7 @@ s-gw setup
 s-gw status
 ```
 
-`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. It backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
+`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. On macOS it installs `s-gw.app` in `/Applications`, falling back to `~/Applications` when needed. It backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
 
 Add a credential from your terminal without placing the value in chat or a process argument:
 

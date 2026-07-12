@@ -19,6 +19,7 @@ import {
 import { guardStatus, prepareGuardedRun, runGuardedAgent } from "./guard.js";
 import {
   getPackageLayout,
+  installMacAppBundle,
   installConsoleLaunchAgent,
   installMenuBarLaunchAgent,
   launchAgentStatus,
@@ -971,6 +972,7 @@ async function handleSetupCommand(
   let service = launchAgentStatus("console");
   let menuBar = launchAgentStatus("menubar");
   let windowsHelper: unknown;
+  const appInstall = process.platform === "darwin" ? installMacAppBundle() : undefined;
 
   if (process.platform === "darwin" && !hasFlag(flags, "no-service")) {
     service = await installConsoleLaunchAgent({ port, start: true });
@@ -1001,6 +1003,7 @@ async function handleSetupCommand(
     service,
     menuBar,
     windowsHelper,
+    appInstall,
     agents,
     nextSteps: [
       "Open the native app with `s-gw app open`.",
@@ -1712,6 +1715,14 @@ async function handleAppCommand(
     return;
   }
 
+  if (action === "install") {
+    if (process.platform !== "darwin") {
+      throw new Error("app install is only available on macOS.");
+    }
+    printJson(installMacAppBundle());
+    return;
+  }
+
   if (action === "open") {
     if (process.platform === "win32") {
       printJson(
@@ -1732,7 +1743,7 @@ async function handleAppCommand(
     return;
   }
 
-  throw new Error("app requires app-path or open.");
+  throw new Error("app requires app-path, install, or open.");
 }
 
 async function handleGuardCommand(
@@ -1846,6 +1857,7 @@ Commands:
   s-gw mcp
   s-gw console [--host 127.0.0.1] [--port 8718] [--no-open]
   s-gw app app-path
+  s-gw app install
   s-gw app open [--port 8718] [--console-url URL]
   s-gw guard status
   s-gw guard run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]

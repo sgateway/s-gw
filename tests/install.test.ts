@@ -24,12 +24,31 @@ describe("customer package layout", () => {
     expect(layout.keychainHelperPath).toBe(
       path.join(layout.packageRoot, "dist", "native", `${process.platform}-${process.arch}`, "s-gw-keychain-helper")
     );
+    expect(layout.packagedMacAppPath).toBe(path.join(layout.packageRoot, "dist", "s-gw.app"));
+    expect(layout.packagedMacAppBinaryPath).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
+    expect(layout.installedMacAppPath).toMatch(/Applications\/s-gw\.app$/);
     expect(layout.macAppPath).toContain("s-gw.app");
     expect(layout.macAppBinaryPath).toContain("s-gw.app/Contents/MacOS/s-gw");
     expect(layout.menuBarAppPath).toContain("s-gw Menu Bar.app");
     expect(layout.windowsClientScriptPath).toMatch(/dist\/windows\/s-gw-client\.ps1$/);
     expect(layout.windowsHelperScriptPath).toMatch(/dist\/windows\/s-gw-helper\.ps1$/);
     expect(layout.windowsCredentialHelperPath).toMatch(/dist\/windows\/s-gw-credential\.ps1$/);
+  });
+
+  it("routes app installation through the native app command", async () => {
+    const cliSource = await readFile(path.join(repoRoot, "src/cli.ts"), "utf8");
+    const menuBarHandler = cliSource.slice(
+      cliSource.indexOf("async function handleMenuBarCommand"),
+      cliSource.indexOf("async function handleOnePasswordCommand")
+    );
+    const appHandler = cliSource.slice(
+      cliSource.indexOf("async function handleAppCommand"),
+      cliSource.indexOf("async function handleGuardCommand")
+    );
+
+    expect(menuBarHandler).not.toContain("installMacAppBundle");
+    expect(appHandler).toContain("installMacAppBundle");
+    expect(cliSource).toContain("const appInstall = process.platform === \"darwin\" ? installMacAppBundle() : undefined");
   });
 
   it("tracks a running native app so open focuses instead of relaunching", async () => {

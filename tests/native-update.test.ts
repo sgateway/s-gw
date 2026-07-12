@@ -56,8 +56,12 @@ describe("native macOS update lifecycle", () => {
     expect(checker).toContain('"sha256sums.txt"');
     expect(checker).toContain("entry.fileName == assetName");
     expect(checker).toContain('"update", "install", "--package", downloadURL.path');
-    expect(checker).toContain("s-gw setup --no-open-app");
-    expect(checker).toContain("s-gw start --no-open-app");
+    expect(checker).toContain("run_sgw setup --no-open-app --no-agents");
+    expect(checker).toContain('process.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")');
+    expect(checker).toContain('environment["SGW_UPDATE_OLD_PID"]');
+    expect(checker).toContain("while kill -0 \"$SGW_UPDATE_OLD_PID\"");
+    expect(checker).toContain("update-relaunch.log");
+    expect(checker).not.toContain('run_sgw app open >/dev/null 2>&1 || true');
     expect(checker).not.toContain('npmCommand()');
   });
 });
