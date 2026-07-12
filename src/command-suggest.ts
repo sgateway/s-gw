@@ -17,6 +17,7 @@ export const KNOWN_COMMANDS = [
   "help",
   "app open",
   "app app-path",
+  "app install",
   "guard status",
   "guard run",
   "run",

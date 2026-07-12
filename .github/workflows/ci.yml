@@ -61,7 +61,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: cargo test --locked -p sgw-core
       - run: npm run build:native
-      - run: npx vitest run tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
+      - run: npx vitest run tests/install-macos.test.ts tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
 
   windows-preview:
     name: Windows preview client

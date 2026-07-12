@@ -1,5 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync
+} from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +24,9 @@ export interface PackageLayout {
   cliPath: string;
   mcpPath: string;
   keychainHelperPath: string;
+  packagedMacAppPath: string;
+  packagedMacAppBinaryPath: string;
+  installedMacAppPath: string;
   macAppPath: string;
   macAppBinaryPath: string;
   menuBarAppPath: string;
@@ -81,6 +93,17 @@ export interface MacAppOpenResult {
   process?: MacAppProcessInfo;
 }
 
+export interface MacAppInstallResult {
+  appPath: string;
+  sourcePath: string;
+  changed: boolean;
+}
+
+export interface MacAppInstallOptions {
+  applicationsDir?: string;
+  registerCliPath?: boolean;
+}
+
 export interface WindowsOpenResult {
   scriptPath: string;
   launcherPath: string;
@@ -105,14 +128,20 @@ export function getPackageLayout(): PackageLayout {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const packageRoot = path.basename(here) === "dist" ? path.dirname(here) : path.dirname(here);
   const nativeTarget = `${process.platform}-${process.arch}`;
+  const packagedMacAppPath = path.join(packageRoot, "dist", "s-gw.app");
+  const installedMacAppPath = path.join(macApplicationsDirectory(), "s-gw.app");
+  const macAppPath = existsSync(installedMacAppPath) ? installedMacAppPath : packagedMacAppPath;
 
   return {
     packageRoot,
     cliPath: path.join(packageRoot, "dist", "cli.js"),
     mcpPath: path.join(packageRoot, "dist", "mcp-server.js"),
     keychainHelperPath: path.join(packageRoot, "dist", "native", nativeTarget, "s-gw-keychain-helper"),
-    macAppPath: path.join(packageRoot, "dist", "s-gw.app"),
-    macAppBinaryPath: path.join(packageRoot, "dist", "s-gw.app", "Contents", "MacOS", "s-gw"),
+    packagedMacAppPath,
+    packagedMacAppBinaryPath: macAppBinaryPath(packagedMacAppPath),
+    installedMacAppPath,
+    macAppPath,
+    macAppBinaryPath: macAppBinaryPath(macAppPath),
     menuBarAppPath: path.join(packageRoot, "dist", "s-gw Menu Bar.app"),
     menuBarBinaryPath: path.join(
       packageRoot,
@@ -149,6 +178,8 @@ export function packageHealth(port = 8718) {
     cliPath: cli,
     mcpPath: mcp,
     keychainHelperPath: pathStatus(layout.keychainHelperPath),
+    packagedMacAppPath: pathStatus(layout.packagedMacAppPath),
+    installedMacAppPath: pathStatus(layout.installedMacAppPath),
     macAppPath: pathStatus(layout.macAppPath),
     macAppBinaryPath: pathStatus(layout.macAppBinaryPath),
     menuBarAppPath: pathStatus(layout.menuBarAppPath),
@@ -468,6 +499,7 @@ export function openMenuBarHelper(options: MenuBarOptions = {}): { appPath: stri
 
 export function openMacApp(options: MenuBarOptions = {}): MacAppOpenResult {
   requireMac("mac app open");
+  installMacAppBundle();
   assertMacAppExists();
   const layout = getPackageLayout();
   const url = options.consoleUrl || consoleUrl(options.port || 8718);
@@ -496,6 +528,65 @@ export function openMacApp(options: MenuBarOptions = {}): MacAppOpenResult {
   }
 
   return { appPath: layout.macAppPath, consoleUrl: url, reusedExisting: false };
+}
+
+export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppInstallResult {
+  requireMac("mac app install");
+  const layout = getPackageLayout();
+  const sourcePath = layout.packagedMacAppPath;
+  const sourceBinary = layout.packagedMacAppBinaryPath;
+  if (!existsSync(sourcePath) || !existsSync(sourceBinary)) {
+    throw new Error(`Packaged macOS app is missing. Expected app bundle at ${sourcePath}`);
+  }
+  assertMacExecutableCompatible(sourceBinary, "macOS app");
+
+  const applicationsDir = path.resolve(options.applicationsDir || macApplicationsDirectory());
+  const appPath = path.join(applicationsDir, "s-gw.app");
+  if (path.resolve(sourcePath) === path.resolve(appPath)) {
+    if (options.registerCliPath !== false) registerMacAppCliPath(layout.cliPath);
+    return { appPath, sourcePath, changed: false };
+  }
+
+  mkdirSync(applicationsDir, { recursive: true });
+  if (sameMacAppBundle(sourcePath, appPath)) {
+    if (options.registerCliPath !== false) registerMacAppCliPath(layout.cliPath);
+    return { appPath, sourcePath, changed: false };
+  }
+
+  const suffix = `${process.pid}-${Date.now()}`;
+  const stagingPath = path.join(applicationsDir, `.s-gw.app.install-${suffix}`);
+  const backupPath = path.join(applicationsDir, `.s-gw.app.backup-${suffix}`);
+  rmSync(stagingPath, { recursive: true, force: true });
+  rmSync(backupPath, { recursive: true, force: true });
+
+  const copied = spawnSync("/usr/bin/ditto", [sourcePath, stagingPath], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (copied.status !== 0) {
+    rmSync(stagingPath, { recursive: true, force: true });
+    throw new Error(copied.stderr.trim() || `Could not copy s-gw to ${applicationsDir}.`);
+  }
+  assertMacExecutableCompatible(macAppBinaryPath(stagingPath), "installed macOS app");
+
+  let movedExisting = false;
+  try {
+    if (existsSync(appPath)) {
+      renameSync(appPath, backupPath);
+      movedExisting = true;
+    }
+    renameSync(stagingPath, appPath);
+    rmSync(backupPath, { recursive: true, force: true });
+  } catch (error) {
+    rmSync(stagingPath, { recursive: true, force: true });
+    if (movedExisting && !existsSync(appPath) && existsSync(backupPath)) {
+      renameSync(backupPath, appPath);
+    }
+    throw new Error(`Could not install s-gw in ${applicationsDir}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (options.registerCliPath !== false) registerMacAppCliPath(layout.cliPath);
+  return { appPath, sourcePath, changed: true };
 }
 
 export function openWindowsClient(options: MenuBarOptions = {}): WindowsOpenResult {
@@ -947,6 +1038,63 @@ function pathStatus(filePath: string) {
     path: filePath,
     exists: existsSync(filePath)
   };
+}
+
+function macApplicationsDirectory(): string {
+  const override = process.env.SGW_APPLICATIONS_DIR?.trim();
+  if (override) return path.resolve(override);
+
+  if (process.platform === "darwin") {
+    try {
+      accessSync("/Applications", constants.W_OK);
+      return "/Applications";
+    } catch {
+      // Standard users can still keep a normal app bundle under their home directory.
+    }
+  }
+  return path.join(os.homedir(), "Applications");
+}
+
+function macAppBinaryPath(appPath: string): string {
+  return path.join(appPath, "Contents", "MacOS", "s-gw");
+}
+
+function sameMacAppBundle(sourcePath: string, installedPath: string): boolean {
+  if (!existsSync(installedPath)) return false;
+  const checkedFiles = [
+    path.join("Contents", "Info.plist"),
+    path.join("Contents", "MacOS", "s-gw"),
+    path.join("Contents", "Resources", "AppIcon.icns"),
+    path.join("Contents", "Resources", "MenuBarTemplate.png")
+  ];
+
+  try {
+    for (const relativePath of checkedFiles) {
+      const source = path.join(sourcePath, relativePath);
+      const installed = path.join(installedPath, relativePath);
+      if (!existsSync(source) || !existsSync(installed) || fileSHA256(source) !== fileSHA256(installed)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function fileSHA256(filePath: string): string {
+  return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
+
+function registerMacAppCliPath(cliPath: string): void {
+  const result = spawnSync(
+    "/usr/bin/defaults",
+    ["write", "com.s-gw.sgw.app", "sgwBinaryPath", "-string", cliPath],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+  );
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || "Could not save the s-gw CLI path for the macOS app.");
+  }
 }
 
 function assertMenuBarExists(): void {

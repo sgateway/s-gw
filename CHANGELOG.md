@@ -4,6 +4,18 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.4 - 2026-07-12
+
+### Added
+
+- `s-gw app install` for explicitly installing or repairing the packaged native macOS app.
+
+### Fixed
+
+- macOS setup and app launch now install `s-gw.app` atomically in the system Applications folder, with a user Applications fallback when the system folder is not writable.
+- Native upgrades wait for the previous app process to exit, refresh the installed app and services, and retry reopening instead of silently leaving s-gw closed. Relaunch failures are retained in `~/.s-gw/logs/update-relaunch.log`.
+- The native app remembers the updated CLI location so Finder launches continue to work after npm changes the package path.
+
 ## 0.1.3 - 2026-07-11
 
 ### Added
