@@ -53,6 +53,9 @@ final class HelperLaunchGuard {
   }
 
   static func lockPath() -> String {
+    if let override = ProcessInfo.processInfo.environment["SGW_MENU_BAR_LOCK_PATH"], !override.isEmpty {
+      return override
+    }
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
       ?? FileManager.default.temporaryDirectory
     let dir = base.appendingPathComponent("s-gw", isDirectory: true)
@@ -471,7 +474,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func requestNotificationPermission() {
-    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    guard notificationsEnabled else { return }
+    Task {
+      _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+    }
   }
 
   private func sendNotification(title: String, body: String) {
@@ -521,11 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func notificationAuthorizationStatus(_ center: UNUserNotificationCenter) async -> UNAuthorizationStatus {
-    await withCheckedContinuation { continuation in
-      center.getNotificationSettings { settings in
-        continuation.resume(returning: settings.authorizationStatus)
-      }
-    }
+    await center.notificationSettings().authorizationStatus
   }
 
   nonisolated func userNotificationCenter(
