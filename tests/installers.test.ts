@@ -66,7 +66,9 @@ describe("platform installers", () => {
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
     }
     const nativeCore = manifest.files.find((item) => item.path === coreName);
-    expect((nativeCore?.mode || 0) & 0o111).not.toBe(0);
+    if (process.platform !== "win32") {
+      expect((nativeCore?.mode || 0) & 0o111).not.toBe(0);
+    }
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);

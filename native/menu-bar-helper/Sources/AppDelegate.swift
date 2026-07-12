@@ -491,12 +491,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   private func sendUpdateNotification(_ update: HelperUpdate) async -> Bool {
     guard notificationsEnabled else { return false }
     let center = UNUserNotificationCenter.current()
-    var status = await center.notificationSettings().authorizationStatus
+    var status = await notificationAuthorizationStatus(center)
     if status == .notDetermined {
       guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else {
         return false
       }
-      status = await center.notificationSettings().authorizationStatus
+      status = await notificationAuthorizationStatus(center)
     }
     guard status == .authorized || status == .provisional else {
       return false
@@ -517,6 +517,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       return true
     } catch {
       return false
+    }
+  }
+
+  private func notificationAuthorizationStatus(_ center: UNUserNotificationCenter) async -> UNAuthorizationStatus {
+    await withCheckedContinuation { continuation in
+      center.getNotificationSettings { settings in
+        continuation.resume(returning: settings.authorizationStatus)
+      }
     }
   }
 
