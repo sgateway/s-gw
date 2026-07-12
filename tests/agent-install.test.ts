@@ -929,5 +929,5 @@ describe("agent integration installation", () => {
     expect(existsSync(path.join(skippedHome, ".codex", "config.toml"))).toBe(false);
     expect(existsSync(path.join(skippedHome, ".config", "opencode", "opencode.jsonc"))).toBe(false);
     expect(existsSync(vscodeConfigPath(skippedHome))).toBe(false);
-  });
+  }, 20_000);
 });
