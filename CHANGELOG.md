@@ -4,6 +4,13 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.8 - 2026-07-13
+
+### Fixed
+
+- Successful CLI updates now restore the console, menu helper, and native app state that was running before installation instead of leaving every surface stopped.
+- Update restart snapshots now require both an installed LaunchAgent plist and a loaded launchd job, avoiding false restart attempts from unrelated user environments.
+
 ## 0.1.7 - 2026-07-13
 
 ### Fixed

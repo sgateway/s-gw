@@ -1044,8 +1044,10 @@ function updateServiceLifecycle(keepAppRunning: boolean): {
   stop: () => Promise<void>;
   restart: () => Promise<void>;
 } {
-  const serviceWasLoaded = process.platform === "darwin" && launchAgentStatus("console").loaded;
-  const menuBarWasLoaded = process.platform === "darwin" && launchAgentStatus("menubar").loaded;
+  const serviceBefore = launchAgentStatus("console");
+  const menuBarBefore = launchAgentStatus("menubar");
+  const serviceWasLoaded = process.platform === "darwin" && serviceBefore.installed && serviceBefore.loaded;
+  const menuBarWasLoaded = process.platform === "darwin" && menuBarBefore.installed && menuBarBefore.loaded;
   let macAppWasRunning = false;
   let windowsStopped: WindowsStoppedSurfaces | undefined;
 

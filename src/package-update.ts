@@ -220,6 +220,7 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
   let removedLegacy = false;
   let rollback: PreparedRollback | null = null;
   let stopAttempted = false;
+  let restartAttempted = false;
 
   try {
     if (options.stopServices) {
@@ -286,6 +287,21 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
     }
 
     await discardRollback(rollback);
+    rollback = null;
+    removedLegacy = false;
+
+    if (stopAttempted && options.restartServices) {
+      restartAttempted = true;
+      try {
+        await options.restartServices();
+      } catch (error) {
+        throw new PackageUpdateError(
+          `${plan.target.name}@${plan.target.version} installed, but s-gw could not restart: ${errorMessage(error)}`,
+          "restart-services",
+          plan.nextCommands
+        );
+      }
+    }
 
     return {
       changed: true,
@@ -315,7 +331,8 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
         );
       }
     }
-    if (stopAttempted && options.restartServices && failure.phase !== "verify-data") {
+    if (stopAttempted && !restartAttempted && options.restartServices && failure.phase !== "verify-data") {
+      restartAttempted = true;
       try {
         await options.restartServices();
       } catch (restartError) {
