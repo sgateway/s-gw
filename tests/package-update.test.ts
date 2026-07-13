@@ -62,14 +62,17 @@ describe("scoped package migration", () => {
     expect((await inspectGlobalSgwInstall({ npmPrefix })).legacy?.version).toBe("0.1.0");
 
     let stopped = 0;
+    let restarted = 0;
     const result = await installPackageUpdate({
       target: scopedTarball,
       npmPrefix,
       sgwHome,
-      stopServices: async () => { stopped += 1; }
+      stopServices: async () => { stopped += 1; },
+      restartServices: async () => { restarted += 1; }
     });
 
     expect(stopped).toBe(1);
+    expect(restarted).toBe(1);
     expect(result.installed.legacy).toBeNull();
     expect(result.installed.scoped?.version).toBe(CURRENT_VERSION);
     expect(result.dataHomePreserved).toBe(true);
@@ -372,6 +375,55 @@ describe("scoped package migration", () => {
     }
   });
 
+  it("reports a successful install that cannot restart without retrying the restart", async () => {
+    const tmp = await tempDir("sgw-package-success-restart-failure-");
+    const prefix = path.join(tmp, "prefix");
+    const sgwHome = path.join(tmp, "home");
+    await mkdir(sgwHome, { recursive: true });
+
+    let listCalls = 0;
+    const runNpm = async (args: string[]): Promise<NpmCommandResult> => {
+      if (args[0] === "root") return ok(path.join(prefix, "lib", "node_modules"));
+      if (args[0] === "list") {
+        listCalls += 1;
+        const version = listCalls === 1 ? "0.1.6" : CURRENT_VERSION;
+        return ok(JSON.stringify({ dependencies: { "@s-gw/s-gw": { version } } }));
+      }
+      if (args[0] === "pack") {
+        return ok(JSON.stringify([{ name: "@s-gw/s-gw", version: CURRENT_VERSION }]));
+      }
+      if (args[0] === "install") return ok("");
+      return ok("");
+    };
+    let restarted = 0;
+
+    let thrown: unknown;
+    try {
+      await installPackageUpdate({
+        npmPrefix: prefix,
+        sgwHome,
+        runNpm,
+        stopServices: async () => undefined,
+        restartServices: async () => {
+          restarted += 1;
+          throw new Error("simulated restart failure");
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({ phase: "restart-services" });
+    expect((thrown as Error).message).toContain("installed, but s-gw could not restart");
+    expect((thrown as Error).message).toContain("simulated restart failure");
+    expect((thrown as PackageUpdateError).recoveryCommands).toEqual([
+      "s-gw setup",
+      "s-gw doctor",
+      "s-gw app open"
+    ]);
+    expect(restarted).toBe(1);
+  });
+
   it("preserves the update failure when restarting services also fails", async () => {
     const prefix = "/tmp/sgw-restart-failure";
     const runNpm = async (args: string[]): Promise<NpmCommandResult> => {
@@ -403,6 +455,8 @@ describe("scoped package migration", () => {
   it("wires CLI update failures back to the previously loaded local services", async () => {
     const cli = await readFile(path.join(process.cwd(), "src", "cli.ts"), "utf8");
     expect(cli).toContain("restartServices: services.restart");
+    expect(cli).toContain("serviceBefore.installed && serviceBefore.loaded");
+    expect(cli).toContain("menuBarBefore.installed && menuBarBefore.loaded");
     expect(cli).toContain('restartLaunchAgent("console", serviceWasLoaded');
     expect(cli).toContain('restartLaunchAgent("menubar", menuBarWasLoaded');
     expect(cli).toContain("verifyRestoredLaunchAgents(serviceWasLoaded, menuBarWasLoaded");
