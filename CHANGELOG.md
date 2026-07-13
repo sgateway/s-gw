@@ -4,6 +4,12 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.7 - 2026-07-13
+
+### Fixed
+
+- Routine macOS status and menu refreshes now check Keychain item metadata without reading the stored unlock passphrase, preventing authorization prompts when no credential is being used.
+
 ## 0.1.6 - 2026-07-12
 
 ### Fixed

@@ -21,8 +21,11 @@ afterEach(async () => {
   delete process.env.SGW_KEYCHAIN_SERVICE;
   delete process.env.SGW_KEYCHAIN_ACCOUNT;
   delete process.env.SGW_KEYCHAIN_HELPER;
+  delete process.env.SGW_KEYCHAIN_STATUS_CLI;
   delete process.env.SGW_FAKE_KEYCHAIN_VALUE;
   delete process.env.SGW_FAKE_KEYCHAIN_CAPTURE;
+  delete process.env.SGW_FAKE_KEYCHAIN_GET_DENIED;
+  delete process.env.SGW_FAKE_SECURITY_CAPTURE;
   if (tmpDir) {
     await rm(tmpDir, { recursive: true, force: true });
   }
@@ -67,6 +70,31 @@ describe("unlock passphrase provider", () => {
     expect(captured.args.join(" ")).not.toContain("native helper passphrase");
   });
 
+  it("checks Keychain status without asking the helper to reveal the passphrase", async () => {
+    if (process.platform !== "darwin") {
+      return;
+    }
+
+    const capturePath = path.join(tmpDir, "security-args.json");
+    process.env.SGW_FAKE_SECURITY_CAPTURE = capturePath;
+    process.env.SGW_FAKE_KEYCHAIN_GET_DENIED = "1";
+    await installFakeHelper("configured keychain passphrase");
+
+    const status = unlockStatus();
+    expect(status.activeSource).toBe("macos-keychain");
+    expect(status.keychain.configured).toBe(true);
+
+    const args = JSON.parse(await readText(capturePath)) as string[];
+    expect(args).toEqual([
+      "find-generic-password",
+      "-a",
+      "unit-test",
+      "-s",
+      "com.s-gw.test"
+    ]);
+    expect(args).not.toContain("-w");
+  });
+
   it("reports a clear unlock error when no provider is configured", async () => {
     if (process.platform === "darwin") {
       await installFakeHelper("");
@@ -86,6 +114,7 @@ const fs = require("fs");
 const passphrase = process.env.SGW_FAKE_KEYCHAIN_VALUE || "";
 const command = process.argv[2];
 if (command === "get") {
+  if (process.env.SGW_FAKE_KEYCHAIN_GET_DENIED === "1") process.exit(70);
   if (!passphrase) process.exit(44);
   process.stdout.write(passphrase + "\\n");
   process.exit(0);
@@ -112,6 +141,22 @@ process.exit(2);
   );
   await chmod(fakePath, 0o700);
   process.env.SGW_KEYCHAIN_HELPER = fakePath;
+
+  const fakeSecurity = path.join(tmpDir, "security");
+  await writeFile(
+    fakeSecurity,
+    `#!/usr/bin/env node
+const fs = require("fs");
+const args = process.argv.slice(2);
+if (process.env.SGW_FAKE_SECURITY_CAPTURE) {
+  fs.writeFileSync(process.env.SGW_FAKE_SECURITY_CAPTURE, JSON.stringify(args));
+}
+if (args[0] !== "find-generic-password" || args.includes("-w")) process.exit(2);
+process.exit(process.env.SGW_FAKE_KEYCHAIN_VALUE ? 0 : 44);
+`
+  );
+  await chmod(fakeSecurity, 0o700);
+  process.env.SGW_KEYCHAIN_STATUS_CLI = fakeSecurity;
 }
 
 async function readText(filePath: string): Promise<string> {
