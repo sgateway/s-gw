@@ -89,12 +89,16 @@ export function deleteKeychainPassphrase(): boolean {
 }
 
 export function hasKeychainPassphrase(): boolean {
-  if (!keychainInfo().supported || process.env.SGW_DISABLE_KEYCHAIN === "1") {
+  const info = keychainInfo();
+  if (!info.supported || info.provider === "none" || process.env.SGW_DISABLE_KEYCHAIN === "1") {
     return false;
   }
 
-  const passphrase = readKeychainPassphrase();
-  return validPassphrase(passphrase);
+  try {
+    return keychainItemExists(info);
+  } catch {
+    return false;
+  }
 }
 
 export function keychainInfo(): KeychainInfo {
@@ -267,6 +271,38 @@ function runKeychainGet(info: KeychainInfo): string {
   throw missingCredentialStoreError();
 }
 
+function keychainItemExists(info: KeychainInfo): boolean {
+  if (process.platform === "darwin") {
+    const result = spawnSync(
+      keychainStatusCliPath(),
+      ["find-generic-password", "-a", info.account, "-s", info.service],
+      { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] }
+    );
+
+    if (result.error) {
+      throw result.error;
+    }
+    if (result.status === 0) {
+      return true;
+    }
+    if (result.status === 44) {
+      return false;
+    }
+    throw new Error(result.stderr.trim() || `Keychain status check failed with status ${result.status}`);
+  }
+
+  if (info.provider === "windows-helper" && info.helperPath) {
+    const output = runWindowsCredentialHelper(
+      info.helperPath,
+      ["status", "-Service", info.service, "-Account", info.account]
+    );
+    const status = JSON.parse(output) as { configured?: unknown };
+    return status.configured === true;
+  }
+
+  return false;
+}
+
 function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw local unlock passphrase"): void {
   if (info.provider === "native-helper" && info.helperPath) {
     runNativeHelper(info.helperPath, ["set", "--service", info.service, "--account", info.account, "--label", label], passphrase);
@@ -345,10 +381,14 @@ function runNativeHelper(helperPath: string, args: string[], input?: string): st
 }
 
 function runSecurity(args: string[]): string {
-  return execFileSync("security", args, {
+  return execFileSync("/usr/bin/security", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
+}
+
+function keychainStatusCliPath(): string {
+  return process.env.SGW_KEYCHAIN_STATUS_CLI || "/usr/bin/security";
 }
 
 function runWindowsCredentialHelper(helperPath: string, args: string[], input?: string): string {
