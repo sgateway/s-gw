@@ -171,6 +171,43 @@ describe("SecretStore", () => {
     expect(summary.proof).toMatch(/^s-gw-proof:/);
   });
 
+  it("treats repeated approval as the same decision", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "repeat approval token",
+      type: "api-token",
+      value: "repeat-approval-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_REPEAT_APPROVAL_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const request = await store.createRequest(
+      record.handle,
+      buildEnvCommandAction({
+        command: process.execPath,
+        args: ["-e", "0"],
+        injectEnv: "SGW_REPEAT_APPROVAL_TOKEN"
+      }),
+      "repeat approval test"
+    );
+
+    const first = await store.approveRequest(request.id, {
+      mode: "timed-session",
+      durationMs: 60 * 60 * 1000,
+      agentScope: "same-agent"
+    });
+    const repeated = await store.approveRequest(request.id, {
+      mode: "per-transaction",
+      agentScope: "same-agent"
+    });
+
+    expect(repeated.state).toBe("approved");
+    expect(repeated.approvalGrantId).toBe(first.approvalGrantId);
+    expect(await store.listApprovalGrants()).toHaveLength(1);
+    expect((await store.auditLog()).filter((event) => event.type === "request.approved")).toHaveLength(1);
+  });
+
   it("records the runtime agent for generic local CLI requests", async () => {
     const oldCodexShell = process.env.CODEX_SHELL;
     process.env.CODEX_SHELL = "1";
