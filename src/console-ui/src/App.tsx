@@ -332,6 +332,22 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
   }, []);
 
   React.useEffect(() => {
+    if (!approval || !ctx.state) return;
+    const current = ctx.state.requests.find((request) => request.id === approval.id);
+    if (current?.state === "pending") {
+      if (current !== approval) setApproval(current);
+      return;
+    }
+
+    setApproval(null);
+    if (current?.state === "approved" || current?.state === "executing" || current?.state === "executed") {
+      toast.success("Request already approved");
+      return;
+    }
+    toast.info(current ? `Request is already ${current.state}` : "Request is no longer pending");
+  }, [approval, ctx.state]);
+
+  React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();

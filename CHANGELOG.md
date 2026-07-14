@@ -4,6 +4,13 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.9 - 2026-07-13
+
+### Fixed
+
+- Repeated approval is now idempotent when another app surface or policy already approved the request.
+- Approval sheets now close and report the current decision instead of leaving an obsolete pending request on screen.
+
 ## 0.1.8 - 2026-07-13
 
 ### Fixed

@@ -209,6 +209,48 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(launched.approvePostCount()).toBe(1);
   }, 45_000);
 
+  it("closes an approval sheet when another surface already approved the request", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "browser stale approval passphrase";
+    running = await startConsoleServer({ port: 0 });
+    const created = await api<{ handle: string }>("api/secrets", {
+      name: "browser-stale-approval",
+      type: "api-token",
+      value: "browser-stale-approval-secret-value-1234567890",
+      injectEnv: "SGW_BROWSER_STALE_TOKEN",
+      allowedCommands: [process.execPath]
+    });
+    const request = await api<{ id: string; state: string }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_BROWSER_STALE_TOKEN",
+      reason: "Codex stale approval browser e2e"
+    });
+    expect(request.state).toBe("pending");
+
+    const launched = await launchChrome(new URL("approvals", running.url).toString());
+    cdp = launched.cdp;
+    await waitFor(
+      () => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length > 0"),
+      "pending request row"
+    );
+    await cdp.eval("document.querySelector('tbody tr').dispatchEvent(new MouseEvent('click', { bubbles: true }))");
+    await waitFor(
+      () => cdp!.eval<boolean>(`Boolean(document.querySelector('[data-approve="${request.id}"]'))`),
+      "approval sheet button"
+    );
+
+    await api(`api/requests/${request.id}/approve`, {});
+    await cdp.eval(`document.querySelector('[data-approve="${request.id}"]').click()`);
+
+    await waitFor(
+      () => cdp!.eval<boolean>(`!document.querySelector('[data-approve="${request.id}"]')`),
+      "stale approval sheet closes"
+    );
+    const state = await api<{ requests: Array<{ id: string; state: string }> }>("api/state");
+    expect(state.requests.find((item) => item.id === request.id)?.state).toBe("approved");
+  }, 45_000);
+
   it("renders a real d3 Sankey chart and opens a shadcn Sheet for flow drill-in", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "browser react passphrase";
     running = await startConsoleServer({ port: 0 });

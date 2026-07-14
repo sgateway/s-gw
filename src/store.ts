@@ -715,6 +715,9 @@ export class SecretStore {
 
   async approveRequest(id: string, options: ApproveRequestOptions = {}): Promise<RequestRecord> {
     return this.updateRequest(id, (request, store) => {
+      if (request.state === "approved" || request.state === "executing" || request.state === "executed") {
+        return;
+      }
       if (request.state !== "pending") {
         throw new Error(`Only pending requests can be approved. Current state: ${request.state}`);
       }
