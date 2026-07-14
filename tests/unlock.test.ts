@@ -1,9 +1,15 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { requirePassphrase } from "../src/crypto.js";
-import { setKeychainPassphrase, unlockStatus } from "../src/unlock.js";
+import {
+  installPersistentKeychainHelper,
+  keychainInfo,
+  persistentKeychainHelperPath,
+  setKeychainPassphrase,
+  unlockStatus
+} from "../src/unlock.js";
 
 let tmpDir = "";
 
@@ -26,6 +32,7 @@ afterEach(async () => {
   delete process.env.SGW_FAKE_KEYCHAIN_CAPTURE;
   delete process.env.SGW_FAKE_KEYCHAIN_GET_DENIED;
   delete process.env.SGW_FAKE_SECURITY_CAPTURE;
+  delete process.env.SGW_HOME;
   if (tmpDir) {
     await rm(tmpDir, { recursive: true, force: true });
   }
@@ -93,6 +100,32 @@ describe("unlock passphrase provider", () => {
       "com.s-gw.test"
     ]);
     expect(args).not.toContain("-w");
+  });
+
+  it("keeps the first installed helper identity in the s-gw data directory", async () => {
+    if (process.platform !== "darwin") {
+      return;
+    }
+
+    const sgwHome = path.join(tmpDir, "home");
+    const original = path.join(tmpDir, "original-helper");
+    const replacement = path.join(tmpDir, "replacement-helper");
+    await writeFile(original, "trusted helper\n");
+    await writeFile(replacement, "new helper\n");
+    await chmod(original, 0o755);
+    await chmod(replacement, 0o755);
+
+    const first = installPersistentKeychainHelper({ sourcePath: original, sgwHome });
+    const second = installPersistentKeychainHelper({ sourcePath: replacement, sgwHome });
+    const helperPath = persistentKeychainHelperPath(sgwHome);
+
+    expect(first).toMatchObject({ helperPath, sourcePath: original, changed: true });
+    expect(second).toMatchObject({ helperPath, changed: false });
+    expect(await readFile(helperPath, "utf8")).toBe("trusted helper\n");
+    expect((await stat(helperPath)).mode & 0o777).toBe(0o700);
+
+    process.env.SGW_HOME = sgwHome;
+    expect(keychainInfo().helperPath).toBe(helperPath);
   });
 
   it("reports a clear unlock error when no provider is configured", async () => {

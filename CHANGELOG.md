@@ -4,6 +4,13 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.10 - 2026-07-13
+
+### Fixed
+
+- macOS setup now pins the first working Keychain helper under `~/.s-gw`, and package upgrades preserve that exact binary so credential access does not acquire a new requester identity.
+- Direct credential-store enrollment and redemption also establish the persistent helper before touching Keychain, covering users who do not rerun setup.
+
 ## 0.1.9 - 2026-07-13
 
 ### Fixed

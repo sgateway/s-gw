@@ -42,7 +42,12 @@ import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordRefe
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { SecretStore } from "./store.js";
-import { deleteKeychainPassphrase, setKeychainPassphrase, unlockStatus } from "./unlock.js";
+import {
+  deleteKeychainPassphrase,
+  installPersistentKeychainHelper,
+  setKeychainPassphrase,
+  unlockStatus
+} from "./unlock.js";
 import { releaseChecker } from "./update-check.js";
 import type {
   ApprovalAgentScope,
@@ -952,6 +957,7 @@ async function handleSetupCommand(
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
   const port = numericFlag(flags, "port", 8718);
+  const keychainHelper = process.platform === "darwin" ? installPersistentKeychainHelper() : undefined;
   const beforeUnlock = unlockStatus();
   let unlockAction = beforeUnlock.activeSource === "none" ? "not-configured" : `existing-${beforeUnlock.activeSource}`;
 
@@ -1003,6 +1009,7 @@ async function handleSetupCommand(
     service,
     menuBar,
     windowsHelper,
+    keychainHelper,
     appInstall,
     agents,
     nextSteps: [

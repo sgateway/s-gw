@@ -49,6 +49,7 @@ describe("customer package layout", () => {
     expect(menuBarHandler).not.toContain("installMacAppBundle");
     expect(appHandler).toContain("installMacAppBundle");
     expect(cliSource).toContain("const appInstall = process.platform === \"darwin\" ? installMacAppBundle() : undefined");
+    expect(cliSource).toContain("installPersistentKeychainHelper()");
   });
 
   it("tracks a running native app so open focuses instead of relaunching", async () => {
