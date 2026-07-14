@@ -64,7 +64,7 @@ actor UpdateChecker: UpdateChecking {
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.10"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.11"
     }
 
     static func isNewer(_ candidate: String, than current: String) -> Bool {

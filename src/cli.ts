@@ -45,6 +45,8 @@ import { SecretStore } from "./store.js";
 import {
   deleteKeychainPassphrase,
   installPersistentKeychainHelper,
+  pinPackagedKeychainHelper,
+  repairKeychainPassphraseAccess,
   setKeychainPassphrase,
   unlockStatus
 } from "./unlock.js";
@@ -237,6 +239,22 @@ async function main(): Promise<void> {
     printJson({
       deleted: deleteKeychainPassphrase(),
       keychain: unlockStatus().keychain
+    });
+    return;
+  }
+
+  if (first === "unlock" && second === "keychain" && third === "repair") {
+    const keychainHelper = process.platform === "darwin" ? installPersistentKeychainHelper() : undefined;
+    const keychainCompatibility = process.platform === "darwin" ? pinPackagedKeychainHelper() : undefined;
+    const master = repairKeychainPassphraseAccess();
+    await store.init();
+    const secrets = await store.repairKeychainAccess();
+    printJson({
+      ok: secrets.failed.length === 0,
+      keychainHelper,
+      keychainCompatibility,
+      master,
+      secrets
     });
     return;
   }
@@ -958,7 +976,11 @@ async function handleSetupCommand(
 ): Promise<void> {
   const port = numericFlag(flags, "port", 8718);
   const keychainHelper = process.platform === "darwin" ? installPersistentKeychainHelper() : undefined;
+  const keychainCompatibility = process.platform === "darwin" ? pinPackagedKeychainHelper() : undefined;
   const beforeUnlock = unlockStatus();
+  const masterKeychainRepair = process.platform === "darwin" && beforeUnlock.keychain.configured
+    ? repairKeychainPassphraseAccess()
+    : undefined;
   let unlockAction = beforeUnlock.activeSource === "none" ? "not-configured" : `existing-${beforeUnlock.activeSource}`;
 
   if (beforeUnlock.activeSource === "none") {
@@ -974,6 +996,9 @@ async function handleSetupCommand(
   }
 
   await store.init();
+  const secretKeychainRepair = process.platform === "darwin"
+    ? await store.repairKeychainAccess()
+    : undefined;
   const consoleUrl = `http://127.0.0.1:${port}/`;
   let service = launchAgentStatus("console");
   let menuBar = launchAgentStatus("menubar");
@@ -1001,7 +1026,7 @@ async function handleSetupCommand(
     : { skipped: false, results: installAgentIntegrations() };
 
   printJson({
-    ok: true,
+    ok: !secretKeychainRepair || secretKeychainRepair.failed.length === 0,
     unlock: unlockAction,
     storePath: store.storePath,
     consoleUrl,
@@ -1010,6 +1035,11 @@ async function handleSetupCommand(
     menuBar,
     windowsHelper,
     keychainHelper,
+    keychainCompatibility,
+    keychainRepair: {
+      master: masterKeychainRepair,
+      secrets: secretKeychainRepair
+    },
     appInstall,
     agents,
     nextSteps: [
@@ -1881,6 +1911,7 @@ Commands:
   s-gw unlock status
   s-gw unlock keychain set --value-stdin
   s-gw unlock keychain delete
+  s-gw unlock keychain repair
   s-gw secret add --name NAME --type api-token --value-stdin --inject-env ENV --allow-command CMD
   s-gw secret add-keychain --name NAME --type api-token --value-stdin --inject-env ENV --allow-command CMD [--service SERVICE]
   s-gw secret add-1password --name NAME --type api-token --ref op://vault/item/field --inject-env ENV --allow-command CMD [--verify]

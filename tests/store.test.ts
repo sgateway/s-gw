@@ -275,6 +275,12 @@ describe("SecretStore", () => {
     expect(handles[0].backend).toBe("keychain");
     expect(handles[0].provider).toBe("macos-keychain");
 
+    expect(await store.repairKeychainAccess()).toMatchObject({
+      checked: 1,
+      unsupported: 1,
+      failed: []
+    });
+
     const request = await store.createRequest(
       record.handle,
       buildEnvCommandAction({

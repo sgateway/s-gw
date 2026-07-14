@@ -421,8 +421,9 @@ npm pack
 For macOS production packages, also verify:
 
 - native helper exists at `dist/native/darwin-arm64/s-gw-keychain-helper`;
+- metadata-only Keychain inspector exists at `dist/native/darwin-arm64/s-gw-keychain-inspector`;
 - Rust core exists at `dist/native/darwin-arm64/s-gw-core`;
-- all four native executables report `arm64` through `lipo -verify_arch`;
+- all five native executables report `arm64` through `lipo -verify_arch`;
 - native macOS app exists at `dist/s-gw.app`;
 - `s-gw unlock status` reports `provider: "native-helper"`;
 - real Keychain + MCP e2e passes with no `SGW_MASTER_PASSPHRASE`;
@@ -451,6 +452,7 @@ The public npm package contains:
 - compiled TypeScript under `dist`;
 - compiled Rust execution core at `dist/native/darwin-arm64/s-gw-core`;
 - native macOS Keychain helper at `dist/native/darwin-arm64/s-gw-keychain-helper`;
+- metadata-only macOS Keychain inspector at `dist/native/darwin-arm64/s-gw-keychain-inspector`;
 - native macOS management app at `dist/s-gw.app`;
 - native macOS menu-bar helper app at `dist/s-gw Menu Bar.app`;
 - local console HTML/CSS/JS assets under `docs/ui`;

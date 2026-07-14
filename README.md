@@ -104,7 +104,7 @@ s-gw status
 
 To build from source, use a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
 
-Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path. It includes the native app, menu helper, Keychain helper, and Rust core for Apple Silicon Macs; Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; the npm package and DMG reject their arm64-only helpers with a clear compatibility error.
+Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path. It includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs; Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; the npm package and DMG reject their arm64-only helpers with a clear compatibility error.
 
 ```bash
 git clone https://github.com/sgateway/s-gw.git

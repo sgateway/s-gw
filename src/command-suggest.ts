@@ -38,6 +38,7 @@ export const KNOWN_COMMANDS = [
   "unlock status",
   "unlock keychain set",
   "unlock keychain delete",
+  "unlock keychain repair",
   "secret add",
   "secret add-1password",
   "secret list",

@@ -4,6 +4,19 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.11 - 2026-07-13
+
+### Added
+
+- `s-gw unlock keychain repair` verifies and repairs the master unlock item and every Keychain-backed credential without exposing their values.
+
+### Fixed
+
+- macOS Keychain access now validates the helper's exact trusted-application identity before reading or deleting an item, so an unknown helper fails with a repair error instead of opening a login-password dialog.
+- Existing items are transactionally rebound to the persistent helper through a verified temporary Keychain backup, with automatic recovery after an interrupted repair.
+- The macOS installer preserves the pre-upgrade helper before npm replaces its package path, allowing old ACLs to be migrated after an upgrade.
+- Upgrades pin the preserved helper back at the npm compatibility path used by already-running MCP servers, preventing stale agent sessions from launching a newly built helper identity.
+
 ## 0.1.10 - 2026-07-13
 
 ### Fixed
