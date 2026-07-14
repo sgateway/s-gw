@@ -7,6 +7,8 @@ import path from "node:path";
 import { getSgwHome } from "./paths.js";
 import {
   installPersistentKeychainHelper,
+  pinPackagedKeychainHelper,
+  type PackagedKeychainHelperPin,
   type PersistentKeychainHelperInstall
 } from "./unlock.js";
 
@@ -94,6 +96,7 @@ export interface PackageUpdateResult {
   installed: GlobalSgwInstall;
   dataHomePreserved: boolean;
   keychainHelper?: PersistentKeychainHelperInstall;
+  keychainCompatibility?: PackagedKeychainHelperPin;
   nextCommands: string[];
 }
 
@@ -227,6 +230,7 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
   let stopAttempted = false;
   let restartAttempted = false;
   let keychainHelper: PersistentKeychainHelperInstall | undefined;
+  let keychainCompatibility: PackagedKeychainHelperPin | undefined;
 
   try {
     if (options.stopServices) {
@@ -294,6 +298,14 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
       );
     }
 
+    if (process.platform === "darwin" && keychainHelper && finalInstall.scoped) {
+      keychainCompatibility = pinPackagedKeychainHelper(
+        finalInstall.scoped.packageRoot,
+        keychainHelper.helperPath,
+        plan.dataHome
+      );
+    }
+
     await discardRollback(rollback);
     rollback = null;
     removedLegacy = false;
@@ -318,6 +330,7 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
       installed: finalInstall,
       dataHomePreserved,
       keychainHelper,
+      keychainCompatibility,
       nextCommands: plan.nextCommands
     };
   } catch (error) {

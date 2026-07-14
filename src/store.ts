@@ -12,6 +12,7 @@ import {
   defaultSecretKeychainService,
   deleteMacKeychainItem,
   getMacKeychainItem,
+  repairMacKeychainItemAccess,
   setMacKeychainItem,
   type MacKeychainItemRef
 } from "./unlock.js";
@@ -149,6 +150,16 @@ export interface StoreBackupSummary {
   path: string;
   bytes: number;
   modifiedAt: string;
+}
+
+export interface KeychainAccessRepairSummary {
+  checked: number;
+  alreadyBound: number;
+  migrated: number;
+  recovered: number;
+  missing: number;
+  unsupported: number;
+  failed: Array<{ handle: string; name: string; error: string }>;
 }
 
 export class SecretStore {
@@ -399,6 +410,41 @@ export class SecretStore {
     }
 
     return decryptSecret(record.encrypted);
+  }
+
+  async repairKeychainAccess(): Promise<KeychainAccessRepairSummary> {
+    const store = await this.read();
+    const result: KeychainAccessRepairSummary = {
+      checked: 0,
+      alreadyBound: 0,
+      migrated: 0,
+      recovered: 0,
+      missing: 0,
+      unsupported: 0,
+      failed: []
+    };
+
+    for (const record of store.secrets) {
+      if (record.backend !== "keychain") continue;
+      result.checked += 1;
+
+      try {
+        const repair = repairMacKeychainItemAccess(keychainRefFromRecord(record));
+        if (repair.state === "already-bound") result.alreadyBound += 1;
+        else if (repair.state === "migrated") result.migrated += 1;
+        else if (repair.state === "recovered") result.recovered += 1;
+        else if (repair.state === "missing") result.missing += 1;
+        else result.unsupported += 1;
+      } catch (error) {
+        result.failed.push({
+          handle: record.handle,
+          name: record.name,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
+    return result;
   }
 
   private async storeOnePasswordCache(handle: string, value: string, request?: RequestRecord): Promise<void> {

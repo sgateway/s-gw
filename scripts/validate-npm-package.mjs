@@ -28,6 +28,7 @@ const files = new Map(packed.files.map((entry) => [entry.path, entry]));
 const requiredExecutables = [
   `dist/native/${target}/s-gw-core`,
   `dist/native/${target}/s-gw-keychain-helper`,
+  `dist/native/${target}/s-gw-keychain-inspector`,
   "dist/s-gw.app/Contents/MacOS/s-gw",
   "dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper"
 ];
@@ -64,7 +65,7 @@ for (const filePath of forbidden) {
 
 const targetExecutables = [...files.keys()].filter((filePath) => (
   /^dist\/native\/[^/]+\/s-gw-core(?:\.exe)?$/.test(filePath)
-  || /^dist\/native\/[^/]+\/(?:s-gw-keychain-helper|sgw-keychain-helper)$/.test(filePath)
+  || /^dist\/native\/[^/]+\/(?:s-gw-keychain-helper|sgw-keychain-helper|s-gw-keychain-inspector)$/.test(filePath)
 ));
 for (const filePath of targetExecutables) {
   if (!filePath.startsWith(`dist/native/${target}/`)) {

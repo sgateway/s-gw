@@ -46,6 +46,54 @@ if [[ -n "$old_sgw" ]]; then
   fi
 fi
 
+node_arch=$(node -p 'process.arch')
+keychain_target="darwin-$node_arch"
+sgw_home=${SGW_HOME:-"$HOME/.s-gw"}
+persistent_helper="$sgw_home/native/$keychain_target/s-gw-keychain-helper"
+
+archive_keychain_helper() {
+  local candidate=$1
+  [[ -f "$candidate" && -x "$candidate" && ! -L "$candidate" ]] || return 0
+
+  local helper_hash
+  helper_hash=$(/usr/bin/shasum -a 256 "$candidate" | /usr/bin/awk '{print $1}') || fail "An existing Keychain helper could not be fingerprinted."
+  print -r -- "$helper_hash" | /usr/bin/grep -Eq '^[0-9a-f]{64}$' || fail "An existing Keychain helper returned an invalid fingerprint."
+
+  local archive_dir="$sgw_home/native/legacy/$helper_hash"
+  local archive_path="$archive_dir/s-gw-keychain-helper"
+  [[ ! -L "$archive_path" ]] || fail "A preserved Keychain helper has an unsafe path."
+  if [[ -f "$archive_path" ]]; then
+    local archived_hash
+    archived_hash=$(/usr/bin/shasum -a 256 "$archive_path" | /usr/bin/awk '{print $1}') || fail "A preserved Keychain helper could not be verified."
+    [[ "$archived_hash" == "$helper_hash" ]] || fail "A preserved Keychain helper failed verification."
+    /bin/chmod 700 "$archive_dir" "$archive_path" || fail "A preserved Keychain helper could not be secured."
+    return 0
+  fi
+
+  /bin/mkdir -p "$archive_dir" || fail "The Keychain helper archive could not be created."
+  /bin/chmod 700 "$sgw_home/native/legacy" "$archive_dir" || fail "The Keychain helper archive could not be secured."
+  local archive_staging="$archive_path.preserve-$$"
+  /bin/cp "$candidate" "$archive_staging" || fail "An existing Keychain helper could not be archived."
+  /bin/chmod 700 "$archive_staging" || fail "An archived Keychain helper could not be secured."
+  /bin/mv -f "$archive_staging" "$archive_path" || fail "An archived Keychain helper could not be activated."
+}
+
+for package_root in "$npm_root/@s-gw/s-gw" "$npm_root/s-gw"; do
+  for candidate in \
+    "$package_root/dist/native/$keychain_target/s-gw-keychain-helper" \
+    "$package_root/dist/native/s-gw-keychain-helper" \
+    "$package_root/dist/native/sgw-keychain-helper"; do
+    [[ -f "$candidate" && -x "$candidate" && ! -L "$candidate" ]] || continue
+    archive_keychain_helper "$candidate"
+    if [[ ! -f "$persistent_helper" ]]; then
+      /bin/mkdir -p "${persistent_helper:h}" || fail "The existing Keychain helper directory could not be created."
+      /bin/chmod 700 "${persistent_helper:h}" || fail "The existing Keychain helper directory could not be secured."
+      /bin/cp "$candidate" "$persistent_helper" || fail "The existing Keychain helper could not be preserved before upgrade."
+      /bin/chmod 700 "$persistent_helper" || fail "The preserved Keychain helper could not be secured."
+    fi
+  done
+done
+
 legacy_root="$npm_root/s-gw"
 legacy_version=""
 rollback_dir=""
@@ -97,6 +145,16 @@ if ! npm install --global --prefix "$npm_prefix" --ignore-scripts -- "$package_p
     fail "The new package and automatic rollback both failed. Your ~/.s-gw data was preserved. Restore with: npm uninstall --global --prefix '$npm_prefix' @s-gw/s-gw && npm install --global --prefix '$npm_prefix' '$rollback_path'"
   fi
   fail "npm could not install the package. Check your npm global-directory permissions. Your ~/.s-gw data was preserved."
+fi
+
+installed_helper="$npm_root/@s-gw/s-gw/dist/native/$keychain_target/s-gw-keychain-helper"
+if [[ -f "$persistent_helper" ]]; then
+  archive_keychain_helper "$installed_helper"
+  /bin/mkdir -p "${installed_helper:h}" || fail "The installed Keychain helper directory could not be created."
+  helper_staging="$installed_helper.pin-$$"
+  /bin/cp "$persistent_helper" "$helper_staging" || fail "The stable Keychain helper could not be restored after upgrade."
+  /bin/chmod 755 "$helper_staging" || fail "The restored Keychain helper could not be made executable."
+  /bin/mv -f "$helper_staging" "$installed_helper" || fail "The stable Keychain helper could not be activated after upgrade."
 fi
 
 [[ -z "$rollback_dir" ]] || rm -rf "$rollback_dir"

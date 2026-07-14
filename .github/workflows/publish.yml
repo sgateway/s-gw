@@ -45,6 +45,7 @@ jobs:
           for binary in \
             dist/native/darwin-arm64/s-gw-core \
             dist/native/darwin-arm64/s-gw-keychain-helper \
+            dist/native/darwin-arm64/s-gw-keychain-inspector \
             dist/s-gw.app/Contents/MacOS/s-gw \
             "dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper"; do
             lipo "$binary" -verify_arch arm64
@@ -72,6 +73,7 @@ jobs:
           test -x "$prefix/bin/s-gw"
           test -x "$package_root/dist/native/darwin-arm64/s-gw-core"
           test -x "$package_root/dist/native/darwin-arm64/s-gw-keychain-helper"
+          test -x "$package_root/dist/native/darwin-arm64/s-gw-keychain-inspector"
           test -x "$package_root/dist/s-gw.app/Contents/MacOS/s-gw"
           test -x "$package_root/dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper"
           test ! -e "$package_root/dist/native/s-gw-core"

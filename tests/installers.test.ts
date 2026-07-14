@@ -7,9 +7,10 @@ const root = process.cwd();
 
 describe("platform installers", () => {
   it("builds versioned Mac and Windows artifacts from the package tarball", async () => {
-    const [pkgRaw, builder] = await Promise.all([
+    const [pkgRaw, builder, inspectorSource] = await Promise.all([
       readFile(path.join(root, "package.json"), "utf8"),
-      readFile(path.join(root, "scripts/build-installers.mjs"), "utf8")
+      readFile(path.join(root, "scripts/build-installers.mjs"), "utf8"),
+      readFile(path.join(root, "native/macos-keychain/SgwKeychainInspector.swift"), "utf8")
     ]);
     const pkg = JSON.parse(pkgRaw);
 
@@ -35,6 +36,10 @@ describe("platform installers", () => {
     expect(builder).toContain("s-gw-${version}-windows.zip");
     expect(builder).toContain('const packageFile = `s-gw-${version}.tgz`');
     expect(builder).toContain("SHA256SUMS.txt");
+    expect(inspectorSource).toContain("validateTrustedApplication");
+    expect(inspectorSource).not.toContain("kSecReturnData");
+    const publishWorkflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
+    expect(publishWorkflow).toContain("dist/native/darwin-arm64/s-gw-keychain-inspector");
     const validator = await readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8");
     expect(validator).toContain("validateReleaseDirectory");
   });
@@ -62,6 +67,7 @@ describe("platform installers", () => {
     expect(files).not.toContain("dist/native/s-gw-core.exe");
     if (process.platform === "darwin") {
       expect(files).toContain(`dist/native/${target}/s-gw-keychain-helper`);
+      expect(files).toContain(`dist/native/${target}/s-gw-keychain-inspector`);
       expect(files).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
     }
@@ -83,6 +89,13 @@ describe("platform installers", () => {
 
     expect(mac).toContain('"$sgw_bin" setup --port 8718');
     expect(mac).toContain('PATH="$npm_prefix/bin:$PATH" "$sgw_bin" setup');
+    expect(mac).toContain('persistent_helper="$sgw_home/native/$keychain_target/s-gw-keychain-helper"');
+    expect(mac).toContain('The existing Keychain helper could not be preserved before upgrade.');
+    expect(mac).toContain('archive_keychain_helper "$candidate"');
+    expect(mac).toContain('archive_keychain_helper "$installed_helper"');
+    expect(mac).toContain('/usr/bin/shasum -a 256');
+    expect(mac).toContain('installed_helper="$npm_root/@s-gw/s-gw/dist/native/$keychain_target/s-gw-keychain-helper"');
+    expect(mac).toContain('The stable Keychain helper could not be activated after upgrade.');
     expect(windows).toContain('$setupArgs = @("setup", "--port", [string]$Port)');
     expect(combined).toContain("npm");
     expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");

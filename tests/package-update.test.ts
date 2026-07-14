@@ -98,7 +98,15 @@ describe("scoped package migration", () => {
     const tarballs = path.join(tmp, "tarballs");
     await mkdir(tarballs, { recursive: true });
     const oldTarball = await packageFixture(tmp, tarballs, "old-scoped", "@s-gw/s-gw", "0.1.8");
-    const nextTarball = await packageFixture(tmp, tarballs, "next-scoped", "@s-gw/s-gw", CURRENT_VERSION);
+    const nextHelperIdentity = "new helper identity\n";
+    const nextTarball = await packageFixture(
+      tmp,
+      tarballs,
+      "next-scoped",
+      "@s-gw/s-gw",
+      CURRENT_VERSION,
+      nextHelperIdentity
+    );
     await npm(["install", "--global", "--prefix", npmPrefix, "--ignore-scripts", "--", oldTarball]);
 
     const before = await inspectGlobalSgwInstall({ npmPrefix });
@@ -113,7 +121,7 @@ describe("scoped package migration", () => {
     await writeFile(oldHelper, "trusted helper identity\n");
     await chmod(oldHelper, 0o755);
 
-    await installPackageUpdate({
+    const result = await installPackageUpdate({
       target: nextTarball,
       npmPrefix,
       sgwHome,
@@ -129,6 +137,25 @@ describe("scoped package migration", () => {
     );
     expect(await readFile(persistent, "utf8")).toBe("trusted helper identity\n");
     expect((await stat(persistent)).mode & 0o777).toBe(0o700);
+    const installedHelper = path.join(
+      result.installed.scoped?.packageRoot || "",
+      "dist",
+      "native",
+      `${process.platform}-${process.arch}`,
+      "s-gw-keychain-helper"
+    );
+    expect(result.keychainCompatibility?.packagePath).toBe(installedHelper);
+    expect(await readFile(installedHelper, "utf8")).toBe("trusted helper identity\n");
+    const nextHash = createHash("sha256").update(nextHelperIdentity).digest("hex");
+    const archivedHelper = path.join(
+      sgwHome,
+      "native",
+      "legacy",
+      nextHash,
+      "s-gw-keychain-helper"
+    );
+    expect(await readFile(archivedHelper, "utf8")).toBe(nextHelperIdentity);
+    expect((await stat(archivedHelper)).mode & 0o777).toBe(0o700);
   }, 30_000);
 
   it("exposes the migration plan and top-level install result through the CLI", async () => {
@@ -683,7 +710,8 @@ async function packageFixture(
   outputDir: string,
   folder: string,
   name: string,
-  version: string
+  version: string,
+  nativeHelper?: string
 ): Promise<string> {
   const packageDir = path.join(root, folder);
   await mkdir(packageDir, { recursive: true });
@@ -694,6 +722,18 @@ async function packageFixture(
   }, null, 2)}\n`);
   await writeFile(path.join(packageDir, "cli.js"), `#!/usr/bin/env node\nconsole.log(${JSON.stringify(`${name} ${version}`)});\n`);
   await chmod(path.join(packageDir, "cli.js"), 0o755);
+  if (nativeHelper !== undefined) {
+    const helperPath = path.join(
+      packageDir,
+      "dist",
+      "native",
+      `${process.platform}-${process.arch}`,
+      "s-gw-keychain-helper"
+    );
+    await mkdir(path.dirname(helperPath), { recursive: true });
+    await writeFile(helperPath, nativeHelper);
+    await chmod(helperPath, 0o755);
+  }
   const packed = await npm(["pack", "--ignore-scripts", "--json", "--pack-destination", outputDir], packageDir);
   const manifest = JSON.parse(packed.stdout) as Array<{ filename: string }>;
   return path.join(outputDir, manifest[0].filename);
