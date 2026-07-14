@@ -38,6 +38,8 @@ describe("platform installers", () => {
     expect(builder).toContain("SHA256SUMS.txt");
     expect(inspectorSource).toContain("validateTrustedApplication");
     expect(inspectorSource).not.toContain("kSecReturnData");
+    const publishWorkflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
+    expect(publishWorkflow).toContain("dist/native/darwin-arm64/s-gw-keychain-inspector");
     const validator = await readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8");
     expect(validator).toContain("validateReleaseDirectory");
   });
