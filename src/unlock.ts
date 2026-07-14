@@ -1,8 +1,19 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  rmSync,
+  statSync
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getSgwHome } from "./paths.js";
 
 const defaultService = "com.s-gw.sgw.master-passphrase";
 const defaultSecretService = "com.s-gw.sgw.secret";
@@ -29,6 +40,17 @@ export interface MacKeychainItemRef {
   service: string;
   account: string;
   label?: string;
+}
+
+export interface PersistentKeychainHelperInstall {
+  helperPath: string;
+  sourcePath: string;
+  changed: boolean;
+}
+
+export interface PersistentKeychainHelperOptions {
+  sourcePath?: string;
+  sgwHome?: string;
 }
 
 export function requireUnlockPassphrase(): string {
@@ -75,11 +97,13 @@ export function setKeychainPassphrase(passphrase: string): void {
   }
 
   ensureLocalCredentialStore();
+  preparePersistentMacHelper();
   runKeychainSet(keychainInfo(), passphrase);
 }
 
 export function deleteKeychainPassphrase(): boolean {
   ensureLocalCredentialStore();
+  preparePersistentMacHelper();
   try {
     runKeychainDelete(keychainInfo());
     return true;
@@ -119,12 +143,14 @@ export function setMacKeychainItem(ref: MacKeychainItemRef, value: string): void
     throw new Error("Cannot store an empty Keychain item.");
   }
 
+  preparePersistentMacHelper();
   const info = keychainInfoForItem(ref);
   ensureNativeCredentialStore(info);
   runKeychainSet(info, value, ref.label || "s-gw local secret");
 }
 
 export function getMacKeychainItem(ref: MacKeychainItemRef): string {
+  preparePersistentMacHelper();
   const info = keychainInfoForItem(ref);
   ensureNativeCredentialStore(info);
   return runKeychainGet(info).replace(/\r?\n$/, "");
@@ -132,6 +158,7 @@ export function getMacKeychainItem(ref: MacKeychainItemRef): string {
 
 export function deleteMacKeychainItem(ref: MacKeychainItemRef): boolean {
   try {
+    preparePersistentMacHelper();
     const info = keychainInfoForItem(ref);
     ensureNativeCredentialStore(info);
     runKeychainDelete(info);
@@ -142,11 +169,12 @@ export function deleteMacKeychainItem(ref: MacKeychainItemRef): boolean {
 }
 
 function readKeychainPassphrase(): string | undefined {
-  const info = keychainInfo();
-  if (!info.supported || process.env.SGW_DISABLE_KEYCHAIN === "1") {
+  if (!supportsLocalCredentialStore() || process.env.SGW_DISABLE_KEYCHAIN === "1") {
     return undefined;
   }
 
+  preparePersistentMacHelper();
+  const info = keychainInfo();
   try {
     const output = runKeychainGet(info);
 
@@ -223,14 +251,94 @@ function findNativeHelper(): string | undefined {
     return fromEnv;
   }
 
+  const persistent = persistentKeychainHelperPath();
+  if (existsSync(persistent)) {
+    return persistent;
+  }
+
+  return findPackagedNativeHelper();
+}
+
+function findPackagedNativeHelper(): string | undefined {
+  if (process.platform !== "darwin") {
+    return undefined;
+  }
+
   const here = path.dirname(fileURLToPath(import.meta.url));
   const nativeTarget = `${process.platform}-${process.arch}`;
   const candidates = [
     path.resolve(here, "native", nativeTarget, nativeHelperName),
-    path.resolve(process.cwd(), "dist", "native", nativeTarget, nativeHelperName)
+    path.resolve(process.cwd(), "dist", "native", nativeTarget, nativeHelperName),
+    path.resolve(here, "native", nativeHelperName),
+    path.resolve(process.cwd(), "dist", "native", nativeHelperName)
   ];
 
   return candidates.find((candidate) => existsSync(candidate));
+}
+
+export function persistentKeychainHelperPath(sgwHome = getSgwHome()): string {
+  const nativeTarget = `${process.platform}-${process.arch}`;
+  return path.join(path.resolve(sgwHome), "native", nativeTarget, nativeHelperName);
+}
+
+export function installPersistentKeychainHelper(
+  options: PersistentKeychainHelperOptions = {}
+): PersistentKeychainHelperInstall {
+  if (process.platform !== "darwin") {
+    throw new Error("The persistent Keychain helper is only available on macOS.");
+  }
+
+  const source = options.sourcePath || findPackagedNativeHelper();
+  if (!source) {
+    throw missingCredentialStoreError();
+  }
+  const sourcePath = path.resolve(source);
+  if (!existsSync(sourcePath)) throw missingCredentialStoreError();
+  assertUsableHelper(sourcePath);
+
+  const helperPath = persistentKeychainHelperPath(options.sgwHome);
+  if (existsSync(helperPath)) {
+    assertUsableHelper(helperPath);
+    chmodSync(helperPath, 0o700);
+    return { helperPath, sourcePath, changed: false };
+  }
+
+  const helperDir = path.dirname(helperPath);
+  mkdirSync(helperDir, { recursive: true, mode: 0o700 });
+  chmodSync(helperDir, 0o700);
+  const staging = `${helperPath}.install-${process.pid}-${Date.now()}`;
+
+  try {
+    copyFileSync(sourcePath, staging);
+    chmodSync(staging, 0o700);
+    try {
+      linkSync(staging, helperPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  } finally {
+    rmSync(staging, { force: true });
+  }
+
+  assertUsableHelper(helperPath);
+  return { helperPath, sourcePath, changed: true };
+}
+
+function preparePersistentMacHelper(): void {
+  if (process.platform !== "darwin" || process.env.SGW_KEYCHAIN_HELPER) {
+    return;
+  }
+  if (!existsSync(persistentKeychainHelperPath())) {
+    installPersistentKeychainHelper();
+  }
+}
+
+function assertUsableHelper(helperPath: string): void {
+  const info = statSync(helperPath);
+  if (!info.isFile() || info.size === 0) {
+    throw new Error(`Keychain helper is not a usable file: ${helperPath}`);
+  }
+  accessSync(helperPath, constants.X_OK);
 }
 
 function findWindowsCredentialHelper(): string | undefined {

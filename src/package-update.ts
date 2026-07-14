@@ -5,6 +5,10 @@ import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { getSgwHome } from "./paths.js";
+import {
+  installPersistentKeychainHelper,
+  type PersistentKeychainHelperInstall
+} from "./unlock.js";
 
 export const LEGACY_PACKAGE_NAME = "s-gw";
 export const SCOPED_PACKAGE_NAME = "@s-gw/s-gw";
@@ -89,6 +93,7 @@ export interface PackageUpdateResult {
   plan: PackageUpdatePlan;
   installed: GlobalSgwInstall;
   dataHomePreserved: boolean;
+  keychainHelper?: PersistentKeychainHelperInstall;
   nextCommands: string[];
 }
 
@@ -221,6 +226,7 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
   let rollback: PreparedRollback | null = null;
   let stopAttempted = false;
   let restartAttempted = false;
+  let keychainHelper: PersistentKeychainHelperInstall | undefined;
 
   try {
     if (options.stopServices) {
@@ -234,6 +240,8 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
         );
       }
     }
+
+    keychainHelper = preserveInstalledKeychainHelper(plan);
 
     if (plan.installed.legacy) {
       rollback = await prepareLegacyRollback(plan, npm);
@@ -309,6 +317,7 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
       plan,
       installed: finalInstall,
       dataHomePreserved,
+      keychainHelper,
       nextCommands: plan.nextCommands
     };
   } catch (error) {
@@ -345,6 +354,35 @@ export async function installPackageUpdate(options: PackageInstallOptions = {}):
     }
     throw failure;
   }
+}
+
+function preserveInstalledKeychainHelper(
+  plan: PackageUpdatePlan
+): PersistentKeychainHelperInstall | undefined {
+  if (process.platform !== "darwin") {
+    return undefined;
+  }
+
+  const current = plan.installed.scoped || plan.installed.legacy;
+  if (!current) {
+    return undefined;
+  }
+
+  const target = `${process.platform}-${process.arch}`;
+  const candidates = [
+    path.join(current.packageRoot, "dist", "native", target, "s-gw-keychain-helper"),
+    path.join(current.packageRoot, "dist", "native", "s-gw-keychain-helper"),
+    path.join(current.packageRoot, "dist", "native", "sgw-keychain-helper")
+  ];
+  const sourcePath = candidates.find((candidate) => existsSync(candidate));
+  if (!sourcePath) {
+    return undefined;
+  }
+
+  return installPersistentKeychainHelper({
+    sourcePath,
+    sgwHome: plan.dataHome
+  });
 }
 
 export function selectReleasePackageAssets(

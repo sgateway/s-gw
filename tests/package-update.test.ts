@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -85,6 +85,50 @@ describe("scoped package migration", () => {
       ? await execFileAsync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${command}"`])
       : await execFileAsync(command);
     expect(output.stdout.trim()).toBe(`@s-gw/s-gw ${CURRENT_VERSION}`);
+  }, 30_000);
+
+  it("preserves the installed macOS helper before replacing a scoped package", async () => {
+    if (process.platform !== "darwin") {
+      return;
+    }
+
+    const tmp = await tempDir("sgw-helper-upgrade-");
+    const npmPrefix = path.join(tmp, "npm-prefix");
+    const sgwHome = path.join(tmp, "sgw-home");
+    const tarballs = path.join(tmp, "tarballs");
+    await mkdir(tarballs, { recursive: true });
+    const oldTarball = await packageFixture(tmp, tarballs, "old-scoped", "@s-gw/s-gw", "0.1.8");
+    const nextTarball = await packageFixture(tmp, tarballs, "next-scoped", "@s-gw/s-gw", CURRENT_VERSION);
+    await npm(["install", "--global", "--prefix", npmPrefix, "--ignore-scripts", "--", oldTarball]);
+
+    const before = await inspectGlobalSgwInstall({ npmPrefix });
+    const oldHelper = path.join(
+      before.scoped?.packageRoot || "",
+      "dist",
+      "native",
+      `${process.platform}-${process.arch}`,
+      "s-gw-keychain-helper"
+    );
+    await mkdir(path.dirname(oldHelper), { recursive: true });
+    await writeFile(oldHelper, "trusted helper identity\n");
+    await chmod(oldHelper, 0o755);
+
+    await installPackageUpdate({
+      target: nextTarball,
+      npmPrefix,
+      sgwHome,
+      stopServices: async () => undefined,
+      restartServices: async () => undefined
+    });
+
+    const persistent = path.join(
+      sgwHome,
+      "native",
+      `${process.platform}-${process.arch}`,
+      "s-gw-keychain-helper"
+    );
+    expect(await readFile(persistent, "utf8")).toBe("trusted helper identity\n");
+    expect((await stat(persistent)).mode & 0o777).toBe(0o700);
   }, 30_000);
 
   it("exposes the migration plan and top-level install result through the CLI", async () => {

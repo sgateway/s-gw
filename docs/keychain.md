@@ -24,6 +24,8 @@ The raw credential is written through the bundled helper on stdin. The encrypted
 
 Use `--service SERVICE` or `SGW_SECRET_KEYCHAIN_SERVICE` when you want a separate credential-store namespace for testing, work, or isolated profiles.
 
+On macOS, setup copies the first working Keychain helper to `~/.s-gw/native/darwin-arm64/s-gw-keychain-helper` with owner-only permissions. s-gw keeps using that exact helper across npm and desktop upgrades because Keychain authorization is tied to the helper's code identity. The updater preserves the existing helper before replacing a package, and later releases do not overwrite it silently.
+
 Automatic capture paths, including guard mode and the local console API, prefer the OS credential store on macOS and Windows. Set `SGW_SECRET_BACKEND=local` only for compatibility testing or environments without the native helper.
 
 ## Local Execution Flow
@@ -33,6 +35,8 @@ Automatic capture paths, including guard mode and the local console API, prefer 
 3. s-gw applies policy and asks for approval when required.
 4. During approved execution, s-gw reads the credential from the local store and injects it into the local child process.
 5. Command output is sanitized back to handles before it is returned.
+
+Routine status, dashboard, and menu refreshes inspect only Keychain metadata. They do not read the unlock passphrase or credential values and should not open a macOS password prompt. A prompt during an approved execution means macOS does not recognize the helper that originally created the item; choosing `Always Allow` authorizes that helper for the item, while current s-gw installations avoid future identity changes by retaining the persistent helper above.
 
 ## 1Password Migration Later
 
