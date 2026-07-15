@@ -27,6 +27,8 @@ The TypeScript CLI owns setup, handle enrollment, request creation, approval orc
 
 The ledger stores handle metadata, encrypted local values or credential-store pointers, request manifests, reusable grants, policy rules, and audit events. Its unlock material comes from the operating system credential store during normal desktop use. `SGW_MASTER_PASSPHRASE` exists for tests and controlled automation.
 
+Control-plane changes use a pending transaction marker and fingerprinted manifest. Compact encrypted checkpoints are retained both inside the s-gw home and in a sibling recovery home, so loss of the ledger or the entire primary home does not silently become a new empty installation. Request-only writes use the rolling backup ring but do not consume control-plane checkpoint retention. A mismatched, corrupt, or missing ledger is quarantined when available and recovered from a verified checkpoint; s-gw refuses an empty reset when recovery evidence exists but cannot be validated.
+
 ### Credential Backends
 
 - **macOS Keychain:** the preferred backend on macOS.
