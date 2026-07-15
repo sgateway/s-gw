@@ -177,6 +177,7 @@ describe("launch-agent packaging", () => {
     expect(plist).toContain("<string>--notify-on-launch</string>");
     expect(plist).toContain("http://127.0.0.1:9900/");
     expect(plist).toContain("<string>Aqua</string>");
+    expect(plist).toContain("<key>KeepAlive</key>\n  <true/>");
     expect(plist).not.toContain("SGW_MASTER_PASSPHRASE");
   });
 
