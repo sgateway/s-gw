@@ -845,7 +845,7 @@ export function buildMenuBarLaunchAgentPlist(options: MenuBarOptions, logsDir: s
     programArguments: args,
     environment: menuBarEnvironment(options.consoleUrl || consoleUrl(options.port || 8718), options.countMode),
     runAtLoad: true,
-    keepAlive: false,
+    keepAlive: true,
     stdoutPath: path.join(logsDir, "menubar.log"),
     stderrPath: path.join(logsDir, "menubar.err.log"),
     limitToAqua: true
