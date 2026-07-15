@@ -4,6 +4,15 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.12 - 2026-07-15
+
+### Fixed
+
+- An initialized credential ledger that is missing, corrupt, or replaced now recovers from a verified encrypted checkpoint instead of silently starting empty.
+- Compact control-plane checkpoints are retained separately from request traffic and outside the primary s-gw home, so retry storms or whole-home deletion cannot erase every credential and policy recovery point.
+- The test suite refuses to use the live s-gw home, including during module startup and child CLI runs.
+- The macOS menu helper LaunchAgent now remains available after a clean singleton handoff instead of staying stopped.
+
 ## 0.1.11 - 2026-07-13
 
 ### Added

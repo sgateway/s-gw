@@ -1,6 +1,6 @@
 {
   "name": "s-gw",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Local s-gw plugin that lets coding agents use typed secret handles without receiving raw credentials.",
   "author": {
     "name": "Barry Yuan"
