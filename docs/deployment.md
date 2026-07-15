@@ -262,6 +262,16 @@ Default local ledger:
 ~/.s-gw/store.json
 ```
 
+Independent encrypted recovery checkpoints:
+
+```text
+~/.s-gw-recovery/control-plane/
+```
+
+The recovery checkpoints contain credential records, approval settings, grants, and policy rules. They omit request history, audit history, and cached values, which keeps them small and prevents high-volume request traffic from rotating away the last usable control-plane state. s-gw also keeps ordinary rolling backups under `~/.s-gw/backups/`.
+
+Every committed control-plane change updates an integrity manifest through a pending transaction record. If the primary ledger is missing, corrupt, or replaced with a different valid ledger, s-gw restores a verified checkpoint and records `store.recovered`. If recovery evidence exists but no valid copy remains, s-gw fails closed instead of initializing an empty ledger.
+
 Default Keychain item:
 
 ```text
@@ -273,6 +283,7 @@ Environment overrides:
 
 ```bash
 export SGW_HOME="$HOME/.s-gw"
+export SGW_RECOVERY_HOME="$HOME/.s-gw-recovery"
 export SGW_KEYCHAIN_SERVICE="com.s-gw.sgw.master-passphrase"
 export SGW_KEYCHAIN_ACCOUNT="$USER"
 ```

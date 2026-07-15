@@ -64,28 +64,34 @@ describe("command suggestions", () => {
 });
 
 describe("CLI unknown-command behavior (end to end)", () => {
-  it("reports update status without requiring local store setup", () => {
-    const result = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "update", "check"], {
-      cwd: repoRoot,
-      env: { ...process.env, SGW_DISABLE_UPDATE_CHECK: "1" },
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"]
-    }));
+  it("reports update status without requiring local store setup", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-update-"));
+    try {
+      const result = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "update", "check"], {
+        cwd: repoRoot,
+        env: { ...process.env, SGW_HOME: home, SGW_DISABLE_UPDATE_CHECK: "1" },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
 
-    expect(result).toMatchObject({
-      checked: false,
-      currentVersion: CURRENT_VERSION,
-      available: false
-    });
+      expect(result).toMatchObject({
+        checked: false,
+        currentVersion: CURRENT_VERSION,
+        available: false
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
-  it("exits non-zero and prints a suggestion to stderr for a typo", () => {
+  it("exits non-zero and prints a suggestion to stderr for a typo", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-typo-"));
     let stderr = "";
     let code = 0;
     try {
       execFileSync(tsxBin, ["src/cli.ts", "statu"], {
         cwd: repoRoot,
-        env: { ...process.env, SGW_DISABLE_KEYCHAIN: "1" },
+        env: { ...process.env, SGW_HOME: home, SGW_DISABLE_KEYCHAIN: "1" },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       });
@@ -93,6 +99,8 @@ describe("CLI unknown-command behavior (end to end)", () => {
       const err = error as { status?: number; stderr?: string };
       code = err.status ?? 0;
       stderr = err.stderr ?? "";
+    } finally {
+      await rm(home, { recursive: true, force: true });
     }
 
     expect(code).toBe(1);
@@ -108,13 +116,19 @@ describe("CLI unknown-command behavior (end to end)", () => {
     const port = await new Promise<number>((resolve) => {
       occupier.listen(0, "127.0.0.1", () => resolve((occupier.address() as AddressInfo).port));
     });
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-port-"));
 
     let stderr = "";
     let code = 0;
     try {
       execFileSync(tsxBin, ["src/cli.ts", "console", "--port", String(port), "--no-open"], {
         cwd: repoRoot,
-        env: { ...process.env, SGW_DISABLE_KEYCHAIN: "1", SGW_MASTER_PASSPHRASE: "throwaway-eaddr-test" },
+        env: {
+          ...process.env,
+          SGW_HOME: home,
+          SGW_DISABLE_KEYCHAIN: "1",
+          SGW_MASTER_PASSPHRASE: "throwaway-eaddr-test"
+        },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       });
@@ -124,6 +138,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       stderr = err.stderr ?? "";
     } finally {
       await new Promise<void>((resolve) => occupier.close(() => resolve()));
+      await rm(home, { recursive: true, force: true });
     }
 
     expect(code).toBe(1);

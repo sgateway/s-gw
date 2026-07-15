@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -26,19 +26,25 @@ beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-test-"));
   process.env.SGW_HOME = tmpHome;
   process.env.SGW_MASTER_PASSPHRASE = "local test passphrase";
+  process.env.SGW_DISABLE_KEYCHAIN = "1";
+  process.env.SGW_DISABLE_ONEPASSWORD_BACKUP = "1";
 });
 
 afterEach(async () => {
   delete process.env.SGW_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
+  delete process.env.SGW_DISABLE_KEYCHAIN;
+  delete process.env.SGW_DISABLE_ONEPASSWORD_BACKUP;
   delete process.env.SGW_OP_CLI;
   delete process.env.SGW_ONEPASSWORD_TIMEOUT_MS;
   delete process.env.SGW_KEYCHAIN_HELPER;
   delete process.env.SGW_SECRET_KEYCHAIN_SERVICE;
   delete process.env.SGW_LOGIN_SESSION_ID;
+  delete process.env.SGW_RECOVERY_HOME;
   delete process.env.AWS_SECRET_ACCESS_KEY;
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
   }
 });
 
@@ -118,6 +124,196 @@ describe("SecretStore", () => {
     expect(backupText).not.toContain(firstSecret);
     expect(backupText).not.toContain(secondSecret);
     expect(backupText).not.toContain("op://");
+  });
+
+  it("recovers a missing ledger without losing credentials or approval policies", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "recovery token",
+      type: "api-token",
+      value: fakeOpenAiToken("missing_store_recovery"),
+      policy: { injectEnv: "RECOVERY_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Allow Codex recovery test",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+
+    await rm(store.storePath);
+
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    expect((await recovered.listApprovalPolicyRules()).map((item) => item.id)).toContain(rule.id);
+    expect((await recovered.auditLog()).some((event) => event.type === "store.recovered")).toBe(true);
+  });
+
+  it("recovers credentials and policies after the entire primary home is removed", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "external recovery token",
+      type: "api-token",
+      value: fakeOpenAiToken("external_recovery"),
+      policy: { injectEnv: "EXTERNAL_RECOVERY_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "External recovery policy",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+
+    await rm(tmpHome, { recursive: true, force: true });
+
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    expect((await recovered.listApprovalPolicyRules()).map((item) => item.id)).toContain(rule.id);
+  });
+
+  it("rejects an externally replaced ledger and restores the verified control state", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "replacement guard token",
+      type: "api-token",
+      value: fakeOpenAiToken("replacement_guard"),
+      policy: { injectEnv: "REPLACEMENT_GUARD_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Replacement guard policy",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    await writeFile(store.storePath, `${JSON.stringify({
+      version: 1,
+      secrets: [],
+      requests: [],
+      audit: [],
+      approvalSettings: { mode: "per-transaction", durationMs: 15 * 60 * 1000 },
+      approvalGrants: [],
+      approvalPolicyRules: []
+    }, null, 2)}\n`);
+
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    expect((await recovered.listApprovalPolicyRules()).map((item) => item.id)).toContain(rule.id);
+
+    const preserved = await readdir(path.join(tmpHome, "recovery", "automatic"));
+    expect(preserved.some((name) => name.includes("control-mismatch"))).toBe(true);
+  });
+
+  it("recovers a corrupt ledger and preserves it for investigation", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "corrupt recovery token",
+      type: "api-token",
+      value: fakeOpenAiToken("corrupt_recovery"),
+      policy: { injectEnv: "CORRUPT_RECOVERY_TOKEN" }
+    });
+    await writeFile(store.storePath, "{not valid json\n");
+
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    const preserved = await readdir(path.join(tmpHome, "recovery", "automatic"));
+    expect(preserved.some((name) => name.includes("store-invalid"))).toBe(true);
+  });
+
+  it("rebuilds a missing control manifest only from a matching checkpoint", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "manifest recovery token",
+      type: "api-token",
+      value: fakeOpenAiToken("manifest_recovery"),
+      policy: { injectEnv: "MANIFEST_RECOVERY_TOKEN" }
+    });
+    await rm(path.join(tmpHome, ".store-control.json"));
+
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    expect(JSON.parse(await readFile(path.join(tmpHome, ".store-control.json"), "utf8"))).toMatchObject({
+      version: 1,
+      secrets: 1
+    });
+  });
+
+  it("does not rotate control-plane checkpoints for request-only traffic", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "request traffic token",
+      type: "api-token",
+      value: fakeOpenAiToken("request_traffic"),
+      policy: { injectEnv: "REQUEST_TRAFFIC_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const checkpointDir = path.join(tmpHome, "backups", "control-plane");
+    const before = (await readdir(checkpointDir)).length;
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "REQUEST_TRAFFIC_TOKEN"
+    });
+
+    for (let index = 0; index < 8; index += 1) {
+      await store.createRequest(secret.handle, action, `request traffic ${index}`);
+    }
+
+    expect((await readdir(checkpointDir)).length).toBe(before);
+    await store.addApprovalPolicyRule({
+      name: "New durable policy",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    expect((await readdir(checkpointDir)).length).toBeGreaterThan(before);
+  });
+
+  it("fails closed when recovery evidence exists but no valid ledger remains", async () => {
+    const store = new SecretStore();
+    await store.addSecret({
+      name: "fail closed token",
+      type: "api-token",
+      value: fakeOpenAiToken("fail_closed"),
+      policy: { injectEnv: "FAIL_CLOSED_TOKEN" }
+    });
+    await rm(store.storePath);
+    await rm(path.join(tmpHome, "backups"), { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+
+    await expect(new SecretStore().listHandles()).rejects.toThrow(/refusing to create an empty ledger/i);
+    await expect(readFile(store.storePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("serializes concurrent recovery so every reader gets the same ledger", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "concurrent recovery token",
+      type: "api-token",
+      value: fakeOpenAiToken("concurrent_recovery"),
+      policy: { injectEnv: "CONCURRENT_RECOVERY_TOKEN" }
+    });
+    await rm(store.storePath);
+
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => new SecretStore().listHandles())
+    );
+    for (const handles of results) {
+      expect(handles.map((item) => item.handle)).toContain(secret.handle);
+    }
+  });
+
+  it("refuses to use the live s-gw home while running tests", () => {
+    const oldHome = process.env.SGW_HOME;
+    const oldLiveHome = process.env.SGW_TEST_LIVE_HOME;
+    const guardedHome = path.join(tmpHome, "pretend-live-home");
+    process.env.SGW_HOME = guardedHome;
+    process.env.SGW_TEST_LIVE_HOME = guardedHome;
+
+    try {
+      expect(() => new SecretStore()).toThrow(/refusing to use the live s-gw home/i);
+    } finally {
+      process.env.SGW_HOME = oldHome;
+      if (oldLiveHome === undefined) {
+        delete process.env.SGW_TEST_LIVE_HOME;
+      } else {
+        process.env.SGW_TEST_LIVE_HOME = oldLiveHome;
+      }
+    }
   });
 
   it("tokenizes local text with a unique handle representation", async () => {

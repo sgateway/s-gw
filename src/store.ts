@@ -7,7 +7,7 @@ import { decryptSecret, encryptSecret, fingerprintSecret, shortId } from "./cryp
 import { requestAgentIdentity, requestAgentName, type AgentIdentityContext } from "./agent-context.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
 import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, sshSessionIdentity } from "./ssh.js";
-import { ensureSgwHome, getSgwHome, getStorePath } from "./paths.js";
+import { ensureSgwHome, getSgwHome, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
   defaultSecretKeychainService,
   deleteMacKeychainItem,
@@ -55,6 +55,10 @@ const staleLockMs = 30_000;
 // so we reap it back to a terminal failed state instead of bricking it forever.
 const staleExecutionMs = 10 * 60 * 1000;
 const maxStoreBackups = 20;
+const maxControlPlaneBackups = 50;
+const storeMarkerName = ".store-initialized";
+const controlStateName = ".store-control.json";
+const pendingControlStateName = ".store-control.pending.json";
 
 const emptyStore = (): StoreFile => ({
   version: 1,
@@ -162,6 +166,26 @@ export interface KeychainAccessRepairSummary {
   failed: Array<{ handle: string; name: string; error: string }>;
 }
 
+interface StoreControlState {
+  version: 1;
+  fingerprint: string;
+  updatedAt: string;
+  secrets: number;
+  approvalPolicyRules: number;
+}
+
+interface PendingStoreControlState {
+  version: 1;
+  previousFingerprint?: string;
+  nextFingerprint: string;
+  createdAt: string;
+}
+
+interface RecoveryCandidate {
+  path: string;
+  modifiedAtMs: number;
+}
+
 export class SecretStore {
   readonly home: string;
   readonly storePath: string;
@@ -174,13 +198,7 @@ export class SecretStore {
   async init(): Promise<void> {
     await ensureSgwHome(this.home);
     await this.withStoreLock(async () => {
-      const exists = await this.exists();
-      if (exists) {
-        return;
-      }
-
-      await this.writeUnlocked(emptyStore());
-      await chmod(this.storePath, 0o600);
+      await this.loadOrRecoverUnlocked();
     });
   }
 
@@ -926,45 +944,149 @@ export class SecretStore {
   }
 
   private async read(): Promise<StoreFile> {
-    const exists = await this.exists();
-    if (!exists) {
-      await this.init();
+    if (await this.exists()) {
+      try {
+        const store = await this.readUnlocked();
+        if (await controlStateMatches(this.home, store)) {
+          return store;
+        }
+      } catch {
+        // Recovery runs under the store lock below.
+      }
     }
 
-    return this.readUnlocked();
+    await ensureSgwHome(this.home);
+    return this.withStoreLock(() => this.loadOrRecoverUnlocked());
   }
 
   private async readUnlocked(): Promise<StoreFile> {
     const raw = await readFile(this.storePath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<StoreFile>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.secrets) || !Array.isArray(parsed.requests)) {
-      throw new Error(`Invalid s-gw store at ${this.storePath}`);
-    }
-
-    return normalizeStoreFile(parsed);
+    return parseStoreFile(raw, this.storePath);
   }
 
   private async writeUnlocked(store: StoreFile): Promise<void> {
     await ensureSgwHome(this.home);
+    const previous = await readStoreFileIfValid(this.storePath);
+    const previousFingerprint = previous ? controlPlaneFingerprint(previous) : undefined;
+    const nextFingerprint = controlPlaneFingerprint(store);
+    const controlChanged = previousFingerprint !== nextFingerprint;
+
+    if (controlChanged) {
+      await writePendingControlState(this.home, {
+        version: 1,
+        previousFingerprint,
+        nextFingerprint,
+        createdAt: new Date().toISOString()
+      });
+    }
+
     await backupCurrentStore(this.home, this.storePath);
-    const tmpPath = path.join(this.home, `.store.${process.pid}.${Date.now()}.tmp`);
-    await writeFile(tmpPath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
-    await rename(tmpPath, this.storePath);
-    await chmod(this.storePath, 0o600);
+    const serialized = serializeStore(store);
+    await writeAtomicFile(this.storePath, serialized);
+
+    const controlState = await readControlState(this.home);
+    if (controlChanged || !controlState) {
+      await writeControlPlaneCheckpoint(this.home, store, nextFingerprint);
+      await writeControlState(this.home, controlStateFor(store, nextFingerprint));
+      await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
+    }
+    await ensureStoreMarker(this.home);
   }
 
   private async mutate<T>(updater: (store: StoreFile) => T | Promise<T>): Promise<T> {
     await ensureSgwHome(this.home);
     return this.withStoreLock(async () => {
-      if (!(await this.exists())) {
-        await this.writeUnlocked(emptyStore());
-      }
-
-      const store = await this.readUnlocked();
+      const store = await this.loadOrRecoverUnlocked();
       const result = await updater(store);
       await this.writeUnlocked(store);
       return result;
     });
+  }
+
+  private async loadOrRecoverUnlocked(): Promise<StoreFile> {
+    const manifest = await readControlState(this.home);
+    if (!(await this.exists())) {
+      const recovered = await recoverStoreFromBackups(this.home, this.storePath, manifest?.fingerprint);
+      if (recovered) {
+        return recovered;
+      }
+
+      if (manifest || await hasStoreMarker(this.home) || await hasRecoveryEvidence(this.home)) {
+        throw new Error(
+          `s-gw store is missing at ${this.storePath}; refusing to create an empty ledger because recovery evidence exists.`
+        );
+      }
+
+      const fresh = emptyStore();
+      await this.writeUnlocked(fresh);
+      return fresh;
+    }
+
+    let store: StoreFile;
+    try {
+      store = await this.readUnlocked();
+    } catch (error) {
+      await preserveUnavailableStore(this.home, this.storePath, "invalid");
+      const recovered = await recoverStoreFromBackups(this.home, this.storePath, manifest?.fingerprint);
+      if (recovered) {
+        return recovered;
+      }
+      throw new Error(`s-gw store is invalid and no verified recovery copy is available: ${errorMessage(error)}`);
+    }
+
+    const fingerprint = controlPlaneFingerprint(store);
+    const pending = await readPendingControlState(this.home);
+    if (!manifest) {
+      if (pending?.nextFingerprint === fingerprint) {
+        await initializeControlState(this.home, store);
+        return store;
+      }
+
+      const priorControlState = await fileExists(controlStatePath(this.home)) || await hasStoreMarker(this.home);
+      if (priorControlState) {
+        if (await hasRecoveryCandidateFingerprint(this.home, fingerprint)) {
+          await writeControlState(this.home, controlStateFor(store, fingerprint));
+          await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
+          await ensureStoreMarker(this.home);
+          return store;
+        }
+
+        await preserveUnavailableStore(this.home, this.storePath, "missing-control-state");
+        const recovered = await recoverStoreFromBackups(this.home, this.storePath);
+        if (recovered) {
+          return recovered;
+        }
+        throw new Error("s-gw store control manifest is unavailable and no verified recovery copy exists.");
+      }
+
+      await initializeControlState(this.home, store);
+      return store;
+    }
+
+    if (fingerprint === manifest.fingerprint) {
+      await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
+      await ensureStoreMarker(this.home);
+      return store;
+    }
+
+    if (pending?.nextFingerprint === fingerprint) {
+      const serialized = serializeStore(store);
+      await writeControlPlaneCheckpoint(this.home, store, fingerprint);
+      await writeControlState(this.home, controlStateFor(store, fingerprint));
+      await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
+      await ensureStoreMarker(this.home);
+      return store;
+    }
+
+    await preserveUnavailableStore(this.home, this.storePath, "control-mismatch");
+    const recovered = await recoverStoreFromBackups(this.home, this.storePath, manifest.fingerprint);
+    if (recovered) {
+      return recovered;
+    }
+
+    throw new Error(
+      `s-gw store control state changed outside a committed transaction; refusing to use or replace the ledger.`
+    );
   }
 
   private async withStoreLock<T>(body: () => Promise<T>): Promise<T> {
@@ -995,6 +1117,343 @@ export class SecretStore {
       await unlink(lockPath).catch(() => undefined);
     }
   }
+}
+
+function storeMarkerPath(home: string): string {
+  return path.join(home, storeMarkerName);
+}
+
+function controlStatePath(home: string): string {
+  return path.join(home, controlStateName);
+}
+
+function pendingControlStatePath(home: string): string {
+  return path.join(home, pendingControlStateName);
+}
+
+function controlPlaneBackupDir(home: string): string {
+  return path.join(home, "backups", "control-plane");
+}
+
+function externalControlPlaneBackupDir(home: string): string {
+  return path.join(getSgwRecoveryHome(home), "control-plane");
+}
+
+function serializeStore(store: StoreFile): string {
+  return `${JSON.stringify(store, null, 2)}\n`;
+}
+
+function parseStoreFile(raw: string, source: string): StoreFile {
+  let parsed: Partial<StoreFile>;
+  try {
+    parsed = JSON.parse(raw) as Partial<StoreFile>;
+  } catch {
+    throw new Error(`Invalid JSON in s-gw store at ${source}`);
+  }
+  if (parsed.version !== 1 || !Array.isArray(parsed.secrets) || !Array.isArray(parsed.requests)) {
+    throw new Error(`Invalid s-gw store at ${source}`);
+  }
+  return normalizeStoreFile(parsed);
+}
+
+async function readStoreFileIfValid(storePath: string): Promise<StoreFile | undefined> {
+  try {
+    return parseStoreFile(await readFile(storePath, "utf8"), storePath);
+  } catch {
+    return undefined;
+  }
+}
+
+function controlPlaneFingerprint(store: StoreFile): string {
+  const secrets = store.secrets.map((secret) => {
+    const copy = { ...secret };
+    delete copy.cache;
+    return copy;
+  }).sort((a, b) => a.handle.localeCompare(b.handle));
+  const grants = [...store.approvalGrants].sort((a, b) => a.id.localeCompare(b.id));
+  const rules = [...store.approvalPolicyRules].sort((a, b) => a.id.localeCompare(b.id));
+  const control = {
+    version: store.version,
+    secrets,
+    approvalSettings: store.approvalSettings,
+    approvalGrants: grants,
+    approvalPolicyRules: rules
+  };
+  return createHash("sha256").update(JSON.stringify(canonicalValue(control))).digest("hex");
+}
+
+function controlPlaneSnapshot(store: StoreFile): StoreFile {
+  const secrets = store.secrets.map((secret) => {
+    const copy = { ...secret };
+    delete copy.cache;
+    return copy;
+  });
+  return {
+    version: store.version,
+    secrets,
+    requests: [],
+    audit: [],
+    approvalSettings: store.approvalSettings,
+    approvalGrants: store.approvalGrants,
+    approvalPolicyRules: store.approvalPolicyRules
+  };
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalValue);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const input = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const key of Object.keys(input).sort()) {
+    if (input[key] !== undefined) {
+      output[key] = canonicalValue(input[key]);
+    }
+  }
+  return output;
+}
+
+function controlStateFor(store: StoreFile, fingerprint = controlPlaneFingerprint(store)): StoreControlState {
+  return {
+    version: 1,
+    fingerprint,
+    updatedAt: new Date().toISOString(),
+    secrets: store.secrets.length,
+    approvalPolicyRules: store.approvalPolicyRules.length
+  };
+}
+
+async function controlStateMatches(home: string, store: StoreFile): Promise<boolean> {
+  const manifest = await readControlState(home);
+  if (!manifest || await fileExists(pendingControlStatePath(home))) {
+    return false;
+  }
+  return manifest.fingerprint === controlPlaneFingerprint(store);
+}
+
+async function readControlState(home: string): Promise<StoreControlState | undefined> {
+  try {
+    const value = JSON.parse(await readFile(controlStatePath(home), "utf8")) as Partial<StoreControlState>;
+    if (
+      value.version !== 1 ||
+      typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.fingerprint) ||
+      typeof value.updatedAt !== "string" ||
+      typeof value.secrets !== "number" ||
+      typeof value.approvalPolicyRules !== "number"
+    ) {
+      return undefined;
+    }
+    return value as StoreControlState;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readPendingControlState(home: string): Promise<PendingStoreControlState | undefined> {
+  try {
+    const value = JSON.parse(await readFile(pendingControlStatePath(home), "utf8")) as Partial<PendingStoreControlState>;
+    if (
+      value.version !== 1 ||
+      typeof value.nextFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.nextFingerprint) ||
+      typeof value.createdAt !== "string" ||
+      (value.previousFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(value.previousFingerprint))
+    ) {
+      return undefined;
+    }
+    return value as PendingStoreControlState;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeControlState(home: string, state: StoreControlState): Promise<void> {
+  await writeAtomicFile(controlStatePath(home), `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function writePendingControlState(home: string, state: PendingStoreControlState): Promise<void> {
+  await writeAtomicFile(pendingControlStatePath(home), `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function initializeControlState(home: string, store: StoreFile): Promise<void> {
+  const fingerprint = controlPlaneFingerprint(store);
+  await writeControlPlaneCheckpoint(home, store, fingerprint);
+  await writeControlState(home, controlStateFor(store, fingerprint));
+  await unlink(pendingControlStatePath(home)).catch(() => undefined);
+  await ensureStoreMarker(home);
+}
+
+async function writeControlPlaneCheckpoint(home: string, store: StoreFile, fingerprint: string): Promise<void> {
+  const serialized = serializeStore(controlPlaneSnapshot(store));
+  const backupDirs = new Set([
+    controlPlaneBackupDir(home),
+    externalControlPlaneBackupDir(home)
+  ]);
+  for (const backupDir of backupDirs) {
+    await mkdir(backupDir, { recursive: true, mode: 0o700 });
+    const stamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15);
+    const checkpointPath = path.join(
+      backupDir,
+      `store-${stamp}-${fingerprint.slice(0, 12)}-${process.pid}-${Date.now()}.json`
+    );
+    await writeFile(checkpointPath, serialized, { mode: 0o600 });
+    const entries = await listJsonFiles(backupDir);
+    for (const entry of entries.slice(maxControlPlaneBackups)) {
+      await rm(entry.path, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
+async function writeAtomicFile(targetPath: string, content: string): Promise<void> {
+  const tmpPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`
+  );
+  await writeFile(tmpPath, content, { mode: 0o600 });
+  try {
+    await rename(tmpPath, targetPath);
+    await chmod(targetPath, 0o600);
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function ensureStoreMarker(home: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(storeMarkerPath(home), "wx", 0o600);
+    await handle.writeFile("s-gw store initialized\n");
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "EEXIST") {
+      throw error;
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function hasStoreMarker(home: string): Promise<boolean> {
+  return fileExists(storeMarkerPath(home));
+}
+
+async function hasRecoveryEvidence(home: string): Promise<boolean> {
+  return (await listRecoveryCandidates(home)).length > 0;
+}
+
+async function hasRecoveryCandidateFingerprint(home: string, requiredFingerprint: string): Promise<boolean> {
+  const candidates = await listRecoveryCandidates(home);
+  for (const candidate of candidates) {
+    try {
+      const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+      if (controlPlaneFingerprint(store) === requiredFingerprint) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+async function recoverStoreFromBackups(
+  home: string,
+  storePath: string,
+  requiredFingerprint?: string
+): Promise<StoreFile | undefined> {
+  const candidates = await listRecoveryCandidates(home);
+  for (const candidate of candidates) {
+    let store: StoreFile;
+    try {
+      store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+    } catch {
+      continue;
+    }
+    const fingerprint = controlPlaneFingerprint(store);
+    if (requiredFingerprint && fingerprint !== requiredFingerprint) {
+      continue;
+    }
+
+    store.audit.push(audit(
+      "store.recovered",
+      `Recovered the s-gw ledger from ${path.basename(candidate.path)} after the primary store became unavailable.`
+    ));
+    const serialized = serializeStore(store);
+    await writeAtomicFile(storePath, serialized);
+    await writeControlPlaneCheckpoint(home, store, fingerprint);
+    await writeControlState(home, controlStateFor(store, fingerprint));
+    await unlink(pendingControlStatePath(home)).catch(() => undefined);
+    await ensureStoreMarker(home);
+    return store;
+  }
+  return undefined;
+}
+
+async function preserveUnavailableStore(home: string, storePath: string, reason: string): Promise<void> {
+  if (!(await fileExists(storePath))) {
+    return;
+  }
+  const recoveryDir = path.join(home, "recovery", "automatic");
+  await mkdir(recoveryDir, { recursive: true, mode: 0o700 });
+  const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+  const recoveryPath = path.join(recoveryDir, `store-${reason}-${stamp}-${process.pid}.json`);
+  await rename(storePath, recoveryPath);
+  await chmod(recoveryPath, 0o600);
+}
+
+async function listRecoveryCandidates(home: string): Promise<RecoveryCandidate[]> {
+  const dirs = new Set([
+    controlPlaneBackupDir(home),
+    externalControlPlaneBackupDir(home),
+    path.join(home, "backups", "manual"),
+    path.join(home, "backups")
+  ]);
+  const candidates: RecoveryCandidate[] = [];
+  for (const dir of dirs) {
+    const entries = await readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) {
+        continue;
+      }
+      const candidatePath = path.join(dir, entry);
+      const info = await stat(candidatePath).catch(() => undefined);
+      if (info?.isFile()) {
+        candidates.push({ path: candidatePath, modifiedAtMs: info.mtimeMs });
+      }
+    }
+  }
+  return candidates.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
+}
+
+async function listJsonFiles(dir: string): Promise<RecoveryCandidate[]> {
+  const entries = await readdir(dir).catch(() => []);
+  const files: RecoveryCandidate[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) {
+      continue;
+    }
+    const entryPath = path.join(dir, entry);
+    const info = await stat(entryPath).catch(() => undefined);
+    if (info?.isFile()) {
+      files.push({ path: entryPath, modifiedAtMs: info.mtimeMs });
+    }
+  }
+  return files.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function backupCurrentStore(home: string, storePath: string): Promise<void> {
