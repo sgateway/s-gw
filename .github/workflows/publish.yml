@@ -26,13 +26,17 @@ jobs:
       SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Check out private Rust core
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: barryqy/s-gw-rust-core
           token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
+          ref: ${{ github.event.release.tag_name }}
           path: .private/sgw-core
+          persist-credentials: false
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -106,6 +110,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -145,10 +151,22 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.ref_name || inputs.release_tag }}
+      SGW_REQUIRE_RUST_CORE: "1"
+      SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check out private Rust core
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: barryqy/s-gw-rust-core
+          token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
+          ref: ${{ env.RELEASE_TAG }}
+          path: .private/sgw-core
+          persist-credentials: false
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -164,6 +182,7 @@ jobs:
           test "v${package_version}" = "${RELEASE_TAG}"
 
       - run: npm run verify
+      - run: npm run validate:npm-package
       - run: npm run build:installers
 
       - name: Upload verified release assets

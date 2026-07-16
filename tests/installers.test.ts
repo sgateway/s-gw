@@ -167,7 +167,12 @@ describe("platform installers", () => {
     expect(workflow).toContain("release_tag:");
     expect(assetJob).toContain("inputs.release_tag != ''");
     expect(assetJob).toContain("ref: ${{ env.RELEASE_TAG }}");
+    expect(assetJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
+    expect(assetJob).toContain("SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core");
+    expect(assetJob).toContain("repository: barryqy/s-gw-rust-core");
+    expect(assetJob).toContain("path: .private/sgw-core");
     expect(assetJob).toContain("npm run verify");
+    expect(assetJob).toContain("npm run validate:npm-package");
     expect(assetJob).toContain("npm run build:installers");
     expect(assetJob).toContain("first_tgz");
     expect(assetJob).not.toContain("needs: publish");
@@ -188,6 +193,9 @@ describe("platform installers", () => {
     );
 
     expect(npmJob).toContain("runs-on: macos-15");
+    expect(npmJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
+    expect(npmJob).toContain("repository: barryqy/s-gw-rust-core");
+    expect(npmJob).toContain("ref: ${{ github.event.release.tag_name }}");
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");
