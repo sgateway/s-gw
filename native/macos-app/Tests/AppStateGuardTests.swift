@@ -1,6 +1,6 @@
 import CryptoKit
 import Foundation
-import UserNotifications
+import SgwUpdateState
 
 // Standalone test driver for the native macOS app's AppState.
 //
@@ -69,31 +69,6 @@ private actor FakeUpdateChecker: UpdateChecking {
   func checkCount() -> Int { checks }
 }
 
-@MainActor
-private final class FakeNotificationCenter: UpdateNotificationCenterClient {
-  var status: UNAuthorizationStatus
-  var authorizationResult: Bool
-  var authorizationRequests = 0
-  var requests: [UNNotificationRequest] = []
-
-  init(status: UNAuthorizationStatus, authorizationResult: Bool = false) {
-    self.status = status
-    self.authorizationResult = authorizationResult
-  }
-
-  func authorizationStatus() async -> UNAuthorizationStatus { status }
-
-  func requestAuthorization() async -> Bool {
-    authorizationRequests += 1
-    if authorizationResult { status = .authorized }
-    return authorizationResult
-  }
-
-  func add(_ request: UNNotificationRequest) async throws {
-    requests.append(request)
-  }
-}
-
 private func makeRelease(
   _ version: String,
   checksumName: String = "SHA256SUMS.txt",
@@ -108,6 +83,19 @@ private func makeRelease(
     checksumAssetURL: installable ? "https://example.test/\(checksumName)" : "",
     htmlURL: "https://example.test/releases/v\(version)",
     notes: ""
+  )
+}
+
+private func storedRelease(_ release: ReleaseInfo) -> UpdateNoticeRelease {
+  UpdateNoticeRelease(
+    tag: release.tag,
+    version: release.version,
+    assetName: release.assetName,
+    assetURL: release.assetURL,
+    checksumAssetName: release.checksumAssetName,
+    checksumAssetURL: release.checksumAssetURL,
+    htmlURL: release.htmlURL,
+    notes: release.notes
   )
 }
 
@@ -241,8 +229,10 @@ struct AppStateGuardTests {
     await runCommandOutputCaptureTest()
     await runUpdateRetryTest()
     await runIncompleteReleaseRetryTest()
-    await runUpdateNotificationTest()
-    await runDeniedNotificationFallbackTest()
+    await runUpdateAvailabilityPersistenceTest()
+    await runUpdateAcknowledgementAndReminderTest()
+    runUpdateStateClearAfterInstallTest()
+    runSharedUpdateStateConsistencyTest()
     runSemVerComparisonTest()
     runAtomFallbackParsingTest()
     runChecksumManifestTest()
@@ -363,12 +353,12 @@ struct AppStateGuardTests {
     let defaults = isolatedDefaults("update-retry")
     let release = makeRelease("9.0.0")
     let checker = FakeUpdateChecker([.failure, .release(release)])
-    let center = FakeNotificationCenter(status: .denied)
-    let notifier = UpdateNotifier(center: center, defaults: defaults)
     let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let notice = UpdateNoticeStore(defaults: defaults, now: { now })
+    notice.clear()
+    defer { notice.clear() }
     let app = AppState(
       updater: checker,
-      updateNotifier: notifier,
       defaults: defaults,
       now: { now }
     )
@@ -393,13 +383,13 @@ struct AppStateGuardTests {
     let incomplete = makeRelease("9.0.1", installable: false)
     let complete = makeRelease("9.0.1")
     let checker = FakeUpdateChecker([.release(incomplete), .release(complete)])
-    let center = FakeNotificationCenter(status: .authorized)
-    let notifier = UpdateNotifier(center: center, defaults: defaults)
     let now = Date(timeIntervalSince1970: 1_800_000_100)
+    let notice = UpdateNoticeStore(defaults: defaults, now: { now })
+    notice.clear()
+    defer { notice.clear() }
     defaults.set(now.timeIntervalSince1970 - 60 * 60, forKey: UpdateChecker.lastCheckDefaultsKey)
     let app = AppState(
       updater: checker,
-      updateNotifier: notifier,
       defaults: defaults,
       now: { now }
     )
@@ -408,71 +398,147 @@ struct AppStateGuardTests {
     check(app.availableUpdate == incomplete, "the published release should remain visible while assets upload")
     check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == 0,
           "a release missing its verified package must not consume the six-hour interval")
-    check(center.requests.isEmpty, "an incomplete release should not notify before it can be installed")
 
     await app.checkForUpdates()
     check(await checker.checkCount() == 2,
           "an incomplete release should retry on the next polling cycle")
     check(app.availableUpdate == complete, "the retry should pick up the completed release assets")
-    check(center.requests.count == 1, "the completed release should send exactly one notification")
     check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == now.timeIntervalSince1970,
           "the completed release should start the successful-check interval")
   }
 
   @MainActor
-  static func runUpdateNotificationTest() async {
-    let defaults = isolatedDefaults("update-notification")
+  static func runUpdateAvailabilityPersistenceTest() async {
+    let defaults = isolatedDefaults("update-persistence")
     let release = makeRelease("9.1.0")
-    let center = FakeNotificationCenter(status: .notDetermined, authorizationResult: true)
-    let notifier = UpdateNotifier(center: center, defaults: defaults)
+    let now = Date(timeIntervalSince1970: 1_800_000_200)
+    let notice = UpdateNoticeStore(defaults: defaults, now: { now })
+    notice.clear()
+    defer { notice.clear() }
+    let first = AppState(
+      updater: FakeUpdateChecker([.release(release)]),
+      defaults: defaults,
+      now: { now }
+    )
 
-    let first = await notifier.notifyIfNeeded(for: release)
-    let second = await notifier.notifyIfNeeded(for: release)
-    check(first == .systemDelivered, "the first sighting of a version should send a system notification")
-    check(second == .alreadyDelivered, "the same version should not notify twice in one process")
-    check(center.requests.count == 1, "exactly one notification request expected for a version")
-    check(center.authorizationRequests == 1,
-          "notification permission should be requested only when an update first needs it")
-    check(center.requests.first?.identifier == "s-gw-update-9.1.0",
-          "the notification identifier should be stable per version")
-    check(defaults.string(forKey: UpdateNotifier.notifiedVersionDefaultsKey) == release.version,
-          "the notified version should be persisted")
+    await first.checkForUpdates()
+    check(first.availableUpdate == release, "a discovered update should be visible in the app")
+    check(!first.updateBannerDismissed, "a discovered update should begin unacknowledged")
 
-    let afterRestartCenter = FakeNotificationCenter(status: .authorized)
-    let afterRestart = UpdateNotifier(center: afterRestartCenter, defaults: defaults)
-    let persisted = await afterRestart.notifyIfNeeded(for: release)
-    check(persisted == .alreadyDelivered,
-          "the persisted version should suppress a duplicate after restart")
-    check(afterRestartCenter.requests.isEmpty,
-          "restart suppression should happen before notification delivery")
-
-    let next = await afterRestart.notifyIfNeeded(for: makeRelease("9.2.0"))
-    check(next == .systemDelivered, "a later version should produce a new notification")
-    check(afterRestartCenter.requests.count == 1,
-          "the later version should add exactly one new request")
-    let olderAgain = await afterRestart.notifyIfNeeded(for: release)
-    check(olderAgain == .alreadyDelivered,
-          "a version must stay deduplicated after another version was delivered")
-    check(afterRestartCenter.requests.count == 1,
-          "returning to an older release must not enqueue a duplicate")
+    let afterRestart = AppState(
+      updater: FakeUpdateChecker([]),
+      defaults: defaults,
+      now: { now }
+    )
+    check(afterRestart.availableUpdate == release,
+          "an available update must survive an app restart even if the next feed check has not run")
+    check(!afterRestart.updateBannerDismissed,
+          "restart must not turn an unacknowledged update into a dismissal")
   }
 
   @MainActor
-  static func runDeniedNotificationFallbackTest() async {
-    let defaults = isolatedDefaults("update-denied")
-    let release = makeRelease("9.3.0")
-    let checker = FakeUpdateChecker([.release(release)])
-    let center = FakeNotificationCenter(status: .denied)
-    let notifier = UpdateNotifier(center: center, defaults: defaults)
-    let app = AppState(updater: checker, updateNotifier: notifier, defaults: defaults)
+  static func runUpdateAcknowledgementAndReminderTest() async {
+    let defaults = isolatedDefaults("update-acknowledgement")
+    let release = makeRelease("9.2.0")
+    var now = Date(timeIntervalSince1970: 1_800_000_300)
+    let notice = UpdateNoticeStore(defaults: defaults, now: { now })
+    notice.clear()
+    defer { notice.clear() }
+    let app = AppState(
+      updater: FakeUpdateChecker([.release(release)]),
+      defaults: defaults,
+      now: { now }
+    )
 
     await app.checkForUpdates()
-    check(app.availableUpdate == release, "denied notification permission must not hide the update banner")
-    check(!app.updateBannerDismissed, "the in-app update banner should start visible")
-    check(app.updateUsesInAppFallback, "the banner should identify itself as the notification fallback")
-    check(center.requests.isEmpty, "denied permission should not enqueue a system notification")
-    check(defaults.string(forKey: UpdateNotifier.notifiedVersionDefaultsKey) == nil,
-          "a denied notification must not be recorded as delivered")
+    app.dismissUpdateBanner()
+
+    let afterDismiss = AppState(
+      updater: FakeUpdateChecker([]),
+      defaults: defaults,
+      now: { now }
+    )
+    check(afterDismiss.availableUpdate == release,
+          "dismissing the banner must not discard the release details")
+    check(afterDismiss.updateBannerDismissed,
+          "a banner dismissal must survive app restart")
+
+    afterDismiss.requestUpdateReminder()
+    for attempt in 1...3 {
+      check(notice.reserveNotificationAttempt(version: release.version),
+            "an eligible reminder should reserve exactly one queue attempt")
+      check(notice.recordQueuedNotification(version: release.version),
+            "a reserved reminder should record only after the system queue accepts it")
+      if attempt < 3,
+         let nextEligibleAt = notice.available(installedVersion: UpdateChecker.currentVersion)?.notification.nextEligibleAt {
+        now = nextEligibleAt.addingTimeInterval(1)
+      }
+    }
+    check(!notice.shouldQueueNotification(version: release.version),
+          "automatic reminders must stop after their bounded queue attempts")
+
+    afterDismiss.dismissUpdateBanner()
+    afterDismiss.requestUpdateReminder()
+    let reset = notice.available(installedVersion: UpdateChecker.currentVersion)
+    check(reset?.notification.attemptCount == 0,
+          "an explicit Notify Again request should start a fresh bounded reminder sequence")
+    check(notice.shouldQueueNotification(version: release.version),
+          "Notify Again should make the selected update eligible immediately")
+
+    let afterReminder = AppState(
+      updater: FakeUpdateChecker([]),
+      defaults: defaults,
+      now: { now }
+    )
+    check(!afterReminder.updateBannerDismissed,
+          "an explicit reminder request should restore the in-app banner after restart")
+  }
+
+  static func runUpdateStateClearAfterInstallTest() {
+    let defaults = isolatedDefaults("update-installed")
+    let now = Date(timeIntervalSince1970: 1_800_000_400)
+    let notice = UpdateNoticeStore(defaults: defaults, now: { now })
+    notice.clear()
+    defer { notice.clear() }
+    let release = storedRelease(makeRelease("9.3.0"))
+
+    _ = notice.observe(release, installedVersion: "9.0.0")
+    check(notice.available(installedVersion: "9.0.0")?.release.version == release.version,
+          "a newer release should remain available before installation")
+    check(notice.available(installedVersion: "9.3.0") == nil,
+          "installing the available version must clear its stale reminder state")
+    check(defaults.data(forKey: UpdateNoticeStore.defaultsKey) == nil,
+          "clearing an installed update must remove the persisted notice")
+  }
+
+  static func runSharedUpdateStateConsistencyTest() {
+    let defaults = isolatedDefaults("update-shared-state")
+    var now = Date(timeIntervalSince1970: 1_800_000_500)
+    let helperState = UpdateNoticeStore(defaults: defaults, now: { now })
+    let appState = UpdateNoticeStore(defaults: defaults, now: { now })
+    helperState.clear()
+    defer { helperState.clear() }
+
+    let release = storedRelease(makeRelease("9.5.0"))
+    _ = helperState.observe(release, installedVersion: "9.0.0")
+    check(appState.available(installedVersion: "9.0.0")?.release.version == release.version,
+          "independent app and helper stores must read the same durable update snapshot")
+
+    check(helperState.reserveNotificationAttempt(version: release.version),
+          "the helper should reserve before submitting a notification")
+    appState.acknowledge(version: release.version)
+    check(!helperState.recordQueuedNotification(version: release.version),
+          "a late helper completion must not overwrite a newer app acknowledgement")
+    let acknowledged = appState.available(installedVersion: "9.0.0")
+    check(acknowledged?.acknowledgedAt != nil && acknowledged?.notification.inFlightAt == nil,
+          "acknowledgement must survive a concurrent helper completion")
+
+    now = now.addingTimeInterval(1)
+    check(appState.requestReminder(version: release.version),
+          "the app should be able to reset the reminder schedule after acknowledgement")
+    let reset = helperState.available(installedVersion: "9.0.0")
+    check(reset?.acknowledgedAt == nil && reset?.notification.attemptCount == 0,
+          "the helper must observe the app's reset rather than writing a stale snapshot")
   }
 
   static func runChecksumManifestTest() {

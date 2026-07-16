@@ -4,6 +4,10 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Fixed
+
+- macOS update availability now survives app restarts and is acknowledged separately from notification delivery. The menu helper owns automatic alerts, respects disabled macOS alerts, retries only on a bounded schedule, and cannot overwrite a newer dismissal or reminder request.
+
 ## 0.1.13 - 2026-07-15
 
 ### Changed

@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const helperRoot = path.resolve(here, "../native/menu-bar-helper");
+const updateStateSource = path.resolve(here, "../native/update-state/Sources/SgwUpdateState/UpdateNoticeState.swift");
 const helperSources = readdirSync(path.join(helperRoot, "Sources"))
   .filter((name) => name.endsWith(".swift"))
   .sort()
@@ -39,7 +40,7 @@ function hasSwift(): boolean {
   return probe.status === 0;
 }
 
-const enabled = hasSwift() && sources.every((p) => existsSync(p));
+const enabled = hasSwift() && existsSync(updateStateSource) && sources.every((p) => existsSync(p));
 const describeNative = enabled ? describe : describe.skip;
 
 let workDir = "";
@@ -156,7 +157,8 @@ describe("menu-bar helper approval surface contract", () => {
     const source = helperSource();
 
     expect(source).toContain("try? await UNUserNotificationCenter.current().requestAuthorization");
-    expect(source).toContain("await center.notificationSettings().authorizationStatus");
+    expect(source).toContain("var settings = await center.notificationSettings()");
+    expect(source).toContain("settings.alertSetting == .enabled");
     expect(source).not.toMatch(/requestAuthorization\(options: \[\.alert, \.sound\]\) \{/);
     expect(source).not.toContain("withCheckedContinuation");
   });
@@ -166,9 +168,39 @@ describeNative("menu-bar helper DecisionController (real Swift source)", () => {
   beforeAll(async () => {
     workDir = await mkdtemp(path.join(os.tmpdir(), "sgw-menubar-test-"));
     binary = path.join(workDir, "menubar-tests");
+    const updateStateModule = path.join(workDir, "SgwUpdateState.swiftmodule");
+    const updateStateLibrary = path.join(workDir, "libSgwUpdateState.dylib");
+    const compileUpdateState = spawnSync(
+      "swiftc",
+      [
+        "-O",
+        "-parse-as-library",
+        "-emit-library",
+        "-emit-module",
+        "-module-name", "SgwUpdateState",
+        "-emit-module-path", updateStateModule,
+        updateStateSource,
+        "-o", updateStateLibrary
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+    );
+    if (compileUpdateState.status !== 0) {
+      throw new Error(`swiftc shared update state failed:\n${compileUpdateState.stderr || compileUpdateState.stdout}`);
+    }
     const compile = spawnSync(
       "swiftc",
-      ["-O", "-parse-as-library", "-DSGW_TEST", ...sources, "-o", binary],
+      [
+        "-O",
+        "-parse-as-library",
+        "-DSGW_TEST",
+        "-I", workDir,
+        "-L", workDir,
+        "-lSgwUpdateState",
+        "-Xlinker", "-rpath",
+        "-Xlinker", "@executable_path",
+        ...sources,
+        "-o", binary
+      ],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
     );
     if (compile.status !== 0) {
@@ -181,7 +213,15 @@ describeNative("menu-bar helper DecisionController (real Swift source)", () => {
   });
 
   it("enforces the approve/deny in-flight guard and honest-failure reasons", () => {
-    const run = spawnSync(binary, [], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const run = spawnSync(binary, [], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        DYLD_LIBRARY_PATH: workDir,
+        SGW_UPDATE_NOTICE_STATE_PATH: path.join(workDir, "update-notice-state.json")
+      }
+    });
     const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
     expect(output, output).toContain("ALL_MENUBAR_TESTS_OK");
     expect(run.status).toBe(0);

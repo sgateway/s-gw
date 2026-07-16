@@ -9,9 +9,15 @@ let package = Package(
   products: [
     .executable(name: "s-gw-menu-bar-helper", targets: ["SgwMenuBar"])
   ],
+  dependencies: [
+    .package(path: "../update-state")
+  ],
   targets: [
     .executableTarget(
       name: "SgwMenuBar",
+      dependencies: [
+        .product(name: "SgwUpdateState", package: "update-state")
+      ],
       path: "Sources"
     )
   ]

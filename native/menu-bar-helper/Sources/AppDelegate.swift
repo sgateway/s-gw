@@ -1,12 +1,14 @@
 import AppKit
 import Darwin
 import Foundation
+import SgwUpdateState
 import SwiftUI
 @preconcurrency import UserNotifications
 
 extension Notification.Name {
   static let sgwShowMenuHelper = Notification.Name("com.s-gw.sgw.showMenuHelper")
   static let sgwOpenMainWindow = Notification.Name("com.s-gw.sgw.openMainWindow")
+  static let sgwRequestUpdateReminder = Notification.Name("com.s-gw.sgw.requestUpdateReminder")
 }
 
 @MainActor
@@ -125,6 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
           args: args,
           environment: environment
         )
+      },
+      canQueueNotification: { [weak self] in
+        guard let self else { return false }
+        return await self.canQueueUpdateNotification()
       },
       notify: { [weak self] update in
         guard let self else { return false }
@@ -246,10 +252,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       name: .sgwShowMenuHelper,
       object: nil
     )
+    DistributedNotificationCenter.default().addObserver(
+      self,
+      selector: #selector(requestUpdateReminder(_:)),
+      name: .sgwRequestUpdateReminder,
+      object: nil
+    )
   }
 
   @objc private func showMenuHelper(_ notification: Notification) {
     showStatusPopover()
+  }
+
+  @objc private func requestUpdateReminder(_ notification: Notification) {
+    guard let version = notification.userInfo?["version"] as? String else { return }
+    updateMonitor.requestReminder(version: version)
   }
 
   private func refreshState() {
@@ -495,24 +512,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func sendUpdateNotification(_ update: HelperUpdate) async -> Bool {
-    guard notificationsEnabled else { return false }
+    guard await canQueueUpdateNotification() else { return false }
     let center = UNUserNotificationCenter.current()
-    var status = await notificationAuthorizationStatus(center)
-    if status == .notDetermined {
-      guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else {
-        return false
-      }
-      status = await notificationAuthorizationStatus(center)
-    }
-    guard status == .authorized || status == .provisional else {
-      return false
-    }
 
     let content = UNMutableNotificationContent()
     content.title = "s-gw \(update.version) is available"
     content.body = "Open s-gw to review and upgrade."
     content.sound = .default
-    content.userInfo = ["releaseURL": update.releaseURL.absoluteString]
+    content.userInfo = [
+      "releaseURL": update.releaseURL.absoluteString,
+      "updateVersion": update.version
+    ]
 
     do {
       try await center.add(UNNotificationRequest(
@@ -526,8 +536,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
   }
 
-  private func notificationAuthorizationStatus(_ center: UNUserNotificationCenter) async -> UNAuthorizationStatus {
-    await center.notificationSettings().authorizationStatus
+  private func canQueueUpdateNotification() async -> Bool {
+    guard notificationsEnabled else { return false }
+    let center = UNUserNotificationCenter.current()
+    var settings = await center.notificationSettings()
+    if settings.authorizationStatus == .notDetermined {
+      guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else {
+        return false
+      }
+      settings = await center.notificationSettings()
+    }
+    guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+      return false
+    }
+    return settings.alertSetting == .enabled
   }
 
   nonisolated func userNotificationCenter(
@@ -544,10 +566,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     let releaseURL = response.notification.request.content.userInfo["releaseURL"] as? String
+    let updateVersion = response.notification.request.content.userInfo["updateVersion"] as? String
     completionHandler()
-    guard let releaseURL, let url = URL(string: releaseURL) else { return }
     Task { @MainActor in
-      NSWorkspace.shared.open(url)
+      if let updateVersion {
+        let defaults = UserDefaults(suiteName: "com.s-gw.sgw.app") ?? .standard
+        UpdateNoticeStore(defaults: defaults).acknowledge(version: updateVersion)
+      }
+      if let releaseURL, let url = URL(string: releaseURL) {
+        NSWorkspace.shared.open(url)
+      }
     }
   }
 }

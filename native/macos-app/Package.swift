@@ -9,9 +9,15 @@ let package = Package(
   products: [
     .executable(name: "s-gw", targets: ["SgwMac"])
   ],
+  dependencies: [
+    .package(path: "../update-state")
+  ],
   targets: [
     .executableTarget(
       name: "SgwMac",
+      dependencies: [
+        .product(name: "SgwUpdateState", package: "update-state")
+      ],
       path: "Sources/SgwMac"
     )
   ]
