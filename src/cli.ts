@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import path from "node:path";
 import { stdin } from "node:process";
 import { agentIntegrationStatus, installAgentIntegrations, uninstallAgentIntegrations } from "./agent-install.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
@@ -1508,8 +1507,12 @@ async function handleAwsCommand(
   flags: Record<string, string | boolean | string[]>,
   positionalArgs: string[] = []
 ): Promise<void> {
+  if (!action && hasFlag(flags, "version")) {
+    throw new Error("`s-gw aws --version` does not run the AWS CLI. Use `aws --version`, or `s-gw aws run --raw -- --version` when testing the configured AWS wrapper.");
+  }
+
   const handles = await resolveAwsHandles(store, flags);
-  const wrapper = getFlag(flags, "wrapper") || chooseAwsWrapper(handles.secret, handles.access);
+  const wrapper = chooseAwsWrapper(handles.secret, handles.access, getFlag(flags, "wrapper"));
   const awsArgs = positionalArgs.length > 0 ? positionalArgs : commandArgsFromFlags(flags);
 
   if (!action || action === "plan" || action === "path") {
@@ -1521,8 +1524,8 @@ async function handleAwsCommand(
       secretEnv: handles.secret.policy.injectEnv || "AWS_SECRET_ACCESS_KEY",
       accessKeyHandle: handles.access.handle,
       accessKeyEnv: handles.access.policy.injectEnv || "AWS_ACCESS_KEY_ID",
-      sampleRequestCommand: awsCommandLine("request", sampleArgs),
-      sampleRunCommand: awsCommandLine("run", sampleArgs)
+      sampleRequestCommand: awsCommandLine("request", sampleArgs, { wrapper }),
+      sampleRunCommand: awsCommandLine("run", sampleArgs, { wrapper })
     });
     return;
   }
@@ -1559,7 +1562,7 @@ async function handleAwsCommand(
 
   printJson({
     approvalRequired: false,
-    repeatCommand: awsCommandLine("run", awsArgs),
+    repeatCommand: awsCommandLine("run", awsArgs, { wrapper }),
     wrapper,
     secretHandle: handles.secret.handle,
     accessKeyHandle: handles.access.handle,
@@ -1638,17 +1641,28 @@ function findAwsAccessHandle(handles: HandleSummary[], secretHandle: string): Ha
   throw new Error("No AWS access-key-id handle found. Import companion fields with `s-gw onepassword import --include-companions`, then retry.");
 }
 
-function chooseAwsWrapper(secret: HandleSummary, access: HandleSummary): string {
+function chooseAwsWrapper(secret: HandleSummary, access: HandleSummary, requested?: string): string {
   const secretAllowed = secret.policy.allowedCommands || [];
   const accessAllowed = new Set(access.policy.allowedCommands || []);
-  const common = secretAllowed.filter((command) => accessAllowed.has(command));
-  const wrapper = common.find((command) => path.basename(command).includes("aws"))
-    || common[0];
+  const common = [...new Set(secretAllowed.filter((command) => accessAllowed.has(command)))];
 
-  if (!wrapper) {
+  if (common.length === 0) {
     throw new Error("No shared AWS wrapper command is allowed for the AWS secret/access handles. Pass --wrapper or update both handle policies.");
   }
-  return wrapper;
+
+  if (requested) {
+    if (!common.includes(requested)) {
+      throw new Error(`AWS wrapper is not allowed by both credential handles: ${requested}`);
+    }
+    return requested;
+  }
+
+  if (common.length > 1) {
+    const choices = common.map((command) => `  ${command}`).join("\n");
+    throw new Error(`Multiple AWS wrappers are allowed by both credential handles. Select one explicitly with --wrapper:\n${choices}`);
+  }
+
+  return common[0];
 }
 
 async function createAwsRequest(
@@ -1693,7 +1707,7 @@ function awsRequestResponse(
       ? undefined
       : `s-gw approve ${request.id} --mode timed-session --duration 8h --agent-scope any-agent`,
     localRunCommand: `s-gw execute ${request.id}`,
-    repeatCommand: awsCommandLine("run", awsArgs),
+    repeatCommand: awsCommandLine("run", awsArgs, { wrapper }),
     wrapper,
     secretHandle: handles.secret.handle,
     accessKeyHandle: handles.access.handle,

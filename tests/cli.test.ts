@@ -524,8 +524,14 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(plan.secretHandle).toBe(secret.handle);
       expect(plan.accessKeyHandle).toBe(access.handle);
       expect(plan.wrapper).toBe(wrapper);
-      expect(plan.sampleRunCommand).toBe("s-gw aws run -- sts get-caller-identity");
-      expect(plan.sampleRunCommand).not.toContain(wrapper);
+      expect(plan.sampleRunCommand).toBe(`s-gw aws run --wrapper ${wrapper} -- sts get-caller-identity`);
+
+      expect(() => execFileSync(tsxBin, ["src/cli.ts", "aws", "--version"], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      })).toThrow(/does not run the AWS CLI/);
 
       const request = JSON.parse(execFileSync(tsxBin, [
         "src/cli.ts",
@@ -546,8 +552,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(request.approvalRequired).toBe(true);
       expect(request.localApprovalCommand).toContain("--duration 8h");
       expect(request.localRunCommand).toBe(`s-gw execute ${request.request.id}`);
-      expect(request.repeatCommand).toBe("s-gw aws run -- sts get-caller-identity");
-      expect(request.repeatCommand).not.toContain(wrapper);
+      expect(request.repeatCommand).toBe(`s-gw aws run --wrapper ${wrapper} -- sts get-caller-identity`);
       expect(request.request.handle).toBe(secret.handle);
       expect(request.request.action.env).toEqual([{ handle: access.handle, injectEnv: "SGW_AWS_DEV_ACCESS_KEY_ID" }]);
       expect(request.request.action.command).toBe(wrapper);
@@ -620,6 +625,87 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(raw).toContain("args=sts get-caller-identity");
       expect(raw).not.toContain("aws-secret-shortcut-value-123456789");
       expect(raw).not.toContain(fakeAwsAccessKey());
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("requires an explicit AWS wrapper when credential policies share more than one", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-aws-wrapper-"));
+    const firstWrapper = path.join(home, "project-a-aws");
+    const secondWrapper = path.join(home, "project-b-aws");
+    const env = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
+      SGW_MASTER_PASSPHRASE: "cli-aws-wrapper-test-passphrase",
+      SGW_DISABLE_KEYCHAIN: "1"
+    };
+
+    try {
+      for (const wrapperPath of [firstWrapper, secondWrapper]) {
+        await writeFile(wrapperPath, "#!/bin/sh\nexit 0\n");
+        await chmod(wrapperPath, 0o700);
+      }
+
+      const secret = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "secret", "add",
+        "--name", "AWS secret",
+        "--type", "credential",
+        "--value-stdin",
+        "--inject-env", "AWS_SECRET_ACCESS_KEY",
+        "--allow-command", firstWrapper,
+        "--allow-command", secondWrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        input: "aws-secret-value-123456789",
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+
+      const access = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "secret", "add",
+        "--name", "AWS access key id",
+        "--type", "credential",
+        "--value-stdin",
+        "--inject-env", "AWS_ACCESS_KEY_ID",
+        "--allow-command", firstWrapper,
+        "--allow-command", secondWrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        input: fakeAwsAccessKey(),
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+
+      expect(() => execFileSync(tsxBin, [
+        "src/cli.ts", "aws", "plan",
+        "--secret-handle", secret.handle,
+        "--access-handle", access.handle
+      ], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      })).toThrow(/Multiple AWS wrappers/);
+
+      const plan = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "aws", "plan",
+        "--secret-handle", secret.handle,
+        "--access-handle", access.handle,
+        "--wrapper", secondWrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+
+      expect(plan.wrapper).toBe(secondWrapper);
+      expect(plan.sampleRunCommand).toContain(`--wrapper ${secondWrapper}`);
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
