@@ -10,7 +10,10 @@ const coreRoot = resolve(
 const manifest = resolve(coreRoot, "Cargo.toml");
 const extension = process.platform === "win32" ? ".exe" : "";
 const target = `${process.platform}-${process.arch}`;
-const built = resolve(coreRoot, "target", "release", `sgw-core${extension}`);
+const cargoTargetDir = process.env.CARGO_TARGET_DIR
+  ? resolve(coreRoot, process.env.CARGO_TARGET_DIR)
+  : resolve(coreRoot, "target");
+const built = resolve(cargoTargetDir, "release", `sgw-core${extension}`);
 const output = resolve(root, "dist", "native", target, `s-gw-core${extension}`);
 const legacyOutputs = [
   resolve(root, "dist", "native", "s-gw-core"),
