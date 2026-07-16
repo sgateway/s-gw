@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import SgwUpdateState
 import SwiftUI
 import UserNotifications
 
@@ -215,8 +216,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     let releaseURL = response.notification.request.content.userInfo["releaseURL"] as? String
+    let updateVersion = response.notification.request.content.userInfo["updateVersion"] as? String
     completionHandler()
     Task { @MainActor in
+      if let updateVersion {
+        UpdateNoticeStore().acknowledge(version: updateVersion)
+      }
       _ = Self.openMainWindow()
       if let releaseURL, let url = URL(string: releaseURL) {
         NSWorkspace.shared.open(url)

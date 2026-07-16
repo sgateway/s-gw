@@ -189,6 +189,9 @@ struct SettingsView: View {
             Button("Open Release Notes") {
               appState.openAvailableRelease()
             }
+            Button("Notify Again") {
+              appState.requestUpdateReminder()
+            }
             Button(appState.updateState.isBusy ? appState.updateState.label : "Install Package") {
               appState.installAvailableUpdate()
             }

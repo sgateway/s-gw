@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SgwUpdateState
 import SwiftUI
 
 @MainActor
@@ -9,7 +10,7 @@ final class AppState {
   let store = StoreReader()
   let activity = CommandActivityStore()
   @ObservationIgnored let updater: any UpdateChecking
-  @ObservationIgnored let updateNotifier: UpdateNotifier
+  @ObservationIgnored let updateNotice: UpdateNoticeStore
 
   var selectedPanel: PanelID = .overview
   var commandPalettePresented = false
@@ -35,7 +36,6 @@ final class AppState {
   var availableUpdate: ReleaseInfo?
   var updateState: UpdateState = .idle
   var updateBannerDismissed = false
-  var updateUsesInAppFallback = false
   var updateRepository: String {
     didSet {
       defaults.set(updateRepository, forKey: UpdateChecker.repositoryDefaultsKey)
@@ -50,17 +50,17 @@ final class AppState {
 
   init(
     updater: any UpdateChecking = UpdateChecker(),
-    updateNotifier: UpdateNotifier? = nil,
     defaults: UserDefaults = .standard,
     now: @escaping () -> Date = Date.init,
     updateCheckInterval: TimeInterval = 6 * 60 * 60
   ) {
     self.updater = updater
-    self.updateNotifier = updateNotifier ?? UpdateNotifier(defaults: defaults)
+    updateNotice = UpdateNoticeStore(defaults: defaults, now: now)
     self.defaults = defaults
     self.now = now
     self.updateCheckInterval = updateCheckInterval
     updateRepository = savedSgwUpdateRepository(defaults: defaults)
+    restoreAvailableUpdate()
   }
 
   var pendingRequests: [RequestRecord] {
@@ -665,24 +665,28 @@ final class AppState {
 
     guard let release else {
       defaults.set(now().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
-      availableUpdate = nil
-      updateBannerDismissed = false
-      updateUsesInAppFallback = false
+      restoreAvailableUpdate()
       updateState = .idle
       if force {
-        operationMessage = "s-gw is up to date"
+        if let availableUpdate {
+          operationMessage = "s-gw \(availableUpdate.version) is still available"
+        } else {
+          operationMessage = "s-gw is up to date"
+        }
       }
       return
     }
 
     if UpdateChecker.isNewer(release.version, than: UpdateChecker.currentVersion) {
-      if availableUpdate?.version != release.version {
-        updateBannerDismissed = false
+      if let snapshot = updateNotice.observe(
+        noticeRelease(from: release),
+        installedVersion: UpdateChecker.currentVersion
+      ) {
+        availableUpdate = releaseInfo(from: snapshot.release)
+        updateBannerDismissed = snapshot.acknowledgedAt != nil
       }
-      availableUpdate = release
       if !release.canInstallPackage {
         defaults.removeObject(forKey: UpdateChecker.lastCheckDefaultsKey)
-        updateUsesInAppFallback = false
         updateState = .idle
         if force {
           operationMessage = "s-gw \(release.version) is published; its verified package is still being uploaded"
@@ -690,8 +694,6 @@ final class AppState {
         return
       }
       defaults.set(now().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
-      let notificationResult = await updateNotifier.notifyIfNeeded(for: release)
-      updateUsesInAppFallback = notificationResult == .inAppOnly
       updateState = .idle
       if force {
         operationMessage = "s-gw \(release.version) is available"
@@ -700,17 +702,36 @@ final class AppState {
     }
 
     defaults.set(now().timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
-    availableUpdate = nil
-    updateBannerDismissed = false
-    updateUsesInAppFallback = false
+    restoreAvailableUpdate()
     updateState = .idle
     if force {
-      operationMessage = "s-gw is up to date"
+      if let availableUpdate {
+        operationMessage = "s-gw \(availableUpdate.version) is still available"
+      } else {
+        operationMessage = "s-gw is up to date"
+      }
     }
   }
 
   func dismissUpdateBanner() {
+    guard let release = availableUpdate else { return }
+    updateNotice.acknowledge(version: release.version)
     updateBannerDismissed = true
+  }
+
+  func requestUpdateReminder() {
+    guard let release = availableUpdate,
+          updateNotice.requestReminder(version: release.version) else {
+      return
+    }
+    updateBannerDismissed = false
+    DistributedNotificationCenter.default().postNotificationName(
+      .sgwRequestUpdateReminder,
+      object: nil,
+      userInfo: ["version": release.version],
+      deliverImmediately: true
+    )
+    operationMessage = "A menu-bar update reminder was requested."
   }
 
   func openAvailableRelease() {
@@ -748,6 +769,16 @@ final class AppState {
     return now().timeIntervalSince1970 - lastCheck > updateCheckInterval
   }
 
+  private func restoreAvailableUpdate() {
+    guard let snapshot = updateNotice.available(installedVersion: UpdateChecker.currentVersion) else {
+      availableUpdate = nil
+      updateBannerDismissed = false
+      return
+    }
+    availableUpdate = releaseInfo(from: snapshot.release)
+    updateBannerDismissed = snapshot.acknowledgedAt != nil
+  }
+
 }
 
 private extension PanelID {
@@ -769,9 +800,36 @@ private extension PanelID {
 extension Notification.Name {
   static let sgwRefreshPanel = Notification.Name("sgwRefreshPanel")
   static let sgwOpenMainWindow = Notification.Name("com.s-gw.sgw.openMainWindow")
+  static let sgwRequestUpdateReminder = Notification.Name("com.s-gw.sgw.requestUpdateReminder")
 }
 
 private func savedSgwUpdateRepository(defaults: UserDefaults) -> String {
   let saved = defaults.string(forKey: UpdateChecker.repositoryDefaultsKey)
   return saved ?? UpdateChecker.defaultRepository
+}
+
+private func noticeRelease(from release: ReleaseInfo) -> UpdateNoticeRelease {
+  UpdateNoticeRelease(
+    tag: release.tag,
+    version: release.version,
+    assetName: release.assetName,
+    assetURL: release.assetURL,
+    checksumAssetName: release.checksumAssetName,
+    checksumAssetURL: release.checksumAssetURL,
+    htmlURL: release.htmlURL,
+    notes: release.notes
+  )
+}
+
+private func releaseInfo(from release: UpdateNoticeRelease) -> ReleaseInfo {
+  ReleaseInfo(
+    tag: release.tag,
+    version: release.version,
+    assetName: release.assetName,
+    assetURL: release.assetURL,
+    checksumAssetName: release.checksumAssetName,
+    checksumAssetURL: release.checksumAssetURL,
+    htmlURL: release.htmlURL,
+    notes: release.notes
+  )
 }

@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(here, "../native/macos-app");
+const updateStateSource = path.resolve(here, "../native/update-state/Sources/SgwUpdateState/UpdateNoticeState.swift");
 const sources = [
   "Sources/SgwMac/App/AppState.swift",
   "Sources/SgwMac/Models/Models.swift",
@@ -31,7 +32,6 @@ const sources = [
   "Sources/SgwMac/Services/CommandRegistry.swift",
   "Sources/SgwMac/Stores/StoreReader.swift",
   "Sources/SgwMac/Services/UpdateChecker.swift",
-  "Sources/SgwMac/Services/UpdateNotifier.swift",
   "Tests/AppStateGuardTests.swift"
 ].map((rel) => path.join(appRoot, rel));
 
@@ -41,7 +41,7 @@ function hasSwift(): boolean {
   return probe.status === 0;
 }
 
-const enabled = hasSwift() && sources.every((p) => existsSync(p));
+const enabled = hasSwift() && existsSync(updateStateSource) && sources.every((p) => existsSync(p));
 const describeNative = enabled ? describe : describe.skip;
 
 let workDir = "";
@@ -51,9 +51,38 @@ describeNative("native macOS AppState (real Swift sources)", () => {
   beforeAll(async () => {
     workDir = await mkdtemp(path.join(os.tmpdir(), "sgw-native-test-"));
     binary = path.join(workDir, "appstate-tests");
+    const updateStateModule = path.join(workDir, "SgwUpdateState.swiftmodule");
+    const updateStateLibrary = path.join(workDir, "libSgwUpdateState.dylib");
+    const compileUpdateState = spawnSync(
+      "swiftc",
+      [
+        "-O",
+        "-parse-as-library",
+        "-emit-library",
+        "-emit-module",
+        "-module-name", "SgwUpdateState",
+        "-emit-module-path", updateStateModule,
+        updateStateSource,
+        "-o", updateStateLibrary
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+    );
+    if (compileUpdateState.status !== 0) {
+      throw new Error(`swiftc shared update state failed:\n${compileUpdateState.stderr || compileUpdateState.stdout}`);
+    }
     const compile = spawnSync(
       "swiftc",
-      ["-O", "-parse-as-library", ...sources, "-o", binary],
+      [
+        "-O",
+        "-parse-as-library",
+        "-I", workDir,
+        "-L", workDir,
+        "-lSgwUpdateState",
+        "-Xlinker", "-rpath",
+        "-Xlinker", "@executable_path",
+        ...sources,
+        "-o", binary
+      ],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
     );
     if (compile.status !== 0) {
@@ -66,7 +95,15 @@ describeNative("native macOS AppState (real Swift sources)", () => {
   });
 
   it("enforces the approve/deny in-flight guard and readiness derivation", () => {
-    const run = spawnSync(binary, [], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const run = spawnSync(binary, [], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        DYLD_LIBRARY_PATH: workDir,
+        SGW_UPDATE_NOTICE_STATE_PATH: path.join(workDir, "update-notice-state.json")
+      }
+    });
     const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
     expect(output, output).toContain("ALL_NATIVE_TESTS_OK");
     expect(run.status).toBe(0);

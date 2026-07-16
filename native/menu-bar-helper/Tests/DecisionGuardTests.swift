@@ -1,4 +1,5 @@
 import Foundation
+import SgwUpdateState
 
 // Standalone test driver for the menu-bar helper's approve/deny decision core.
 //
@@ -273,6 +274,7 @@ struct DecisionGuardTests {
     let defaults = UserDefaults(suiteName: suite)!
     defaults.removePersistentDomain(forName: suite)
     defer { defaults.removePersistentDomain(forName: suite) }
+    var now = Date(timeIntervalSince1970: 1_800_000_000)
     var notified: [String] = []
     let firstRunner = FakeHelperUpdateRunner([
       helperUpdateResult("9.1.0"),
@@ -280,27 +282,48 @@ struct DecisionGuardTests {
     ])
     let first = UpdateMonitor(
       defaults: defaults,
+      now: { now },
       runCheck: { firstRunner.run() },
       notify: { update in notified.append(update.version); return true }
     )
 
     await first.checkNow()
     await first.checkNow()
-    check(notified == ["9.1.0"], "the helper should notify once per available version")
+    check(notified == ["9.1.0"],
+          "a queued alert should wait for its retry schedule instead of firing every helper poll")
 
     let afterRestartRunner = FakeHelperUpdateRunner([
       helperUpdateResult("9.1.0"),
-      helperUpdateResult("9.2.0")
+      helperUpdateResult("9.1.0")
     ])
     let afterRestart = UpdateMonitor(
       defaults: defaults,
+      now: { now },
       runCheck: { afterRestartRunner.run() },
       notify: { update in notified.append(update.version); return true }
     )
     await afterRestart.checkNow()
+    now = now.addingTimeInterval(24 * 60 * 60 + 1)
     await afterRestart.checkNow()
-    check(notified == ["9.1.0", "9.2.0"],
-          "persisted update history should suppress a duplicate after helper restart")
+    check(notified == ["9.1.0", "9.1.0"],
+          "an unacknowledged update should receive a bounded retry after helper restart")
+
+    let notice = UpdateNoticeStore(defaults: defaults, now: { now })
+    notice.acknowledge(version: "9.1.0")
+    let acknowledgedRunner = FakeHelperUpdateRunner([
+      helperUpdateResult("9.1.0"),
+      helperUpdateResult("9.2.0")
+    ])
+    let acknowledged = UpdateMonitor(
+      defaults: defaults,
+      now: { now },
+      runCheck: { acknowledgedRunner.run() },
+      notify: { update in notified.append(update.version); return true }
+    )
+    await acknowledged.checkNow()
+    await acknowledged.checkNow()
+    check(notified == ["9.1.0", "9.1.0", "9.2.0"],
+          "acknowledging one update must stop its reminders without suppressing a newer version")
 
     let retryRunner = FakeHelperUpdateRunner([
       CliRunResult(ok: false, stdout: nil, stderr: "offline"),
@@ -309,6 +332,7 @@ struct DecisionGuardTests {
     ])
     let retry = UpdateMonitor(
       defaults: defaults,
+      now: { now },
       runCheck: { retryRunner.run() },
       notify: { update in notified.append(update.version); return true }
     )
@@ -316,6 +340,79 @@ struct DecisionGuardTests {
     await retry.checkNow()
     await retry.checkNow()
     check(notified.last == "9.3.0", "failed and invalid checks must retry without consuming a version")
+
+    defaults.set("9.4.0", forKey: UpdateNoticeStore.legacyLastVersionKey)
+    let legacy = UpdateMonitor(
+      defaults: defaults,
+      now: { now },
+      runCheck: { helperUpdateResult("9.4.0") },
+      notify: { update in notified.append(update.version); return true }
+    )
+    await legacy.checkNow()
+    check(notified.last == "9.4.0",
+          "a legacy queued version should get one real retry instead of being treated as delivered")
+    check(defaults.object(forKey: UpdateNoticeStore.legacyLastVersionKey) == nil,
+          "legacy permanent-dedupe markers should be retired after migration")
+    check(notice.available(installedVersion: "0.1.2")?.notification.attemptCount == 1,
+          "the first reliable retry after a legacy marker should start the normal reminder schedule")
+
+    notice.acknowledge(version: "9.4.0")
+    let manualRunner = FakeHelperUpdateRunner([helperUpdateResult("9.4.0")])
+    let manual = UpdateMonitor(
+      defaults: defaults,
+      now: { now },
+      runCheck: { manualRunner.run() },
+      notify: { update in notified.append(update.version); return true }
+    )
+    let beforeManualReminder = notified.count
+    manual.requestReminder(version: "9.4.0")
+    let manualReminderSent = await waitUntil(1.0) { notified.count == beforeManualReminder + 1 }
+    check(manualReminderSent,
+          "an explicit Notify Again request should re-enable a bounded reminder after acknowledgement")
+
+    let unavailableRunner = FakeHelperUpdateRunner([helperUpdateResult("9.5.0")])
+    let unavailable = UpdateMonitor(
+      defaults: defaults,
+      now: { now },
+      runCheck: { unavailableRunner.run() },
+      canQueueNotification: { false },
+      notify: { _ in fail("a disabled alert setting must not submit a notification request") }
+    )
+    await unavailable.checkNow()
+    check(notice.available(installedVersion: "0.1.2")?.notification.attemptCount == 0,
+          "a known non-alert notification setting must not consume a reminder attempt")
+
+    let failedRunner = FakeHelperUpdateRunner([helperUpdateResult("9.5.0")])
+    let failed = UpdateMonitor(
+      defaults: defaults,
+      now: { now },
+      runCheck: { failedRunner.run() },
+      notify: { _ in false }
+    )
+    await failed.checkNow()
+    let afterFailedQueue = notice.available(installedVersion: "0.1.2")?.notification
+    check(afterFailedQueue?.attemptCount == 0 && afterFailedQueue?.inFlightAt == nil,
+          "a rejected notification submission must release its reservation without consuming an attempt")
+
+    let crashRelease = UpdateNoticeRelease(
+      tag: "v9.6.0",
+      version: "9.6.0",
+      assetName: "",
+      assetURL: "",
+      checksumAssetName: "",
+      checksumAssetURL: "",
+      htmlURL: "https://example.test/releases/v9.6.0",
+      notes: ""
+    )
+    _ = notice.observe(crashRelease, installedVersion: "0.1.2")
+    check(notice.reserveNotificationAttempt(version: "9.6.0"),
+          "an eligible update should reserve a notification attempt before submitting it")
+    now = now.addingTimeInterval(5 * 60 + 1)
+    check(!notice.shouldQueueNotification(version: "9.6.0"),
+          "an expired in-flight queue should become a delayed retry instead of duplicating immediately")
+    let recovered = notice.available(installedVersion: "0.1.2")?.notification
+    check(recovered?.attemptCount == 1 && recovered?.inFlightAt == nil,
+          "a crashed reservation should be recovered as one conservative queue attempt")
   }
 
   static func runApprovalFlowTest() {

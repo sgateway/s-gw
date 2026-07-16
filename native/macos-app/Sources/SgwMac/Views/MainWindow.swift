@@ -59,11 +59,9 @@ struct MainWindow: View {
         Text("Installed \(UpdateChecker.currentVersion)")
           .font(.caption)
           .foregroundStyle(.secondary)
-        if appState.updateUsesInAppFallback {
-          Text("System notification unavailable. This banner is your update notice.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
+        Text("This update stays available here until you dismiss it or install it.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
       Spacer()
       Button("Release Notes") {
@@ -143,6 +141,7 @@ private struct UpdateReleaseSheet: View {
         }
         Spacer()
         Button("Not Now") {
+          appState.dismissUpdateBanner()
           dismiss()
         }
         Button(appState.updateState.isBusy ? appState.updateState.label : "Upgrade") {

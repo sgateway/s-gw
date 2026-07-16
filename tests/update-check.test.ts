@@ -166,7 +166,8 @@ describe("release update checks", () => {
       "utf8"
     );
     expect(appState).not.toContain("private var updateTask");
-    expect(helper).toContain("update check");
+    expect(helper).toContain('static let command = ["update", "check"]');
+    expect(helper).not.toContain('["update", "check", "--force"]');
     expect(helper).toContain("15 * 60");
   });
 });
