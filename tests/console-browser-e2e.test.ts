@@ -211,6 +211,152 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(launched.approvePostCount()).toBe(1);
   }, 45_000);
 
+  it("creates a scoped policy from the approval sheet without widening access", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "browser scoped policy passphrase";
+    running = await startConsoleServer({ port: 0 });
+
+    const created = await api<{ handle: string }>("api/secrets", {
+      name: "react-scoped-policy",
+      type: "api-token",
+      value: "react-scoped-policy-secret-value-1234567890",
+      injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
+      allowedCommands: [process.execPath]
+    });
+    const request = await api<{ id: string; state: string }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "console.log('scoped policy')"],
+      injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
+      workingDir: repoRoot,
+      reason: "Scoped policy browser e2e",
+      agentName: "Codex"
+    });
+    expect(request.state).toBe("pending");
+
+    const launched = await launchChrome(new URL("approvals", running.url).toString());
+    cdp = launched.cdp;
+    await waitFor(
+      () => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length > 0"),
+      "scoped policy request row"
+    );
+    await cdp.eval("document.querySelector('tbody tr').dispatchEvent(new MouseEvent('click', { bubbles: true }))");
+    await waitFor(
+      () => cdp!.eval<boolean>(`Boolean(document.querySelector('[data-approve="${request.id}"]'))`),
+      "scoped policy approval sheet"
+    );
+    await cdp.eval(`(() => {
+      const button = [...document.querySelectorAll('button')]
+        .find((item) => item.textContent?.trim().startsWith('Allow for'));
+      button?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return Boolean(button);
+    })()`);
+    await waitFor(
+      () => cdp!.eval<boolean>(`Boolean(document.querySelector('[data-approve-policy="${request.id}"]'))`),
+      "scoped policy approval action"
+    );
+    await clickElement(cdp, `[data-approve-policy="${request.id}"]`);
+
+    await waitFor(async () => {
+      const state = await api<{
+        requests: Array<{ id: string; state: string }>;
+        approvalPolicyRules: Array<unknown>;
+      }>("api/state");
+      return state.requests.find((item) => item.id === request.id)?.state === "approved"
+        && state.approvalPolicyRules.length === 1;
+    }, "scoped policy approval");
+
+    const state = await api<{
+      approvalPolicyRules: Array<{
+        id: string;
+        decision: string;
+        conditions: {
+          handles?: string[];
+          agents?: string[];
+          actionKinds?: string[];
+          commands?: string[];
+          injectEnvs?: string[];
+          workingDirs?: string[];
+        };
+      }>;
+    }>("api/state");
+    const rule = state.approvalPolicyRules[0];
+    expect(rule).toBeDefined();
+    if (!rule) {
+      throw new Error("Expected the approval sheet to create one scoped policy rule.");
+    }
+    expect(rule.decision).toBe("allow");
+    expect(rule.conditions).toMatchObject({
+      handles: [created.handle],
+      agents: ["codex"],
+      actionKinds: ["env_command"],
+      commands: [process.execPath],
+      injectEnvs: ["SGW_REACT_SCOPED_POLICY_TOKEN"],
+      workingDirs: [repoRoot]
+    });
+
+    const matchingRequest = await api<{
+      state: string;
+      approvalSource?: string;
+      approvalPolicyRuleId?: string;
+    }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "console.log('matching scope')"],
+      injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
+      workingDir: repoRoot,
+      reason: "Matching scoped policy browser e2e",
+      agentName: "Codex"
+    });
+    expect(matchingRequest).toMatchObject({
+      state: "approved",
+      approvalSource: "policy",
+      approvalPolicyRuleId: rule.id
+    });
+
+    const differentAgent = await api<{ state: string }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "console.log('different agent')"],
+      injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
+      workingDir: repoRoot,
+      reason: "Different agent scoped policy browser e2e",
+      agentName: "Claude"
+    });
+    expect(differentAgent.state).toBe("pending");
+
+    const differentDirectory = await api<{ state: string }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "console.log('different directory')"],
+      injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
+      workingDir: path.join(repoRoot, "other-directory"),
+      reason: "Different directory scoped policy browser e2e",
+      agentName: "Codex"
+    });
+    expect(differentDirectory.state).toBe("pending");
+
+    await cdp.send("Page.navigate", { url: new URL("policies", running.url).toString() });
+    await waitFor(
+      () => cdp!.eval<boolean>(`Boolean(document.querySelector('[data-policy-edit="${rule.id}"]'))`),
+      "scoped policy edit action"
+    );
+    await clickElement(cdp, `[data-policy-edit="${rule.id}"]`);
+    await waitFor(
+      () => cdp!.eval<boolean>("document.body.innerText.includes('Exact credential bindings')"),
+      "exact binding editor notice"
+    );
+    const lockedFields = await cdp.eval<{ credentialsLocked: boolean; envLocked: boolean }>(`(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      return {
+        credentialsLocked: Boolean(dialog?.querySelector('[aria-label="Policy credentials"]')?.disabled),
+        envLocked: Boolean(dialog?.querySelector('[aria-label="Policy environment variables"]')?.disabled)
+      };
+    })()`);
+    expect(lockedFields).toEqual({ credentialsLocked: true, envLocked: true });
+
+    expect(launched.approvePostCount()).toBe(0);
+  }, 45_000);
+
   it("closes an approval sheet when another surface already approved the request", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "browser stale approval passphrase";
     running = await startConsoleServer({ port: 0 });

@@ -4,8 +4,9 @@ import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir
 import os from "node:os";
 import path from "node:path";
 import { decryptSecret, encryptSecret, fingerprintSecret, shortId } from "./crypto.js";
-import { requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
+import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
+import { arrangeApprovalPolicyRules as arrangePolicyRules, compareApprovalPolicyRules } from "./policy-order.js";
 import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, sshSessionIdentity } from "./ssh.js";
 import { ensureSgwHome, getSgwHome, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
@@ -60,6 +61,20 @@ const storeMarkerName = ".store-initialized";
 const controlStateName = ".store-control.json";
 const pendingControlStateName = ".store-control.pending.json";
 const reusableExecutionPermits = new WeakMap<object, string>();
+const approvalPolicyConditionFields: Array<keyof ApprovalPolicyConditions> = [
+  "handles",
+  "envBindings",
+  "secretTypes",
+  "providers",
+  "minSeverity",
+  "agents",
+  "actionKinds",
+  "commands",
+  "injectEnvs",
+  "workingDirs",
+  "sshTargets",
+  "sshPorts"
+];
 
 const emptyStore = (): StoreFile => ({
   version: 1,
@@ -110,9 +125,30 @@ export interface AddApprovalPolicyRuleInput {
   durationMs?: number;
 }
 
+export interface UpdateApprovalPolicyRuleInput {
+  name?: string;
+  enabled?: boolean;
+  priority?: number;
+  decision?: ApprovalPolicyDecision;
+  conditions?: Partial<ApprovalPolicyConditions>;
+  expiresAt?: string | null;
+  durationMs?: number;
+}
+
 export interface SetApprovalPolicyRuleEnabledResult {
   id: string;
   enabled: boolean;
+}
+
+export interface ArrangeApprovalPolicyRulesResult {
+  rules: ApprovalPolicyRule[];
+  reordered: number;
+}
+
+export interface ApproveRequestWithPolicyResult {
+  request: RequestRecord;
+  rule: ApprovalPolicyRule;
+  created: boolean;
 }
 
 export interface ApproveRequestOptions {
@@ -609,7 +645,8 @@ export class SecretStore {
         return !request || !requestReferencesHandle(request, handle);
       });
       store.approvalPolicyRules = (store.approvalPolicyRules || []).filter((rule) => {
-        return !(rule.conditions.handles || []).includes(handle);
+        return !(rule.conditions.handles || []).includes(handle) &&
+          !(rule.conditions.envBindings || []).some((binding) => binding.handle === handle);
       });
       clearOnePasswordPolicyCaches(store);
 
@@ -709,25 +746,79 @@ export class SecretStore {
   async addApprovalPolicyRule(input: AddApprovalPolicyRuleInput): Promise<ApprovalPolicyRule> {
     return this.mutate((store) => {
       const now = new Date().toISOString();
+      const rule = addApprovalPolicyRuleInStore(store, input, now);
+      clearOnePasswordPolicyCaches(store);
+      return rule;
+    });
+  }
+
+  async updateApprovalPolicyRule(id: string, input: UpdateApprovalPolicyRuleInput): Promise<ApprovalPolicyRule> {
+    return this.mutate((store) => {
+      if (!hasApprovalPolicyUpdate(input)) {
+        throw new Error("Approval policy update must include at least one change.");
+      }
+
+      const rules = store.approvalPolicyRules || [];
+      const existing = rules.find((rule) => rule.id === id);
+      if (!existing) {
+        throw new Error(`Unknown approval policy: ${id}`);
+      }
+
+      const now = new Date().toISOString();
+      const existingConditions = normalizeApprovalPolicyConditions(existing.conditions);
+      if (exactBindingsWouldConflict(existingConditions, input.conditions)) {
+        throw new Error("Approval policies with exact credential bindings keep their bindings, credentials, and environment variables fixed. Create a new rule to change them.");
+      }
       const rule = normalizeApprovalPolicyRule(
         {
-          id: shortId("policy"),
-          name: input.name || defaultPolicyRuleName(input.decision),
-          enabled: input.enabled !== false,
-          priority: input.priority ?? nextPolicyPriority(store),
-          decision: input.decision,
-          conditions: normalizeApprovalPolicyConditions(input.conditions),
-          expiresAt: policyExpiresAt(input, now),
-          createdAt: now,
-          updatedAt: now
+          ...existing,
+          name: input.name === undefined ? existing.name : requirePolicyName(input.name),
+          enabled: input.enabled === undefined ? existing.enabled : requirePolicyEnabled(input.enabled),
+          priority: input.priority === undefined ? existing.priority : requirePolicyPriority(input.priority),
+          decision: input.decision === undefined ? existing.decision : requireApprovalPolicyDecision(input.decision),
+          conditions: input.conditions === undefined
+            ? existingConditions
+            : mergeApprovalPolicyConditions(existingConditions, input.conditions),
+          expiresAt: resolveUpdatedPolicyExpiresAt(existing, input, now),
+          updatedAt: existing.updatedAt
         },
-        now
+        existing.updatedAt
       );
+      if (sameApprovalPolicyRuleContent(existing, rule)) {
+        return existing;
+      }
 
-      store.approvalPolicyRules = sortApprovalPolicyRules([...(store.approvalPolicyRules || []), rule]);
+      rule.updatedAt = now;
+
+      store.approvalPolicyRules = sortApprovalPolicyRules(
+        rules.map((candidate) => candidate.id === id ? rule : candidate)
+      );
       clearOnePasswordPolicyCaches(store);
-      store.audit.push(audit("approval.policy.created", `Created approval policy ${rule.name}.`));
+      store.audit.push(audit("approval.policy.updated", `Updated approval policy ${rule.name}.`));
       return rule;
+    });
+  }
+
+  async arrangeApprovalPolicyRules(): Promise<ArrangeApprovalPolicyRulesResult> {
+    const current = await this.read();
+    const preview = arrangePolicyRules(current.approvalPolicyRules || []);
+    if (preview.reordered === 0) {
+      return preview;
+    }
+
+    return this.mutate((store) => {
+      const now = new Date().toISOString();
+      const arranged = arrangePolicyRules(store.approvalPolicyRules || [], now);
+      if (arranged.reordered === 0) {
+        return arranged;
+      }
+
+      store.approvalPolicyRules = arranged.rules;
+      clearOnePasswordPolicyCaches(store);
+      store.audit.push(
+        audit("approval.policy.arranged", `Auto-arranged ${arranged.reordered} approval polic${arranged.reordered === 1 ? "y" : "ies"}.`)
+      );
+      return arranged;
     });
   }
 
@@ -752,6 +843,9 @@ export class SecretStore {
       const rule = (store.approvalPolicyRules || []).find((item) => item.id === id);
       if (!rule) {
         throw new Error(`Unknown approval policy: ${id}`);
+      }
+      if (rule.enabled === enabled) {
+        return { id, enabled };
       }
 
       rule.enabled = enabled;
@@ -853,21 +947,57 @@ export class SecretStore {
 
   async approveRequest(id: string, options: ApproveRequestOptions = {}): Promise<RequestRecord> {
     return this.updateRequest(id, (request, store) => {
-      if (request.state === "approved" || request.state === "executing" || request.state === "executed") {
-        return;
+      approvePendingRequest(store, request, id, options);
+    });
+  }
+
+  async approveRequestWithScopedPolicy(id: string): Promise<ApproveRequestWithPolicyResult> {
+    return this.mutate((store) => {
+      const request = store.requests.find((item) => item.id === id);
+      if (!request) {
+        throw new Error(`Unknown request: ${id}`);
       }
       if (request.state !== "pending") {
         throw new Error(`Only pending requests can be approved. Current state: ${request.state}`);
       }
 
       const now = new Date().toISOString();
-      request.state = "approved";
-      request.approvedAt = now;
-      request.updatedAt = now;
-      request.approvalSource = "manual";
-      const grant = createApprovalGrant(store, request, now, options);
-      request.approvalGrantId = grant?.id;
-      store.audit.push(audit("request.approved", `Approved execution request ${id}.`, request.handle, id));
+      const secret = store.secrets.find((item) => item.handle === request.handle);
+      if (!secret) {
+        throw new Error(`Unknown secret handle: ${request.handle}`);
+      }
+      const agentName = durablePolicyAgentName(request);
+      let rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, now);
+      let created = false;
+
+      if (rule?.decision !== "allow") {
+        const deny = blockingDenyPolicyRuleForAction(store, secret, request.action, agentName, now);
+        if (deny) {
+          throw new Error(`Approval policy ${deny.name} denies this request. Edit or disable it before creating an allow rule.`);
+        }
+
+        addApprovalPolicyRuleInStore(store, scopedAllowPolicyInput(request, agentName), now, {
+          handle: request.handle,
+          requestId: request.id
+        });
+        created = true;
+        const arranged = arrangePolicyRules(store.approvalPolicyRules || [], now);
+        store.approvalPolicyRules = arranged.rules;
+        rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, now);
+        if (rule?.decision !== "allow") {
+          throw new Error("An existing policy takes precedence over this allow rule. Edit that policy before allowing this request.");
+        }
+
+        clearOnePasswordPolicyCaches(store);
+        if (arranged.reordered > 0) {
+          store.audit.push(
+            audit("approval.policy.arranged", `Auto-arranged ${arranged.reordered} approval polic${arranged.reordered === 1 ? "y" : "ies"}.`)
+          );
+        }
+      }
+
+      approvePendingRequest(store, request, id, { mode: "per-transaction", agentScope: "same-agent" }, now, rule);
+      return { request, rule, created };
     });
   }
 
@@ -2142,10 +2272,62 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
     approvalGrants: Array.isArray(parsed.approvalGrants)
       ? parsed.approvalGrants.filter(isValidApprovalGrant)
       : [],
-    approvalPolicyRules: Array.isArray(parsed.approvalPolicyRules)
-      ? sortApprovalPolicyRules(parsed.approvalPolicyRules.map((rule) => normalizeApprovalPolicyRule(rule)).filter(isValidApprovalPolicyRule))
-      : []
+    approvalPolicyRules: storedApprovalPolicyRules(parsed.approvalPolicyRules)
   };
+}
+
+function storedApprovalPolicyRules(value: unknown): ApprovalPolicyRule[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("approvalPolicyRules must be an array.");
+  }
+  return value.map((rule, index) => storedApprovalPolicyRule(rule, index));
+}
+
+function storedApprovalPolicyRule(value: unknown, index: number): ApprovalPolicyRule {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidStoredApprovalPolicyRule(index, "rule must be an object.");
+  }
+
+  const rule = value as Partial<ApprovalPolicyRule>;
+  if (typeof rule.id !== "string" || !rule.id.trim()) {
+    throw invalidStoredApprovalPolicyRule(index, "id must be a non-empty string.");
+  }
+  if (typeof rule.name !== "string" || !rule.name.trim()) {
+    throw invalidStoredApprovalPolicyRule(index, "name must be a non-empty string.");
+  }
+  if (typeof rule.enabled !== "boolean") {
+    throw invalidStoredApprovalPolicyRule(index, "enabled must be a boolean.");
+  }
+  if (typeof rule.priority !== "number" || !Number.isFinite(rule.priority) || rule.priority < 0) {
+    throw invalidStoredApprovalPolicyRule(index, "priority must be a non-negative finite number.");
+  }
+  if (!isApprovalPolicyDecision(rule.decision)) {
+    throw invalidStoredApprovalPolicyRule(index, "decision must be allow, ask, or deny.");
+  }
+  if (!rule.conditions || typeof rule.conditions !== "object" || Array.isArray(rule.conditions)) {
+    throw invalidStoredApprovalPolicyRule(index, "conditions must be an object.");
+  }
+  if (!isCanonicalPolicyTimestamp(rule.createdAt) || !isCanonicalPolicyTimestamp(rule.updatedAt)) {
+    throw invalidStoredApprovalPolicyRule(index, "createdAt and updatedAt must be ISO timestamps.");
+  }
+  if (rule.expiresAt !== undefined && !isCanonicalPolicyTimestamp(rule.expiresAt)) {
+    throw invalidStoredApprovalPolicyRule(index, "expiresAt must be an ISO timestamp.");
+  }
+
+  try {
+    normalizeApprovalPolicyConditions(rule.conditions, true);
+  } catch (error) {
+    throw invalidStoredApprovalPolicyRule(index, errorMessage(error));
+  }
+
+  return rule as ApprovalPolicyRule;
+}
+
+function invalidStoredApprovalPolicyRule(index: number, message: string): Error {
+  return new Error(`Invalid approval policy at index ${index}: ${message}`);
 }
 
 function migrateRequestApprovalSources(requests: RequestRecord[], auditLog: AuditEvent[]): RequestRecord[] {
@@ -3035,7 +3217,8 @@ function matchingApprovalPolicyRule(
   secret: SecretRecord,
   action: CommandAction,
   agentName: string,
-  nowIso: string
+  nowIso: string,
+  envBindings: CommandEnvBinding[]
 ): ApprovalPolicyRule | undefined {
   const rules = sortApprovalPolicyRules(store.approvalPolicyRules || []);
   for (const rule of rules) {
@@ -3045,7 +3228,7 @@ function matchingApprovalPolicyRule(
     if (rule.expiresAt && rule.expiresAt <= nowIso) {
       continue;
     }
-    if (approvalPolicyMatches(rule, secret, action, agentName)) {
+    if (approvalPolicyMatches(rule, secret, action, agentName, envBindings)) {
       return rule;
     }
   }
@@ -3060,8 +3243,9 @@ function matchingApprovalPolicyRuleForAction(
   agentName: string,
   nowIso: string
 ): ApprovalPolicyRule | undefined {
+  const envBindings = policyEnvBindingsForAction(primarySecret.handle, action);
   const matched = [
-    matchingApprovalPolicyRule(store, primarySecret, policyActionForBinding(action, action.injectEnv), agentName, nowIso)
+    matchingApprovalPolicyRule(store, primarySecret, policyActionForBinding(action, action.injectEnv), agentName, nowIso, envBindings)
   ];
   for (const binding of action.env || []) {
     const secret = store.secrets.find((item) => item.handle === binding.handle);
@@ -3069,7 +3253,7 @@ function matchingApprovalPolicyRuleForAction(
       throw new Error(`Unknown secret handle: ${binding.handle}`);
     }
     matched.push(
-      matchingApprovalPolicyRule(store, secret, policyActionForBinding(action, binding.injectEnv), agentName, nowIso)
+      matchingApprovalPolicyRule(store, secret, policyActionForBinding(action, binding.injectEnv), agentName, nowIso, envBindings)
     );
   }
 
@@ -3088,6 +3272,40 @@ function matchingApprovalPolicyRuleForAction(
     : undefined;
 }
 
+function blockingDenyPolicyRuleForAction(
+  store: StoreFile,
+  primarySecret: SecretRecord,
+  action: CommandAction,
+  agentName: string,
+  nowIso: string
+): ApprovalPolicyRule | undefined {
+  const envBindings = policyEnvBindingsForAction(primarySecret.handle, action);
+  const secrets = [
+    { secret: primarySecret, action: policyActionForBinding(action, action.injectEnv) },
+    ...(action.env || []).map((binding) => {
+      const secret = store.secrets.find((item) => item.handle === binding.handle);
+      if (!secret) {
+        throw new Error(`Unknown secret handle: ${binding.handle}`);
+      }
+      return { secret, action: policyActionForBinding(action, binding.injectEnv) };
+    })
+  ];
+
+  for (const rule of sortApprovalPolicyRules(store.approvalPolicyRules || [])) {
+    if (!rule.enabled || rule.decision !== "deny" || !isValidApprovalPolicyRule(rule)) {
+      continue;
+    }
+    if (rule.expiresAt && rule.expiresAt <= nowIso) {
+      continue;
+    }
+    if (secrets.some((item) => approvalPolicyMatches(rule, item.secret, item.action, agentName, envBindings))) {
+      return rule;
+    }
+  }
+
+  return undefined;
+}
+
 function policyActionForBinding(action: CommandAction, injectEnv: string): CommandAction {
   return { ...action, injectEnv, env: [] };
 }
@@ -3096,10 +3314,14 @@ function approvalPolicyMatches(
   rule: ApprovalPolicyRule,
   secret: SecretRecord,
   action: CommandAction,
-  agentName: string
+  agentName: string,
+  envBindings: CommandEnvBinding[]
 ): boolean {
   const conditions = normalizeApprovalPolicyConditions(rule.conditions);
   if (conditions.handles?.length && !conditions.handles.includes(secret.handle)) {
+    return false;
+  }
+  if (conditions.envBindings?.length && !samePolicyEnvBindings(conditions.envBindings, envBindings)) {
     return false;
   }
   if (conditions.secretTypes?.length && !conditions.secretTypes.includes(secret.type)) {
@@ -3151,6 +3373,24 @@ function approvalPolicyMatches(
   return true;
 }
 
+function policyEnvBindingsForAction(primaryHandle: string, action: CommandAction): CommandEnvBinding[] {
+  return normalizePolicyEnvBindings([
+    { handle: primaryHandle, injectEnv: action.injectEnv },
+    ...(action.env || [])
+  ], true);
+}
+
+function samePolicyEnvBindings(expected: CommandEnvBinding[], actual: CommandEnvBinding[]): boolean {
+  if (expected.length !== actual.length) {
+    return false;
+  }
+
+  return expected.every((binding, index) => {
+    const candidate = actual[index];
+    return candidate?.handle === binding.handle && candidate.injectEnv === binding.injectEnv;
+  });
+}
+
 function requestCreationMessage(
   record: RequestRecord,
   grant: ApprovalGrant | undefined,
@@ -3169,6 +3409,102 @@ function requestCreationMessage(
   return `Created execution request ${record.id}${supersededCount ? ` and superseded ${supersededCount} older duplicate(s)` : ""}.`;
 }
 
+function addApprovalPolicyRuleInStore(
+  store: StoreFile,
+  input: AddApprovalPolicyRuleInput,
+  now: string,
+  auditContext: { handle?: string; requestId?: string } = {}
+): ApprovalPolicyRule {
+  const decision = requireApprovalPolicyDecision(input.decision);
+  const rule = normalizeApprovalPolicyRule(
+    {
+      id: shortId("policy"),
+      name: policyRuleName(input.name, decision),
+      enabled: input.enabled === undefined ? true : requirePolicyEnabled(input.enabled),
+      priority: input.priority === undefined ? nextPolicyPriority(store) : requirePolicyPriority(input.priority),
+      decision,
+      conditions: normalizeApprovalPolicyConditions(input.conditions, true),
+      expiresAt: policyExpiresAt(input, now),
+      createdAt: now,
+      updatedAt: now
+    },
+    now
+  );
+
+  store.approvalPolicyRules = sortApprovalPolicyRules([...(store.approvalPolicyRules || []), rule]);
+  store.audit.push(audit("approval.policy.created", `Created approval policy ${rule.name}.`, auditContext.handle, auditContext.requestId));
+  return rule;
+}
+
+function approvePendingRequest(
+  store: StoreFile,
+  request: RequestRecord,
+  id: string,
+  options: ApproveRequestOptions,
+  now = new Date().toISOString(),
+  policyRule?: ApprovalPolicyRule
+): void {
+  if (request.state === "approved" || request.state === "executing" || request.state === "executed") {
+    return;
+  }
+  if (request.state !== "pending") {
+    throw new Error(`Only pending requests can be approved. Current state: ${request.state}`);
+  }
+
+  request.state = "approved";
+  request.approvedAt = now;
+  request.updatedAt = now;
+  request.approvalSource = policyRule ? "policy" : "manual";
+  request.approvalPolicyRuleId = policyRule?.id;
+  const grant = createApprovalGrant(store, request, now, options);
+  request.approvalGrantId = grant?.id;
+  store.audit.push(
+    policyRule
+      ? audit("request.approved_by_policy", `Approved execution request ${id} with approval policy ${policyRule.name}.`, request.handle, id)
+      : audit("request.approved", `Approved execution request ${id}.`, request.handle, id)
+  );
+}
+
+function durablePolicyAgentName(request: RequestRecord): string {
+  const stored = request.agentName?.trim();
+  if (stored && (stored !== "Agent" || request.agentSource !== "unknown")) {
+    return stored;
+  }
+
+  const derived = agentNameFromReason(request.reason);
+  if (derived !== "Agent") {
+    return derived;
+  }
+
+  throw new Error("s-gw could not identify the requesting agent. Approve once or create a policy with an explicit agent condition.");
+}
+
+function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddApprovalPolicyRuleInput {
+  const action = request.action;
+  const bindings = policyEnvBindingsForAction(request.handle, action);
+  const handles = uniqueStrings(bindings.map((binding) => binding.handle));
+  const injectEnvs = uniqueStrings(bindings.map((binding) => binding.injectEnv));
+  const actionLabel = action.kind === "ssh_session"
+    ? `SSH ${action.ssh?.target || "session"}`
+    : path.basename(action.command);
+
+  return {
+    name: `Allow ${agent || "agent"} to use ${actionLabel}`.slice(0, 120),
+    decision: "allow",
+    conditions: {
+      handles,
+      envBindings: bindings,
+      agents: [agent],
+      actionKinds: [action.kind],
+      commands: [action.command],
+      injectEnvs,
+      workingDirs: action.workingDir ? [action.workingDir] : [],
+      sshTargets: action.ssh?.target ? [action.ssh.target] : [],
+      sshPorts: action.ssh?.port ? [action.ssh.port] : []
+    }
+  };
+}
+
 function normalizeApprovalPolicyRule(rule: Partial<ApprovalPolicyRule>, nowIso = new Date().toISOString()): ApprovalPolicyRule {
   const decision = isApprovalPolicyDecision(rule.decision) ? rule.decision : "ask";
   return {
@@ -3184,20 +3520,220 @@ function normalizeApprovalPolicyRule(rule: Partial<ApprovalPolicyRule>, nowIso =
   };
 }
 
-function normalizeApprovalPolicyConditions(input?: Partial<ApprovalPolicyConditions>): ApprovalPolicyConditions {
+function normalizeApprovalPolicyConditions(
+  input?: Partial<ApprovalPolicyConditions>,
+  strict = false
+): ApprovalPolicyConditions {
+  if (input !== undefined && (!input || typeof input !== "object" || Array.isArray(input))) {
+    if (strict) {
+      throw new Error("conditions must be an object.");
+    }
+    return {};
+  }
+
+  const secretTypes = policyStringValues(input?.secretTypes, "secretTypes", strict);
+  const actionKinds = policyStringValues(input?.actionKinds, "actionKinds", strict);
+  const commands = policyStringValues(input?.commands, "commands", strict);
+  const minSeverity = normalizePolicySeverity(input?.minSeverity, strict);
+
   return {
-    handles: optionalStrings(input?.handles),
-    secretTypes: optionalSecretTypes(input?.secretTypes),
-    providers: optionalStrings(input?.providers).map((provider) => provider.toLowerCase()),
-    minSeverity: isSecretSeverity(input?.minSeverity) ? input.minSeverity : undefined,
-    agents: optionalStrings(input?.agents).map((agent) => agent.toLowerCase()),
-    actionKinds: optionalActionKinds(input?.actionKinds),
-    commands: optionalStrings(input?.commands).map((command) => safeNormalizeCommandGrant(command)).filter(Boolean) as string[],
-    injectEnvs: optionalStrings(input?.injectEnvs),
-    workingDirs: optionalStrings(input?.workingDirs).map((dir) => path.resolve(dir)),
-    sshTargets: optionalStrings(input?.sshTargets).map((target) => normalizeSshTarget(target)),
-    sshPorts: optionalPorts(input?.sshPorts)
+    handles: policyStringValues(input?.handles, "handles", strict),
+    envBindings: normalizePolicyEnvBindings(input?.envBindings, strict),
+    secretTypes: normalizePolicySecretTypes(secretTypes, strict),
+    providers: policyStringValues(input?.providers, "providers", strict).map((provider) => provider.toLowerCase()),
+    minSeverity,
+    agents: policyStringValues(input?.agents, "agents", strict).map((agent) => agent.toLowerCase()),
+    actionKinds: normalizePolicyActionKinds(actionKinds, strict),
+    commands: strict
+      ? commands.map((command) => normalizeCommandGrant(command))
+      : commands.map((command) => safeNormalizeCommandGrant(command)).filter(Boolean) as string[],
+    injectEnvs: policyStringValues(input?.injectEnvs, "injectEnvs", strict),
+    workingDirs: policyStringValues(input?.workingDirs, "workingDirs", strict).map((dir) => path.resolve(dir)),
+    sshTargets: policyStringValues(input?.sshTargets, "sshTargets", strict).map((target) => normalizeSshTarget(target)),
+    sshPorts: normalizePolicyPorts(input?.sshPorts, strict)
   };
+}
+
+function mergeApprovalPolicyConditions(
+  existing: ApprovalPolicyConditions,
+  patch: Partial<ApprovalPolicyConditions>
+): ApprovalPolicyConditions {
+  const current = normalizeApprovalPolicyConditions(existing);
+  const normalizedPatch = normalizeApprovalPolicyConditions(patch, true);
+  const merged: ApprovalPolicyConditions = { ...current };
+  for (const field of approvalPolicyConditionFields) {
+    if (hasOwn(patch, field)) {
+      merged[field] = normalizedPatch[field] as never;
+    }
+  }
+
+  return merged;
+}
+
+function hasApprovalPolicyUpdate(input: UpdateApprovalPolicyRuleInput): boolean {
+  if (
+    input.name !== undefined ||
+    input.enabled !== undefined ||
+    input.priority !== undefined ||
+    input.decision !== undefined ||
+    input.expiresAt !== undefined ||
+    input.durationMs !== undefined
+  ) {
+    return true;
+  }
+
+  const conditions = input.conditions;
+  if (conditions === undefined) {
+    return false;
+  }
+  if (!conditions || typeof conditions !== "object" || Array.isArray(conditions)) {
+    return true;
+  }
+
+  return approvalPolicyConditionFields.some((field) => hasOwn(conditions, field));
+}
+
+function exactBindingsWouldConflict(
+  existing: ApprovalPolicyConditions,
+  patch: Partial<ApprovalPolicyConditions> | undefined
+): boolean {
+  if (!existing.envBindings?.length || !patch || typeof patch !== "object" || Array.isArray(patch)) {
+    return false;
+  }
+
+  return hasOwn(patch, "envBindings") || hasOwn(patch, "handles") || hasOwn(patch, "injectEnvs");
+}
+
+function sameApprovalPolicyRuleContent(left: ApprovalPolicyRule, right: ApprovalPolicyRule): boolean {
+  return left.name === right.name &&
+    left.enabled === right.enabled &&
+    left.priority === right.priority &&
+    left.decision === right.decision &&
+    left.expiresAt === right.expiresAt &&
+    JSON.stringify(normalizeApprovalPolicyConditions(left.conditions)) ===
+      JSON.stringify(normalizeApprovalPolicyConditions(right.conditions));
+}
+
+function policyStringValues(value: unknown, field: string, strict: boolean): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+    if (strict) {
+      throw new Error(`${field} must be an array of strings.`);
+    }
+    return [];
+  }
+  if (strict && value.some((item) => !item.trim())) {
+    throw new Error(`${field} must not contain empty strings.`);
+  }
+
+  return uniqueStrings(value);
+}
+
+function normalizePolicyEnvBindings(value: unknown, strict: boolean): CommandEnvBinding[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    if (strict) {
+      throw new Error("envBindings must be an array of handle and environment-variable pairs.");
+    }
+    return [];
+  }
+
+  const bindings: CommandEnvBinding[] = [];
+  const seenEnvs = new Set<string>();
+  const seenPairs = new Set<string>();
+  for (const item of value) {
+    const handle = typeof item?.handle === "string" ? item.handle.trim() : "";
+    const injectEnv = typeof item?.injectEnv === "string" ? item.injectEnv.trim() : "";
+    if (!handle || handle.includes("\0") || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(injectEnv)) {
+      if (strict) {
+        throw new Error("envBindings must contain non-empty handles and valid environment-variable names.");
+      }
+      continue;
+    }
+    if (seenEnvs.has(injectEnv)) {
+      if (strict) {
+        throw new Error(`Environment variable ${injectEnv} is bound more than once.`);
+      }
+      continue;
+    }
+
+    const key = `${handle}\0${injectEnv}`;
+    if (seenPairs.has(key)) {
+      continue;
+    }
+    seenEnvs.add(injectEnv);
+    seenPairs.add(key);
+    bindings.push({ handle, injectEnv });
+  }
+
+  return bindings.sort((left, right) => {
+    const envOrder = left.injectEnv.localeCompare(right.injectEnv);
+    return envOrder || left.handle.localeCompare(right.handle);
+  });
+}
+
+function normalizePolicySecretTypes(values: string[], strict: boolean): SecretType[] {
+  const types = values.filter(isSecretType);
+  if (strict && types.length !== values.length) {
+    throw new Error("secretTypes contains an unsupported credential type.");
+  }
+  return types;
+}
+
+function normalizePolicyActionKinds(values: string[], strict: boolean): ApprovalPolicyActionKind[] {
+  const kinds = values.filter((value): value is ApprovalPolicyActionKind => value === "env_command" || value === "ssh_session");
+  if (strict && kinds.length !== values.length) {
+    throw new Error("actionKinds must contain env_command or ssh_session.");
+  }
+  return kinds;
+}
+
+function normalizePolicySeverity(value: unknown, strict: boolean): SecretSeverity | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (isSecretSeverity(value)) {
+    return value;
+  }
+  if (strict) {
+    throw new Error("minSeverity must be low, medium, high, or critical.");
+  }
+  return undefined;
+}
+
+function normalizePolicyPorts(value: unknown, strict: boolean): number[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    if (strict) {
+      throw new Error("sshPorts must be an array of port numbers.");
+    }
+    return [];
+  }
+
+  const ports: number[] = [];
+  for (const item of value) {
+    const port = Number(item);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      if (strict) {
+        throw new Error("sshPorts must contain integers from 1 through 65535.");
+      }
+      continue;
+    }
+    if (!ports.includes(port)) {
+      ports.push(port);
+    }
+  }
+  return ports;
+}
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function safeNormalizeCommandGrant(command: string): string | undefined {
@@ -3227,10 +3763,7 @@ function isApprovalPolicyDecision(value: unknown): value is ApprovalPolicyDecisi
 }
 
 function sortApprovalPolicyRules(rules: ApprovalPolicyRule[]): ApprovalPolicyRule[] {
-  return [...rules].sort((a, b) => {
-    const priority = a.priority - b.priority;
-    return priority || b.updatedAt.localeCompare(a.updatedAt);
-  });
+  return [...rules].sort(compareApprovalPolicyRules);
 }
 
 function nextPolicyPriority(store: StoreFile): number {
@@ -3250,14 +3783,14 @@ function defaultPolicyRuleName(decision: ApprovalPolicyDecision): string {
 }
 
 function policyExpiresAt(input: AddApprovalPolicyRuleInput, nowIso: string): string | undefined {
-  const explicit = normalizePolicyExpiresAt(input.expiresAt);
+  const explicit = requirePolicyExpiresAt(input.expiresAt);
   if (explicit) {
     return explicit;
   }
   if (input.durationMs === undefined) {
     return undefined;
   }
-  return new Date(Date.parse(nowIso) + clampApprovalDuration(input.durationMs)).toISOString();
+  return new Date(Date.parse(nowIso) + requirePolicyDuration(input.durationMs)).toISOString();
 }
 
 function normalizePolicyExpiresAt(value: unknown): string | undefined {
@@ -3268,49 +3801,87 @@ function normalizePolicyExpiresAt(value: unknown): string | undefined {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 }
 
+function isCanonicalPolicyTimestamp(value: unknown): value is string {
+  return typeof value === "string" && normalizePolicyExpiresAt(value) === value;
+}
+
+function resolveUpdatedPolicyExpiresAt(
+  existing: ApprovalPolicyRule,
+  input: UpdateApprovalPolicyRuleInput,
+  nowIso: string
+): string | undefined {
+  if (input.expiresAt === null) {
+    return undefined;
+  }
+  if (input.expiresAt !== undefined) {
+    return requirePolicyExpiresAt(input.expiresAt);
+  }
+  if (input.durationMs !== undefined) {
+    return new Date(Date.parse(nowIso) + requirePolicyDuration(input.durationMs)).toISOString();
+  }
+  return existing.expiresAt;
+}
+
+function requirePolicyExpiresAt(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  const normalized = normalizePolicyExpiresAt(value);
+  if (!normalized) {
+    throw new Error("expiresAt must be a valid ISO timestamp.");
+  }
+  return normalized;
+}
+
+function policyRuleName(name: string | undefined, decision: ApprovalPolicyDecision): string {
+  if (name === undefined) {
+    return defaultPolicyRuleName(decision);
+  }
+  return requirePolicyName(name);
+}
+
+function requirePolicyName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error("Policy name is required.");
+  }
+  return trimmed.slice(0, 120);
+}
+
+function requireApprovalPolicyDecision(value: unknown): ApprovalPolicyDecision {
+  if (!isApprovalPolicyDecision(value)) {
+    throw new Error("decision must be allow, ask, or deny.");
+  }
+  return value;
+}
+
+function requirePolicyEnabled(value: unknown): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error("enabled must be a boolean.");
+  }
+  return value;
+}
+
+function requirePolicyPriority(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error("priority must be a non-negative finite number.");
+  }
+  return Math.min(Math.floor(value), 10_000);
+}
+
+function requirePolicyDuration(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error("durationMs must be a positive finite number.");
+  }
+  return clampApprovalDuration(value);
+}
+
 function normalizePolicyPriority(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return 100;
   }
   return Math.max(0, Math.min(10_000, Math.floor(value)));
-}
-
-function optionalStrings(values: unknown): string[] {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-  return uniqueStrings(values.filter((value): value is string => typeof value === "string"));
-}
-
-function optionalSecretTypes(values: unknown): SecretType[] {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-  return uniqueStrings(values.filter((value): value is SecretType => isSecretType(value))) as SecretType[];
-}
-
-function optionalActionKinds(values: unknown): ApprovalPolicyActionKind[] {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-  return uniqueStrings(values.filter((value): value is ApprovalPolicyActionKind => {
-    return value === "env_command" || value === "ssh_session";
-  })) as ApprovalPolicyActionKind[];
-}
-
-function optionalPorts(values: unknown): number[] {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-  const out: number[] = [];
-  for (const value of values) {
-    const port = Number(value);
-    if (!Number.isInteger(port) || port < 1 || port > 65535 || out.includes(port)) {
-      continue;
-    }
-    out.push(port);
-  }
-  return out;
 }
 
 function isSecretType(value: unknown): value is SecretType {

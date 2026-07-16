@@ -57,6 +57,19 @@ export function titleCase(value: string): string {
 export function policyConditionSummary(conditions: Record<string, unknown>): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(conditions)) {
+    if (key === "envBindings" && Array.isArray(value) && value.length > 0) {
+      const bindings = value
+        .filter((binding): binding is { handle: string; injectEnv: string } => {
+          return Boolean(binding) && typeof binding === "object" &&
+            typeof (binding as { handle?: unknown }).handle === "string" &&
+            typeof (binding as { injectEnv?: unknown }).injectEnv === "string";
+        })
+        .map((binding) => `${binding.injectEnv} → ${shortHandle(binding.handle)}`);
+      if (bindings.length > 0) {
+        parts.push(`Credential bindings: ${bindings.slice(0, 2).join(", ")}${bindings.length > 2 ? ` +${bindings.length - 2}` : ""}`);
+      }
+      continue;
+    }
     if (Array.isArray(value) && value.length > 0) {
       parts.push(`${titleCase(key)}: ${value.slice(0, 2).join(", ")}${value.length > 2 ? ` +${value.length - 2}` : ""}`);
     } else if (typeof value === "string" && value) {

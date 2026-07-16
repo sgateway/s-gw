@@ -56,6 +56,7 @@ import type {
   ApprovalMode,
   ApprovalPolicyDecision,
   ApprovalPolicyActionKind,
+  ApprovalPolicyConditions,
   CommandEnvBinding,
   HandleSummary,
   RequestRecord,
@@ -837,6 +838,14 @@ function secretType(input: string): SecretType {
   ];
 
   return allowed.includes(input as SecretType) ? (input as SecretType) : "unknown";
+}
+
+function approvalPolicySecretType(input: string): SecretType {
+  const type = secretType(input);
+  if (type === "unknown" && input.trim().toLowerCase() !== "unknown") {
+    throw new Error(`--type is not a supported credential type: ${input}`);
+  }
+  return type;
 }
 
 function approvalMode(input: string): ApprovalMode {
@@ -1774,21 +1783,35 @@ async function handleApprovalPolicyCommand(
         decision: approvalPolicyDecision(getFlag(flags, "decision") || "ask"),
         durationMs: duration ? parseDurationMs(duration) : undefined,
         expiresAt: getFlag(flags, "expires-at"),
-        conditions: {
-          handles: getFlagList(flags, "handle"),
-          secretTypes: getFlagList(flags, "type").map(secretType),
-          providers: getFlagList(flags, "provider"),
-          minSeverity: optionalSecretSeverity(getFlag(flags, "min-severity")),
-          agents: getFlagList(flags, "agent"),
-          actionKinds: getFlagList(flags, "action-kind").map(approvalPolicyActionKind),
-          commands: getFlagList(flags, "command"),
-          injectEnvs: getFlagList(flags, "inject-env"),
-          workingDirs: getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd")),
-          sshTargets: getFlagList(flags, "ssh-target").concat(getFlagList(flags, "target")),
-          sshPorts: getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item))
-        }
+        conditions: approvalPolicyConditionsFromFlags(flags)
       })
     );
+    return;
+  }
+
+  if (action === "update" || action === "edit") {
+    if (!approvalPolicyUpdateFlags.some((flag) => hasFlag(flags, flag))) {
+      throw new Error("approval policy update needs at least one change.");
+    }
+
+    const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
+    const conditions = approvalPolicyConditionPatchFromFlags(flags);
+    printJson(
+      await store.updateApprovalPolicyRule(requireFlag(flags, "id"), {
+        name: hasFlag(flags, "name") ? getFlag(flags, "name") : undefined,
+        enabled: hasFlag(flags, "enabled") ? true : hasFlag(flags, "disabled") ? false : undefined,
+        priority: hasFlag(flags, "priority") ? optionalNumericFlag(flags, "priority") : undefined,
+        decision: hasFlag(flags, "decision") ? approvalPolicyDecision(getFlag(flags, "decision") || "ask") : undefined,
+        durationMs: duration ? parseDurationMs(duration) : undefined,
+        expiresAt: hasFlag(flags, "clear-expiry") ? null : hasFlag(flags, "expires-at") ? getFlag(flags, "expires-at") : undefined,
+        conditions
+      })
+    );
+    return;
+  }
+
+  if (action === "arrange" || action === "organize") {
+    printJson(await store.arrangeApprovalPolicyRules());
     return;
   }
 
@@ -1803,7 +1826,117 @@ async function handleApprovalPolicyCommand(
     return;
   }
 
-  throw new Error("approval policy requires list, add, delete, enable, or disable.");
+  throw new Error("approval policy requires list, add, update, arrange, delete, enable, or disable.");
+}
+
+const approvalPolicyUpdateFlags = [
+  "name",
+  "enabled",
+  "disabled",
+  "priority",
+  "decision",
+  "duration",
+  "duration-ms",
+  "expires-at",
+  "clear-expiry",
+  "handle",
+  "binding",
+  "type",
+  "provider",
+  "min-severity",
+  "agent",
+  "action-kind",
+  "command",
+  "inject-env",
+  "working-dir",
+  "cwd",
+  "ssh-target",
+  "target",
+  "ssh-port",
+  "port"
+];
+
+function approvalPolicyConditionsFromFlags(
+  flags: Record<string, string | boolean | string[]>
+): ApprovalPolicyConditions {
+  return {
+    handles: getFlagList(flags, "handle"),
+    envBindings: approvalPolicyEnvBindingsFromFlags(flags),
+    secretTypes: getFlagList(flags, "type").map(approvalPolicySecretType),
+    providers: getFlagList(flags, "provider"),
+    minSeverity: optionalSecretSeverity(getFlag(flags, "min-severity")),
+    agents: getFlagList(flags, "agent"),
+    actionKinds: getFlagList(flags, "action-kind").map(approvalPolicyActionKind),
+    commands: getFlagList(flags, "command"),
+    injectEnvs: getFlagList(flags, "inject-env"),
+    workingDirs: getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd")),
+    sshTargets: getFlagList(flags, "ssh-target").concat(getFlagList(flags, "target")),
+    sshPorts: getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item))
+  };
+}
+
+function approvalPolicyConditionPatchFromFlags(
+  flags: Record<string, string | boolean | string[]>
+): Partial<ApprovalPolicyConditions> | undefined {
+  const fields = [
+    "handle",
+    "binding",
+    "type",
+    "provider",
+    "min-severity",
+    "agent",
+    "action-kind",
+    "command",
+    "inject-env",
+    "working-dir",
+    "cwd",
+    "ssh-target",
+    "target",
+    "ssh-port",
+    "port"
+  ];
+  if (!fields.some((field) => hasFlag(flags, field))) {
+    return undefined;
+  }
+
+  const patch: Partial<ApprovalPolicyConditions> = {};
+  if (hasFlag(flags, "handle")) patch.handles = getFlagList(flags, "handle");
+  if (hasFlag(flags, "binding")) patch.envBindings = approvalPolicyEnvBindingsFromFlags(flags);
+  if (hasFlag(flags, "type")) patch.secretTypes = getFlagList(flags, "type").map(approvalPolicySecretType);
+  if (hasFlag(flags, "provider")) patch.providers = getFlagList(flags, "provider");
+  if (hasFlag(flags, "min-severity")) patch.minSeverity = optionalSecretSeverity(getFlag(flags, "min-severity"));
+  if (hasFlag(flags, "agent")) patch.agents = getFlagList(flags, "agent");
+  if (hasFlag(flags, "action-kind")) patch.actionKinds = getFlagList(flags, "action-kind").map(approvalPolicyActionKind);
+  if (hasFlag(flags, "command")) patch.commands = getFlagList(flags, "command");
+  if (hasFlag(flags, "inject-env")) patch.injectEnvs = getFlagList(flags, "inject-env");
+  if (hasFlag(flags, "working-dir") || hasFlag(flags, "cwd")) {
+    patch.workingDirs = getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd"));
+  }
+  if (hasFlag(flags, "ssh-target") || hasFlag(flags, "target")) {
+    patch.sshTargets = getFlagList(flags, "ssh-target").concat(getFlagList(flags, "target"));
+  }
+  if (hasFlag(flags, "ssh-port") || hasFlag(flags, "port")) {
+    patch.sshPorts = getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item));
+  }
+  return patch;
+}
+
+function approvalPolicyEnvBindingsFromFlags(
+  flags: Record<string, string | boolean | string[]>
+): CommandEnvBinding[] {
+  const values = getFlagList(flags, "binding");
+  const out: CommandEnvBinding[] = [];
+  for (const value of values) {
+    const index = value.indexOf("=");
+    if (index <= 0 || index === value.length - 1) {
+      throw new Error("--binding must look like ENV=HANDLE.");
+    }
+    out.push({
+      injectEnv: value.slice(0, index),
+      handle: value.slice(index + 1)
+    });
+  }
+  return out;
 }
 
 function onePasswordHandleName(itemTitle: string, fieldLabel: string): string {
@@ -2006,7 +2139,9 @@ Commands:
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m]
   s-gw approval grants
   s-gw approval policy list
-  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--agent Codex] [--command /path/to/tool] [--action-kind env_command|ssh_session] [--duration 8h]
+  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command /path/to/tool] [--action-kind env_command|ssh_session] [--duration 8h]
+  s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command /path/to/tool] [--clear-expiry]
+  s-gw approval policy arrange
   s-gw approval policy delete --id POLICY_ID
   s-gw approval policy enable|disable --id POLICY_ID
   s-gw approval revoke GRANT_ID

@@ -122,6 +122,52 @@ describe("React console source contracts", () => {
     expect(app).not.toContain("PolicyEnabledStatus");
   });
 
+  it("keeps scoped policy approval atomic and narrowly bound to the request", async () => {
+    const [app, api, server, store] = await Promise.all([
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
+      readFile(path.join(repoRoot, "src/console-ui/src/lib/api.ts"), "utf8"),
+      readFile(path.join(repoRoot, "src/console-server.ts"), "utf8"),
+      readFile(path.join(repoRoot, "src/store.ts"), "utf8")
+    ]);
+    const approvalSheet = app.slice(
+      app.indexOf("function ApprovalSheet"),
+      app.indexOf("function CredentialSheet")
+    );
+
+    expect(approvalSheet).toContain("approveRequestWithScopedPolicy(request)");
+    expect(approvalSheet).toContain('data-approve-policy={request?.id}');
+    expect(approvalSheet).toContain("Always allow this request scope");
+    expect(approvalSheet).not.toContain("addPolicy(");
+    expect(approvalSheet).not.toContain("arrangePolicies(");
+    expect(api).toContain("/approve-policy");
+    expect(server).toContain('if (action === "approve-policy")');
+    expect(server).toContain("store.approveRequestWithScopedPolicy(id)");
+    expect(store).toContain("async approveRequestWithScopedPolicy");
+    expect(store).toContain("scopedAllowPolicyInput(request, agentName)");
+    expect(store).toContain("blockingDenyPolicyRuleForAction");
+    expect(store).toContain("approvePendingRequest(store, request, id, { mode: \"per-transaction\", agentScope: \"same-agent\" }, now, rule)");
+    expect(store).toContain("handles,");
+    expect(store).toContain("envBindings: bindings,");
+    expect(store).toContain("agents: [agent]");
+    expect(store).toContain("actionKinds: [action.kind]");
+    expect(store).toContain("commands: [action.command]");
+    expect(store).toContain("injectEnvs,");
+    expect(store).toContain("workingDirs: action.workingDir ? [action.workingDir] : []");
+  });
+
+  it("keeps exact credential bindings visible and fixed in the policy editor", async () => {
+    const [app, store] = await Promise.all([
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
+      readFile(path.join(repoRoot, "src/store.ts"), "utf8")
+    ]);
+
+    expect(app).toContain("Exact credential bindings");
+    expect(app).toContain("bindingsLocked");
+    expect(app).toContain('label={bindingsLocked ? "Credentials (fixed)" : "Credentials"}');
+    expect(app).toContain('label={bindingsLocked ? "Injected environment variables (fixed)" : "Injected environment variables"}');
+    expect(store).toContain("exactBindingsWouldConflict");
+  });
+
   it("keeps settings sections compact and approval durations readable", async () => {
     const [app, tabs] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),

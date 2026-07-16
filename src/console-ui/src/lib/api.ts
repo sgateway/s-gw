@@ -5,7 +5,8 @@ import type {
   ApprovalPolicyDecision,
   AgentIntegrationMutation,
   ConsoleState,
-  RequestRecord
+  RequestRecord,
+  SecretSeverity
 } from "@/lib/types";
 
 interface ApiOptions {
@@ -58,6 +59,13 @@ export function approveRequest(
   });
 }
 
+export function approveRequestWithScopedPolicy(request: RequestRecord) {
+  return apiJson<{ request: RequestRecord; created: boolean }>(`/api/requests/${encodeURIComponent(request.id)}/approve-policy`, {
+    method: "POST",
+    body: {}
+  });
+}
+
 export function denyRequest(request: RequestRecord) {
   return apiJson<RequestRecord>(`/api/requests/${encodeURIComponent(request.id)}/deny`, {
     method: "POST",
@@ -85,22 +93,37 @@ export function saveApprovalSettings(body: { mode: ApprovalMode; durationMs: num
   return apiJson("/api/approval", { method: "POST", body });
 }
 
-export function addPolicy(body: {
+export interface PolicyInput {
   name: string;
   enabled: boolean;
-  priority: number;
+  priority?: number;
   decision: ApprovalPolicyDecision;
   agents?: string[];
   handles?: string[];
+  envBindings?: Array<{ handle: string; injectEnv: string }>;
   providers?: string[];
   secretTypes?: string[];
+  minSeverity?: SecretSeverity | null;
   actionKinds?: string[];
   commands?: string[];
   injectEnvs?: string[];
+  workingDirs?: string[];
   sshTargets?: string[];
+  sshPorts?: number[];
   durationMs?: number;
-}) {
+  expiresAt?: string | null;
+}
+
+export function addPolicy(body: PolicyInput) {
   return apiJson("/api/approval/policies", { method: "POST", body });
+}
+
+export function updatePolicy(id: string, body: Partial<PolicyInput>) {
+  return apiJson(`/api/approval/policies/${encodeURIComponent(id)}`, { method: "PUT", body });
+}
+
+export function arrangePolicies() {
+  return apiJson<{ reordered: number }>("/api/approval/policies/arrange", { method: "POST", body: {} });
 }
 
 export function setPolicyEnabled(id: string, enabled: boolean) {

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
+import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
@@ -93,6 +94,74 @@ describe("SecretStore", () => {
     expect(handles).toHaveLength(1);
     expect(JSON.stringify(handles)).not.toContain(rawSecret);
     expect(handles[0].policy.injectEnv).toBe("API_TOKEN");
+  });
+
+  it("fails closed without broadening a malformed stored policy", async () => {
+    const store = new SecretStore();
+    const raw = `${JSON.stringify({
+      version: 1,
+      secrets: [],
+      requests: [],
+      audit: [],
+      approvalSettings: { mode: "per-transaction", durationMs: 15 * 60 * 1000 },
+      approvalGrants: [],
+      approvalPolicyRules: [{
+        id: "policy_invalid_command",
+        name: "Invalid command policy",
+        enabled: true,
+        priority: 100,
+        decision: "allow",
+        conditions: { commands: ["relative/tool"] },
+        createdAt: "2030-01-01T00:00:00.000Z",
+        updatedAt: "2030-01-01T00:00:00.000Z"
+      }]
+    }, null, 2)}\n`;
+    await writeFile(store.storePath, raw, { mode: 0o600 });
+
+    await expect(store.addSecret({
+      name: "unrelated credential",
+      type: "api-token",
+      value: fakeOpenAiToken("invalid_stored_policy"),
+      policy: { injectEnv: "UNRELATED_TOKEN" }
+    })).rejects.toThrow(/invalid approval policy.*relative command/i);
+
+    const recoveryDir = path.join(tmpHome, "recovery", "automatic");
+    const preserved = (await readdir(recoveryDir)).find((entry) => entry.includes("store-invalid"));
+    expect(preserved).toBeDefined();
+    expect(await readFile(path.join(recoveryDir, preserved!), "utf8")).toBe(raw);
+  });
+
+  it("preserves legacy policy conditions during unrelated writes", async () => {
+    const store = new SecretStore();
+    const policy = {
+      id: "policy_legacy_condition",
+      name: "Legacy command policy",
+      enabled: true,
+      priority: 100,
+      decision: "allow",
+      conditions: { commands: [process.execPath] },
+      createdAt: "2030-01-01T00:00:00.000Z",
+      updatedAt: "2030-01-01T00:00:00.000Z"
+    };
+    await writeFile(store.storePath, `${JSON.stringify({
+      version: 1,
+      secrets: [],
+      requests: [],
+      audit: [],
+      approvalSettings: { mode: "per-transaction", durationMs: 15 * 60 * 1000 },
+      approvalGrants: [],
+      approvalPolicyRules: [policy]
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    await store.addSecret({
+      name: "unrelated legacy credential",
+      type: "api-token",
+      value: fakeOpenAiToken("legacy_policy"),
+      policy: { injectEnv: "LEGACY_POLICY_TOKEN" }
+    });
+
+    const persisted = JSON.parse(await readFile(store.storePath, "utf8"));
+    expect(persisted.approvalPolicyRules).toEqual([policy]);
   });
 
   it("updates the injection environment without reading the secret", async () => {
@@ -2012,6 +2081,429 @@ describe("SecretStore", () => {
     expect(result.stdout).not.toContain("policy-codex-secret-value");
   });
 
+  it("preserves omitted policy conditions and rejects invalid policy updates", async () => {
+    const store = new SecretStore();
+    const rule = await store.addApprovalPolicyRule({
+      name: "Narrow policy",
+      decision: "allow",
+      expiresAt: "2031-04-05T06:07:08.000Z",
+      conditions: {
+        agents: ["Codex"],
+        envBindings: [{ handle: "s-gw:api-token:policy", injectEnv: "SGW_NARROW_TOKEN" }],
+        commands: [process.execPath],
+        injectEnvs: ["SGW_NARROW_TOKEN"],
+        minSeverity: "high",
+        sshPorts: [22]
+      }
+    });
+
+    const renamed = await store.updateApprovalPolicyRule(rule.id, {
+      name: "Renamed narrow policy",
+      conditions: { providers: ["GitHub"] }
+    });
+    expect(renamed.conditions).toMatchObject({
+      agents: ["codex"],
+      envBindings: [{ handle: "s-gw:api-token:policy", injectEnv: "SGW_NARROW_TOKEN" }],
+      commands: [process.execPath],
+      injectEnvs: ["SGW_NARROW_TOKEN"],
+      minSeverity: "high",
+      sshPorts: [22],
+      providers: ["github"]
+    });
+    expect(renamed.expiresAt).toBe("2031-04-05T06:07:08.000Z");
+
+    const cleared = await store.updateApprovalPolicyRule(rule.id, {
+      conditions: { minSeverity: undefined, commands: [] }
+    });
+    expect(cleared.conditions.minSeverity).toBeUndefined();
+    expect(cleared.conditions.commands).toEqual([]);
+    expect(cleared.conditions.sshPorts).toEqual([22]);
+
+    const beforeInvalidUpdates = await store.listApprovalPolicyRules();
+    await expect(store.updateApprovalPolicyRule(rule.id, {})).rejects.toThrow(/at least one change/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      conditions: { handles: [] }
+    })).rejects.toThrow(/exact credential bindings/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      conditions: { injectEnvs: [] }
+    })).rejects.toThrow(/exact credential bindings/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      conditions: { envBindings: [] }
+    })).rejects.toThrow(/exact credential bindings/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      conditions: { envBindings: [{ handle: "s-gw:api-token:replacement", injectEnv: "SGW_REPLACEMENT_TOKEN" }] }
+    })).rejects.toThrow(/exact credential bindings/i);
+    await expect(store.addApprovalPolicyRule({
+      name: "Relative command",
+      decision: "allow",
+      conditions: { commands: ["relative/tool"] }
+    })).rejects.toThrow(/relative command paths/i);
+    await expect(store.addApprovalPolicyRule({
+      name: "Malformed conditions",
+      decision: "allow",
+      conditions: "not-an-object" as unknown as { handles: string[] }
+    })).rejects.toThrow(/conditions must be an object/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      conditions: { sshPorts: [0] }
+    })).rejects.toThrow(/sshPorts/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      expiresAt: "not-a-timestamp"
+    })).rejects.toThrow(/expiresAt/i);
+    await expect(store.updateApprovalPolicyRule(rule.id, {
+      priority: -1
+    })).rejects.toThrow(/priority/i);
+    await expect(store.addApprovalPolicyRule({
+      name: "Invalid duration",
+      decision: "allow",
+      durationMs: 0
+    })).rejects.toThrow(/durationMs/i);
+    expect(await store.listApprovalPolicyRules()).toEqual(beforeInvalidUpdates);
+  });
+
+  it("does not persist or reprioritize unchanged approval policy saves", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new SecretStore();
+      const record = await store.addSecret({
+        name: "unchanged policy token",
+        type: "api-token",
+        value: "unchanged-policy-secret-value-123456789",
+        policy: { injectEnv: "SGW_UNCHANGED_POLICY", allowedCommands: [process.execPath] }
+      });
+      const conditions = {
+        handles: [record.handle],
+        agents: ["Codex"],
+        commands: [process.execPath]
+      };
+
+      vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+      const allow = await store.addApprovalPolicyRule({
+        name: "Allow unchanged policy",
+        decision: "allow",
+        priority: 100,
+        conditions
+      });
+      vi.setSystemTime(new Date("2030-01-01T00:00:01.000Z"));
+      const deny = await store.addApprovalPolicyRule({
+        name: "Deny unchanged policy",
+        decision: "deny",
+        priority: 100,
+        conditions
+      });
+
+      const beforeRules = await store.listApprovalPolicyRules();
+      expect(beforeRules.map((rule) => rule.id)).toEqual([deny.id, allow.id]);
+      const beforeStore = await readFile(store.storePath, "utf8");
+      const beforeAudit = await store.auditLog();
+      const headPath = path.join(await externalControlPlaneDir(), "head.json");
+      const beforeHead = await readFile(headPath, "utf8");
+
+      vi.setSystemTime(new Date("2030-01-01T00:00:02.000Z"));
+      const saved = await store.updateApprovalPolicyRule(allow.id, {
+        name: allow.name,
+        enabled: allow.enabled,
+        priority: allow.priority,
+        decision: allow.decision,
+        expiresAt: allow.expiresAt || null,
+        conditions: allow.conditions
+      });
+      expect(saved.updatedAt).toBe(allow.updatedAt);
+      expect(await store.setApprovalPolicyRuleEnabled(deny.id, true)).toEqual({ id: deny.id, enabled: true });
+
+      expect((await store.listApprovalPolicyRules()).map((rule) => rule.id)).toEqual(beforeRules.map((rule) => rule.id));
+      expect(await readFile(store.storePath, "utf8")).toBe(beforeStore);
+      expect(await store.auditLog()).toEqual(beforeAudit);
+      expect(await readFile(headPath, "utf8")).toBe(beforeHead);
+
+      const request = await store.createRequest(
+        record.handle,
+        buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_UNCHANGED_POLICY" }),
+        "Codex unchanged policy request"
+      );
+      expect(request.state).toBe("denied");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("arranges narrower policy rules before the scopes they override", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "arranged policy token",
+      type: "api-token",
+      value: "arranged-policy-secret-value-123456789",
+      policy: { injectEnv: "SGW_ARRANGED_POLICY", allowedCommands: [process.execPath] }
+    });
+    const broad = await store.addApprovalPolicyRule({
+      name: "Allow Codex commands",
+      decision: "allow",
+      priority: 10,
+      conditions: { agents: ["Codex"], commands: [process.execPath] }
+    });
+    const narrow = await store.addApprovalPolicyRule({
+      name: "Ask for this credential",
+      decision: "ask",
+      priority: 30,
+      conditions: { handles: [record.handle], agents: ["Codex"], commands: [process.execPath] }
+    });
+
+    const arranged = await store.arrangeApprovalPolicyRules();
+    expect(arranged.reordered).toBe(2);
+    expect(arranged.rules.map((item) => item.id)).toEqual([narrow.id, broad.id]);
+
+    const request = await store.createRequest(
+      record.handle,
+      buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_ARRANGED_POLICY" }),
+      "Codex arranged policy run"
+    );
+    expect(request.state).toBe("pending");
+    expect(request.approvalPolicyRuleId).toBe(narrow.id);
+  });
+
+  it("creates a narrowly scoped allow policy and approves the current request atomically", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "scoped policy token",
+      type: "api-token",
+      value: "scoped-policy-secret-value-123456789",
+      policy: { injectEnv: "SGW_SCOPED_POLICY", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_SCOPED_POLICY",
+      workingDir: tmpHome
+    });
+    const pending = await store.createRequest(record.handle, action, "Codex scoped policy run");
+
+    const approved = await store.approveRequestWithScopedPolicy(pending.id);
+    expect(approved.created).toBe(true);
+    expect(approved.request.state).toBe("approved");
+    expect(approved.request.approvalSource).toBe("policy");
+    expect(approved.request.approvalPolicyRuleId).toBe(approved.rule.id);
+    expect(approved.rule.conditions).toMatchObject({
+      handles: [record.handle],
+      envBindings: [{ handle: record.handle, injectEnv: "SGW_SCOPED_POLICY" }],
+      agents: ["codex"],
+      actionKinds: ["env_command"],
+      commands: [process.execPath],
+      injectEnvs: ["SGW_SCOPED_POLICY"],
+      workingDirs: [tmpHome]
+    });
+
+    const matching = await store.createRequest(record.handle, action, "Codex scoped policy retry");
+    expect(matching.state).toBe("approved");
+    expect(matching.approvalPolicyRuleId).toBe(approved.rule.id);
+
+    const differentDirectory = await store.createRequest(
+      record.handle,
+      buildEnvCommandAction({
+        command: process.execPath,
+        args: ["-e", "0"],
+        injectEnv: "SGW_SCOPED_POLICY",
+        workingDir: path.join(tmpHome, "different-directory")
+      }),
+      "Codex different directory"
+    );
+    expect(differentDirectory.state).toBe("pending");
+
+    await store.setApprovalPolicyRuleEnabled(approved.rule.id, false);
+    await expect(executeApprovedRequest(store, pending.id, { engine: "typescript" })).rejects.toThrow(/policy.*changed|no longer allows/i);
+  });
+
+  it("keeps a scoped policy tied to the full credential binding set", async () => {
+    const store = new SecretStore();
+    const primary = await store.addSecret({
+      name: "binding primary token",
+      type: "api-token",
+      value: "binding-primary-secret-value-123456789",
+      policy: { injectEnv: "SGW_BINDING_PRIMARY", allowedCommands: [process.execPath] }
+    });
+    const secondary = await store.addSecret({
+      name: "binding secondary token",
+      type: "api-token",
+      value: "binding-secondary-secret-value-123456789",
+      policy: { allowedCommands: [process.execPath] }
+    });
+    const third = await store.addSecret({
+      name: "binding third token",
+      type: "api-token",
+      value: "binding-third-secret-value-123456789",
+      policy: { allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_BINDING_PRIMARY",
+      env: [{ handle: secondary.handle, injectEnv: "SGW_BINDING_SECONDARY" }]
+    });
+    const pending = await store.createRequest(primary.handle, action, "Codex binding policy run");
+    const approved = await store.approveRequestWithScopedPolicy(pending.id);
+
+    expect(approved.rule.conditions.envBindings).toEqual([
+      { handle: primary.handle, injectEnv: "SGW_BINDING_PRIMARY" },
+      { handle: secondary.handle, injectEnv: "SGW_BINDING_SECONDARY" }
+    ]);
+
+    const matching = await store.createRequest(primary.handle, action, "Codex binding policy retry");
+    expect(matching.state).toBe("approved");
+    expect(matching.approvalPolicyRuleId).toBe(approved.rule.id);
+
+    const primaryOnly = await store.createRequest(
+      primary.handle,
+      buildEnvCommandAction({
+        command: process.execPath,
+        args: ["-e", "0"],
+        injectEnv: "SGW_BINDING_PRIMARY"
+      }),
+      "Codex primary-only binding"
+    );
+    expect(primaryOnly.state).toBe("pending");
+
+    const mixedBinding = await store.createRequest(
+      primary.handle,
+      buildEnvCommandAction({
+        command: process.execPath,
+        args: ["-e", "0"],
+        injectEnv: "SGW_BINDING_PRIMARY",
+        env: [{ handle: secondary.handle, injectEnv: "SGW_BINDING_OTHER" }]
+      }),
+      "Codex mixed binding"
+    );
+    expect(mixedBinding.state).toBe("pending");
+
+    const extraBinding = await store.createRequest(
+      primary.handle,
+      buildEnvCommandAction({
+        command: process.execPath,
+        args: ["-e", "0"],
+        injectEnv: "SGW_BINDING_PRIMARY",
+        env: [
+          { handle: secondary.handle, injectEnv: "SGW_BINDING_SECONDARY" },
+          { handle: third.handle, injectEnv: "SGW_BINDING_THIRD" }
+        ]
+      }),
+      "Codex extra binding"
+    );
+    expect(extraBinding.state).toBe("pending");
+  });
+
+  it("uses an existing matching allow policy without creating a duplicate", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "existing scoped policy token",
+      type: "api-token",
+      value: "existing-scoped-policy-secret-value-123456789",
+      policy: { injectEnv: "SGW_EXISTING_POLICY", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_EXISTING_POLICY"
+    });
+    const pending = await store.createRequest(record.handle, action, "Codex pending before policy");
+    const rule = await store.addApprovalPolicyRule({
+      name: "Existing Codex policy",
+      decision: "allow",
+      conditions: {
+        handles: [record.handle],
+        envBindings: [{ handle: record.handle, injectEnv: "SGW_EXISTING_POLICY" }],
+        agents: ["Codex"],
+        actionKinds: ["env_command"],
+        commands: [process.execPath],
+        injectEnvs: ["SGW_EXISTING_POLICY"]
+      }
+    });
+
+    const approved = await store.approveRequestWithScopedPolicy(pending.id);
+    expect(approved.created).toBe(false);
+    expect(approved.rule.id).toBe(rule.id);
+    expect(approved.request.approvalSource).toBe("policy");
+    expect(approved.request.approvalPolicyRuleId).toBe(rule.id);
+    expect(await store.listApprovalPolicyRules()).toHaveLength(1);
+  });
+
+  it("refuses to create a durable policy when the requesting agent is unknown", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "unknown agent token",
+      type: "api-token",
+      value: "unknown-agent-secret-value-123456789",
+      policy: { injectEnv: "SGW_UNKNOWN_AGENT", allowedCommands: [process.execPath] }
+    });
+    const pending = await store.createRequest(
+      record.handle,
+      buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_UNKNOWN_AGENT" }),
+      "generic durable policy run",
+      { env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } }
+    );
+    expect(pending.agentName).toBe("Agent");
+    expect(pending.agentSource).toBe("unknown");
+
+    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/could not identify the requesting agent/i);
+    expect(await store.listApprovalPolicyRules()).toEqual([]);
+    expect((await store.getRequest(pending.id)).state).toBe("pending");
+  });
+
+  it("does not let a scoped allow rule bypass an existing deny policy", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "deny policy token",
+      type: "api-token",
+      value: "deny-policy-secret-value-123456789",
+      policy: { injectEnv: "SGW_DENY_POLICY", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_DENY_POLICY" });
+    const pending = await store.createRequest(record.handle, action, "Codex denied policy run");
+    await store.addApprovalPolicyRule({
+      name: "Deny Codex commands",
+      decision: "deny",
+      conditions: {
+        agents: ["Codex"],
+        commands: [process.execPath]
+      }
+    });
+
+    const before = await store.listApprovalPolicyRules();
+    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/denies this request/i);
+    expect(await store.listApprovalPolicyRules()).toEqual(before);
+    expect((await store.getRequest(pending.id))?.state).toBe("pending");
+  });
+
+  it("preserves SSH command, target, and port when creating a scoped policy", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "scoped SSH key",
+      type: "private-key",
+      value: "scoped-ssh-private-key-value-123456789",
+      policy: { injectEnv: "SGW_SCOPED_SSH", allowedCommands: [SGW_SSH_SESSION_COMMAND] }
+    });
+    const action = buildSshSessionAction({
+      target: "deploy@example.test",
+      port: 2222,
+      injectEnv: "SGW_SCOPED_SSH"
+    });
+    const pending = await store.createRequest(record.handle, action, "Codex SSH scoped policy run");
+
+    const approved = await store.approveRequestWithScopedPolicy(pending.id);
+    expect(approved.rule.conditions).toMatchObject({
+      actionKinds: ["ssh_session"],
+      commands: [SGW_SSH_SESSION_COMMAND],
+      sshTargets: ["deploy@example.test"],
+      sshPorts: [2222]
+    });
+
+    const matching = await store.createRequest(record.handle, action, "Codex SSH scoped policy retry");
+    expect(matching.state).toBe("approved");
+
+    const differentPort = await store.createRequest(
+      record.handle,
+      buildSshSessionAction({ target: "deploy@example.test", port: 2223, injectEnv: "SGW_SCOPED_SSH" }),
+      "Codex SSH other port"
+    );
+    expect(differentPort.state).toBe("pending");
+  });
+
   it("blocks an auto-approved request after its policy is disabled", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
@@ -2309,9 +2801,12 @@ describe("SecretStore", () => {
     });
     const pending = await store.createRequest(record.handle, action, "Claude pending before delete");
     await store.addApprovalPolicyRule({
-      name: "Delete scoped policy",
+      name: "Delete binding policy",
       decision: "allow",
-      conditions: { handles: [record.handle], agents: ["Codex"] }
+      conditions: {
+        envBindings: [{ handle: record.handle, injectEnv: "SGW_DELETE_TOKEN" }],
+        agents: ["Codex"]
+      }
     });
 
     const deleted = await store.deleteSecret(record.handle);

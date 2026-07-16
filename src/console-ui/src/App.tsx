@@ -4,6 +4,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowUpDown,
+  Ban,
   Bell,
   CheckCircle2,
   ChevronDown,
@@ -25,6 +26,7 @@ import {
   MoreVertical,
   Network,
   PanelRightOpen,
+  Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -36,6 +38,7 @@ import {
   ScrollText,
   Trash2,
   UsersRound,
+  Wand2,
   X
 } from "lucide-react";
 import { Cell, Pie, PieChart } from "recharts";
@@ -46,6 +49,7 @@ import { AgentIcon } from "@/components/AgentIcon";
 import { ProviderIdentity } from "@/components/ProviderIdentity";
 import { EventFlowDiagram, describeEventFlow, isAgentActivityEvent } from "@/components/ActivityFlowRow";
 import { UsageFlowSankey } from "@/components/UsageFlowSankey";
+import { MultiSelectField, type MultiSelectOption } from "@/components/MultiSelectField";
 import { useElementSize } from "@/hooks/use-element-size";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -131,6 +135,8 @@ import { Toaster } from "@/components/ui/sonner";
 import {
   addPolicy,
   approveRequest,
+  approveRequestWithScopedPolicy,
+  arrangePolicies,
   auditCsvUrl,
   clearGrants,
   createSecret,
@@ -141,8 +147,10 @@ import {
   installAgentIntegration,
   saveApprovalSettings,
   setPolicyEnabled,
+  updatePolicy,
   uninstallAgentIntegration
 } from "@/lib/api";
+import type { PolicyInput } from "@/lib/api";
 import {
   DASHBOARD_LAYOUT_KEY,
   defaultLayouts,
@@ -154,6 +162,7 @@ import {
   type PanelId
 } from "@/lib/layout";
 import { credentialBackendLabel, credentialProviderPresentation } from "@/lib/credential-presentation";
+import { findShadowingPolicyRule } from "../../policy-order";
 import {
   commandName,
   durationLabel,
@@ -1367,13 +1376,70 @@ function UsageFlowView({ state }: { state: ConsoleState }) {
 }
 
 function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: () => void; search: string }) {
-  const [dialogOpen, setDialogOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<ApprovalPolicyRuleRecord | null>(null);
+  const [adding, setAdding] = React.useState(false);
+  const [deleting, setDeleting] = React.useState<ApprovalPolicyRuleRecord | null>(null);
+  const [arranging, setArranging] = React.useState(false);
   const rows = filterText(state.approvalPolicyRules, search, (rule) => `${rule.name} ${rule.decision} ${policyConditionSummary(rule.conditions)}`);
+  const shadowedBy = React.useMemo(() => {
+    const matches = new Map<string, ApprovalPolicyRuleRecord>();
+    for (const rule of state.approvalPolicyRules) {
+      if (!rule.enabled || (rule.expiresAt && rule.expiresAt <= new Date().toISOString())) continue;
+      const shadow = findShadowingPolicyRule(state.approvalPolicyRules, rule);
+      if (shadow) matches.set(rule.id, shadow);
+    }
+    return matches;
+  }, [state.approvalPolicyRules]);
+  const shadowedCount = shadowedBy.size;
+
+  async function arrange() {
+    if (arranging) return;
+    setArranging(true);
+    try {
+      const result = await arrangePolicies();
+      toast.success(result.reordered ? `Reordered ${result.reordered} rule${result.reordered === 1 ? "" : "s"}` : "Rules already use a safe order");
+      onDone();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not arrange policies");
+    } finally {
+      setArranging(false);
+    }
+  }
+
+  async function deleteRule() {
+    if (!deleting) return;
+    try {
+      await deletePolicy(deleting.id);
+      toast.success("Policy deleted");
+      setDeleting(null);
+      onDone();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not delete policy");
+    }
+  }
+
   return (
     <PageFrame title="Policies" description="Define when agents may use credentials without interrupting you, and when s-gw should always ask or deny.">
-      <div className="mb-4 flex justify-end">
-        <PolicyDialog open={dialogOpen} onOpenChange={setDialogOpen} onDone={onDone} />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="max-w-3xl text-sm text-muted-foreground">
+          Rules run in priority order. Auto-arrange moves narrower rules ahead of broader ask and allow rules; deny rules stay ahead as guardrails.
+        </p>
+        <div className="flex gap-2">
+          <Button variant="outline" disabled={arranging} onClick={() => void arrange()} data-policy-arrange>
+            {arranging ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Wand2 className="mr-2 h-4 w-4" />}
+            Auto-arrange
+          </Button>
+          <Button onClick={() => setAdding(true)} data-policy-add>
+            <Plus className="mr-2 h-4 w-4" />Add policy rule
+          </Button>
+        </div>
       </div>
+      {shadowedCount ? (
+        <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300" data-policy-shadow-summary>
+          <AlertTriangle className="h-4 w-4" />
+          {shadowedCount} rule{shadowedCount === 1 ? " is" : "s are"} unreachable until the earlier rule is changed or auto-arranged.
+        </div>
+      ) : null}
       <DataCard>
         <Table>
           <TableHeader>
@@ -1386,23 +1452,45 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
             </TableRow>
           </TableHeader>
           <TableBody>
+            {rows.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={5} className="py-8 text-center text-sm text-muted-foreground">
+                  No policy rules yet. Add a scoped rule or use Always allow from an approval.
+                </TableCell>
+              </TableRow>
+            ) : null}
             {rows.map((rule) => (
-              <TableRow key={rule.id}>
+              <TableRow key={rule.id} data-policy-row={rule.id} className={cn(shadowedBy.has(rule.id) && "bg-amber-500/5")}>
                 <TableCell>
                   <PolicyStatusControl rule={rule} onDone={onDone} />
                 </TableCell>
-                <TableCell className="font-medium">{rule.name}</TableCell>
+                <TableCell className="font-medium">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate">{rule.name}</span>
+                    {shadowedBy.get(rule.id) ? (
+                      <Badge variant="secondary" className="shrink-0 text-amber-700 dark:text-amber-300" title={`Covered by ${shadowedBy.get(rule.id)?.name}`}>
+                        Shadowed
+                      </Badge>
+                    ) : null}
+                  </div>
+                </TableCell>
                 <TableCell><DecisionBadge decision={rule.decision} /></TableCell>
                 <TableCell className="max-w-[560px] truncate">{policyConditionSummary(rule.conditions)}</TableCell>
-                <TableCell className="text-right">
+                <TableCell className="text-right whitespace-nowrap">
                   <Button
                     variant="ghost"
                     size="icon-sm"
-                    onClick={async () => {
-                      await deletePolicy(rule.id);
-                      toast.success("Policy deleted");
-                      onDone();
-                    }}
+                    aria-label={`Edit ${rule.name}`}
+                    onClick={() => setEditing(rule)}
+                    data-policy-edit={rule.id}
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Delete ${rule.name}`}
+                    onClick={() => setDeleting(rule)}
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -1412,6 +1500,31 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
           </TableBody>
         </Table>
       </DataCard>
+      <PolicyEditorDialog open={adding} state={state} onOpenChange={setAdding} onDone={onDone} />
+      <PolicyEditorDialog
+        open={Boolean(editing)}
+        rule={editing}
+        state={state}
+        onOpenChange={(open) => !open && setEditing(null)}
+        onDone={() => {
+          setEditing(null);
+          onDone();
+        }}
+      />
+      <AlertDialog open={Boolean(deleting)} onOpenChange={(open) => !open && setDeleting(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete policy rule?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleting ? `Delete “${deleting.name}”? Future matching requests will no longer use it.` : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void deleteRule()}>Delete rule</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </PageFrame>
   );
 }
@@ -2671,6 +2784,23 @@ function ApprovalSheet({
     }
   };
 
+  const alwaysAllow = async () => {
+    if (!request || busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const result = await approveRequestWithScopedPolicy(request);
+      toast.success(result.created ? "Created a scoped allow rule and approved this request" : "Approved this request with an existing allow rule");
+      onOpenChange(false);
+      onDone();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not create a policy rule");
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
   const deny = async () => {
     if (!request) return;
     if (busyRef.current) return;
@@ -2733,11 +2863,16 @@ function ApprovalSheet({
                 <ChevronDown className="ml-2 h-4 w-4" />
               </Button>
             </PopoverTrigger>
-            <PopoverContent className="grid w-56 gap-2">
+            <PopoverContent className="grid w-64 gap-2">
               <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 15 * 60 * 1000, agentScope: "same-agent" })}>15 minutes</Button>
               <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 60 * 60 * 1000, agentScope: "same-agent" })}>1 hour</Button>
               <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 24 * 60 * 60 * 1000, agentScope: "same-agent" })}>1 day</Button>
               <Button variant="ghost" onClick={() => approve({ mode: "login-session", agentScope: "same-agent" })}>Current login session</Button>
+              <Separator />
+              <Button variant="ghost" className="justify-start gap-2" disabled={busy} onClick={() => void alwaysAllow()} data-approve-policy={request?.id}>
+                <ShieldCheck className="h-4 w-4" />
+                Always allow this request scope
+              </Button>
             </PopoverContent>
           </Popover>
           <Button disabled={busy} variant="destructive" onClick={deny}>Deny</Button>
@@ -2900,68 +3035,383 @@ function AddCredentialDialog({
   );
 }
 
-function PolicyDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenChange: (open: boolean) => void; onDone: () => void }) {
-  const [name, setName] = React.useState("Codex scoped access");
-  const [decision, setDecision] = React.useState<ApprovalPolicyDecision>("ask");
-  const [agent, setAgent] = React.useState("Codex");
-  const [provider, setProvider] = React.useState("");
-  const [command, setCommand] = React.useState("");
+const policySecretTypeOptions: MultiSelectOption[] = [
+  { value: "api-token", label: "API token" },
+  { value: "ssh-key", label: "SSH key" },
+  { value: "private-key", label: "Private key" },
+  { value: "password", label: "Password" },
+  { value: "credential", label: "Credential pair" },
+  { value: "access-key", label: "Access key" },
+  { value: "unknown", label: "Unknown" }
+];
+
+const policyActionKindOptions: MultiSelectOption[] = [
+  { value: "env_command", label: "Command" },
+  { value: "ssh_session", label: "SSH session" }
+];
+
+type PolicyOptionSources = {
+  agents: MultiSelectOption[];
+  handles: MultiSelectOption[];
+  providers: MultiSelectOption[];
+  commands: MultiSelectOption[];
+  injectEnvs: MultiSelectOption[];
+  workingDirs: MultiSelectOption[];
+  sshTargets: MultiSelectOption[];
+  sshPorts: MultiSelectOption[];
+};
+
+type PolicyFormState = {
+  name: string;
+  decision: ApprovalPolicyDecision;
+  priority: string;
+  agents: string[];
+  handles: string[];
+  providers: string[];
+  secretTypes: string[];
+  minSeverity: string;
+  actionKinds: string[];
+  commands: string[];
+  injectEnvs: string[];
+  workingDirs: string[];
+  sshTargets: string[];
+  sshPorts: string[];
+};
+
+function buildPolicyOptionSources(state: ConsoleState): PolicyOptionSources {
+  const agents = new Set<string>();
+  for (const agent of state.agents) agents.add(agent.name);
+  for (const request of state.requests) if (request.agentName) agents.add(request.agentName);
+
+  const providers = new Set<string>();
+  for (const handle of state.handles) if (handle.provider) providers.add(handle.provider);
+
+  const commands = new Set<string>();
+  for (const request of state.requests) commands.add(request.action.command);
+  for (const handle of state.handles) for (const command of handle.policy.allowedCommands) commands.add(command);
+
+  const injectEnvs = new Set<string>();
+  for (const handle of state.handles) if (handle.policy.injectEnv) injectEnvs.add(handle.policy.injectEnv);
+  for (const request of state.requests) if (request.action.injectEnv) injectEnvs.add(request.action.injectEnv);
+
+  const workingDirs = new Set<string>();
+  for (const request of state.requests) if (request.action.workingDir) workingDirs.add(request.action.workingDir);
+
+  const sshTargets = new Set<string>();
+  const sshPorts = new Set<string>();
+  for (const request of state.requests) {
+    if (request.action.ssh?.target) sshTargets.add(request.action.ssh.target);
+    if (request.action.ssh?.port) sshPorts.add(String(request.action.ssh.port));
+  }
+
+  return {
+    agents: sortedPolicyOptions(agents),
+    handles: state.handles
+      .map((handle) => ({ value: handle.handle, label: handle.name || shortHandle(handle.handle), hint: handle.provider || handle.type }))
+      .sort((left, right) => (left.label || left.value).localeCompare(right.label || right.value)),
+    providers: sortedPolicyOptions(providers),
+    commands: sortedPolicyOptions(commands),
+    injectEnvs: sortedPolicyOptions(injectEnvs),
+    workingDirs: sortedPolicyOptions(workingDirs),
+    sshTargets: sortedPolicyOptions(sshTargets),
+    sshPorts: sortedPolicyOptions(sshPorts)
+  };
+}
+
+function sortedPolicyOptions(values: Iterable<string>): MultiSelectOption[] {
+  return [...new Set([...values].filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right))
+    .map((value) => ({ value }));
+}
+
+function emptyPolicyForm(): PolicyFormState {
+  return {
+    name: "",
+    decision: "ask",
+    priority: "",
+    agents: [],
+    handles: [],
+    providers: [],
+    secretTypes: [],
+    minSeverity: "",
+    actionKinds: [],
+    commands: [],
+    injectEnvs: [],
+    workingDirs: [],
+    sshTargets: [],
+    sshPorts: []
+  };
+}
+
+function policyFormFromRule(rule: ApprovalPolicyRuleRecord): PolicyFormState {
+  const conditions = rule.conditions;
+  return {
+    name: rule.name,
+    decision: rule.decision,
+    priority: String(rule.priority),
+    agents: conditions.agents || [],
+    handles: conditions.handles || [],
+    providers: conditions.providers || [],
+    secretTypes: conditions.secretTypes || [],
+    minSeverity: conditions.minSeverity || "",
+    actionKinds: conditions.actionKinds || [],
+    commands: conditions.commands || [],
+    injectEnvs: conditions.injectEnvs || [],
+    workingDirs: conditions.workingDirs || [],
+    sshTargets: conditions.sshTargets || [],
+    sshPorts: (conditions.sshPorts || []).map(String)
+  };
+}
+
+function policyFormToInput(form: PolicyFormState, enabled: boolean, bindingsLocked = false): PolicyInput {
+  const priority = form.priority.trim();
+  const input: PolicyInput = {
+    name: form.name.trim(),
+    enabled,
+    decision: form.decision,
+    priority: priority ? Number(priority) : undefined,
+    agents: form.agents,
+    providers: form.providers,
+    secretTypes: form.secretTypes,
+    minSeverity: form.minSeverity ? form.minSeverity as SecretSeverity : null,
+    actionKinds: form.actionKinds,
+    commands: form.commands,
+    workingDirs: form.workingDirs,
+    sshTargets: form.sshTargets,
+    sshPorts: form.sshPorts.map((port) => Number(port))
+  };
+  if (!bindingsLocked) {
+    input.handles = form.handles;
+    input.injectEnvs = form.injectEnvs;
+  }
+  return input;
+}
+
+function PolicyEditorDialog({
+  open,
+  onOpenChange,
+  onDone,
+  state,
+  rule
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+  state: ConsoleState;
+  rule?: ApprovalPolicyRuleRecord | null;
+}) {
+  const [form, setForm] = React.useState<PolicyFormState>(emptyPolicyForm);
+  const [advanced, setAdvanced] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const sources = React.useMemo(() => buildPolicyOptionSources(state), [state]);
+  const editing = Boolean(rule);
+  const bindingsLocked = Boolean(rule?.conditions.envBindings?.length);
+
+  React.useEffect(() => {
+    if (!open) return;
+    setForm(rule ? policyFormFromRule(rule) : emptyPolicyForm());
+    setAdvanced(Boolean(rule));
+  }, [open, rule]);
+
+  const update = <K extends keyof PolicyFormState>(field: K, value: PolicyFormState[K]) => {
+    setForm((current) => ({ ...current, [field]: value }));
+  };
+
+  async function save() {
+    if (busy || !form.name.trim()) return;
+    setBusy(true);
+    try {
+      const body = policyFormToInput(form, rule?.enabled ?? true, bindingsLocked);
+      if (rule) {
+        await updatePolicy(rule.id, body);
+        toast.success("Policy rule updated");
+      } else {
+        await addPolicy(body);
+        toast.success("Policy rule added");
+      }
+      onOpenChange(false);
+      onDone();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not save policy");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger asChild>
-        <Button><Plus className="mr-2 h-4 w-4" />Add policy rule</Button>
-      </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="max-h-[calc(100vh-48px)] w-[min(760px,calc(100vw-24px))] overflow-y-auto sm:max-w-none">
         <DialogHeader>
-          <DialogTitle>Add policy rule</DialogTitle>
-          <DialogDescription>Rules are evaluated before the approval queue, with deny taking priority.</DialogDescription>
+          <DialogTitle>{editing ? "Edit policy rule" : "Add policy rule"}</DialogTitle>
+          <DialogDescription>
+            Leave a condition empty to match anything. The preview shows the request shape this rule will affect.
+          </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-3">
-          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Rule name" />
-          <Select value={decision} onValueChange={(value) => setDecision(value as ApprovalPolicyDecision)}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="ask">Ask</SelectItem>
-              <SelectItem value="allow">Allow</SelectItem>
-              <SelectItem value="deny">Deny</SelectItem>
-            </SelectContent>
-          </Select>
-          <Input value={agent} onChange={(event) => setAgent(event.target.value)} placeholder="Agent name" />
-          <Input value={provider} onChange={(event) => setProvider(event.target.value)} placeholder="Provider, e.g. ssh or aws" />
-          <Input value={command} onChange={(event) => setCommand(event.target.value)} placeholder="Command, e.g. ssh" />
+        <div className="space-y-5">
+          {rule?.conditions.envBindings?.length ? (
+            <Alert>
+              <AlertTitle>Exact credential bindings</AlertTitle>
+              <AlertDescription>
+                <span>This rule stays tied to the approved credential and environment-variable set.</span>
+                <span className="mt-2 flex flex-wrap gap-1.5">
+                  {rule.conditions.envBindings.map((binding) => (
+                    <code key={`${binding.injectEnv}:${binding.handle}`} className="rounded bg-muted px-1.5 py-0.5 text-xs">
+                      {binding.injectEnv} → {state.handles.find((handle) => handle.handle === binding.handle)?.name || shortHandle(binding.handle)}
+                    </code>
+                  ))}
+                </span>
+                <span className="mt-2 block">Create a new rule from an approval to change these bindings.</span>
+              </AlertDescription>
+            </Alert>
+          ) : null}
+          <PolicyFlowPreview form={form} state={state} />
+          <PolicyFormFields
+            form={form}
+            update={update}
+            sources={sources}
+            advanced={advanced}
+            bindingsLocked={bindingsLocked}
+            onShowAdvanced={() => setAdvanced(true)}
+          />
         </div>
         <DialogFooter>
-          <Button
-            disabled={busy || !name}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await addPolicy({
-                  name,
-                  enabled: true,
-                  priority: 100,
-                  decision,
-                  agents: agent ? [agent] : [],
-                  providers: provider ? [provider] : [],
-                  commands: command ? [command] : []
-                });
-                toast.success("Policy rule added");
-                onOpenChange(false);
-                onDone();
-              } catch (err) {
-                toast.error(err instanceof Error ? err.message : String(err));
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            Add rule
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>Cancel</Button>
+          <Button onClick={() => void save()} disabled={busy || !form.name.trim()}>
+            {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            {editing ? "Save changes" : "Add rule"}
           </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
+}
+
+function PolicyFormFields({
+  form,
+  update,
+  sources,
+  advanced,
+  bindingsLocked,
+  onShowAdvanced
+}: {
+  form: PolicyFormState;
+  update: <K extends keyof PolicyFormState>(field: K, value: PolicyFormState[K]) => void;
+  sources: PolicyOptionSources;
+  advanced: boolean;
+  bindingsLocked: boolean;
+  onShowAdvanced: () => void;
+}) {
+  return (
+    <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
+      <PolicyField label="Name" className="sm:col-span-2">
+        <Input value={form.name} onChange={(event) => update("name", event.target.value)} placeholder="e.g. Allow Codex to run aws" />
+      </PolicyField>
+      <PolicyField label="Decision" hint="What s-gw does when this rule matches.">
+        <Select value={form.decision} onValueChange={(value) => update("decision", value as ApprovalPolicyDecision)}>
+          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="ask">Ask for approval</SelectItem>
+            <SelectItem value="allow">Allow automatically</SelectItem>
+            <SelectItem value="deny">Deny automatically</SelectItem>
+          </SelectContent>
+        </Select>
+      </PolicyField>
+      <PolicyField label="Agents" hint="Request attribution, not a cryptographic identity boundary.">
+        <MultiSelectField values={form.agents} onChange={(value) => update("agents", value)} options={sources.agents} renderIcon={(value) => <AgentIcon name={value} className="h-4 w-4" />} aria-label="Policy agents" />
+      </PolicyField>
+      <PolicyField label={bindingsLocked ? "Credentials (fixed)" : "Credentials"} hint={bindingsLocked ? "Fixed by the exact binding set above." : undefined}>
+        <MultiSelectField values={form.handles} onChange={(value) => update("handles", value)} options={sources.handles} disabled={bindingsLocked} aria-label="Policy credentials" />
+      </PolicyField>
+      <PolicyField label="Commands">
+        <MultiSelectField values={form.commands} onChange={(value) => update("commands", value)} options={sources.commands} aria-label="Policy commands" />
+      </PolicyField>
+      <PolicyField label="Action kinds">
+        <MultiSelectField values={form.actionKinds} onChange={(value) => update("actionKinds", value)} options={policyActionKindOptions} allowCustom={false} aria-label="Policy action kinds" />
+      </PolicyField>
+      {advanced ? (
+        <>
+          <PolicyField label="Providers">
+            <MultiSelectField values={form.providers} onChange={(value) => update("providers", value)} options={sources.providers} aria-label="Policy providers" />
+          </PolicyField>
+          <PolicyField label="Credential types">
+            <MultiSelectField values={form.secretTypes} onChange={(value) => update("secretTypes", value)} options={policySecretTypeOptions} allowCustom={false} aria-label="Policy credential types" />
+          </PolicyField>
+          <PolicyField label="Minimum severity">
+            <Select value={form.minSeverity || "any"} onValueChange={(value) => update("minSeverity", value === "any" ? "" : value)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="any">Any severity</SelectItem>
+                <SelectItem value="low">Low and above</SelectItem>
+                <SelectItem value="medium">Medium and above</SelectItem>
+                <SelectItem value="high">High and above</SelectItem>
+                <SelectItem value="critical">Critical only</SelectItem>
+              </SelectContent>
+            </Select>
+          </PolicyField>
+          <PolicyField label={bindingsLocked ? "Injected environment variables (fixed)" : "Injected environment variables"} hint={bindingsLocked ? "Fixed by the exact binding set above." : undefined}>
+            <MultiSelectField values={form.injectEnvs} onChange={(value) => update("injectEnvs", value)} options={sources.injectEnvs} disabled={bindingsLocked} aria-label="Policy environment variables" />
+          </PolicyField>
+          <PolicyField label="Working directories">
+            <MultiSelectField values={form.workingDirs} onChange={(value) => update("workingDirs", value)} options={sources.workingDirs} aria-label="Policy working directories" />
+          </PolicyField>
+          <PolicyField label="SSH targets">
+            <MultiSelectField values={form.sshTargets} onChange={(value) => update("sshTargets", value)} options={sources.sshTargets} aria-label="Policy SSH targets" />
+          </PolicyField>
+          <PolicyField label="SSH ports">
+            <MultiSelectField values={form.sshPorts} onChange={(value) => update("sshPorts", value)} options={sources.sshPorts} aria-label="Policy SSH ports" />
+          </PolicyField>
+          <PolicyField label="Priority" hint="Lower values run first. Leave empty to add at the end.">
+            <Input value={form.priority} inputMode="numeric" onChange={(event) => update("priority", event.target.value.replace(/[^0-9]/g, ""))} placeholder="Auto" />
+          </PolicyField>
+        </>
+      ) : (
+        <Button type="button" variant="ghost" size="sm" className="justify-self-start text-muted-foreground sm:col-span-2" onClick={onShowAdvanced}>
+          <SlidersHorizontal className="mr-2 h-4 w-4" />More conditions
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function PolicyField({ label, hint, className, children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
+  return (
+    <div className={cn("min-w-0 space-y-1.5", className)}>
+      <div>
+        <div className="text-sm font-medium">{label}</div>
+        {hint ? <div className="text-xs text-muted-foreground">{hint}</div> : null}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function PolicyFlowPreview({ form, state }: { form: PolicyFormState; state: ConsoleState }) {
+  const handleLabels = form.handles.map((handle) => state.handles.find((item) => item.handle === handle)?.name || shortHandle(handle));
+  const decisionCopy = form.decision === "allow" ? "Runs automatically" : form.decision === "deny" ? "Blocked automatically" : "Requires approval";
+  const DecisionIcon = form.decision === "allow" ? ShieldCheck : form.decision === "deny" ? Ban : Clock3;
+  return (
+    <div className="grid gap-2 rounded-lg border bg-muted/30 p-3 text-sm sm:grid-cols-4" data-policy-flow-preview>
+      <PolicyFlowCell label="Agent" value={summarizePolicyValues(form.agents, "Any agent")} icon={<UsersRound className="h-4 w-4" />} />
+      <PolicyFlowCell label="Action" value={summarizePolicyValues(form.commands, form.actionKinds.includes("ssh_session") ? "SSH session" : "Any command")} icon={<CommandIcon className="h-4 w-4" />} />
+      <PolicyFlowCell label="Credential" value={summarizePolicyValues(handleLabels, "Any credential")} icon={<KeyRound className="h-4 w-4" />} />
+      <PolicyFlowCell label="Decision" value={decisionCopy} icon={<DecisionIcon className="h-4 w-4" />} />
+    </div>
+  );
+}
+
+function PolicyFlowCell({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
+  return (
+    <div className="min-w-0 rounded-md border bg-background/70 p-2">
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">{icon}{label}</div>
+      <div className="mt-1 truncate font-medium">{value}</div>
+    </div>
+  );
+}
+
+function summarizePolicyValues(values: string[], fallback: string): string {
+  if (values.length === 0) return fallback;
+  if (values.length <= 2) return values.join(", ");
+  return `${values.slice(0, 2).join(", ")} +${values.length - 2}`;
 }
 
 function CommandPalette({
