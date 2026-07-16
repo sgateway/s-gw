@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { decryptSecret, encryptSecret, fingerprintSecret, shortId } from "./crypto.js";
-import { requestAgentIdentity, requestAgentName, type AgentIdentityContext } from "./agent-context.js";
+import { requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
 import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, sshSessionIdentity } from "./ssh.js";
 import { ensureSgwHome, getSgwHome, getSgwRecoveryHome, getStorePath } from "./paths.js";
@@ -25,6 +25,7 @@ import type {
   ApprovalPolicyDecision,
   ApprovalPolicyRule,
   ApprovalSettings,
+  AgentIdentitySource,
   AuditEvent,
   CommandAction,
   CommandEnvBinding,
@@ -47,7 +48,6 @@ const defaultApprovalSettings: ApprovalSettings = {
 
 const maxApprovalDurationMs = 30 * 24 * 60 * 60 * 1000;
 const lockTimeoutMs = 5_000;
-const staleLockMs = 30_000;
 
 // A request gets claimed into "executing" right before its secret is revealed. If the
 // runner is killed, sleeps, or crashes before markExecuted/markFailed, that request is
@@ -55,10 +55,11 @@ const staleLockMs = 30_000;
 // so we reap it back to a terminal failed state instead of bricking it forever.
 const staleExecutionMs = 10 * 60 * 1000;
 const maxStoreBackups = 20;
-const maxControlPlaneBackups = 50;
+const requestBackupIntervalMs = 5 * 60 * 1000;
 const storeMarkerName = ".store-initialized";
 const controlStateName = ".store-control.json";
 const pendingControlStateName = ".store-control.pending.json";
+const reusableExecutionPermits = new WeakMap<object, string>();
 
 const emptyStore = (): StoreFile => ({
   version: 1,
@@ -156,6 +157,29 @@ export interface StoreBackupSummary {
   modifiedAt: string;
 }
 
+export interface ReusableExecutionPermit {
+  id: string;
+  handle: string;
+  reason: string;
+  agentName: string;
+  agentSource: AgentIdentitySource;
+  action: CommandAction;
+  createdAt: string;
+  controlFingerprint: string;
+  authorization: {
+    kind: "grant" | "policy";
+    id: string;
+  };
+}
+
+export type OneShotExecutionAdmission =
+  | { kind: "reusable"; permit: ReusableExecutionPermit }
+  | { kind: "request"; request: RequestRecord };
+
+export interface ExecutionLaunch<T> {
+  completion: Promise<T>;
+}
+
 export interface KeychainAccessRepairSummary {
   checked: number;
   alreadyBound: number;
@@ -172,6 +196,10 @@ interface StoreControlState {
   updatedAt: string;
   secrets: number;
   approvalPolicyRules: number;
+  recoverySealed?: true;
+  recoveryCheckpoint?: string;
+  recoveryVaultId?: string;
+  recoveryNamespace?: string;
 }
 
 interface PendingStoreControlState {
@@ -186,6 +214,45 @@ interface RecoveryCandidate {
   modifiedAtMs: number;
 }
 
+interface StoreRevision {
+  storeText?: string;
+  storeHash?: string;
+  controlStateHash?: string;
+  pendingStateHash?: string;
+  manifestFingerprint?: string;
+}
+
+interface StoreLock {
+  assertOwned(): Promise<void>;
+}
+
+interface StoreLockState {
+  version: 1;
+  pid: number;
+  token: string;
+  createdAt: string;
+}
+
+interface StoreLockInspection {
+  state?: StoreLockState;
+  markerPath?: string;
+}
+
+interface SealedControlPlaneCheckpoint extends RecoveryCandidate {
+  fingerprint: string;
+  sequence: number;
+}
+
+interface ControlPlaneHead {
+  version: 1;
+  checkpoint: string;
+  fingerprint: string;
+}
+
+interface VerifiedRecoveryCandidate extends RecoveryCandidate {
+  fingerprint: string;
+}
+
 export class SecretStore {
   readonly home: string;
   readonly storePath: string;
@@ -197,8 +264,8 @@ export class SecretStore {
 
   async init(): Promise<void> {
     await ensureSgwHome(this.home);
-    await this.withStoreLock(async () => {
-      await this.loadOrRecoverUnlocked();
+    await this.withStoreLock(async (lock) => {
+      await this.loadOrRecoverUnlocked(lock);
     });
   }
 
@@ -409,7 +476,11 @@ export class SecretStore {
     return found;
   }
 
-  async revealSecretForLocalUse(handle: string, request?: RequestRecord): Promise<string> {
+  async revealSecretForLocalUse(
+    handle: string,
+    request?: RequestRecord,
+    options: { cache?: boolean } = {}
+  ): Promise<string> {
     const record = await this.getSecretRecord(handle);
     if (record.backend === "onepassword") {
       const cached = cachedOnePasswordValue(record, request);
@@ -419,7 +490,9 @@ export class SecretStore {
 
       const reference = decryptSecret(record.encrypted);
       const value = await readOnePasswordReference(reference);
-      await this.storeOnePasswordCache(handle, value, request);
+      if (options.cache !== false) {
+        await this.storeOnePasswordCache(handle, value, request);
+      }
       return value;
     }
 
@@ -466,7 +539,7 @@ export class SecretStore {
   }
 
   private async storeOnePasswordCache(handle: string, value: string, request?: RequestRecord): Promise<void> {
-    if (!request?.approvalGrantId || !value) {
+    if (!request || !value) {
       return;
     }
 
@@ -474,23 +547,37 @@ export class SecretStore {
       const now = new Date().toISOString();
       pruneExpiredApprovalGrants(store, now);
       const secret = store.secrets.find((item) => item.handle === handle && item.backend === "onepassword");
-      const grant = store.approvalGrants.find((item) => {
+      const primary = store.secrets.find((item) => item.handle === request.handle);
+      const policyRule = request.approvalPolicyRuleId && primary
+        ? matchingApprovalPolicyRuleForAction(store, primary, request.action, request.agentName || requestAgentName(request.reason), now)
+        : undefined;
+      const policyAuthorized = Boolean(
+        policyRule?.decision === "allow" &&
+        policyRule.id === request.approvalPolicyRuleId &&
+        requestReferencesHandle(request, handle)
+      );
+      const grant = policyAuthorized ? undefined : store.approvalGrants.find((item) => {
         return item.id === request.approvalGrantId && requestReferencesHandle(request, handle);
       });
-      if (!secret || !grant || !grantAllowsCache(grant, now)) {
+      if (!secret || (!policyAuthorized && (!grant || !grantAllowsCache(grant, now)))) {
         return;
       }
 
       const existing = secret.cache;
+      const approvalGrantId = grant?.id;
+      const approvalPolicyRuleId = policyAuthorized ? policyRule?.id : undefined;
+      const sameAuthority = existing?.approvalGrantId === approvalGrantId &&
+        existing?.approvalPolicyRuleId === approvalPolicyRuleId;
       secret.cache = {
         backend: "onepassword",
         encrypted: encryptSecret(value),
         fingerprint: fingerprintSecret(`onepassword-cache:${value}`),
-        approvalGrantId: grant.id,
-        createdAt: existing?.approvalGrantId === grant.id ? existing.createdAt : now,
+        approvalGrantId,
+        approvalPolicyRuleId,
+        createdAt: sameAuthority && existing ? existing.createdAt : now,
         updatedAt: now,
-        expiresAt: grant.expiresAt,
-        loginSessionId: grant.mode === "always" ? undefined : grant.loginSessionId
+        expiresAt: grant?.expiresAt || policyRule?.expiresAt,
+        loginSessionId: grant?.mode === "always" ? undefined : grant?.loginSessionId
       };
       secret.updatedAt = now;
       store.audit.push(audit("secret.cache.updated", `Cached 1Password value for ${secret.name}.`, handle, request.id));
@@ -524,6 +611,7 @@ export class SecretStore {
       store.approvalPolicyRules = (store.approvalPolicyRules || []).filter((rule) => {
         return !(rule.conditions.handles || []).includes(handle);
       });
+      clearOnePasswordPolicyCaches(store);
 
       const now = new Date().toISOString();
       const failedRequests: RequestRecord[] = [];
@@ -637,6 +725,7 @@ export class SecretStore {
       );
 
       store.approvalPolicyRules = sortApprovalPolicyRules([...(store.approvalPolicyRules || []), rule]);
+      clearOnePasswordPolicyCaches(store);
       store.audit.push(audit("approval.policy.created", `Created approval policy ${rule.name}.`));
       return rule;
     });
@@ -652,6 +741,7 @@ export class SecretStore {
 
       const [deleted] = rules.splice(index, 1);
       store.approvalPolicyRules = rules;
+      clearOnePasswordPolicyCaches(store);
       store.audit.push(audit("approval.policy.deleted", `Deleted approval policy ${deleted.name}.`));
       return deleted;
     });
@@ -666,6 +756,7 @@ export class SecretStore {
 
       rule.enabled = enabled;
       rule.updatedAt = new Date().toISOString();
+      clearOnePasswordPolicyCaches(store);
       store.audit.push(
         audit("approval.policy.updated", `${enabled ? "Enabled" : "Disabled"} approval policy ${rule.name}.`)
       );
@@ -679,53 +770,36 @@ export class SecretStore {
     reason: string,
     agentContext: AgentIdentityContext = {}
   ): Promise<RequestRecord> {
-    return this.mutate((store) => {
-      const secret = store.secrets.find((item) => item.handle === handle);
-      if (!secret) {
-        throw new Error(`Unknown secret handle: ${handle}`);
-      }
+    return this.mutate((store) => createRequestInStore(store, handle, action, reason, agentContext));
+  }
 
-      const now = new Date().toISOString();
-      pruneExpiredApprovalGrants(store, now);
-      const normalizedAction = normalizeAction(action);
-      const agent = requestAgentIdentity(reason, agentContext);
-      assertActionAllowed(secret, normalizedAction);
-      assertBoundHandlesAllowed(store, handle, normalizedAction);
-      const policyRule = matchingApprovalPolicyRule(store, secret, normalizedAction, agent.name, now);
-      const deniedByPolicy = policyRule?.decision === "deny";
-      const allowedByPolicy = policyRule?.decision === "allow";
-      const grant = activeApprovalGrant(store, handle, normalizedAction, agent.name, now);
-      const record: RequestRecord = {
-        id: shortId("req"),
-        handle,
-        reason: reason || "No reason supplied.",
-        agentName: agent.name,
-        agentSource: agent.source,
-        action: normalizedAction,
-        state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
-        createdAt: now,
-        updatedAt: now,
-        approvedAt: grant || allowedByPolicy ? now : undefined,
-        approvalGrantId: grant?.id,
-        approvalPolicyRuleId: policyRule?.id,
-        deniedAt: deniedByPolicy ? now : undefined,
-        error: deniedByPolicy ? `Denied by approval policy ${policyRule?.name || policyRule?.id}.` : undefined
-      };
+  async prepareOneShotExecution(
+    handle: string,
+    action: CommandAction,
+    reason: string,
+    agentContext: AgentIdentityContext = {}
+  ): Promise<OneShotExecutionAdmission> {
+    return this.mutate((store) => oneShotExecutionAdmission(this.home, store, handle, action, reason, agentContext));
+  }
 
-      if (grant) {
-        grant.lastRequestId = record.id;
-        grant.updatedAt = now;
-      }
+  async validateReusableExecutionPermit(permit: ReusableExecutionPermit): Promise<RequestRecord> {
+    assertReusableExecutionPermit(permit, this.home);
+    const store = await this.read();
+    return validatedReusableExecutionRequest(store, permit);
+  }
 
-      store.requests.push(record);
-      const superseded = record.state === "pending" ? supersedeOlderPendingDuplicates(store, record, now) : [];
-      const eventType = deniedByPolicy
-        ? "request.denied_by_policy"
-        : (allowedByPolicy ? "request.auto_approved_by_policy" : (grant ? "request.auto_approved" : "request.created"));
-      const message = requestCreationMessage(record, grant, policyRule, superseded.length);
-      store.audit.push(audit(eventType, message, handle, record.id));
-      return record;
+  async launchReusableExecution<T>(
+    permit: ReusableExecutionPermit,
+    launch: (request: RequestRecord) => ExecutionLaunch<T>
+  ): Promise<T> {
+    assertReusableExecutionPermit(permit, this.home);
+    await ensureSgwHome(this.home);
+    const started = await this.withStoreLock(async (lock) => {
+      const store = await this.loadOrRecoverUnlocked(lock);
+      const request = validatedReusableExecutionRequest(store, permit);
+      return launch(request);
     });
+    return started.completion;
   }
 
   async listRequests(stateOrOptions?: RequestState | RequestListOptions): Promise<RequestRecord[]> {
@@ -790,6 +864,7 @@ export class SecretStore {
       request.state = "approved";
       request.approvedAt = now;
       request.updatedAt = now;
+      request.approvalSource = "manual";
       const grant = createApprovalGrant(store, request, now, options);
       request.approvalGrantId = grant?.id;
       store.audit.push(audit("request.approved", `Approved execution request ${id}.`, request.handle, id));
@@ -811,10 +886,12 @@ export class SecretStore {
   }
 
   async claimApprovedRequest(id: string): Promise<RequestRecord> {
-    return this.mutate((store) => {
+    const claimed = await this.mutate((store) => {
       // Reap any abandoned executions first so a previously-stranded request for the same
       // handle does not keep its approval grant alive or confuse the audit trail.
-      reapStaleExecutions(store, new Date().toISOString());
+      const now = new Date().toISOString();
+      reapStaleExecutions(store, now);
+      pruneExpiredApprovalGrants(store, now);
       const request = store.requests.find((item) => item.id === id);
       if (!request) {
         throw new Error(`Unknown request: ${id}`);
@@ -823,11 +900,26 @@ export class SecretStore {
         throw new Error(`Request ${id} is ${request.state}; local approval is required before execution.`);
       }
 
+      const authorizationError = automaticRequestAuthorizationError(store, request, now);
+      if (authorizationError) {
+        request.state = "denied";
+        request.deniedAt = now;
+        request.updatedAt = now;
+        request.error = authorizationError;
+        store.audit.push(audit("request.authorization_revoked", authorizationError, request.handle, id));
+        return { request, authorizationError };
+      }
+
       request.state = "executing";
-      request.updatedAt = new Date().toISOString();
+      request.updatedAt = now;
       store.audit.push(audit("request.executing", `Executing approved request ${id}.`, request.handle, id));
-      return request;
+      return { request };
     });
+
+    if (claimed.authorizationError) {
+      throw new Error(claimed.authorizationError);
+    }
+    return claimed.request;
   }
 
   /**
@@ -956,7 +1048,7 @@ export class SecretStore {
     }
 
     await ensureSgwHome(this.home);
-    return this.withStoreLock(() => this.loadOrRecoverUnlocked());
+    return this.withStoreLock((lock) => this.loadOrRecoverUnlocked(lock));
   }
 
   private async readUnlocked(): Promise<StoreFile> {
@@ -964,30 +1056,59 @@ export class SecretStore {
     return parseStoreFile(raw, this.storePath);
   }
 
-  private async writeUnlocked(store: StoreFile): Promise<void> {
+  private async writeUnlocked(store: StoreFile, expectedRevision: StoreRevision, lock: StoreLock): Promise<void> {
     await ensureSgwHome(this.home);
-    const previous = await readStoreFileIfValid(this.storePath);
+    await lock.assertOwned();
+    await assertStoreRevision(this.home, this.storePath, expectedRevision);
+
+    await assertRecoveryVaultMatches(this.home, await readControlState(this.home));
+
+    const previous = expectedRevision.storeText
+      ? parseStoreFile(expectedRevision.storeText, this.storePath)
+      : undefined;
     const previousFingerprint = previous ? controlPlaneFingerprint(previous) : undefined;
     const nextFingerprint = controlPlaneFingerprint(store);
     const controlChanged = previousFingerprint !== nextFingerprint;
 
+    if (expectedRevision.manifestFingerprint && expectedRevision.manifestFingerprint !== previousFingerprint) {
+      throw new Error("s-gw store control manifest changed while a write was in progress; retry the operation.");
+    }
+
+    if (controlChanged && previous && previousFingerprint) {
+      await ensureSealedControlPlaneCheckpoint(this.home, previous, previousFingerprint, lock);
+    }
+
+    const nextCheckpoint = controlChanged
+      ? await ensureSealedControlPlaneCheckpoint(this.home, store, nextFingerprint, lock)
+      : undefined;
+
     if (controlChanged) {
+      await lock.assertOwned();
+      await assertStoreRevision(this.home, this.storePath, expectedRevision);
       await writePendingControlState(this.home, {
         version: 1,
-        previousFingerprint,
+        previousFingerprint: expectedRevision.manifestFingerprint,
         nextFingerprint,
         createdAt: new Date().toISOString()
       });
     }
 
-    await backupCurrentStore(this.home, this.storePath);
+    const revision = controlChanged
+      ? await captureStoreRevision(this.home, this.storePath)
+      : expectedRevision;
+    await lock.assertOwned();
+    await assertStoreRevision(this.home, this.storePath, revision);
+    await backupCurrentStore(this.home, this.storePath, { force: controlChanged });
+    await lock.assertOwned();
+    await assertStoreRevision(this.home, this.storePath, revision);
     const serialized = serializeStore(store);
     await writeAtomicFile(this.storePath, serialized);
 
     const controlState = await readControlState(this.home);
     if (controlChanged || !controlState) {
-      await writeControlPlaneCheckpoint(this.home, store, nextFingerprint);
-      await writeControlState(this.home, controlStateFor(store, nextFingerprint));
+      const checkpoint = nextCheckpoint || await ensureSealedControlPlaneCheckpoint(this.home, store, nextFingerprint, lock);
+      await lock.assertOwned();
+      await writeControlState(this.home, controlStateFor(this.home, store, nextFingerprint, checkpoint));
       await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
     }
     await ensureStoreMarker(this.home);
@@ -995,18 +1116,35 @@ export class SecretStore {
 
   private async mutate<T>(updater: (store: StoreFile) => T | Promise<T>): Promise<T> {
     await ensureSgwHome(this.home);
-    return this.withStoreLock(async () => {
-      const store = await this.loadOrRecoverUnlocked();
+    return this.withStoreLock(async (lock) => {
+      const store = await this.loadOrRecoverUnlocked(lock);
+      const revision = await captureStoreRevision(this.home, this.storePath);
+      const before = serializeStore(store);
       const result = await updater(store);
-      await this.writeUnlocked(store);
+      if (serializeStore(store) !== before) {
+        await this.writeUnlocked(store, revision, lock);
+      }
       return result;
     });
   }
 
-  private async loadOrRecoverUnlocked(): Promise<StoreFile> {
+  private async loadOrRecoverUnlocked(lock: StoreLock): Promise<StoreFile> {
     const manifest = await readControlState(this.home);
+    await assertRecoveryVaultMatches(this.home, manifest);
     if (!(await this.exists())) {
-      const recovered = await recoverStoreFromBackups(this.home, this.storePath, manifest?.fingerprint);
+      if (manifest?.recoverySealed && !(await latestSealedExternalControlPlaneCheckpoint(this.home))) {
+        const legacy = await latestSealedControlPlaneCheckpoint(legacyExternalControlPlaneBackupDir(this.home));
+        if (!legacy) {
+          throw new Error("s-gw sealed recovery checkpoint is unavailable; refusing to initialize from an unanchored ledger.");
+        }
+      }
+      const recovered = await recoverStoreFromBackups(
+        this.home,
+        this.storePath,
+        manifest?.fingerprint,
+        lock,
+        Boolean(manifest?.recoverySealed)
+      );
       if (recovered) {
         return recovered;
       }
@@ -1018,7 +1156,8 @@ export class SecretStore {
       }
 
       const fresh = emptyStore();
-      await this.writeUnlocked(fresh);
+      const revision = await captureStoreRevision(this.home, this.storePath);
+      await this.writeUnlocked(fresh, revision, lock);
       return fresh;
     }
 
@@ -1026,8 +1165,14 @@ export class SecretStore {
     try {
       store = await this.readUnlocked();
     } catch (error) {
-      await preserveUnavailableStore(this.home, this.storePath, "invalid");
-      const recovered = await recoverStoreFromBackups(this.home, this.storePath, manifest?.fingerprint);
+      await preserveUnavailableStore(this.home, this.storePath, "invalid", lock);
+      const recovered = await recoverStoreFromBackups(
+        this.home,
+        this.storePath,
+        manifest?.fingerprint,
+        lock,
+        Boolean(manifest?.recoverySealed)
+      );
       if (recovered) {
         return recovered;
       }
@@ -1037,49 +1182,141 @@ export class SecretStore {
     const fingerprint = controlPlaneFingerprint(store);
     const pending = await readPendingControlState(this.home);
     if (!manifest) {
-      if (pending?.nextFingerprint === fingerprint) {
-        await initializeControlState(this.home, store);
+      const latest = await latestSealedExternalControlPlaneCheckpoint(this.home);
+      if (latest) {
+        if (latest.fingerprint !== fingerprint) {
+          await preserveUnavailableStore(this.home, this.storePath, "missing-control-state", lock);
+          const recovered = await recoverStoreFromBackups(this.home, this.storePath, latest.fingerprint, lock, true);
+          if (recovered) {
+            return recovered;
+          }
+          throw new Error("s-gw store control manifest is unavailable and no verified recovery copy exists.");
+        }
+
+        const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
+        await lock.assertOwned();
+        await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, checkpoint));
+        await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
+        await ensureStoreMarker(this.home);
         return store;
       }
 
-      const priorControlState = await fileExists(controlStatePath(this.home)) || await hasStoreMarker(this.home);
+      if (pending?.nextFingerprint === fingerprint && await hasRecoveryCandidateFingerprint(this.home, fingerprint)) {
+        await initializeControlState(this.home, store, lock);
+        return store;
+      }
+
+      const priorControlState = await fileExists(controlStatePath(this.home))
+        || await hasStoreMarker(this.home)
+        || await hasRecoveryEvidence(this.home);
       if (priorControlState) {
         if (await hasRecoveryCandidateFingerprint(this.home, fingerprint)) {
-          await writeControlState(this.home, controlStateFor(store, fingerprint));
+          const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
+          await lock.assertOwned();
+          await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, checkpoint));
           await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
           await ensureStoreMarker(this.home);
           return store;
         }
 
-        await preserveUnavailableStore(this.home, this.storePath, "missing-control-state");
-        const recovered = await recoverStoreFromBackups(this.home, this.storePath);
+        await preserveUnavailableStore(this.home, this.storePath, "missing-control-state", lock);
+        const recovered = await recoverStoreFromBackups(this.home, this.storePath, undefined, lock);
         if (recovered) {
           return recovered;
         }
         throw new Error("s-gw store control manifest is unavailable and no verified recovery copy exists.");
       }
 
-      await initializeControlState(this.home, store);
+      await initializeControlState(this.home, store, lock);
       return store;
     }
 
     if (fingerprint === manifest.fingerprint) {
+      const manifestBelongsElsewhere = Boolean(
+        manifest.recoveryNamespace && manifest.recoveryNamespace !== recoveryNamespace(this.home)
+      );
+      if (manifestBelongsElsewhere) {
+        const latest = await latestSealedExternalControlPlaneCheckpoint(this.home);
+        if (!latest) {
+          throw new Error("s-gw control manifest belongs to another ledger and this ledger has no verified recovery checkpoint.");
+        }
+        await preserveUnavailableStore(this.home, this.storePath, "foreign-control-manifest", lock);
+        const recovered = await recoverStoreFromBackups(this.home, this.storePath, latest.fingerprint, lock, true);
+        if (recovered) {
+          return recovered;
+        }
+        throw new Error("s-gw control manifest belongs to another ledger and recovery could not restore this ledger.");
+      }
+
+      if (manifest.recoverySealed) {
+        if (!manifest.recoveryCheckpoint) {
+          throw new Error("s-gw sealed recovery manifest has no checkpoint anchor; refusing to trust only the primary ledger.");
+        }
+        const anchor = await verifiedSealedControlPlaneCheckpoint(
+          externalControlPlaneBackupDir(this.home),
+          manifest.recoveryCheckpoint
+        );
+        if (!anchor || anchor.fingerprint !== fingerprint) {
+          throw new Error(
+            "s-gw sealed recovery anchor is unavailable or does not match the primary ledger; refusing to roll back credentials or policies."
+          );
+        }
+        if (
+          !manifest.recoveryVaultId ||
+          manifest.recoveryVaultId !== recoveryVaultId(this.home) ||
+          manifest.recoveryNamespace !== recoveryNamespace(this.home)
+        ) {
+          await lock.assertOwned();
+          await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, anchor));
+        }
+        await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
+        await ensureStoreMarker(this.home);
+        return store;
+      }
+
+      const latest = await latestSealedExternalControlPlaneCheckpoint(this.home);
+      if (latest && latest.fingerprint !== fingerprint) {
+        await preserveUnavailableStore(this.home, this.storePath, "external-checkpoint-mismatch", lock);
+        const recovered = await recoverStoreFromBackups(this.home, this.storePath, latest.fingerprint, lock);
+        if (recovered) {
+          return recovered;
+        }
+        throw new Error("s-gw external control-plane checkpoint does not match the current ledger.");
+      }
+
+      if (!latest) {
+        const legacy = await latestLegacyExternalControlPlaneCheckpoint(this.home);
+        if (legacy && legacy.fingerprint !== fingerprint) {
+          await preserveUnavailableStore(this.home, this.storePath, "external-checkpoint-mismatch", lock);
+          return restoreRecoveryCandidate(this.home, this.storePath, legacy, lock);
+        }
+      }
+
+      const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
+      await lock.assertOwned();
+      await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, checkpoint));
       await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
       await ensureStoreMarker(this.home);
       return store;
     }
 
-    if (pending?.nextFingerprint === fingerprint) {
-      const serialized = serializeStore(store);
-      await writeControlPlaneCheckpoint(this.home, store, fingerprint);
-      await writeControlState(this.home, controlStateFor(store, fingerprint));
+    if (pending?.nextFingerprint === fingerprint && pending.previousFingerprint === manifest.fingerprint) {
+      const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
+      await lock.assertOwned();
+      await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, checkpoint));
       await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
       await ensureStoreMarker(this.home);
       return store;
     }
 
-    await preserveUnavailableStore(this.home, this.storePath, "control-mismatch");
-    const recovered = await recoverStoreFromBackups(this.home, this.storePath, manifest.fingerprint);
+    await preserveUnavailableStore(this.home, this.storePath, "control-mismatch", lock);
+    const recovered = await recoverStoreFromBackups(
+      this.home,
+      this.storePath,
+      manifest.fingerprint,
+      lock,
+      Boolean(manifest.recoverySealed)
+    );
     if (recovered) {
       return recovered;
     }
@@ -1089,32 +1326,32 @@ export class SecretStore {
     );
   }
 
-  private async withStoreLock<T>(body: () => Promise<T>): Promise<T> {
+  private async withStoreLock<T>(body: (lock: StoreLock) => Promise<T>): Promise<T> {
     const lockPath = `${this.storePath}.lock`;
     const started = Date.now();
-    let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
+    const state: StoreLockState = {
+      version: 1,
+      pid: process.pid,
+      token: randomUUID(),
+      createdAt: new Date().toISOString()
+    };
 
-    while (!lockHandle) {
-      try {
-        lockHandle = await open(lockPath, "wx", 0o600);
-      } catch (error) {
-        if (!isNodeError(error) || error.code !== "EEXIST") {
-          throw error;
-        }
-
-        await removeStaleLock(lockPath);
-        if (Date.now() - started > lockTimeoutMs) {
-          throw new Error(`Timed out waiting for s-gw store lock at ${lockPath}.`);
-        }
-        await sleep(25);
+    while (!(await publishStoreLock(lockPath, state))) {
+      await removeAbandonedStoreLock(lockPath);
+      if (Date.now() - started > storeLockTimeoutMs()) {
+        throw new Error(`Timed out waiting for s-gw store lock at ${lockPath}.`);
       }
+      await sleep(25);
     }
 
+    const lock: StoreLock = {
+      assertOwned: () => assertStoreLockOwnership(lockPath, state.token)
+    };
     try {
-      return await body();
+      await lock.assertOwned();
+      return await body(lock);
     } finally {
-      await lockHandle.close().catch(() => undefined);
-      await unlink(lockPath).catch(() => undefined);
+      await releaseStoreLock(lockPath, state.token);
     }
   }
 }
@@ -1136,7 +1373,42 @@ function controlPlaneBackupDir(home: string): string {
 }
 
 function externalControlPlaneBackupDir(home: string): string {
+  return path.join(getSgwRecoveryHome(home), "control-plane", recoveryNamespace(home));
+}
+
+function legacyExternalControlPlaneBackupDir(home: string): string {
   return path.join(getSgwRecoveryHome(home), "control-plane");
+}
+
+function recoveryNamespace(home: string): string {
+  return createHash("sha256").update(path.resolve(home)).digest("hex").slice(0, 24);
+}
+
+function recoveryVaultId(home: string): string {
+  return createHash("sha256")
+    .update(path.resolve(getSgwRecoveryHome(home)))
+    .digest("hex");
+}
+
+async function assertRecoveryVaultMatches(home: string, manifest: StoreControlState | undefined): Promise<void> {
+  if (!manifest?.recoverySealed || !manifest.recoveryVaultId) {
+    return;
+  }
+  if (manifest.recoveryVaultId === recoveryVaultId(home)) {
+    return;
+  }
+  const checkpoint = manifest.recoveryCheckpoint
+    ? await verifiedSealedControlPlaneCheckpoint(externalControlPlaneBackupDir(home), manifest.recoveryCheckpoint)
+    : undefined;
+  if (
+    checkpoint?.fingerprint === manifest.fingerprint &&
+    path.basename(checkpoint.path) === manifest.recoveryCheckpoint
+  ) {
+    return;
+  }
+  throw new Error(
+    "s-gw recovery home changed since this ledger was sealed; restore the original SGW_RECOVERY_HOME or copy its verified recovery namespace before continuing."
+  );
 }
 
 function serializeStore(store: StoreFile): string {
@@ -1156,21 +1428,54 @@ function parseStoreFile(raw: string, source: string): StoreFile {
   return normalizeStoreFile(parsed);
 }
 
-async function readStoreFileIfValid(storePath: string): Promise<StoreFile | undefined> {
-  try {
-    return parseStoreFile(await readFile(storePath, "utf8"), storePath);
-  } catch {
-    return undefined;
+async function captureStoreRevision(home: string, storePath: string): Promise<StoreRevision> {
+  const [storeText, controlStateText, pendingStateText] = await Promise.all([
+    readOptionalText(storePath),
+    readOptionalText(controlStatePath(home)),
+    readOptionalText(pendingControlStatePath(home))
+  ]);
+  return {
+    storeText,
+    storeHash: contentHash(storeText),
+    controlStateHash: contentHash(controlStateText),
+    pendingStateHash: contentHash(pendingStateText),
+    manifestFingerprint: controlStateText ? parseControlState(controlStateText)?.fingerprint : undefined
+  };
+}
+
+async function assertStoreRevision(home: string, storePath: string, expected: StoreRevision): Promise<void> {
+  const current = await captureStoreRevision(home, storePath);
+  if (
+    current.storeHash !== expected.storeHash ||
+    current.controlStateHash !== expected.controlStateHash ||
+    current.pendingStateHash !== expected.pendingStateHash
+  ) {
+    throw new Error("s-gw ledger changed while a write was in progress; retry the operation.");
   }
 }
 
+async function readOptionalText(filePath: string): Promise<string | undefined> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function contentHash(content: string | undefined): string | undefined {
+  return content === undefined
+    ? undefined
+    : createHash("sha256").update(content).digest("hex");
+}
+
 function controlPlaneFingerprint(store: StoreFile): string {
-  const secrets = store.secrets.map((secret) => {
-    const copy = { ...secret };
-    delete copy.cache;
-    return copy;
-  }).sort((a, b) => a.handle.localeCompare(b.handle));
-  const grants = [...store.approvalGrants].sort((a, b) => a.id.localeCompare(b.id));
+  const secrets = store.secrets.map(({ cache: _cache, updatedAt: _updatedAt, ...secret }) => secret)
+    .sort((a, b) => a.handle.localeCompare(b.handle));
+  const grants = store.approvalGrants.map(({ lastRequestId: _lastRequestId, updatedAt: _updatedAt, ...grant }) => grant)
+    .sort((a, b) => a.id.localeCompare(b.id));
   const rules = [...store.approvalPolicyRules].sort((a, b) => a.id.localeCompare(b.id));
   const control = {
     version: store.version,
@@ -1216,33 +1521,91 @@ function canonicalValue(value: unknown): unknown {
   return output;
 }
 
-function controlStateFor(store: StoreFile, fingerprint = controlPlaneFingerprint(store)): StoreControlState {
+function controlStateFor(
+  home: string,
+  store: StoreFile,
+  fingerprint = controlPlaneFingerprint(store),
+  checkpoint?: SealedControlPlaneCheckpoint
+): StoreControlState {
   return {
     version: 1,
     fingerprint,
     updatedAt: new Date().toISOString(),
     secrets: store.secrets.length,
-    approvalPolicyRules: store.approvalPolicyRules.length
+    approvalPolicyRules: store.approvalPolicyRules.length,
+    recoverySealed: true,
+    recoveryCheckpoint: checkpoint ? path.basename(checkpoint.path) : undefined,
+    recoveryVaultId: recoveryVaultId(home),
+    recoveryNamespace: recoveryNamespace(home)
   };
 }
 
 async function controlStateMatches(home: string, store: StoreFile): Promise<boolean> {
   const manifest = await readControlState(home);
-  if (!manifest || await fileExists(pendingControlStatePath(home))) {
+  if (
+    !manifest?.recoverySealed ||
+    !manifest.recoveryVaultId ||
+    manifest.recoveryVaultId !== recoveryVaultId(home) ||
+    manifest.recoveryNamespace !== recoveryNamespace(home) ||
+    await fileExists(pendingControlStatePath(home))
+  ) {
     return false;
   }
-  return manifest.fingerprint === controlPlaneFingerprint(store);
+  const fingerprint = controlPlaneFingerprint(store);
+  if (manifest.fingerprint !== fingerprint) {
+    return false;
+  }
+
+  if (!manifest.recoveryCheckpoint) {
+    return false;
+  }
+  const checkpoint = await verifiedSealedControlPlaneCheckpoint(
+    externalControlPlaneBackupDir(home),
+    manifest.recoveryCheckpoint
+  );
+  return checkpoint?.fingerprint === fingerprint;
 }
 
 async function readControlState(home: string): Promise<StoreControlState | undefined> {
+  let raw: string;
   try {
-    const value = JSON.parse(await readFile(controlStatePath(home), "utf8")) as Partial<StoreControlState>;
+    raw = await readFile(controlStatePath(home), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  const state = parseControlState(raw);
+  if (!state) {
+    throw new Error("s-gw store control manifest is invalid; refusing to trust or replace the ledger.");
+  }
+  return state;
+}
+
+function parseControlState(raw: string): StoreControlState | undefined {
+  try {
+    const value = JSON.parse(raw) as Partial<StoreControlState>;
+    const sealedRecoveryIsComplete = value.recoverySealed !== true || (
+      typeof value.recoveryCheckpoint === "string" &&
+      isSealedCheckpointName(value.recoveryCheckpoint) &&
+      typeof value.recoveryVaultId === "string" &&
+      /^[a-f0-9]{64}$/.test(value.recoveryVaultId) &&
+      typeof value.recoveryNamespace === "string" &&
+      /^[a-f0-9]{24}$/.test(value.recoveryNamespace)
+    );
     if (
       value.version !== 1 ||
       typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.fingerprint) ||
       typeof value.updatedAt !== "string" ||
       typeof value.secrets !== "number" ||
-      typeof value.approvalPolicyRules !== "number"
+      typeof value.approvalPolicyRules !== "number" ||
+      (value.recoverySealed !== undefined && value.recoverySealed !== true) ||
+      !sealedRecoveryIsComplete ||
+      (value.recoveryCheckpoint !== undefined && !isSealedCheckpointName(value.recoveryCheckpoint)) ||
+      (value.recoveryVaultId !== undefined && !/^[a-f0-9]{64}$/.test(value.recoveryVaultId)) ||
+      (value.recoveryNamespace !== undefined && !/^[a-f0-9]{24}$/.test(value.recoveryNamespace))
     ) {
       return undefined;
     }
@@ -1277,32 +1640,218 @@ async function writePendingControlState(home: string, state: PendingStoreControl
   await writeAtomicFile(pendingControlStatePath(home), `${JSON.stringify(state, null, 2)}\n`);
 }
 
-async function initializeControlState(home: string, store: StoreFile): Promise<void> {
+async function initializeControlState(home: string, store: StoreFile, lock: StoreLock): Promise<void> {
   const fingerprint = controlPlaneFingerprint(store);
-  await writeControlPlaneCheckpoint(home, store, fingerprint);
-  await writeControlState(home, controlStateFor(store, fingerprint));
+  const checkpoint = await ensureSealedControlPlaneCheckpoint(home, store, fingerprint, lock);
+  await lock.assertOwned();
+  await writeControlState(home, controlStateFor(home, store, fingerprint, checkpoint));
   await unlink(pendingControlStatePath(home)).catch(() => undefined);
   await ensureStoreMarker(home);
 }
 
-async function writeControlPlaneCheckpoint(home: string, store: StoreFile, fingerprint: string): Promise<void> {
+async function ensureSealedControlPlaneCheckpoint(
+  home: string,
+  store: StoreFile,
+  fingerprint: string,
+  lock: StoreLock
+): Promise<SealedControlPlaneCheckpoint> {
   const serialized = serializeStore(controlPlaneSnapshot(store));
-  const backupDirs = new Set([
-    controlPlaneBackupDir(home),
-    externalControlPlaneBackupDir(home)
-  ]);
-  for (const backupDir of backupDirs) {
-    await mkdir(backupDir, { recursive: true, mode: 0o700 });
-    const stamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15);
+  const externalDir = externalControlPlaneBackupDir(home);
+  const internalDir = controlPlaneBackupDir(home);
+  let externalLatest = await latestSealedControlPlaneCheckpoint(externalDir);
+  if (externalLatest?.fingerprint !== fingerprint) {
+    await lock.assertOwned();
+    externalLatest = await writeSealedControlPlaneCheckpoint(externalDir, serialized, fingerprint);
+  }
+  await writeExternalControlPlaneHead(externalDir, externalLatest);
+
+  const internalLatest = await latestSealedControlPlaneCheckpoint(internalDir);
+  if (internalLatest?.fingerprint !== fingerprint) {
+    await lock.assertOwned();
+    await writeSealedControlPlaneCheckpoint(internalDir, serialized, fingerprint);
+  }
+
+  return externalLatest;
+}
+
+async function writeSealedControlPlaneCheckpoint(
+  backupDir: string,
+  serialized: string,
+  fingerprint: string
+): Promise<SealedControlPlaneCheckpoint> {
+  await mkdir(backupDir, { recursive: true, mode: 0o700 });
+  const latestSequence = (await listSealedControlPlaneCheckpoints(backupDir))[0]?.sequence || 0;
+  const firstSequence = Math.max(Date.now(), latestSequence + 1);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const sequence = String(firstSequence + attempt).padStart(13, "0");
     const checkpointPath = path.join(
       backupDir,
-      `store-${stamp}-${fingerprint.slice(0, 12)}-${process.pid}-${Date.now()}.json`
+      `checkpoint-${sequence}-${shortId("cp")}-${fingerprint}.json`
     );
-    await writeFile(checkpointPath, serialized, { mode: 0o600 });
-    const entries = await listJsonFiles(backupDir);
-    for (const entry of entries.slice(maxControlPlaneBackups)) {
-      await rm(entry.path, { force: true }).catch(() => undefined);
+    let checkpoint: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      checkpoint = await open(checkpointPath, "wx", 0o400);
+      await checkpoint.writeFile(serialized);
+      await checkpoint.sync();
+      await checkpoint.close();
+      await syncDirectory(backupDir);
+      const info = await stat(checkpointPath);
+      return {
+        path: checkpointPath,
+        modifiedAtMs: info.mtimeMs,
+        sequence: Number(sequence),
+        fingerprint
+      };
+    } catch (error) {
+      await checkpoint?.close().catch(() => undefined);
+      if (isNodeError(error) && error.code === "EEXIST") {
+        continue;
+      }
+      throw error;
     }
+  }
+
+  throw new Error(`Unable to create a unique s-gw control-plane checkpoint in ${backupDir}.`);
+}
+
+async function writeExternalControlPlaneHead(
+  backupDir: string,
+  checkpoint: SealedControlPlaneCheckpoint
+): Promise<void> {
+  const state: ControlPlaneHead = {
+    version: 1,
+    checkpoint: path.basename(checkpoint.path),
+    fingerprint: checkpoint.fingerprint
+  };
+  const headPath = path.join(backupDir, "head.json");
+  try {
+    const existing = JSON.parse(await readFile(headPath, "utf8")) as Partial<ControlPlaneHead>;
+    if (existing.version === state.version && existing.checkpoint === state.checkpoint && existing.fingerprint === state.fingerprint) {
+      return;
+    }
+  } catch {
+    // A missing or invalid index is rebuilt from the checkpoint that was just verified.
+  }
+  await writeAtomicFile(headPath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function latestSealedExternalControlPlaneCheckpoint(home: string): Promise<SealedControlPlaneCheckpoint | undefined> {
+  return latestSealedControlPlaneCheckpoint(externalControlPlaneBackupDir(home));
+}
+
+async function latestSealedControlPlaneCheckpoint(dir: string): Promise<SealedControlPlaneCheckpoint | undefined> {
+  const checkpoints = await listSealedControlPlaneCheckpoints(dir);
+  for (const checkpoint of checkpoints) {
+    const verified = await verifiedSealedControlPlaneCheckpoint(dir, path.basename(checkpoint.path));
+    if (verified) return verified;
+  }
+  return undefined;
+}
+
+async function listSealedExternalControlPlaneCheckpoints(home: string): Promise<SealedControlPlaneCheckpoint[]> {
+  return listSealedControlPlaneCheckpoints(externalControlPlaneBackupDir(home));
+}
+
+async function listLegacySealedExternalControlPlaneCheckpoints(home: string): Promise<SealedControlPlaneCheckpoint[]> {
+  return listSealedControlPlaneCheckpoints(legacyExternalControlPlaneBackupDir(home));
+}
+
+async function latestLegacyExternalControlPlaneCheckpoint(home: string): Promise<VerifiedRecoveryCandidate | undefined> {
+  const candidates = await listLegacyExternalControlPlaneCheckpoints(home);
+  for (const candidate of candidates) {
+    try {
+      const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+      return { ...candidate, fingerprint: controlPlaneFingerprint(store) };
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+async function listLegacyExternalControlPlaneCheckpoints(home: string): Promise<RecoveryCandidate[]> {
+  const dir = legacyExternalControlPlaneBackupDir(home);
+  const entries = await readdir(dir).catch(() => []);
+  const candidates: RecoveryCandidate[] = [];
+  for (const entry of entries) {
+    if (!/^store-.*\.json$/.test(entry)) {
+      continue;
+    }
+    const candidatePath = path.join(dir, entry);
+    const info = await regularFileInfo(candidatePath);
+    if (info) {
+      candidates.push({ path: candidatePath, modifiedAtMs: info.mtimeMs });
+    }
+  }
+  return candidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+}
+
+async function listSealedControlPlaneCheckpoints(dir: string): Promise<SealedControlPlaneCheckpoint[]> {
+  const entries = await readdir(dir).catch(() => []);
+  const checkpoints: SealedControlPlaneCheckpoint[] = [];
+  for (const entry of entries) {
+    const checkpoint = await sealedControlPlaneCheckpoint(dir, entry);
+    if (checkpoint) checkpoints.push(checkpoint);
+  }
+  return checkpoints.sort((left, right) => {
+    return right.sequence - left.sequence
+      || right.modifiedAtMs - left.modifiedAtMs
+      || right.path.localeCompare(left.path);
+  });
+}
+
+async function verifiedSealedControlPlaneCheckpoint(
+  dir: string,
+  checkpointName: string
+): Promise<SealedControlPlaneCheckpoint | undefined> {
+  const checkpoint = await sealedControlPlaneCheckpoint(dir, checkpointName);
+  if (!checkpoint) {
+    return undefined;
+  }
+  try {
+    const store = parseStoreFile(await readFile(checkpoint.path, "utf8"), checkpoint.path);
+    return controlPlaneFingerprint(store) === checkpoint.fingerprint ? checkpoint : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function sealedControlPlaneCheckpoint(
+  dir: string,
+  checkpointName: string
+): Promise<SealedControlPlaneCheckpoint | undefined> {
+  const match = /^checkpoint-(\d{13})-[A-Za-z0-9_-]+-([a-f0-9]{64})\.json$/.exec(checkpointName);
+  if (!match) {
+    return undefined;
+  }
+  const checkpointPath = path.join(dir, checkpointName);
+  const info = await regularFileInfo(checkpointPath);
+  if (!info) {
+    return undefined;
+  }
+  return {
+    path: checkpointPath,
+    modifiedAtMs: info.mtimeMs,
+    sequence: Number(match[1]),
+    fingerprint: match[2]
+  };
+}
+
+function isSealedCheckpointName(name: string): boolean {
+  return /^checkpoint-\d{13}-[A-Za-z0-9_-]+-[a-f0-9]{64}\.json$/.test(name);
+}
+
+async function syncDirectory(dir: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(dir, "r");
+    await handle.sync();
+  } catch (error) {
+    if (!isNodeError(error) || !["EINVAL", "EPERM", "EISDIR"].includes(error.code || "")) {
+      throw error;
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -1311,11 +1860,18 @@ async function writeAtomicFile(targetPath: string, content: string): Promise<voi
     path.dirname(targetPath),
     `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`
   );
-  await writeFile(tmpPath, content, { mode: 0o600 });
+  let tmpFile: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    tmpFile = await open(tmpPath, "wx", 0o600);
+    await tmpFile.writeFile(content);
+    await tmpFile.sync();
+    await tmpFile.close();
+    tmpFile = undefined;
     await rename(tmpPath, targetPath);
     await chmod(targetPath, 0o600);
+    await syncDirectory(path.dirname(targetPath));
   } catch (error) {
+    await tmpFile?.close().catch(() => undefined);
     await rm(tmpPath, { force: true }).catch(() => undefined);
     throw error;
   }
@@ -1344,57 +1900,118 @@ async function hasRecoveryEvidence(home: string): Promise<boolean> {
 }
 
 async function hasRecoveryCandidateFingerprint(home: string, requiredFingerprint: string): Promise<boolean> {
-  const candidates = await listRecoveryCandidates(home);
-  for (const candidate of candidates) {
-    try {
-      const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
-      if (controlPlaneFingerprint(store) === requiredFingerprint) {
-        return true;
-      }
-    } catch {
-      continue;
-    }
+  const sealed = await listSealedExternalControlPlaneCheckpoints(home);
+  if (sealed.length > 0) {
+    return Boolean(await findRecoveryCandidate(sealed, requiredFingerprint));
   }
-  return false;
+  const legacySealed = await listLegacySealedExternalControlPlaneCheckpoints(home);
+  if (legacySealed.length > 0) {
+    return Boolean(await findRecoveryCandidate(legacySealed, requiredFingerprint));
+  }
+  return Boolean(await findRecoveryCandidate(await listRecoveryCandidates(home), requiredFingerprint));
 }
 
 async function recoverStoreFromBackups(
   home: string,
   storePath: string,
-  requiredFingerprint?: string
+  requiredFingerprint: string | undefined,
+  lock: StoreLock,
+  requireSealed = false
 ): Promise<StoreFile | undefined> {
-  const candidates = await listRecoveryCandidates(home);
+  const sealed = await listSealedExternalControlPlaneCheckpoints(home);
+  const sealedMatch = await findRecoveryCandidate(sealed, requiredFingerprint);
+  if (sealedMatch) {
+    return restoreRecoveryCandidate(home, storePath, sealedMatch, lock);
+  }
+
+  if (requiredFingerprint) {
+    const legacySealed = await listLegacySealedExternalControlPlaneCheckpoints(home);
+    const legacySealedMatch = await findRecoveryCandidate(legacySealed, requiredFingerprint);
+    if (legacySealedMatch) {
+      return restoreRecoveryCandidate(home, storePath, legacySealedMatch, lock);
+    }
+
+    if (sealed.length > 0 || legacySealed.length > 0 || requireSealed) {
+      return undefined;
+    }
+
+    const legacy = await findRecoveryCandidate(
+      await listLegacyExternalControlPlaneCheckpoints(home),
+      requiredFingerprint
+    );
+    if (legacy) {
+      return restoreRecoveryCandidate(home, storePath, legacy, lock);
+    }
+  } else if (sealed.length > 0 || requireSealed) {
+    return undefined;
+  }
+
+  const fallback = await findRecoveryCandidate(
+    await listRecoveryCandidates(home, { includeLegacyExternal: Boolean(requiredFingerprint) }),
+    requiredFingerprint
+  );
+  if (!fallback) {
+    return undefined;
+  }
+  return restoreRecoveryCandidate(home, storePath, fallback, lock);
+}
+
+async function findRecoveryCandidate(
+  candidates: RecoveryCandidate[],
+  requiredFingerprint?: string
+): Promise<RecoveryCandidate | undefined> {
   for (const candidate of candidates) {
-    let store: StoreFile;
     try {
-      store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+      if (!(await regularFileInfo(candidate.path))) {
+        continue;
+      }
+      const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+      const fingerprint = controlPlaneFingerprint(store);
+      if (!requiredFingerprint || fingerprint === requiredFingerprint) {
+        return candidate;
+      }
     } catch {
       continue;
     }
-    const fingerprint = controlPlaneFingerprint(store);
-    if (requiredFingerprint && fingerprint !== requiredFingerprint) {
-      continue;
-    }
-
-    store.audit.push(audit(
-      "store.recovered",
-      `Recovered the s-gw ledger from ${path.basename(candidate.path)} after the primary store became unavailable.`
-    ));
-    const serialized = serializeStore(store);
-    await writeAtomicFile(storePath, serialized);
-    await writeControlPlaneCheckpoint(home, store, fingerprint);
-    await writeControlState(home, controlStateFor(store, fingerprint));
-    await unlink(pendingControlStatePath(home)).catch(() => undefined);
-    await ensureStoreMarker(home);
-    return store;
   }
   return undefined;
 }
 
-async function preserveUnavailableStore(home: string, storePath: string, reason: string): Promise<void> {
+async function restoreRecoveryCandidate(
+  home: string,
+  storePath: string,
+  candidate: RecoveryCandidate,
+  lock: StoreLock
+): Promise<StoreFile> {
+  if (!(await regularFileInfo(candidate.path))) {
+    throw new Error(`s-gw recovery candidate disappeared or is not a regular file: ${candidate.path}`);
+  }
+  const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+  const fingerprint = controlPlaneFingerprint(store);
+  store.audit.push(audit(
+    "store.recovered",
+    `Recovered the s-gw ledger from ${path.basename(candidate.path)} after the primary store became unavailable.`
+  ));
+  await lock.assertOwned();
+  await writeAtomicFile(storePath, serializeStore(store));
+  const checkpoint = await ensureSealedControlPlaneCheckpoint(home, store, fingerprint, lock);
+  await lock.assertOwned();
+  await writeControlState(home, controlStateFor(home, store, fingerprint, checkpoint));
+  await unlink(pendingControlStatePath(home)).catch(() => undefined);
+  await ensureStoreMarker(home);
+  return store;
+}
+
+async function preserveUnavailableStore(
+  home: string,
+  storePath: string,
+  reason: string,
+  lock: StoreLock
+): Promise<void> {
   if (!(await fileExists(storePath))) {
     return;
   }
+  await lock.assertOwned();
   const recoveryDir = path.join(home, "recovery", "automatic");
   await mkdir(recoveryDir, { recursive: true, mode: 0o700 });
   const stamp = new Date().toISOString().replace(/[-:.]/g, "");
@@ -1403,13 +2020,19 @@ async function preserveUnavailableStore(home: string, storePath: string, reason:
   await chmod(recoveryPath, 0o600);
 }
 
-async function listRecoveryCandidates(home: string): Promise<RecoveryCandidate[]> {
+async function listRecoveryCandidates(
+  home: string,
+  options: { includeLegacyExternal?: boolean } = {}
+): Promise<RecoveryCandidate[]> {
   const dirs = new Set([
     controlPlaneBackupDir(home),
     externalControlPlaneBackupDir(home),
     path.join(home, "backups", "manual"),
     path.join(home, "backups")
   ]);
+  if (options.includeLegacyExternal !== false) {
+    dirs.add(legacyExternalControlPlaneBackupDir(home));
+  }
   const candidates: RecoveryCandidate[] = [];
   for (const dir of dirs) {
     const entries = await readdir(dir).catch(() => []);
@@ -1418,8 +2041,8 @@ async function listRecoveryCandidates(home: string): Promise<RecoveryCandidate[]
         continue;
       }
       const candidatePath = path.join(dir, entry);
-      const info = await stat(candidatePath).catch(() => undefined);
-      if (info?.isFile()) {
+      const info = await regularFileInfo(candidatePath);
+      if (info) {
         candidates.push({ path: candidatePath, modifiedAtMs: info.mtimeMs });
       }
     }
@@ -1427,20 +2050,9 @@ async function listRecoveryCandidates(home: string): Promise<RecoveryCandidate[]
   return candidates.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
 }
 
-async function listJsonFiles(dir: string): Promise<RecoveryCandidate[]> {
-  const entries = await readdir(dir).catch(() => []);
-  const files: RecoveryCandidate[] = [];
-  for (const entry of entries) {
-    if (!entry.endsWith(".json")) {
-      continue;
-    }
-    const entryPath = path.join(dir, entry);
-    const info = await stat(entryPath).catch(() => undefined);
-    if (info?.isFile()) {
-      files.push({ path: entryPath, modifiedAtMs: info.mtimeMs });
-    }
-  }
-  return files.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
+async function regularFileInfo(filePath: string): Promise<{ mtimeMs: number } | undefined> {
+  const info = await lstat(filePath).catch(() => undefined);
+  return info?.isFile() ? { mtimeMs: Number(info.mtimeMs) } : undefined;
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -1456,7 +2068,18 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function backupCurrentStore(home: string, storePath: string): Promise<void> {
+async function backupCurrentStore(
+  home: string,
+  storePath: string,
+  options: { force?: boolean } = {}
+): Promise<void> {
+  if (!options.force) {
+    const latest = (await listStoreBackups(home))[0];
+    if (latest && Date.now() - Date.parse(latest.modifiedAt) < requestBackupIntervalMs) {
+      return;
+    }
+  }
+
   let current = "";
   try {
     current = await readFile(storePath, "utf8");
@@ -1509,11 +2132,12 @@ async function pruneStoreBackups(backupDir: string): Promise<void> {
 }
 
 function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
+  const audit = parsed.audit || [];
   return {
     version: 1,
     secrets: (parsed.secrets || []).map((secret) => normalizeSecretRecord(secret)),
-    requests: parsed.requests || [],
-    audit: parsed.audit || [],
+    requests: migrateRequestApprovalSources(parsed.requests || [], audit),
+    audit,
     approvalSettings: normalizeApprovalSettings(parsed.approvalSettings),
     approvalGrants: Array.isArray(parsed.approvalGrants)
       ? parsed.approvalGrants.filter(isValidApprovalGrant)
@@ -1522,6 +2146,29 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
       ? sortApprovalPolicyRules(parsed.approvalPolicyRules.map((rule) => normalizeApprovalPolicyRule(rule)).filter(isValidApprovalPolicyRule))
       : []
   };
+}
+
+function migrateRequestApprovalSources(requests: RequestRecord[], auditLog: AuditEvent[]): RequestRecord[] {
+  const sources = new Map<string, "grant" | "policy">();
+  for (const event of auditLog) {
+    if (!event.requestId) {
+      continue;
+    }
+    if (event.type === "request.auto_approved") {
+      sources.set(event.requestId, "grant");
+    }
+    if (event.type === "request.auto_approved_by_policy") {
+      sources.set(event.requestId, "policy");
+    }
+  }
+
+  return requests.map((request) => {
+    if (request.approvalSource === "manual" || request.approvalSource === "grant" || request.approvalSource === "policy") {
+      return request;
+    }
+    const source = sources.get(request.id);
+    return source ? { ...request, approvalSource: source } : request;
+  });
 }
 
 function normalizeSecretRecord(secret: SecretRecord): SecretRecord {
@@ -1607,11 +2254,13 @@ function isValidApprovalGrant(grant: ApprovalGrant): boolean {
 }
 
 function isValidSecretCache(cache: SecretValueCache): boolean {
+  const approvalAuthorities = Number(typeof cache.approvalGrantId === "string") +
+    Number(typeof cache.approvalPolicyRuleId === "string");
   return (
     Boolean(cache) &&
     cache.backend === "onepassword" &&
     typeof cache.fingerprint === "string" &&
-    typeof cache.approvalGrantId === "string" &&
+    approvalAuthorities === 1 &&
     typeof cache.createdAt === "string" &&
     typeof cache.updatedAt === "string" &&
     isEncryptedBox(cache.encrypted)
@@ -1640,12 +2289,16 @@ function isTerminalRequestState(state: RequestState): boolean {
 
 function cachedOnePasswordValue(record: SecretRecord, request?: RequestRecord): string | undefined {
   const cache = record.cache;
-  if (record.backend !== "onepassword" || !cache || !request?.approvalGrantId) {
+  if (record.backend !== "onepassword" || !cache || !request) {
     return undefined;
   }
 
   const now = new Date().toISOString();
-  if (!isValidSecretCache(cache) || cache.approvalGrantId !== request.approvalGrantId) {
+  const matchingGrant = Boolean(request.approvalGrantId && cache.approvalGrantId === request.approvalGrantId);
+  const matchingPolicy = Boolean(
+    request.approvalPolicyRuleId && cache.approvalPolicyRuleId === request.approvalPolicyRuleId
+  );
+  if (!isValidSecretCache(cache) || (!matchingGrant && !matchingPolicy)) {
     return undefined;
   }
 
@@ -1674,11 +2327,19 @@ function grantAllowsCache(grant: ApprovalGrant, nowIso: string): boolean {
 
 function clearOnePasswordCaches(store: StoreFile, grantIds?: Set<string>): void {
   for (const secret of store.secrets) {
-    if (!secret.cache) {
+    if (!secret.cache?.approvalGrantId) {
       continue;
     }
 
     if (!grantIds || grantIds.has(secret.cache.approvalGrantId)) {
+      delete secret.cache;
+    }
+  }
+}
+
+function clearOnePasswordPolicyCaches(store: StoreFile): void {
+  for (const secret of store.secrets) {
+    if (secret.cache?.approvalPolicyRuleId) {
       delete secret.cache;
     }
   }
@@ -1775,12 +2436,350 @@ function requestReferencesHandle(request: RequestRecord, handle: string): boolea
   return request.handle === handle || (request.action.env || []).some((binding) => binding.handle === handle);
 }
 
+interface ExecutionAdmissionContext {
+  secret: SecretRecord;
+  action: CommandAction;
+  agent: AgentIdentity;
+  now: string;
+  policyRule?: ApprovalPolicyRule;
+  grant?: ApprovalGrant;
+}
+
+function createRequestInStore(
+  store: StoreFile,
+  handle: string,
+  action: CommandAction,
+  reason: string,
+  agentContext: AgentIdentityContext,
+  options: { coalesce?: boolean } = {}
+): RequestRecord {
+  const now = new Date().toISOString();
+  pruneExpiredApprovalGrants(store, now);
+  const admission = executionAdmissionContext(store, handle, action, reason, agentContext, now);
+  const { secret, agent, policyRule, grant } = admission;
+  const deniedByPolicy = policyRule?.decision === "deny";
+  const allowedByPolicy = policyRule?.decision === "allow";
+
+  if (options.coalesce && deniedByPolicy && policyRule) {
+    const existing = matchingDeniedRequest(store, handle, admission.action, agent.name, policyRule.id);
+    if (existing) {
+      return existing;
+    }
+  }
+
+  if (options.coalesce && !deniedByPolicy && !allowedByPolicy && !grant) {
+    const existing = matchingPendingRequest(store, handle, admission.action, agent.name);
+    if (existing) {
+      return existing;
+    }
+  }
+
+  const record: RequestRecord = {
+    id: shortId("req"),
+    handle,
+    reason: reason || "No reason supplied.",
+    agentName: agent.name,
+    agentSource: agent.source,
+    action: admission.action,
+    state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
+    createdAt: now,
+    updatedAt: now,
+    approvedAt: grant || allowedByPolicy ? now : undefined,
+    approvalSource: allowedByPolicy ? "policy" : (grant ? "grant" : undefined),
+    approvalGrantId: grant?.id,
+    approvalPolicyRuleId: policyRule?.id,
+    deniedAt: deniedByPolicy ? now : undefined,
+    error: deniedByPolicy ? `Denied by approval policy ${policyRule?.name || policyRule?.id}.` : undefined
+  };
+
+  if (grant) {
+    grant.lastRequestId = record.id;
+    grant.updatedAt = now;
+  }
+
+  store.requests.push(record);
+  const superseded = record.state === "pending" ? supersedeOlderPendingDuplicates(store, record, now) : [];
+  const eventType = deniedByPolicy
+    ? "request.denied_by_policy"
+    : (allowedByPolicy ? "request.auto_approved_by_policy" : (grant ? "request.auto_approved" : "request.created"));
+  const message = requestCreationMessage(record, grant, policyRule, superseded.length);
+  store.audit.push(audit(eventType, message, secret.handle, record.id));
+  return record;
+}
+
+function oneShotExecutionAdmission(
+  home: string,
+  store: StoreFile,
+  handle: string,
+  action: CommandAction,
+  reason: string,
+  agentContext: AgentIdentityContext
+): OneShotExecutionAdmission {
+  const now = new Date().toISOString();
+  pruneExpiredApprovalGrants(store, now);
+  const admission = executionAdmissionContext(store, handle, action, reason, agentContext, now);
+  if (admission.action.kind !== "env_command") {
+    return {
+      kind: "request",
+      request: createRequestInStore(store, handle, action, reason, agentContext, { coalesce: true })
+    };
+  }
+  const { policyRule, grant } = admission;
+  if (policyRule?.decision === "deny") {
+    return {
+      kind: "request",
+      request: createRequestInStore(store, handle, action, reason, agentContext, { coalesce: true })
+    };
+  }
+
+  if (policyRule?.decision === "allow") {
+    return {
+      kind: "reusable",
+      permit: reusableExecutionPermit(home, store, handle, admission.action, reason, admission.agent, admission.now, {
+        kind: "policy",
+        id: policyRule.id
+      })
+    };
+  }
+
+  if (grant) {
+    return {
+      kind: "reusable",
+      permit: reusableExecutionPermit(home, store, handle, admission.action, reason, admission.agent, admission.now, {
+        kind: "grant",
+        id: grant.id
+      })
+    };
+  }
+
+  return {
+    kind: "request",
+    request: createRequestInStore(store, handle, action, reason, agentContext, { coalesce: true })
+  };
+}
+
+function executionAdmissionContext(
+  store: StoreFile,
+  handle: string,
+  action: CommandAction,
+  reason: string,
+  agentContext: AgentIdentityContext,
+  now = new Date().toISOString()
+): ExecutionAdmissionContext {
+  const secret = store.secrets.find((item) => item.handle === handle);
+  if (!secret) {
+    throw new Error(`Unknown secret handle: ${handle}`);
+  }
+
+  const normalizedAction = normalizeAction(action);
+  const agent = requestAgentIdentity(reason, agentContext);
+  assertActionAllowed(secret, normalizedAction);
+  assertBoundHandlesAllowed(store, handle, normalizedAction);
+  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, normalizedAction, agent.name, now);
+  const grant = activeApprovalGrant(store, handle, normalizedAction, agent.name, now);
+  return { secret, action: normalizedAction, agent, now, policyRule, grant };
+}
+
+function automaticRequestAuthorizationError(
+  store: StoreFile,
+  request: RequestRecord,
+  nowIso: string
+): string | undefined {
+  if (request.approvalSource === "grant") {
+    const agentName = request.agentName || requestAgentName(request.reason);
+    const grant = activeApprovalGrant(store, request.handle, request.action, agentName, nowIso);
+    if (!request.approvalGrantId || !grant || grant.id !== request.approvalGrantId) {
+      return "The reusable approval for this request was revoked or expired; request approval again.";
+    }
+  }
+
+  if (request.approvalSource === "policy") {
+    const secret = store.secrets.find((item) => item.handle === request.handle);
+    const agentName = request.agentName || requestAgentName(request.reason);
+    const policyRule = secret
+      ? matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, nowIso)
+      : undefined;
+    if (
+      !request.approvalPolicyRuleId ||
+      policyRule?.decision !== "allow" ||
+      policyRule.id !== request.approvalPolicyRuleId
+    ) {
+      return "The approval policy for this request changed or no longer allows it; request approval again.";
+    }
+  }
+
+  return undefined;
+}
+
+function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExecutionPermit): RequestRecord {
+  if (controlPlaneFingerprint(store) !== permit.controlFingerprint) {
+    throw new Error("s-gw execution authorization changed before the command started; retry the command.");
+  }
+
+  const secret = store.secrets.find((item) => item.handle === permit.handle);
+  if (!secret) {
+    throw new Error(`Unknown secret handle: ${permit.handle}`);
+  }
+
+  const action = normalizeAction(permit.action);
+  assertActionAllowed(secret, action);
+  assertBoundHandlesAllowed(store, permit.handle, action);
+
+  const now = new Date().toISOString();
+  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, action, permit.agentName, now);
+  if (policyRule?.decision === "deny") {
+    throw new Error(`Execution is denied by approval policy ${policyRule.name}.`);
+  }
+
+  if (permit.authorization.kind === "policy") {
+    if (policyRule?.decision !== "allow" || policyRule.id !== permit.authorization.id) {
+      throw new Error("s-gw approval policy changed before the command started; retry the command.");
+    }
+  } else {
+    if (policyRule?.decision === "allow") {
+      throw new Error("s-gw approval policy changed before the command started; retry the command.");
+    }
+    const grant = activeApprovalGrant(store, permit.handle, action, permit.agentName, now);
+    if (!grant || grant.id !== permit.authorization.id) {
+      throw new Error("s-gw approval grant is no longer valid; request approval again.");
+    }
+  }
+
+  return {
+    id: permit.id,
+    handle: permit.handle,
+    reason: permit.reason,
+    agentName: permit.agentName,
+    agentSource: permit.agentSource,
+    action,
+    state: "approved",
+    createdAt: permit.createdAt,
+    updatedAt: now,
+    approvedAt: now,
+    approvalSource: permit.authorization.kind,
+    approvalGrantId: permit.authorization.kind === "grant" ? permit.authorization.id : undefined,
+    approvalPolicyRuleId: permit.authorization.kind === "policy" ? permit.authorization.id : undefined
+  };
+}
+
+function reusableExecutionPermit(
+  home: string,
+  store: StoreFile,
+  handle: string,
+  action: CommandAction,
+  reason: string,
+  agent: AgentIdentity,
+  createdAt: string,
+  authorization: ReusableExecutionPermit["authorization"]
+): ReusableExecutionPermit {
+  const frozenAction = freezeAction(action);
+  const permit = Object.freeze({
+    id: shortId("run"),
+    handle,
+    reason: reason || "No reason supplied.",
+    agentName: agent.name,
+    agentSource: agent.source,
+    action: frozenAction,
+    createdAt,
+    controlFingerprint: controlPlaneFingerprint(store),
+    authorization: Object.freeze({ ...authorization })
+  }) as ReusableExecutionPermit;
+  reusableExecutionPermits.set(permit, path.resolve(home));
+  return permit;
+}
+
+function freezeAction(action: CommandAction): CommandAction {
+  const env = (action.env || []).map((binding) => Object.freeze({ ...binding }));
+  const ssh = action.ssh ? Object.freeze({ ...action.ssh }) : undefined;
+  const copy = {
+    ...action,
+    args: Object.freeze([...action.args]),
+    env: Object.freeze(env),
+    ssh
+  };
+  return Object.freeze(copy) as CommandAction;
+}
+
+function matchingPendingRequest(
+  store: StoreFile,
+  handle: string,
+  action: CommandAction,
+  agentName: string
+): RequestRecord | undefined {
+  const key = requestDuplicateKeyFor(handle, action, agentName);
+  for (let index = store.requests.length - 1; index >= 0; index -= 1) {
+    const request = store.requests[index];
+    if (request.state === "pending" && requestDuplicateKey(request) === key) {
+      return request;
+    }
+  }
+  return undefined;
+}
+
+function matchingDeniedRequest(
+  store: StoreFile,
+  handle: string,
+  action: CommandAction,
+  agentName: string,
+  policyRuleId: string
+): RequestRecord | undefined {
+  const key = requestDuplicateKeyFor(handle, action, agentName);
+  for (let index = store.requests.length - 1; index >= 0; index -= 1) {
+    const request = store.requests[index];
+    if (
+      request.state === "denied" &&
+      request.approvalPolicyRuleId === policyRuleId &&
+      requestDuplicateKey(request) === key
+    ) {
+      return request;
+    }
+  }
+  return undefined;
+}
+
 function requestDuplicateKey(request: RequestRecord): string {
+  return requestDuplicateKeyFor(
+    request.handle,
+    request.action,
+    request.agentName || requestAgentName(request.reason)
+  );
+}
+
+function requestDuplicateKeyFor(handle: string, action: CommandAction, agentName: string): string {
   return JSON.stringify({
-    handle: request.handle,
-    actionKey: approvalActionKey(request.handle, request.action),
-    agentName: request.agentName || requestAgentName(request.reason)
+    handle,
+    actionKey: approvalActionKey(handle, action),
+    agentName
   });
+}
+
+function assertReusableExecutionPermit(permit: ReusableExecutionPermit, home: string): void {
+  if (
+    !permit ||
+    reusableExecutionPermits.get(permit) !== path.resolve(home) ||
+    typeof permit.id !== "string" || !permit.id ||
+    typeof permit.handle !== "string" || !permit.handle ||
+    typeof permit.reason !== "string" ||
+    typeof permit.agentName !== "string" || !permit.agentName ||
+    !isAgentIdentitySource(permit.agentSource) ||
+    typeof permit.createdAt !== "string" ||
+    typeof permit.controlFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(permit.controlFingerprint) ||
+    !permit.authorization ||
+    (permit.authorization.kind !== "grant" && permit.authorization.kind !== "policy") ||
+    typeof permit.authorization.id !== "string" || !permit.authorization.id
+  ) {
+    throw new Error("Invalid s-gw reusable execution permit.");
+  }
+}
+
+function isAgentIdentitySource(value: unknown): value is AgentIdentitySource {
+  return value === "configured" ||
+    value === "mcp-client" ||
+    value === "runtime" ||
+    value === "process" ||
+    value === "reason" ||
+    value === "manual" ||
+    value === "unknown";
 }
 
 function supersedeOlderPendingDuplicates(store: StoreFile, latest: RequestRecord, nowIso: string): RequestRecord[] {
@@ -1955,10 +2954,23 @@ function pruneOnePasswordCaches(store: StoreFile, nowIso: string): void {
     if (!cache) {
       continue;
     }
+    const policy = cache.approvalPolicyRuleId
+      ? (store.approvalPolicyRules || []).find((rule) => rule.id === cache.approvalPolicyRuleId)
+      : undefined;
+    const policyIsLive = Boolean(
+      policy &&
+      isValidApprovalPolicyRule(policy) &&
+      policy.enabled &&
+      policy.decision === "allow" &&
+      (!policy.expiresAt || policy.expiresAt > nowIso)
+    );
+    const authorityIsLive = cache.approvalGrantId
+      ? liveGrantIds.has(cache.approvalGrantId)
+      : policyIsLive;
 
     if (
       !isValidSecretCache(cache) ||
-      !liveGrantIds.has(cache.approvalGrantId) ||
+      !authorityIsLive ||
       (cache.expiresAt && cache.expiresAt <= nowIso) ||
       (cache.loginSessionId && cache.loginSessionId !== currentLoginSessionId())
     ) {
@@ -2041,6 +3053,45 @@ function matchingApprovalPolicyRule(
   return undefined;
 }
 
+function matchingApprovalPolicyRuleForAction(
+  store: StoreFile,
+  primarySecret: SecretRecord,
+  action: CommandAction,
+  agentName: string,
+  nowIso: string
+): ApprovalPolicyRule | undefined {
+  const matched = [
+    matchingApprovalPolicyRule(store, primarySecret, policyActionForBinding(action, action.injectEnv), agentName, nowIso)
+  ];
+  for (const binding of action.env || []) {
+    const secret = store.secrets.find((item) => item.handle === binding.handle);
+    if (!secret) {
+      throw new Error(`Unknown secret handle: ${binding.handle}`);
+    }
+    matched.push(
+      matchingApprovalPolicyRule(store, secret, policyActionForBinding(action, binding.injectEnv), agentName, nowIso)
+    );
+  }
+
+  const denied = matched.find((rule) => rule?.decision === "deny");
+  if (denied) {
+    return denied;
+  }
+
+  const primaryRule = matched[0];
+  if (primaryRule?.decision !== "allow") {
+    return primaryRule;
+  }
+
+  return matched.every((rule) => rule?.decision === "allow" && rule.id === primaryRule.id)
+    ? primaryRule
+    : undefined;
+}
+
+function policyActionForBinding(action: CommandAction, injectEnv: string): CommandAction {
+  return { ...action, injectEnv, env: [] };
+}
+
 function approvalPolicyMatches(
   rule: ApprovalPolicyRule,
   secret: SecretRecord,
@@ -2074,8 +3125,7 @@ function approvalPolicyMatches(
     }
   }
   if (conditions.injectEnvs?.length) {
-    const names = new Set([action.injectEnv, ...(action.env || []).map((binding) => binding.injectEnv)]);
-    if (![...names].some((name) => conditions.injectEnvs?.includes(name))) {
+    if (!conditions.injectEnvs.includes(action.injectEnv)) {
       return false;
     }
   }
@@ -2543,14 +3593,185 @@ function audit(type: string, message: string, handle?: string, requestId?: strin
   };
 }
 
-async function removeStaleLock(lockPath: string): Promise<void> {
-  try {
-    const info = await stat(lockPath);
-    if (Date.now() - info.mtimeMs > staleLockMs) {
-      await unlink(lockPath).catch(() => undefined);
+function storeLockTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") {
+    return lockTimeoutMs;
+  }
+
+  const configured = Number(process.env.SGW_TEST_LOCK_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return lockTimeoutMs;
+  }
+  return Math.min(Math.floor(configured), lockTimeoutMs);
+}
+
+async function removeAbandonedStoreLock(lockPath: string): Promise<void> {
+  const inspection = await inspectStoreLock(lockPath);
+  if (!inspection?.state || !inspection.markerPath || !processIsDefinitelyDead(inspection.state.pid)) {
+    return;
+  }
+
+  const removed = await unlink(inspection.markerPath).then(
+    () => true,
+    (error) => {
+      if (isNodeError(error) && error.code === "ENOENT") return false;
+      throw error;
     }
+  );
+  if (removed) {
+    await rmdir(lockPath).catch(() => undefined);
+  }
+}
+
+async function assertStoreLockOwnership(lockPath: string, token: string): Promise<void> {
+  const state = await readStoreLockState(lockPath);
+  if (!state || state.token !== token) {
+    throw new Error("s-gw store lock ownership was lost; retry the operation.");
+  }
+}
+
+async function releaseStoreLock(lockPath: string, token: string): Promise<void> {
+  const inspection = await inspectStoreLock(lockPath);
+  if (!inspection?.state || !inspection.markerPath || inspection.state.token !== token) {
+    return;
+  }
+
+  const removed = await unlink(inspection.markerPath).then(
+    () => true,
+    (error) => {
+      if (isNodeError(error) && error.code === "ENOENT") return false;
+      throw error;
+    }
+  );
+  if (removed) {
+    await rmdir(lockPath).catch(() => undefined);
+  }
+}
+
+async function readStoreLockState(lockPath: string): Promise<StoreLockState | undefined> {
+  return (await inspectStoreLock(lockPath))?.state;
+}
+
+async function publishStoreLock(lockPath: string, state: StoreLockState): Promise<boolean> {
+  const tempPath = `${lockPath}.tmp-${process.pid}-${state.token}`;
+  const markerPath = path.join(tempPath, storeLockMarkerName(state.token));
+  let marker: Awaited<ReturnType<typeof open>> | undefined;
+  let published = false;
+
+  try {
+    await mkdir(tempPath, { mode: 0o700 });
+    marker = await open(markerPath, "wx", 0o600);
+    await marker.writeFile(`${JSON.stringify(state)}\n`);
+    await marker.sync();
+    await marker.close();
+    marker = undefined;
+    await syncDirectory(tempPath);
+
+    try {
+      await rename(tempPath, lockPath);
+      await syncDirectory(path.dirname(lockPath));
+      published = true;
+      return true;
+    } catch (error) {
+      if (await isStoreLockExistsError(error, lockPath)) {
+        return false;
+      }
+      throw error;
+    }
+  } finally {
+    await marker?.close().catch(() => undefined);
+    if (!published) {
+      await rm(tempPath, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+}
+
+async function inspectStoreLock(lockPath: string): Promise<StoreLockInspection | undefined> {
+  let lockInfo: Awaited<ReturnType<typeof lstat>>;
+  try {
+    lockInfo = await lstat(lockPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  if (lockInfo.isSymbolicLink() || !lockInfo.isDirectory()) {
+    return {};
+  }
+
+  let entries: string[];
+  try {
+    entries = await readdir(lockPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+  if (entries.length !== 1) {
+    return {};
+  }
+
+  const markerPath = path.join(lockPath, entries[0]);
+  let markerInfo: Awaited<ReturnType<typeof lstat>>;
+  try {
+    markerInfo = await lstat(markerPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+  if (markerInfo.isSymbolicLink() || !markerInfo.isFile()) {
+    return {};
+  }
+
+  const state = parseStoreLockState(await readFile(markerPath, "utf8").catch(() => ""));
+  if (!state || entries[0] !== storeLockMarkerName(state.token)) {
+    return {};
+  }
+  return { state, markerPath };
+}
+
+function parseStoreLockState(raw: string): StoreLockState | undefined {
+  try {
+    const value = JSON.parse(raw) as Partial<StoreLockState>;
+    const pid = value.pid;
+    const token = value.token;
+    const createdAt = value.createdAt;
+    if (
+      value.version !== 1 ||
+      typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 ||
+      typeof token !== "string" || token.length < 16 ||
+      typeof createdAt !== "string"
+    ) {
+      return undefined;
+    }
+    return { version: 1, pid, token, createdAt };
   } catch {
-    // Another process may have released the lock between our open and stat.
+    return undefined;
+  }
+}
+
+function storeLockMarkerName(token: string): string {
+  return `owner-${token}.json`;
+}
+
+async function isStoreLockExistsError(error: unknown, lockPath: string): Promise<boolean> {
+  if (!isNodeError(error)) return false;
+  if (error.code === "EEXIST" || error.code === "ENOTEMPTY") return true;
+  if (error.code !== "EPERM" && error.code !== "EACCES") return false;
+  return fileExists(lockPath);
+}
+
+function processIsDefinitelyDead(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return isNodeError(error) && error.code === "ESRCH";
   }
 }
 

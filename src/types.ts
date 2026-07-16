@@ -10,6 +10,7 @@ export type SecretType =
 export type SecretSeverity = "low" | "medium" | "high" | "critical";
 
 export type RequestState = "pending" | "approved" | "executing" | "denied" | "executed" | "failed";
+export type RequestApprovalSource = "manual" | "grant" | "policy";
 
 export type ApprovalMode = "per-transaction" | "timed-session" | "login-session" | "always";
 export type ApprovalAgentScope = "same-agent" | "any-agent";
@@ -83,7 +84,8 @@ export interface SecretValueCache {
   backend: "onepassword";
   encrypted: EncryptedBox;
   fingerprint: string;
-  approvalGrantId: string;
+  approvalGrantId?: string;
+  approvalPolicyRuleId?: string;
   createdAt: string;
   updatedAt: string;
   expiresAt?: string;
@@ -168,6 +170,7 @@ export interface RequestRecord {
   createdAt: string;
   updatedAt: string;
   approvedAt?: string;
+  approvalSource?: RequestApprovalSource;
   approvalGrantId?: string;
   approvalPolicyRuleId?: string;
   deniedAt?: string;

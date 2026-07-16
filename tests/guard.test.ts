@@ -21,16 +21,19 @@ function fakeOpenAiToken(suffix: string): string {
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-guard-test-"));
   process.env.SGW_HOME = tmpHome;
+  process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "guard test passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
 });
 
 afterEach(async () => {
   delete process.env.SGW_HOME;
+  delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
   delete process.env.SGW_DISABLE_KEYCHAIN;
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
   }
 });
 
@@ -124,6 +127,7 @@ describe("guard mode", () => {
         env: {
           ...process.env,
           SGW_HOME: tmpHome,
+          SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
           SGW_MASTER_PASSPHRASE: "guard cli passphrase",
           SGW_DISABLE_KEYCHAIN: "1",
           OPENAI_API_KEY: raw

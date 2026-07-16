@@ -13,17 +13,22 @@ let tmpHome = "";
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-ssh-test-"));
   process.env.SGW_HOME = tmpHome;
+  process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "ssh test passphrase";
   process.env.SGW_SSH_CONTROL_DIR = path.join(tmpHome, "ssh-control");
 });
 
 afterEach(async () => {
   delete process.env.SGW_HOME;
+  delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
   delete process.env.SGW_SSH_CONTROL_DIR;
   delete process.env.SGW_SSH_CLI;
   delete process.env.SGW_FAKE_SSH_LOG;
-  if (tmpHome) await rm(tmpHome, { recursive: true, force: true });
+  if (tmpHome) {
+    await rm(tmpHome, { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+  }
 });
 
 describe("s-gw-owned SSH sessions", () => {
@@ -81,6 +86,45 @@ describe("s-gw-owned SSH sessions", () => {
       "Codex owned ssh other host"
     );
     expect(otherTarget.state).toBe("pending");
+  });
+
+  it("keeps SSH one-shot execution durable after reusable approval", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "durable ssh one-shot key",
+      type: "private-key",
+      value: fakePrivateKey(),
+      policy: {
+        injectEnv: "SGW_SSH_PRIVATE_KEY",
+        allowedCommands: [SGW_SSH_SESSION_COMMAND]
+      }
+    });
+    const firstAction = buildSshSessionAction({
+      target: "ubuntu@example.test",
+      args: ["hostname"],
+      injectEnv: "SGW_SSH_PRIVATE_KEY"
+    });
+    const first = await store.createRequest(record.handle, firstAction, "Codex durable ssh first run");
+    await store.approveRequest(first.id, {
+      mode: "timed-session",
+      durationMs: 8 * 60 * 60 * 1000,
+      agentScope: "same-agent"
+    });
+
+    const admission = await store.prepareOneShotExecution(
+      record.handle,
+      buildSshSessionAction({
+        target: "ubuntu@example.test",
+        args: ["uptime"],
+        injectEnv: "SGW_SSH_PRIVATE_KEY"
+      }),
+      "Codex durable ssh follow-up"
+    );
+
+    expect(admission.kind).toBe("request");
+    if (admission.kind !== "request") throw new Error("Expected a durable SSH request.");
+    expect(admission.request.state).toBe("approved");
+    expect((await store.listRequests()).filter((request) => request.handle === record.handle)).toHaveLength(2);
   });
 
   it("opens one ControlMaster and runs later commands over the s-gw control socket", async () => {

@@ -41,6 +41,7 @@ afterEach(async () => {
   delete process.env.SGW_FAKE_SECURITY_CAPTURE;
   delete process.env.SGW_FAKE_KEYCHAIN_DB;
   delete process.env.SGW_HOME;
+  delete process.env.SGW_RECOVERY_HOME;
   if (tmpDir) {
     await rm(tmpDir, { recursive: true, force: true });
   }
@@ -143,6 +144,7 @@ describe("unlock passphrase provider", () => {
     expect((await stat(archivedReplacement)).mode & 0o777).toBe(0o700);
 
     process.env.SGW_HOME = sgwHome;
+    process.env.SGW_RECOVERY_HOME = `${sgwHome}-recovery`;
     expect(keychainInfo().helperPath).toBe(helperPath);
   });
 
@@ -165,6 +167,7 @@ describe("unlock passphrase provider", () => {
     await writeFile(packageHelper, "replacement helper identity\n");
     await chmod(packageHelper, 0o755);
     process.env.SGW_HOME = sgwHome;
+    process.env.SGW_RECOVERY_HOME = `${sgwHome}-recovery`;
     installPersistentKeychainHelper({ sourcePath: original, sgwHome });
 
     expect(pinPackagedKeychainHelper(packageRoot)).toMatchObject({
@@ -421,6 +424,7 @@ process.exit(2);
   await chmod(security, 0o700);
 
   process.env.SGW_HOME = sgwHome;
+  process.env.SGW_RECOVERY_HOME = `${sgwHome}-recovery`;
   process.env.SGW_FAKE_KEYCHAIN_DB = dbPath;
   process.env.SGW_KEYCHAIN_INSPECTOR = inspector;
   process.env.SGW_KEYCHAIN_LEGACY_HELPERS = legacy;

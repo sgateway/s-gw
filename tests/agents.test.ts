@@ -20,6 +20,15 @@ const defenseClawConnectors = [
   "omnigent"
 ];
 
+function cliEnv(): NodeJS.ProcessEnv {
+  const home = process.env.SGW_HOME;
+  const recoveryHome = process.env.SGW_RECOVERY_HOME;
+  if (!home || !recoveryHome) {
+    throw new Error("Agent CLI tests require isolated s-gw homes.");
+  }
+  return { ...process.env, SGW_HOME: home, SGW_RECOVERY_HOME: recoveryHome };
+}
+
 describe("agent profiles", () => {
   it("includes DefenseClaw's first-class connector set", () => {
     const profiles = listAgentProfiles();
@@ -153,6 +162,7 @@ describe("agent profiles", () => {
     const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
     const out = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "mcp-snippet", "codex"], {
       cwd: process.cwd(),
+      env: cliEnv(),
       encoding: "utf8"
     });
 
@@ -162,6 +172,7 @@ describe("agent profiles", () => {
 
     const planned = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "show", "omnigent"], {
       cwd: process.cwd(),
+      env: cliEnv(),
       encoding: "utf8"
     });
     expect(JSON.parse(planned).mcpSnippet).toBeNull();
@@ -171,6 +182,7 @@ describe("agent profiles", () => {
     const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
     const codex = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "codeguard-plan", "codex"], {
       cwd: process.cwd(),
+      env: cliEnv(),
       encoding: "utf8"
     });
     const codexPlan = JSON.parse(codex);

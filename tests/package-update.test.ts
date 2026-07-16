@@ -81,9 +81,14 @@ describe("scoped package migration", () => {
     const command = process.platform === "win32"
       ? path.join(npmPrefix, "s-gw.cmd")
       : path.join(npmPrefix, "bin", "s-gw");
+    const env = {
+      ...process.env,
+      SGW_HOME: sgwHome,
+      SGW_RECOVERY_HOME: `${sgwHome}-recovery`
+    };
     const output = process.platform === "win32"
-      ? await execFileAsync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${command}"`])
-      : await execFileAsync(command);
+      ? await execFileAsync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${command}"`], { env })
+      : await execFileAsync(command, [], { env });
     expect(output.stdout.trim()).toBe(`@s-gw/s-gw ${CURRENT_VERSION}`);
   }, 30_000);
 
@@ -175,6 +180,7 @@ describe("scoped package migration", () => {
       HOME: tmp,
       USERPROFILE: tmp,
       SGW_HOME: sgwHome,
+      SGW_RECOVERY_HOME: `${sgwHome}-recovery`,
       SGW_DISABLE_UPDATE_CHECK: "1",
       SGW_SKIP_APP_STOP: "1"
     };
@@ -637,6 +643,8 @@ describe("scoped package migration", () => {
         ...process.env,
         HOME: home,
         NPM_CONFIG_PREFIX: npmPrefix,
+        SGW_HOME: path.join(home, ".s-gw"),
+        SGW_RECOVERY_HOME: path.join(home, ".s-gw-recovery"),
         SGW_SKIP_APP_STOP: "1",
         PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ""}`
       },

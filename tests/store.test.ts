@@ -1,9 +1,9 @@
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { executeApprovedRequest } from "../src/executor.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { SecretStore } from "../src/store.js";
@@ -22,9 +22,30 @@ function onePasswordFixtureRef(): string {
   return ["op://", "Example", "/e2e-token/credential"].join("");
 }
 
+async function writeStoreLock(lockPath: string, state: { pid: number; token: string; createdAt: string }): Promise<void> {
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(path.join(lockPath, `owner-${state.token}.json`), `${JSON.stringify({ version: 1, ...state })}\n`);
+}
+
+async function externalControlPlaneDir(home = tmpHome, recoveryHome = `${home}-recovery`): Promise<string> {
+  const root = path.join(recoveryHome, "control-plane");
+  const entries = await readdir(root);
+  const namespaces: string[] = [];
+  for (const entry of entries) {
+    if ((await stat(path.join(root, entry))).isDirectory()) {
+      namespaces.push(entry);
+    }
+  }
+  if (namespaces.length !== 1) {
+    throw new Error(`Expected one recovery namespace in ${root}.`);
+  }
+  return path.join(root, namespaces[0]);
+}
+
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-test-"));
   process.env.SGW_HOME = tmpHome;
+  process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "local test passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
   process.env.SGW_DISABLE_ONEPASSWORD_BACKUP = "1";
@@ -124,6 +145,35 @@ describe("SecretStore", () => {
     expect(backupText).not.toContain(firstSecret);
     expect(backupText).not.toContain(secondSecret);
     expect(backupText).not.toContain("op://");
+  });
+
+  it("seals the next control state before replacing the primary ledger", async () => {
+    if (process.platform === "win32") return;
+
+    const store = new SecretStore();
+    await store.addSecret({
+      name: "preseal candidate token",
+      type: "credential",
+      value: "preseal-candidate-secret-value-123456789",
+      policy: { injectEnv: "PRESEAL_CANDIDATE_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const primaryBefore = await readFile(store.storePath, "utf8");
+    const manifestBefore = await readFile(path.join(tmpHome, ".store-control.json"), "utf8");
+    const externalDir = await externalControlPlaneDir();
+
+    await chmod(externalDir, 0o500);
+    try {
+      await expect(store.addApprovalPolicyRule({
+        name: "This write cannot be sealed",
+        decision: "allow",
+        conditions: { agents: ["codex"] }
+      })).rejects.toThrow(/EACCES|permission denied|operation not permitted/i);
+    } finally {
+      await chmod(externalDir, 0o700);
+    }
+
+    expect(await readFile(store.storePath, "utf8")).toBe(primaryBefore);
+    expect(await readFile(path.join(tmpHome, ".store-control.json"), "utf8")).toBe(manifestBefore);
   });
 
   it("recovers a missing ledger without losing credentials or approval policies", async () => {
@@ -263,6 +313,519 @@ describe("SecretStore", () => {
     expect((await readdir(checkpointDir)).length).toBeGreaterThan(before);
   });
 
+  it("does not churn rolling backups for high-frequency request traffic", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "request backup cadence token",
+      type: "api-token",
+      value: fakeOpenAiToken("request_backup_cadence"),
+      policy: { injectEnv: "REQUEST_BACKUP_CADENCE_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "REQUEST_BACKUP_CADENCE_TOKEN"
+    });
+    const before = await store.listStoreBackups();
+
+    for (let index = 0; index < 8; index += 1) {
+      await store.createRequest(secret.handle, action, `request backup cadence ${index}`);
+    }
+
+    expect(await store.listStoreBackups()).toHaveLength(before.length);
+    await store.addApprovalPolicyRule({
+      name: "Durable backup cadence policy",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    expect(await store.listStoreBackups()).toHaveLength(before.length + 1);
+  });
+
+  it("does not churn durable backups for reusable approval traffic", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "reusable request backup token",
+      type: "api-token",
+      value: fakeOpenAiToken("reusable_request_backup"),
+      policy: { injectEnv: "REUSABLE_REQUEST_BACKUP_TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "REUSABLE_REQUEST_BACKUP_TOKEN"
+    });
+    const context = { agentName: "codex" };
+    const first = await store.createRequest(secret.handle, action, "reusable request backup", context);
+    await store.approveRequest(first.id, { mode: "timed-session", durationMs: 60 * 60 * 1000 });
+
+    const backupCount = (await store.listStoreBackups()).length;
+    const externalDir = await externalControlPlaneDir();
+    const checkpointCount = (await readdir(externalDir)).filter((entry) => entry.startsWith("checkpoint-")).length;
+
+    for (let index = 0; index < 8; index += 1) {
+      const request = await store.createRequest(secret.handle, action, `reusable request backup ${index}`, context);
+      expect(request.state).toBe("approved");
+    }
+
+    expect(await store.listStoreBackups()).toHaveLength(backupCount);
+    expect((await readdir(externalDir)).filter((entry) => entry.startsWith("checkpoint-"))).toHaveLength(checkpointCount);
+  });
+
+  it("keeps an append-only control-plane history instead of pruning it", async () => {
+    const store = new SecretStore();
+    await store.addSecret({
+      name: "checkpoint history token",
+      type: "api-token",
+      value: fakeOpenAiToken("checkpoint_history"),
+      policy: { injectEnv: "CHECKPOINT_HISTORY_TOKEN" }
+    });
+
+    for (let index = 0; index < 52; index += 1) {
+      await store.addApprovalPolicyRule({
+        name: `Checkpoint policy ${index}`,
+        decision: "allow",
+        conditions: { agents: ["codex"] }
+      });
+    }
+
+    const externalDir = await externalControlPlaneDir();
+    const checkpoints = (await readdir(externalDir)).filter((entry) => entry.startsWith("checkpoint-"));
+    expect(checkpoints.length).toBeGreaterThan(50);
+    expect((await stat(path.join(externalDir, checkpoints[0]))).mode & 0o200).toBe(0);
+  }, 15_000);
+
+  it("keeps the newest sealed checkpoint when the clock moves backwards", async () => {
+    const store = new SecretStore();
+    await store.addSecret({
+      name: "clock-safe checkpoint token",
+      type: "api-token",
+      value: fakeOpenAiToken("clock_safe_checkpoint"),
+      policy: { injectEnv: "CLOCK_SAFE_CHECKPOINT_TOKEN" }
+    });
+
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now - 60 * 60 * 1000);
+    try {
+      await store.addApprovalPolicyRule({
+        name: "Clock-safe durable policy",
+        decision: "allow",
+        conditions: { agents: ["codex"] }
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
+
+    expect((await store.listApprovalPolicyRules()).some((rule) => rule.name === "Clock-safe durable policy")).toBe(true);
+  });
+
+  it("keeps separate recovery namespaces when ledgers share one recovery home", async () => {
+    const firstHome = await mkdtemp(path.join(os.tmpdir(), "sgw-first-ledger-"));
+    const secondHome = await mkdtemp(path.join(os.tmpdir(), "sgw-second-ledger-"));
+    const sharedRecoveryHome = await mkdtemp(path.join(os.tmpdir(), "sgw-shared-recovery-"));
+    const originalHome = process.env.SGW_HOME;
+    const originalRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    try {
+      process.env.SGW_HOME = firstHome;
+      process.env.SGW_RECOVERY_HOME = sharedRecoveryHome;
+      const first = await new SecretStore(firstHome).addSecret({
+        name: "first shared recovery token",
+        type: "api-token",
+        value: fakeOpenAiToken("first_shared_recovery"),
+        policy: { injectEnv: "FIRST_SHARED_RECOVERY_TOKEN" }
+      });
+
+      process.env.SGW_HOME = secondHome;
+      const second = await new SecretStore(secondHome).addSecret({
+        name: "second shared recovery token",
+        type: "api-token",
+        value: fakeOpenAiToken("second_shared_recovery"),
+        policy: { injectEnv: "SECOND_SHARED_RECOVERY_TOKEN" }
+      });
+
+      const namespaces = await readdir(path.join(sharedRecoveryHome, "control-plane"));
+      expect(namespaces).toHaveLength(2);
+
+      process.env.SGW_HOME = firstHome;
+      expect((await new SecretStore(firstHome).listHandles()).map((item) => item.handle)).toEqual([first.handle]);
+      process.env.SGW_HOME = secondHome;
+      expect((await new SecretStore(secondHome).listHandles()).map((item) => item.handle)).toEqual([second.handle]);
+    } finally {
+      process.env.SGW_HOME = originalHome;
+      process.env.SGW_RECOVERY_HOME = originalRecoveryHome;
+      await rm(firstHome, { recursive: true, force: true });
+      await rm(secondHome, { recursive: true, force: true });
+      await rm(sharedRecoveryHome, { recursive: true, force: true });
+    }
+  });
+
+  it("does not cross-restore an unanchored legacy checkpoint from a shared recovery home", async () => {
+    const firstHome = await mkdtemp(path.join(os.tmpdir(), "sgw-first-legacy-ledger-"));
+    const secondHome = await mkdtemp(path.join(os.tmpdir(), "sgw-second-legacy-ledger-"));
+    const sharedRecoveryHome = await mkdtemp(path.join(os.tmpdir(), "sgw-shared-legacy-recovery-"));
+    const originalHome = process.env.SGW_HOME;
+    const originalRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    try {
+      process.env.SGW_HOME = firstHome;
+      process.env.SGW_RECOVERY_HOME = sharedRecoveryHome;
+      const first = new SecretStore(firstHome);
+      await first.addSecret({
+        name: "legacy source token",
+        type: "api-token",
+        value: fakeOpenAiToken("legacy_shared_source"),
+        policy: { injectEnv: "LEGACY_SHARED_SOURCE" }
+      });
+
+      const firstRecoveryDir = await externalControlPlaneDir(firstHome, sharedRecoveryHome);
+      const head = JSON.parse(await readFile(path.join(firstRecoveryDir, "head.json"), "utf8"));
+      const snapshot = await readFile(path.join(firstRecoveryDir, head.checkpoint), "utf8");
+      await writeFile(
+        path.join(sharedRecoveryHome, "control-plane", "store-20260715T000000-legacy-1.json"),
+        snapshot
+      );
+
+      process.env.SGW_HOME = secondHome;
+      await expect(new SecretStore(secondHome).listHandles()).rejects.toThrow(/refusing to create an empty ledger/i);
+    } finally {
+      process.env.SGW_HOME = originalHome;
+      process.env.SGW_RECOVERY_HOME = originalRecoveryHome;
+      await rm(firstHome, { recursive: true, force: true });
+      await rm(secondHome, { recursive: true, force: true });
+      await rm(sharedRecoveryHome, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the configured recovery home changes after sealing", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "recovery vault binding token",
+      type: "api-token",
+      value: fakeOpenAiToken("recovery_vault_binding"),
+      policy: { injectEnv: "RECOVERY_VAULT_BINDING" }
+    });
+    const originalRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    const alternateRecoveryHome = await mkdtemp(path.join(os.tmpdir(), "sgw-alternate-recovery-"));
+
+    try {
+      process.env.SGW_RECOVERY_HOME = alternateRecoveryHome;
+      await expect(new SecretStore().listHandles()).rejects.toThrow(/recovery home changed/i);
+
+      const sourceDir = await externalControlPlaneDir();
+      const targetDir = path.join(alternateRecoveryHome, "control-plane", path.basename(sourceDir));
+      await mkdir(targetDir, { recursive: true, mode: 0o700 });
+      for (const entry of await readdir(sourceDir)) {
+        const source = path.join(sourceDir, entry);
+        const target = path.join(targetDir, entry);
+        if (!(await stat(source)).isFile()) {
+          continue;
+        }
+        await writeFile(target, await readFile(source));
+        if (entry.startsWith("checkpoint-")) {
+          await chmod(target, 0o400);
+        }
+      }
+
+      expect((await new SecretStore().listHandles()).map((item) => item.handle)).toEqual([secret.handle]);
+    } finally {
+      process.env.SGW_RECOVERY_HOME = originalRecoveryHome;
+      await rm(alternateRecoveryHome, { recursive: true, force: true });
+    }
+
+    expect((await new SecretStore().listHandles()).map((item) => item.handle)).toEqual([secret.handle]);
+  });
+
+  it("restores the sealed external checkpoint when the primary and manifest are both replaced", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "sealed checkpoint token",
+      type: "api-token",
+      value: fakeOpenAiToken("sealed_checkpoint"),
+      policy: { injectEnv: "SEALED_CHECKPOINT_TOKEN" }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Sealed checkpoint policy",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+
+    const fixtureHome = await mkdtemp(path.join(os.tmpdir(), "sgw-empty-ledger-"));
+    const fixtureRecoveryHome = `${tmpHome}-recovery`;
+    const originalHome = process.env.SGW_HOME;
+    const originalRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    let emptyStore = "";
+    let emptyManifest = "";
+    try {
+      process.env.SGW_HOME = fixtureHome;
+      process.env.SGW_RECOVERY_HOME = fixtureRecoveryHome;
+      await new SecretStore().init();
+      emptyStore = await readFile(path.join(fixtureHome, "store.json"), "utf8");
+      emptyManifest = await readFile(path.join(fixtureHome, ".store-control.json"), "utf8");
+    } finally {
+      process.env.SGW_HOME = originalHome;
+      process.env.SGW_RECOVERY_HOME = originalRecoveryHome;
+      await rm(fixtureHome, { recursive: true, force: true });
+    }
+
+    await writeFile(store.storePath, emptyStore);
+    await writeFile(path.join(tmpHome, ".store-control.json"), emptyManifest);
+
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    expect((await recovered.listApprovalPolicyRules()).map((item) => item.id)).toContain(rule.id);
+  });
+
+  it("fails closed when the manifest-pinned sealed checkpoint disappears", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "pinned checkpoint token",
+      type: "api-token",
+      value: fakeOpenAiToken("pinned_checkpoint"),
+      policy: { injectEnv: "PINNED_CHECKPOINT_TOKEN" }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Pinned checkpoint policy",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    const primaryBefore = await readFile(store.storePath, "utf8");
+    const manifest = JSON.parse(await readFile(path.join(tmpHome, ".store-control.json"), "utf8"));
+    const externalDir = await externalControlPlaneDir();
+
+    expect(manifest).toMatchObject({ recoverySealed: true });
+    expect(typeof manifest.recoveryCheckpoint).toBe("string");
+    expect((await readdir(externalDir)).filter((entry) => entry.startsWith("checkpoint-")).length).toBeGreaterThan(1);
+    await rm(path.join(externalDir, manifest.recoveryCheckpoint));
+
+    await expect(new SecretStore().listHandles()).rejects.toThrow(
+      /sealed recovery anchor is unavailable or does not match.*refusing to roll back credentials or policies/i
+    );
+    expect(await readFile(store.storePath, "utf8")).toBe(primaryBefore);
+
+    const primary = JSON.parse(primaryBefore);
+    expect(primary.secrets.map((item: { handle: string }) => item.handle)).toContain(secret.handle);
+    expect(primary.approvalPolicyRules.map((item: { id: string }) => item.id)).toContain(rule.id);
+  });
+
+  it("fails closed when a sealed manifest is missing its recovery anchors", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "incomplete sealed manifest token",
+      type: "api-token",
+      value: fakeOpenAiToken("incomplete_sealed_manifest"),
+      policy: { injectEnv: "INCOMPLETE_SEALED_MANIFEST_TOKEN" }
+    });
+    const primaryBefore = await readFile(store.storePath, "utf8");
+    const controlPath = path.join(tmpHome, ".store-control.json");
+    const manifest = JSON.parse(await readFile(controlPath, "utf8"));
+    delete manifest.recoveryCheckpoint;
+    delete manifest.recoveryVaultId;
+    delete manifest.recoveryNamespace;
+    await writeFile(controlPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    await expect(new SecretStore().listHandles()).rejects.toThrow(/control manifest is invalid/i);
+    expect(await readFile(store.storePath, "utf8")).toBe(primaryBefore);
+    expect(JSON.parse(primaryBefore).secrets.map((item: { handle: string }) => item.handle)).toContain(secret.handle);
+  });
+
+  it("does not bootstrap a replacement ledger after its manifest and marker disappear", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "manifestless replacement token",
+      type: "api-token",
+      value: fakeOpenAiToken("manifestless_replacement"),
+      policy: { injectEnv: "MANIFESTLESS_REPLACEMENT_TOKEN" }
+    });
+
+    const fixtureHome = await mkdtemp(path.join(os.tmpdir(), "sgw-empty-ledger-"));
+    const fixtureRecoveryHome = `${fixtureHome}-recovery`;
+    const originalHome = process.env.SGW_HOME;
+    const originalRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    let emptyStore = "";
+    try {
+      process.env.SGW_HOME = fixtureHome;
+      process.env.SGW_RECOVERY_HOME = fixtureRecoveryHome;
+      await new SecretStore().init();
+      emptyStore = await readFile(path.join(fixtureHome, "store.json"), "utf8");
+    } finally {
+      process.env.SGW_HOME = originalHome;
+      process.env.SGW_RECOVERY_HOME = originalRecoveryHome;
+      await rm(fixtureHome, { recursive: true, force: true });
+      await rm(fixtureRecoveryHome, { recursive: true, force: true });
+    }
+
+    await writeFile(store.storePath, emptyStore);
+    await rm(path.join(tmpHome, ".store-control.json"));
+    await rm(path.join(tmpHome, ".store-initialized"));
+
+    expect((await new SecretStore().listHandles()).map((item) => item.handle)).toContain(secret.handle);
+  });
+
+  it("migrates a legacy external control-plane checkpoint into a sealed anchor", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "legacy checkpoint token",
+      type: "api-token",
+      value: fakeOpenAiToken("legacy_checkpoint"),
+      policy: { injectEnv: "LEGACY_CHECKPOINT_TOKEN" }
+    });
+    const externalDir = await externalControlPlaneDir();
+    const head = JSON.parse(await readFile(path.join(externalDir, "head.json"), "utf8"));
+    const snapshot = await readFile(path.join(externalDir, head.checkpoint), "utf8");
+    const legacyDir = path.join(`${tmpHome}-recovery`, "control-plane");
+    await writeFile(path.join(legacyDir, "store-20260715T000000-legacy-1.json"), snapshot);
+    await rm(externalDir, { recursive: true, force: true });
+
+    const controlPath = path.join(tmpHome, ".store-control.json");
+    const legacyManifest = JSON.parse(await readFile(controlPath, "utf8"));
+    delete legacyManifest.recoverySealed;
+    await writeFile(controlPath, `${JSON.stringify(legacyManifest, null, 2)}\n`);
+
+    const migrated = new SecretStore();
+    expect((await migrated.listHandles()).map((item) => item.handle)).toContain(secret.handle);
+    expect(JSON.parse(await readFile(controlPath, "utf8"))).toMatchObject({ recoverySealed: true });
+    const migratedDir = await externalControlPlaneDir();
+    expect((await readdir(migratedDir)).some((entry) => entry.startsWith("checkpoint-"))).toBe(true);
+  });
+
+  it("does not commit a pending state with the wrong predecessor fingerprint", async () => {
+    const store = new SecretStore();
+    const original = await store.addSecret({
+      name: "known control state",
+      type: "api-token",
+      value: fakeOpenAiToken("known_control_state"),
+      policy: { injectEnv: "KNOWN_CONTROL_STATE" }
+    });
+
+    const fixtureHome = await mkdtemp(path.join(os.tmpdir(), "sgw-pending-fixture-"));
+    const fixtureRecoveryHome = `${fixtureHome}-recovery`;
+    const originalHome = process.env.SGW_HOME;
+    const originalRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    let replacementStore = "";
+    let replacementFingerprint = "";
+    let replacementHandle = "";
+    try {
+      process.env.SGW_HOME = fixtureHome;
+      process.env.SGW_RECOVERY_HOME = fixtureRecoveryHome;
+      const replacement = await new SecretStore().addSecret({
+        name: "untrusted pending state",
+        type: "api-token",
+        value: fakeOpenAiToken("untrusted_pending_state"),
+        policy: { injectEnv: "UNTRUSTED_PENDING_STATE" }
+      });
+      replacementHandle = replacement.handle;
+      replacementStore = await readFile(path.join(fixtureHome, "store.json"), "utf8");
+      replacementFingerprint = JSON.parse(
+        await readFile(path.join(fixtureHome, ".store-control.json"), "utf8")
+      ).fingerprint;
+    } finally {
+      process.env.SGW_HOME = originalHome;
+      process.env.SGW_RECOVERY_HOME = originalRecoveryHome;
+      await rm(fixtureHome, { recursive: true, force: true });
+      await rm(fixtureRecoveryHome, { recursive: true, force: true });
+    }
+
+    await writeFile(store.storePath, replacementStore);
+    await writeFile(path.join(tmpHome, ".store-control.pending.json"), `${JSON.stringify({
+      version: 1,
+      previousFingerprint: "0".repeat(64),
+      nextFingerprint: replacementFingerprint,
+      createdAt: new Date().toISOString()
+    })}\n`);
+
+    const recovered = new SecretStore();
+    const handles = (await recovered.listHandles()).map((item) => item.handle);
+    expect(handles).toContain(original.handle);
+    expect(handles).not.toContain(replacementHandle);
+  });
+
+  it("does not replace the ledger when the external checkpoint cannot be written", async () => {
+    const store = new SecretStore();
+    const first = await store.addSecret({
+      name: "durable before failure",
+      type: "api-token",
+      value: fakeOpenAiToken("durable_before_failure"),
+      policy: { injectEnv: "DURABLE_BEFORE_FAILURE" }
+    });
+    const recoveryHome = process.env.SGW_RECOVERY_HOME;
+    const unavailableRecoveryHome = path.join(tmpHome, "unavailable-recovery");
+    await writeFile(unavailableRecoveryHome, "not a directory\n");
+    process.env.SGW_RECOVERY_HOME = unavailableRecoveryHome;
+
+    await expect(store.addSecret({
+      name: "must not commit",
+      type: "api-token",
+      value: fakeOpenAiToken("must_not_commit"),
+      policy: { injectEnv: "MUST_NOT_COMMIT" }
+    })).rejects.toThrow();
+
+    process.env.SGW_RECOVERY_HOME = recoveryHome;
+    const recovered = new SecretStore();
+    expect((await recovered.listHandles()).map((item) => item.handle)).toEqual([first.handle]);
+  });
+
+  it("fails closed instead of trusting a rolling backup when sealed recovery is unavailable", async () => {
+    const store = new SecretStore();
+    await store.addSecret({
+      name: "sealed recovery required token",
+      type: "api-token",
+      value: fakeOpenAiToken("sealed_recovery_required"),
+      policy: { injectEnv: "SEALED_RECOVERY_REQUIRED_TOKEN" }
+    });
+    const current = await readFile(store.storePath, "utf8");
+    await writeFile(
+      path.join(tmpHome, "backups", "store-20260715T000000-999-1.json"),
+      current
+    );
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+    await writeFile(store.storePath, "not valid json\n");
+
+    await expect(new SecretStore().listHandles()).rejects.toThrow(/invalid and no verified recovery copy/i);
+  });
+
+  it("does not steal a lock held by a live process", async () => {
+    const store = new SecretStore();
+    await store.init();
+    const lockPath = `${store.storePath}.lock`;
+    const previousTimeout = process.env.SGW_TEST_LOCK_TIMEOUT_MS;
+    await writeStoreLock(lockPath, {
+      pid: process.pid,
+      token: "live-process-lock-token-1234567890",
+      createdAt: "2000-01-01T00:00:00.000Z"
+    });
+    process.env.SGW_TEST_LOCK_TIMEOUT_MS = "30";
+
+    try {
+      await expect(store.addApprovalPolicyRule({
+        name: "Blocked by live lock",
+        decision: "allow",
+        conditions: { agents: ["codex"] }
+      })).rejects.toThrow(/timed out waiting/i);
+    } finally {
+      if (previousTimeout === undefined) {
+        delete process.env.SGW_TEST_LOCK_TIMEOUT_MS;
+      } else {
+        process.env.SGW_TEST_LOCK_TIMEOUT_MS = previousTimeout;
+      }
+      await rm(lockPath, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a lock only after its owner is definitely dead", async () => {
+    const store = new SecretStore();
+    await store.init();
+    await writeStoreLock(`${store.storePath}.lock`, {
+      pid: 2147483647,
+      token: "dead-process-lock-token-1234567890",
+      createdAt: "2000-01-01T00:00:00.000Z"
+    });
+
+    const rule = await store.addApprovalPolicyRule({
+      name: "Recovered dead lock",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    expect(rule.name).toBe("Recovered dead lock");
+  });
+
   it("fails closed when recovery evidence exists but no valid ledger remains", async () => {
     const store = new SecretStore();
     await store.addSecret({
@@ -275,7 +838,7 @@ describe("SecretStore", () => {
     await rm(path.join(tmpHome, "backups"), { recursive: true, force: true });
     await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
 
-    await expect(new SecretStore().listHandles()).rejects.toThrow(/refusing to create an empty ledger/i);
+    await expect(new SecretStore().listHandles()).rejects.toThrow(/refusing to (create an empty ledger|initialize from an unanchored ledger)/i);
     await expect(readFile(store.storePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -886,6 +1449,45 @@ describe("SecretStore", () => {
     expect(second.approvalGrantId).toBe(approved.approvalGrantId);
   });
 
+  it("blocks a revoked grant's auto-approved request but keeps the manual approval valid", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "revoked auto-approved request token",
+      type: "api-token",
+      value: "revoked-auto-approved-request-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_REVOKED_AUTO_APPROVED_REQUEST",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('approved')"],
+      injectEnv: "SGW_REVOKED_AUTO_APPROVED_REQUEST"
+    });
+    const manual = await store.createRequest(record.handle, action, "Codex manual approval");
+    const approved = await store.approveRequest(manual.id, {
+      mode: "timed-session",
+      durationMs: 60 * 60 * 1000
+    });
+    const automatic = await store.createRequest(record.handle, action, "Codex reusable approval");
+    expect(manual.approvalSource).toBeUndefined();
+    expect(approved.approvalSource).toBe("manual");
+    expect(automatic.approvalSource).toBe("grant");
+
+    const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    delete raw.requests.find((request: { id: string }) => request.id === automatic.id).approvalSource;
+    await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
+
+    const reloaded = new SecretStore();
+    await reloaded.revokeApprovalGrant(approved.approvalGrantId!);
+    await expect(executeApprovedRequest(reloaded, automatic.id, { engine: "typescript" })).rejects.toThrow(/revoked or expired/i);
+    expect((await reloaded.getRequest(automatic.id)).state).toBe("denied");
+
+    const summary = await executeApprovedRequest(reloaded, manual.id, { engine: "typescript" });
+    expect(summary.stdout).toBe("approved");
+  });
+
   it("scopes login-session approval reuse to the current login session id", async () => {
     process.env.SGW_LOGIN_SESSION_ID = "login-session-a";
     const store = new SecretStore();
@@ -965,6 +1567,412 @@ describe("SecretStore", () => {
     expect(otherAgent.state).toBe("pending");
   });
 
+  it("runs policy-authorized one-shot commands without rewriting the ledger", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "one-shot policy token",
+      type: "api-token",
+      value: "one-shot-policy-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_ONE_SHOT_POLICY_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Allow one-shot policy execution",
+      decision: "allow",
+      conditions: {
+        handles: [record.handle],
+        agents: ["Codex"],
+        commands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('ok')"],
+      injectEnv: "SGW_ONE_SHOT_POLICY_TOKEN"
+    });
+    const before = await readFile(store.storePath, "utf8");
+    const beforeMtime = (await stat(store.storePath)).mtimeMs;
+    const headPath = path.join(await externalControlPlaneDir(), "head.json");
+    const headBefore = await readFile(headPath, "utf8");
+    const headBeforeMtime = (await stat(headPath)).mtimeMs;
+
+    for (let index = 0; index < 12; index += 1) {
+      const admission = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run");
+      expect(admission.kind).toBe("reusable");
+      if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+      const summary = await executeReusablePermit(store, admission.permit, { engine: "typescript" });
+      expect(summary.stdout).toBe("ok");
+    }
+
+    expect(await readFile(store.storePath, "utf8")).toBe(before);
+    expect((await stat(store.storePath)).mtimeMs).toBe(beforeMtime);
+    expect(await readFile(headPath, "utf8")).toBe(headBefore);
+    expect((await stat(headPath)).mtimeMs).toBe(headBeforeMtime);
+    await store.setApprovalPolicyRuleEnabled(rule.id, false);
+
+    const invalidated = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run");
+    expect(invalidated.kind).toBe("request");
+  }, 15_000);
+
+  it("rejects a serialized reusable execution permit", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "opaque one-shot permit token",
+      type: "api-token",
+      value: "opaque-one-shot-permit-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_OPAQUE_ONE_SHOT_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    await store.addApprovalPolicyRule({
+      name: "Allow opaque permit execution",
+      decision: "allow",
+      conditions: { handles: [record.handle], commands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('opaque')"],
+      injectEnv: "SGW_OPAQUE_ONE_SHOT_TOKEN"
+    });
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex opaque permit run");
+    expect(admission.kind).toBe("reusable");
+    if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+
+    const copiedPermit = JSON.parse(JSON.stringify(admission.permit));
+    await expect(executeReusablePermit(store, copiedPermit)).rejects.toThrow(/invalid s-gw reusable execution permit/i);
+
+    const summary = await executeReusablePermit(store, admission.permit, { engine: "typescript" });
+    expect(summary.stdout).toBe("opaque");
+  });
+
+  it("revalidates a reusable permit after delayed secret materialization", async () => {
+    const enteredPath = path.join(tmpHome, "op-read-entered");
+    const releasePath = path.join(tmpHome, "op-read-release");
+    process.env.SGW_OP_CLI = await writeGatedFakeOp(
+      "gated-one-shot-secret-value-123456789",
+      enteredPath,
+      releasePath
+    );
+
+    const store = new SecretStore();
+    const record = await store.addOnePasswordReference({
+      name: "gated one-shot permit token",
+      type: "api-token",
+      reference: onePasswordFixtureRef(),
+      policy: {
+        injectEnv: "SGW_GATED_ONE_SHOT_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Allow gated one-shot permit execution",
+      decision: "allow",
+      conditions: { handles: [record.handle], commands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('must-not-run')"],
+      injectEnv: "SGW_GATED_ONE_SHOT_TOKEN"
+    });
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex gated permit run");
+    expect(admission.kind).toBe("reusable");
+    if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+
+    const execution = executeReusablePermit(store, admission.permit, { engine: "typescript" });
+    try {
+      await waitForFile(enteredPath);
+      await store.setApprovalPolicyRuleEnabled(rule.id, false);
+    } finally {
+      await writeFile(releasePath, "release\n");
+    }
+
+    await expect(execution).rejects.toThrow(/authorization changed|approval policy changed/i);
+  });
+
+  it("caches policy-authorized 1Password one-shot execution after the first run", async () => {
+    const counterPath = path.join(tmpHome, "op-policy-read-count.txt");
+    process.env.SGW_OP_CLI = await writeCountingFakeOp("op-policy-cache-secret-value-1234567890", counterPath);
+
+    const store = new SecretStore();
+    const record = await store.addOnePasswordReference({
+      name: "1password policy-cached token",
+      type: "api-token",
+      reference: onePasswordFixtureRef(),
+      policy: {
+        injectEnv: "SGW_OP_POLICY_CACHED_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Allow policy-cached 1Password execution",
+      decision: "allow",
+      conditions: { handles: [record.handle], commands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "console.log(process.env.SGW_OP_POLICY_CACHED_TOKEN)"],
+      injectEnv: "SGW_OP_POLICY_CACHED_TOKEN"
+    });
+
+    const first = await store.prepareOneShotExecution(record.handle, action, "Codex policy-cached one-shot run");
+    expect(first.kind).toBe("reusable");
+    if (first.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+    const firstSummary = await executeReusablePermit(store, first.permit, { engine: "typescript" });
+    expect(firstSummary.stdout).toContain(tokenForHandle(record.handle));
+    const afterFirst = await readFile(store.storePath, "utf8");
+
+    const second = await store.prepareOneShotExecution(record.handle, action, "Codex policy-cached one-shot run");
+    expect(second.kind).toBe("reusable");
+    if (second.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+    const secondSummary = await executeReusablePermit(store, second.permit, { engine: "typescript" });
+    expect(secondSummary.stdout).toContain(tokenForHandle(record.handle));
+
+    expect(await readCount(counterPath)).toBe(1);
+    expect(await readFile(store.storePath, "utf8")).toBe(afterFirst);
+    expect(JSON.parse(afterFirst).secrets[0].cache.approvalPolicyRuleId).toBe(rule.id);
+
+    await store.setApprovalPolicyRuleEnabled(rule.id, false);
+    expect(JSON.parse(await readFile(store.storePath, "utf8")).secrets[0].cache).toBeUndefined();
+  });
+
+  it("runs grant-authorized one-shot commands without changing grant usage metadata", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "one-shot grant token",
+      type: "api-token",
+      value: "one-shot-grant-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_ONE_SHOT_GRANT_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('grant')"],
+      injectEnv: "SGW_ONE_SHOT_GRANT_TOKEN"
+    });
+    const context = { agentName: "Codex", env: {} };
+    const first = await store.createRequest(record.handle, action, "Codex one-shot grant run", context);
+    await store.approveRequest(first.id, { mode: "timed-session", durationMs: 60 * 60 * 1000 });
+    const before = await readFile(store.storePath, "utf8");
+
+    for (let index = 0; index < 12; index += 1) {
+      const admission = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot grant run", context);
+      expect(admission.kind).toBe("reusable");
+      if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+      const summary = await executeReusablePermit(store, admission.permit, { engine: "typescript" });
+      expect(summary.stdout).toBe("grant");
+    }
+
+    expect(await readFile(store.storePath, "utf8")).toBe(before);
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot grant run", context);
+    if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
+    await store.clearApprovalGrants();
+    await expect(executeReusablePermit(store, admission.permit)).rejects.toThrow(/authorization changed|grant is no longer valid/i);
+  });
+
+  it("coalesces repeated unapproved one-shot commands into one pending request", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "one-shot pending token",
+      type: "api-token",
+      value: "one-shot-pending-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_ONE_SHOT_PENDING_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_ONE_SHOT_PENDING_TOKEN"
+    });
+    const admissions = await Promise.all(Array.from({ length: 16 }, () => {
+      return new SecretStore().prepareOneShotExecution(record.handle, action, "Codex repeated pending run");
+    }));
+    const ids = new Set<string>();
+
+    for (const admission of admissions) {
+      expect(admission.kind).toBe("request");
+      if (admission.kind !== "request") throw new Error("Expected a pending approval request.");
+      ids.add(admission.request.id);
+    }
+
+    expect(ids.size).toBe(1);
+    expect((await store.listRequests("pending")).filter((request) => request.handle === record.handle)).toHaveLength(1);
+  });
+
+  it("coalesces repeated policy denials into one durable record", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "one-shot denied token",
+      type: "api-token",
+      value: "one-shot-denied-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_ONE_SHOT_DENIED_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    await store.addApprovalPolicyRule({
+      name: "Deny repeated one-shot execution",
+      decision: "deny",
+      conditions: { handles: [record.handle], commands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_ONE_SHOT_DENIED_TOKEN"
+    });
+    const admissions = await Promise.all(Array.from({ length: 16 }, () => {
+      return new SecretStore().prepareOneShotExecution(record.handle, action, "Codex repeated denied run");
+    }));
+    const ids = new Set<string>();
+
+    for (const admission of admissions) {
+      expect(admission.kind).toBe("request");
+      if (admission.kind !== "request") throw new Error("Expected a denied request.");
+      expect(admission.request.state).toBe("denied");
+      ids.add(admission.request.id);
+    }
+
+    expect(ids.size).toBe(1);
+    expect((await store.listRequests("denied")).filter((request) => request.handle === record.handle)).toHaveLength(1);
+  });
+
+  it("requires one matching allow policy for every injected secret", async () => {
+    const store = new SecretStore();
+    const primary = await store.addSecret({
+      name: "multi-handle primary token",
+      type: "api-token",
+      value: "multi-handle-primary-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_MULTI_PRIMARY_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const extra = await store.addSecret({
+      name: "multi-handle extra token",
+      type: "api-token",
+      value: "multi-handle-extra-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_MULTI_EXTRA_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_MULTI_PRIMARY_TOKEN",
+      env: [{ handle: extra.handle, injectEnv: "SGW_MULTI_EXTRA_TOKEN" }]
+    });
+    await store.addApprovalPolicyRule({
+      name: "Allow only the primary secret",
+      priority: 200,
+      decision: "allow",
+      conditions: { handles: [primary.handle], commands: [process.execPath] }
+    });
+
+    const incomplete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
+    expect(incomplete.kind).toBe("request");
+    if (incomplete.kind !== "request") throw new Error("Expected a pending approval request.");
+    expect(incomplete.request.state).toBe("pending");
+
+    await store.addApprovalPolicyRule({
+      name: "Allow both injected secrets",
+      priority: 100,
+      decision: "allow",
+      conditions: { handles: [primary.handle, extra.handle], commands: [process.execPath] }
+    });
+    const complete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
+    expect(complete.kind).toBe("reusable");
+  });
+
+  it("matches each injected secret against its own policy environment binding", async () => {
+    const store = new SecretStore();
+    const primary = await store.addSecret({
+      name: "binding scoped primary token",
+      type: "api-token",
+      value: "binding-scoped-primary-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_BINDING_SCOPED_PRIMARY",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const extra = await store.addSecret({
+      name: "binding scoped extra token",
+      type: "api-token",
+      value: "binding-scoped-extra-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_BINDING_SCOPED_EXTRA",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_BINDING_SCOPED_PRIMARY",
+      env: [{ handle: extra.handle, injectEnv: "SGW_BINDING_SCOPED_EXTRA" }]
+    });
+    await store.addApprovalPolicyRule({
+      name: "Allow only the primary environment binding",
+      decision: "allow",
+      conditions: {
+        handles: [primary.handle, extra.handle],
+        commands: [process.execPath],
+        injectEnvs: ["SGW_BINDING_SCOPED_PRIMARY"]
+      }
+    });
+
+    const admission = await store.prepareOneShotExecution(primary.handle, action, "Codex binding scoped policy run");
+    expect(admission.kind).toBe("request");
+    if (admission.kind !== "request") throw new Error("Expected a durable approval request.");
+    expect(admission.request.state).toBe("pending");
+  });
+
+  it("lets a deny policy for an injected secret override a reusable grant", async () => {
+    const store = new SecretStore();
+    const primary = await store.addSecret({
+      name: "grant primary token",
+      type: "api-token",
+      value: "grant-primary-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_GRANT_PRIMARY_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const extra = await store.addSecret({
+      name: "grant extra token",
+      type: "api-token",
+      value: "grant-extra-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_GRANT_EXTRA_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_GRANT_PRIMARY_TOKEN",
+      env: [{ handle: extra.handle, injectEnv: "SGW_GRANT_EXTRA_TOKEN" }]
+    });
+    const context = { agentName: "Codex", env: {} };
+    const request = await store.createRequest(primary.handle, action, "Codex multi-handle grant run", context);
+    await store.approveRequest(request.id, { mode: "timed-session", durationMs: 60 * 60 * 1000 });
+    await store.addApprovalPolicyRule({
+      name: "Deny the extra injected secret",
+      decision: "deny",
+      conditions: { handles: [extra.handle], commands: [process.execPath] }
+    });
+
+    const admission = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle grant run", context);
+    expect(admission.kind).toBe("request");
+    if (admission.kind !== "request") throw new Error("Expected a denied request.");
+    expect(admission.request.state).toBe("denied");
+  });
+
   it("auto-approves a matching request from an approval policy rule", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
@@ -1002,6 +2010,35 @@ describe("SecretStore", () => {
     const result = await executeApprovedRequest(store, request.id);
     expect(result.stdout).toContain(`<<SGW_SECRET:${record.handle}>>`);
     expect(result.stdout).not.toContain("policy-codex-secret-value");
+  });
+
+  it("blocks an auto-approved request after its policy is disabled", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "revoked policy request token",
+      type: "api-token",
+      value: "revoked-policy-request-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_REVOKED_POLICY_REQUEST",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Allow revocable policy request",
+      decision: "allow",
+      conditions: { handles: [record.handle], commands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('must-not-run')"],
+      injectEnv: "SGW_REVOKED_POLICY_REQUEST"
+    });
+    const automatic = await store.createRequest(record.handle, action, "Codex revocable policy request");
+    expect(automatic.approvalSource).toBe("policy");
+
+    await store.setApprovalPolicyRuleEnabled(rule.id, false);
+    await expect(executeApprovedRequest(store, automatic.id, { engine: "typescript" })).rejects.toThrow(/policy.*changed|no longer allows/i);
+    expect((await store.getRequest(automatic.id)).state).toBe("denied");
   });
 
   it("lets a higher-priority ask policy override a broader allow policy", async () => {
@@ -1144,6 +2181,9 @@ describe("SecretStore", () => {
     const raw = JSON.parse(await readFile(store.storePath, "utf8"));
     raw.approvalGrants[0].actionKey = legacyKey;
     await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
+
+    const direct = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up");
+    expect(direct.kind).toBe("reusable");
 
     const next = await store.createRequest(record.handle, secondAction, "Codex legacy wrapper follow-up");
     expect(next.state).toBe("approved");
@@ -1563,6 +2603,39 @@ exit 2
 `);
   await chmod(fakeOp, 0o755);
   return fakeOp;
+}
+
+async function writeGatedFakeOp(secret: string, enteredPath: string, releasePath: string): Promise<string> {
+  const fakeOp = path.join(tmpHome, "op-gated");
+  const reference = onePasswordFixtureRef();
+  await writeFile(fakeOp, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '2.34.0\\n'
+  exit 0
+fi
+if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
+  : > '${enteredPath}'
+  while [ ! -f '${releasePath}' ]; do
+    sleep 0.01
+  done
+  printf '%s' '${secret}'
+  exit 0
+fi
+printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
+exit 2
+`);
+  await chmod(fakeOp, 0o755);
+  return fakeOp;
+}
+
+async function waitForFile(file: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (await stat(file).catch(() => undefined)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${file}.`);
 }
 
 async function writeFakeKeychainHelper(dbPath: string): Promise<string> {

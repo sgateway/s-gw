@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { assertActionAllowed, type SecretStore } from "./store.js";
+import {
+  assertActionAllowed,
+  type ExecutionLaunch,
+  type ReusableExecutionPermit,
+  type SecretStore
+} from "./store.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
 import { runOwnedSshSession } from "./ssh.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
@@ -19,13 +24,7 @@ export async function executeApprovedRequest(
 ): Promise<ExecutionSummary> {
   const request = await store.claimApprovedRequest(requestId);
   try {
-    const secretRecord = await store.getSecretRecord(request.handle);
-    assertActionAllowed(secretRecord, request.action);
-    const secretValue = await store.revealSecretForLocalUse(request.handle, request);
-    const extraSecrets = await resolveExtraSecrets(store, request);
-    const summary = request.action.kind === "ssh_session"
-      ? await runOwnedSshSession(request, secretRecord, secretValue, store.home)
-      : await runEnvCommand(request, secretRecord, secretValue, extraSecrets, options);
+    const summary = await executeRequest(store, request, options);
     await store.markExecuted(requestId, summary);
     return summary;
   } catch (error) {
@@ -33,6 +32,66 @@ export async function executeApprovedRequest(
     await store.markFailed(requestId, message);
     throw error;
   }
+}
+
+export async function executeReusablePermit(
+  store: SecretStore,
+  permit: ReusableExecutionPermit,
+  options: ExecutionOptions = {}
+): Promise<ExecutionSummary> {
+  const initialRequest = await store.validateReusableExecutionPermit(permit);
+  if (initialRequest.action.kind !== "env_command") {
+    throw new Error("Reusable execution permits only support environment-command actions.");
+  }
+
+  const prepared = await prepareEnvExecution(store, initialRequest);
+  let nativeLaunch = false;
+  try {
+    return await store.launchReusableExecution(permit, (request) => {
+      const launch = launchReusableEnvCommand(request, prepared.secretRecord, prepared.secretValue, prepared.extraSecrets, options);
+      nativeLaunch = launch.nativeLaunch;
+      return launch;
+    });
+  } catch (error) {
+    if (!nativeLaunch || executionEngine(options.engine) !== "auto" || !isNativeLaunchError(error)) {
+      throw error;
+    }
+
+    return store.launchReusableExecution(permit, (request) => {
+      return startTypeScriptEnvCommand(request, prepared.secretRecord, prepared.secretValue, prepared.extraSecrets);
+    });
+  }
+}
+
+async function executeRequest(
+  store: SecretStore,
+  request: RequestRecord,
+  options: ExecutionOptions,
+  executionOptions: { cacheOnePassword?: boolean } = {}
+): Promise<ExecutionSummary> {
+  const secretRecord = await store.getSecretRecord(request.handle);
+  assertActionAllowed(secretRecord, request.action);
+  const secretValue = await store.revealSecretForLocalUse(request.handle, request, {
+    cache: executionOptions.cacheOnePassword !== false
+  });
+  const extraSecrets = await resolveExtraSecrets(store, request, executionOptions);
+  return request.action.kind === "ssh_session"
+    ? runOwnedSshSession(request, secretRecord, secretValue, store.home)
+    : runEnvCommand(request, secretRecord, secretValue, extraSecrets, options);
+}
+
+interface PreparedEnvExecution {
+  secretRecord: SecretRecord;
+  secretValue: string;
+  extraSecrets: ResolvedEnvSecret[];
+}
+
+async function prepareEnvExecution(store: SecretStore, request: RequestRecord): Promise<PreparedEnvExecution> {
+  const secretRecord = await store.getSecretRecord(request.handle);
+  assertActionAllowed(secretRecord, request.action);
+  const secretValue = await store.revealSecretForLocalUse(request.handle, request);
+  const extraSecrets = await resolveExtraSecrets(store, request);
+  return { secretRecord, secretValue, extraSecrets };
 }
 
 async function runEnvCommand(
@@ -49,14 +108,14 @@ async function runEnvCommand(
       if (engine === "rust") {
         throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
       }
-      return runTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets);
+      return startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets).completion;
     }
 
     try {
-      return await runRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets);
+      return await startRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets).completion;
     } catch (error) {
       if (engine === "auto" && isNativeLaunchError(error)) {
-        return runTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets);
+        return startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets).completion;
       }
       if (engine === "rust" && isNativeLaunchError(error)) {
         throw new Error(`Rust execution core could not be launched: ${coreBinary}. ${errorMessage(error)}`);
@@ -68,16 +127,58 @@ async function runEnvCommand(
     throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
   }
 
-  return runTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets);
+  return startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets).completion;
 }
 
-async function runRustEnvCommand(
+interface ReusableEnvLaunch extends ExecutionLaunch<ExecutionSummary> {
+  nativeLaunch: boolean;
+}
+
+function launchReusableEnvCommand(
+  request: RequestRecord,
+  secretRecord: SecretRecord,
+  secretValue: string,
+  extraSecrets: ResolvedEnvSecret[],
+  options: ExecutionOptions
+): ReusableEnvLaunch {
+  const engine = executionEngine(options.engine);
+  const coreBinary = options.coreBinary || rustCoreBinary();
+  if (engine !== "typescript" && existsSync(coreBinary)) {
+    if (!nativeCoreIsCompatible(coreBinary)) {
+      if (engine === "rust") {
+        throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
+      }
+      return { ...startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
+    }
+
+    const launch = startRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets);
+    if (engine !== "rust") {
+      return { ...launch, nativeLaunch: true };
+    }
+    return {
+      nativeLaunch: true,
+      completion: launch.completion.catch((error) => {
+        if (isNativeLaunchError(error)) {
+          throw new Error(`Rust execution core could not be launched: ${coreBinary}. ${errorMessage(error)}`);
+        }
+        throw error;
+      })
+    };
+  }
+  if (engine === "rust") {
+    throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
+  }
+
+  return { ...startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
+}
+
+function startRustEnvCommand(
   coreBinary: string,
   request: RequestRecord,
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[]
-): Promise<ExecutionSummary> {
+): ExecutionLaunch<ExecutionSummary> {
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
   const child = spawn(coreBinary, ["execute"], {
     env: buildCoreEnv(),
@@ -95,7 +196,7 @@ async function runRustEnvCommand(
     stderr = appendBounded(stderr, chunk.toString("utf8"), responseLimit);
   });
 
-  const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+  const childCompletion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal }));
   });
@@ -126,28 +227,31 @@ async function runRustEnvCommand(
     }), resolve);
   });
 
-  const [status] = await Promise.all([completion, input]);
-  if (status.code !== 0) {
-    throw new Error(stderr.trim() || `Rust execution core exited ${status.code ?? status.signal ?? "unexpectedly"}.`);
-  }
+  const completion = Promise.all([childCompletion, input]).then(([status]) => {
+    if (status.code !== 0) {
+      throw new Error(stderr.trim() || `Rust execution core exited ${status.code ?? status.signal ?? "unexpectedly"}.`);
+    }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    throw new Error("Rust execution core returned an invalid response.");
-  }
-  const summary = parseCoreSummary(parsed, request);
-  const secretValues = [secretValue, ...extraSecrets.map((item) => item.value)];
-  if (secretValues.some((value) => summary.stdout.includes(value) || summary.stderr.includes(value))) {
-    throw new Error("Rust execution core returned unsanitized output.");
-  }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      throw new Error("Rust execution core returned an invalid response.");
+    }
+    const summary = parseCoreSummary(parsed, request);
+    const secretValues = [secretValue, ...extraSecrets.map((item) => item.value)];
+    if (secretValues.some((value) => summary.stdout.includes(value) || summary.stderr.includes(value))) {
+      throw new Error("Rust execution core returned unsanitized output.");
+    }
 
-  const expectedProof = proofFor(request, summary.stdout, summary.stderr);
-  if (summary.proof !== expectedProof) {
-    throw new Error("Rust execution core returned an invalid execution proof.");
-  }
-  return summary;
+    const expectedProof = proofFor(request, summary.stdout, summary.stderr);
+    if (summary.proof !== expectedProof) {
+      throw new Error("Rust execution core returned an invalid execution proof.");
+    }
+    return summary;
+  });
+  void completion.catch(() => undefined);
+  return { completion };
 }
 
 function parseCoreSummary(value: unknown, request: RequestRecord): ExecutionSummary {
@@ -308,12 +412,12 @@ function buildCoreEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-async function runTypeScriptEnvCommand(
+function startTypeScriptEnvCommand(
   request: RequestRecord,
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[]
-): Promise<ExecutionSummary> {
+): ExecutionLaunch<ExecutionSummary> {
   const started = Date.now();
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
   const secretPairs = [
@@ -354,37 +458,35 @@ async function runTypeScriptEnvCommand(
     stderr = appendBounded(stderr, chunk.toString("utf8"), captureCap);
   });
 
-  const status = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+  const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (code, signal) => resolve({ code, signal }));
+  }).then((status) => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    if (killTimer) {
+      clearTimeout(killTimer);
+    }
+
+    const sanitizedStdout = sanitizeKnownSecrets(stdout, secretPairs);
+    const sanitizedStderr = sanitizeKnownSecrets(stderr, secretPairs);
+    const cleanStdout = capBytes(sanitizedStdout, maxOutput);
+    const cleanStderr = capBytes(sanitizedStderr, maxOutput);
+    return {
+      exitCode: timedOut ? 124 : status.code,
+      signal: status.signal,
+      stdout: cleanStdout,
+      stderr: cleanStderr,
+      proof: proofFor(request, cleanStdout, cleanStderr),
+      durationMs: Date.now() - started,
+      timeoutMs: request.action.timeoutMs,
+      timedOut,
+      sanitized: sanitizedStdout !== stdout || sanitizedStderr !== stderr
+    } satisfies ExecutionSummary;
   });
-  if (timeout) {
-    clearTimeout(timeout);
-  }
-  if (killTimer) {
-    clearTimeout(killTimer);
-  }
-
-  // Sanitize the full captured output BEFORE applying the display cap. Sanitized
-  // text no longer contains the raw secret, so the final byte-cap can never split
-  // a credential and leak a partial value to the caller.
-  const sanitizedStdout = sanitizeKnownSecrets(stdout, secretPairs);
-  const sanitizedStderr = sanitizeKnownSecrets(stderr, secretPairs);
-  const cleanStdout = capBytes(sanitizedStdout, maxOutput);
-  const cleanStderr = capBytes(sanitizedStderr, maxOutput);
-  const summary: ExecutionSummary = {
-    exitCode: timedOut ? 124 : status.code,
-    signal: status.signal,
-    stdout: cleanStdout,
-    stderr: cleanStderr,
-    proof: proofFor(request, cleanStdout, cleanStderr),
-    durationMs: Date.now() - started,
-    timeoutMs: request.action.timeoutMs,
-    timedOut,
-    sanitized: sanitizedStdout !== stdout || sanitizedStderr !== stderr
-  };
-
-  return summary;
+  void completion.catch(() => undefined);
+  return { completion };
 }
 
 interface ResolvedEnvSecret {
@@ -393,7 +495,11 @@ interface ResolvedEnvSecret {
   value: string;
 }
 
-async function resolveExtraSecrets(store: SecretStore, request: RequestRecord): Promise<ResolvedEnvSecret[]> {
+async function resolveExtraSecrets(
+  store: SecretStore,
+  request: RequestRecord,
+  executionOptions: { cacheOnePassword?: boolean } = {}
+): Promise<ResolvedEnvSecret[]> {
   const out: ResolvedEnvSecret[] = [];
   for (const binding of request.action.env || []) {
     const secret = await store.getSecretRecord(binding.handle);
@@ -405,7 +511,9 @@ async function resolveExtraSecrets(store: SecretStore, request: RequestRecord): 
     out.push({
       handle: binding.handle,
       injectEnv: binding.injectEnv,
-      value: await store.revealSecretForLocalUse(binding.handle, request)
+      value: await store.revealSecretForLocalUse(binding.handle, request, {
+        cache: executionOptions.cacheOnePassword !== false
+      })
     });
   }
 

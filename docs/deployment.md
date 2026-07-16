@@ -262,15 +262,19 @@ Default local ledger:
 ~/.s-gw/store.json
 ```
 
-Independent encrypted recovery checkpoints:
+Append-only local recovery checkpoints:
 
 ```text
-~/.s-gw-recovery/control-plane/
+~/.s-gw-recovery/control-plane/<ledger-namespace>/
 ```
 
-The recovery checkpoints contain credential records, approval settings, grants, and policy rules. They omit request history, audit history, and cached values, which keeps them small and prevents high-volume request traffic from rotating away the last usable control-plane state. s-gw also keeps ordinary rolling backups under `~/.s-gw/backups/`.
+The recovery checkpoints contain credential records, approval settings, grants, and policy rules. They omit request history, audit history, and cached values, which keeps them small and prevents high-volume request traffic from rotating away the last usable control-plane state. s-gw writes each `checkpoint-*` file create-only and read-only; it never rewrites or automatically prunes this control-plane history. `head.json` is a mutable O(1) index for the newest checkpoint, while the checkpoint files remain the recovery history. Each primary ledger gets a separate namespace even when several ledgers share `SGW_RECOVERY_HOME`; the control manifest pins that namespace as well as its vault and checkpoint.
 
-Every committed control-plane change updates an integrity manifest through a pending transaction record. If the primary ledger is missing, corrupt, or replaced with a different valid ledger, s-gw restores a verified checkpoint and records `store.recovered`. If recovery evidence exists but no valid copy remains, s-gw fails closed instead of initializing an empty ledger.
+Ordinary rolling backups remain under `~/.s-gw/backups/`, are deliberately separate from this history, and are created at most once per five minutes for request-only traffic. A credential or policy change forces a rolling backup immediately. Reusable, already-authorized environment commands (`aws run`, `run env-command`, and MCP `sgw_run_execution`) do not append a request/audit record or rewrite the ledger per invocation. They revalidate inside an authorization fence immediately before spawn. SSH stays on the durable request path so a remote session cannot hold the ledger lock. A first 1Password cache fill under a matching reusable grant or allow policy is the bounded exception; it is authority-bound and later matching runs do not rewrite the ledger. Repeated unapproved calls coalesce to one pending request.
+
+Before a control-plane mutation replaces `store.json`, s-gw confirms that the preceding state and the candidate new state are sealed in the recovery home. If it cannot write the candidate recovery copy, the primary ledger is left unchanged. Every committed control-plane change updates an integrity manifest through a pending transaction record. The manifest includes hashes of the configured recovery-home identity and ledger namespace, so changing `SGW_RECOVERY_HOME` fails closed unless the new location already contains the exact anchored checkpoint for this ledger. If the primary ledger and manifest are jointly replaced from another ledger, s-gw recognizes the foreign namespace and restores this ledger's newest fingerprint-validated external checkpoint. If a manifest-pinned checkpoint disappears from this ledger's namespace, s-gw fails closed rather than rolling back credentials or policies to an older checkpoint. If recovery evidence exists but no valid copy remains, s-gw fails closed instead of initializing an empty ledger.
+
+`~/.s-gw-recovery` protects against application faults and accidental local loss; it is not true immutable storage because the same macOS/Linux user can still remove, chmod, or replace it. Set `SGW_RECOVERY_HOME` to a separate protected location and replicate each ledger namespace to a separately controlled versioned/WORM backup target when credentials and policies require retention guarantees. Do not place the recovery home inside `SGW_HOME`; s-gw rejects overlapping paths. Keychain and 1Password records restore their handles and policies, but their backing provider values and the keychain-held unlock material still need provider-native recovery if they are deleted.
 
 Default Keychain item:
 
@@ -307,7 +311,7 @@ Use `SGW_SECRET_KEYCHAIN_SERVICE` or `--service` to isolate test, work, or user 
 
 ### 1Password backend
 
-If credentials already live in 1Password, s-gw can use `op://...` references as an optional backend or migration source. Reusable approvals read 1Password once, then keep an encrypted local keystore copy until the approval expires or is revoked:
+If credentials already live in 1Password, s-gw can use `op://...` references as an optional backend or migration source. Matching reusable grants and allow policies read 1Password once, then keep an encrypted local cache until that authority expires, is revoked, or changes:
 
 ```bash
 s-gw secret add-1password \
@@ -319,7 +323,7 @@ s-gw secret add-1password \
   --verify
 ```
 
-For interactive desktop users, the first approved reusable use may still require the normal 1Password app/CLI unlock. Later matching uses stay in s-gw until the TTL ends. For team automation, set `OP_SERVICE_ACCOUNT_TOKEN` in the environment used by the local s-gw service.
+For interactive desktop users, the first approved reusable use may still require the normal 1Password app/CLI unlock. Later matching uses stay in s-gw until the authority ends or changes. For team automation, set `OP_SERVICE_ACCOUNT_TOKEN` in the environment used by the local s-gw service.
 
 ## Operational Recovery
 

@@ -34,6 +34,7 @@ beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-react-browser-"));
   profileDir = await mkdtemp(path.join(os.tmpdir(), "sgw-react-chrome-"));
   process.env.SGW_HOME = tmpHome;
+  process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_DISABLE_KEYCHAIN = "1";
   delete process.env.SGW_MASTER_PASSPHRASE;
 });
@@ -53,6 +54,7 @@ afterEach(async () => {
   }
   process.env = oldEnv;
   await rm(tmpHome, { recursive: true, force: true }).catch(() => {});
+  await rm(`${tmpHome}-recovery`, { recursive: true, force: true }).catch(() => {});
   await rm(profileDir, { recursive: true, force: true }).catch(() => {});
 });
 

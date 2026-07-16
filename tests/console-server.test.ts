@@ -18,6 +18,7 @@ beforeEach(async () => {
   oldEnv = { ...process.env };
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-console-e2e-"));
   process.env.SGW_HOME = tmpHome;
+  process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "console e2e passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
 });
@@ -31,6 +32,7 @@ afterEach(async () => {
   process.env = oldEnv;
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
   }
 });
 

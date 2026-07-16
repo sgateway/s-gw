@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { executeApprovedRequest } from "./executor.js";
+import { executeApprovedRequest, executeReusablePermit } from "./executor.js";
 import { buildEnvCommandAction, buildSshSessionAction, scanLocalFile, scanLocalText } from "./gateway.js";
 import { SecretStore } from "./store.js";
 import { defaultSshInjectEnv } from "./ssh.js";
@@ -98,6 +98,48 @@ server.registerTool(
       approvalRequired: request.state !== "approved",
       localApprovalCommand: request.state === "approved" ? undefined : `s-gw approve ${request.id}`,
       request
+    });
+  }
+);
+
+server.registerTool(
+  "sgw_run_execution",
+  {
+    title: "Run Secret-Backed Execution",
+    description: "Run a command through reusable local approval without creating a ledger record for every invocation.",
+    inputSchema: {
+      handle: z.string().min(1),
+      command: z.string().min(1),
+      args: z.array(z.string()).optional(),
+      injectEnv: z.string().min(1),
+      env: z.array(z.object({
+        handle: z.string().min(1),
+        injectEnv: z.string().min(1)
+      })).optional(),
+      workingDir: z.string().optional(),
+      timeoutMs: z.number().int().nonnegative().optional(),
+      reason: z.string().optional()
+    }
+  },
+  async ({ handle, command, args, injectEnv, env, workingDir, timeoutMs, reason }) => {
+    const action = buildEnvCommandAction({ command, args, injectEnv, env, workingDir, timeoutMs });
+    const admission = await store.prepareOneShotExecution(
+      handle,
+      action,
+      reason || "Agent requested reusable local secret-backed execution.",
+      mcpAgentContext()
+    );
+    if (admission.kind === "request") {
+      return asText({
+        approvalRequired: admission.request.state !== "approved",
+        localApprovalCommand: admission.request.state === "approved" ? undefined : `s-gw approve ${admission.request.id}`,
+        request: admission.request
+      });
+    }
+    return asText({
+      approvalRequired: false,
+      reusableAuthorization: admission.permit.authorization,
+      summary: await executeReusablePermit(store, admission.permit)
     });
   }
 );
