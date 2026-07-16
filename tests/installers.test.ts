@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -44,7 +44,7 @@ describe("platform installers", () => {
     expect(validator).toContain("validateReleaseDirectory");
   });
 
-  it("ships runtime artifacts without development source or source maps", () => {
+  it("ships runtime artifacts without development source or source maps", async () => {
     const npmCli = process.env.npm_execpath;
     if (!npmCli) {
       throw new Error("npm_execpath is required for the package manifest test.");
@@ -62,7 +62,14 @@ describe("platform installers", () => {
       ? `dist/native/${target}/s-gw-core.exe`
       : `dist/native/${target}/s-gw-core`;
 
-    expect(files).toContain(coreName);
+    const hasCore = await fileExists(path.join(root, coreName));
+    if (process.env.SGW_REQUIRE_RUST_CORE === "1" || hasCore) {
+      expect(files).toContain(coreName);
+      const nativeCore = manifest.files.find((item) => item.path === coreName);
+      if (process.platform !== "win32") {
+        expect((nativeCore?.mode || 0) & 0o111).not.toBe(0);
+      }
+    }
     expect(files).not.toContain("dist/native/s-gw-core");
     expect(files).not.toContain("dist/native/s-gw-core.exe");
     if (process.platform === "darwin") {
@@ -70,10 +77,6 @@ describe("platform installers", () => {
       expect(files).toContain(`dist/native/${target}/s-gw-keychain-inspector`);
       expect(files).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
-    }
-    const nativeCore = manifest.files.find((item) => item.path === coreName);
-    if (process.platform !== "win32") {
-      expect((nativeCore?.mode || 0) & 0o111).not.toBe(0);
     }
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
@@ -198,3 +201,12 @@ describe("platform installers", () => {
     expect(registryJob).not.toContain("npm publish --access public");
   });
 });
+
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}

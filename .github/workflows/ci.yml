@@ -38,7 +38,6 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
       - run: npm ci --ignore-scripts
       - run: npm run check:rust
       - run: npm run check
@@ -57,9 +56,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: rustup toolchain install 1.96.1 --profile minimal
       - run: npm ci --ignore-scripts
-      - run: cargo test --locked -p sgw-core
       - run: npm run build:native
       - run: npx vitest run tests/install-macos.test.ts tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
 
@@ -73,9 +70,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: rustup toolchain install 1.96.1 --profile minimal
       - run: npm ci --ignore-scripts
-      - run: cargo test --locked -p sgw-core
       - run: npm run check
       - run: npm run build:windows-client
       - run: npx tsc -p tsconfig.json

@@ -15,7 +15,6 @@ Requirements:
 
 - Node.js 20 or newer;
 - npm;
-- a stable Rust toolchain;
 - Swift on macOS when changing the native app, menu helper, or Keychain helper;
 - PowerShell on Windows when changing the preview client or credential helper.
 
@@ -35,9 +34,11 @@ npm run dev:console-ui
 
 The console uses sanitized sample data when it is not connected to a live local daemon.
 
+The Rust execution core is maintained in a separate private repository. Public contributors can build and test the TypeScript compatibility path; core changes require maintainer access.
+
 ## Change Guidelines
 
-- Follow the existing Rust, TypeScript, React, Swift, and PowerShell patterns.
+- Follow the existing TypeScript, React, Swift, and PowerShell patterns.
 - Prefer small functions and explicit error handling.
 - Add focused tests for behavior changes and regressions.
 - Update the threat model when a trust boundary or security claim changes.

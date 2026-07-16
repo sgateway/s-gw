@@ -50,7 +50,9 @@ The approval broker claims the request, validates the handle policy again, and r
 
 The Rust runner clears the child environment, restores a small allowlist of ordinary process variables, injects only approved credential bindings, enforces the timeout, captures bounded stdout and stderr, replaces known values with handles, and returns a proof-bound result. The broker rejects malformed responses, raw credential output, or an invalid proof before updating the request record.
 
-Owned SSH sessions use the TypeScript execution path. Native runners live under `dist/native/<platform>-<architecture>/`, and automatic mode only selects the current target. The public npm package includes the macOS arm64 runner; Linux, Windows, and other architectures use the TypeScript compatibility path when their target directory is absent. Native Windows source builds produce `dist/native/win32-x64/s-gw-core.exe`. `SGW_EXECUTION_ENGINE=rust` requires a compatible compiled runner, while `SGW_EXECUTION_ENGINE=typescript` selects the compatibility path explicitly.
+The runner is proprietary and maintained in the private `barryqy/s-gw-rust-core` repository. This public repository contains the protocol integration and TypeScript compatibility path, but not the Rust source. Maintainer builds locate a sibling checkout or use `SGW_RUST_CORE_DIR`; release automation requires the private checkout and packages only the compiled runner.
+
+Owned SSH sessions use the TypeScript execution path. Native runners live under `dist/native/<platform>-<architecture>/`, and automatic mode only selects the current target. The public npm package includes the macOS arm64 runner; Linux, Windows, and other architectures use the TypeScript compatibility path when their target directory is absent. Native Windows maintainer builds produce `dist/native/win32-x64/s-gw-core.exe`. `SGW_EXECUTION_ENGINE=rust` requires a compatible compiled runner, while `SGW_EXECUTION_ENGINE=typescript` selects the compatibility path explicitly.
 
 ### User Interfaces
 
@@ -69,6 +71,6 @@ See the [threat model](threat-model.md) for what these boundaries do and do not 
 
 ## Deployment Models
 
-The open-source product is a complete standalone endpoint: Rust core, local storage, approvals, policies, agent integrations, audit history, and desktop clients. Independent local installations do not require a control plane.
+The standalone endpoint is a mixed-source distribution: the broker, local storage, approvals, policies, agent integrations, audit history, and desktop clients are open source, while the compiled Rust execution core is proprietary. Independent local installations do not require a control plane.
 
 Team deployments can add a control plane for endpoint fleets, shared policy, delegated approvals, identity, compliance retention, and enterprise vault references. The intended boundary exchanges handle metadata, signed policy, approval state, and sanitized events. Raw credentials remain in the endpoint credential store or an enterprise vault.

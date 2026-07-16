@@ -21,8 +21,18 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      SGW_REQUIRE_RUST_CORE: "1"
+      SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Check out private Rust core
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: barryqy/s-gw-rust-core
+          token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
+          path: .private/sgw-core
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:

@@ -34,6 +34,8 @@ Stop handing raw credentials to coding agents. s-gw gives agents typed handles, 
 
 > [!IMPORTANT]
 > s-gw is an early preview. Storage formats and interfaces may change, Windows support is still experimental, and the project has not completed an independent security audit. Do not treat it as a replacement for endpoint security or a hardened enterprise secrets platform yet.
+>
+> The TypeScript broker, clients, and documentation in this repository are Apache-2.0 licensed. Distributed packages also contain a proprietary compiled Rust execution core whose source is maintained separately.
 
 ## The Short Version
 
@@ -102,7 +104,7 @@ s-gw setup
 s-gw status
 ```
 
-To build from source, use a stable Rust toolchain. Building the native macOS surfaces also requires a Swift toolchain.
+The public source builds the TypeScript compatibility path. Building the native macOS surfaces also requires a Swift toolchain. Maintainer release builds additionally require access to the private Rust core checkout.
 
 Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path. It includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs; Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; the npm package and DMG reject their arm64-only helpers with a clear compatibility error.
 
@@ -221,7 +223,7 @@ Read the [threat model](docs/threat-model.md) before relying on s-gw for sensiti
 
 ## Project Status
 
-- Public source distribution is preview quality.
+- The public broker and client source distribution is preview quality; the compiled Rust execution core is proprietary.
 - macOS is the primary development and test platform.
 - Windows Credential Manager support is present but still needs broader native QA.
 - Linux currently depends on environment-provided unlock material.
@@ -247,4 +249,4 @@ Planning a launch, write-up, or community post? The maintainer notes in [docs/co
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party names and artwork remain the property of their respective owners and are documented in [TRADEMARKS.md](TRADEMARKS.md) and the [third-party notices](docs/ui/THIRD_PARTY_NOTICES.md).
+Source in this repository is Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The separately maintained Rust core and its compiled binaries are proprietary and are not licensed under Apache-2.0. Third-party names and artwork remain the property of their respective owners and are documented in [TRADEMARKS.md](TRADEMARKS.md) and the [third-party notices](docs/ui/THIRD_PARTY_NOTICES.md).
