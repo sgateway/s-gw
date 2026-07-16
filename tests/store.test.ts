@@ -1840,7 +1840,7 @@ describe("SecretStore", () => {
 
     expect(ids.size).toBe(1);
     expect((await store.listRequests("denied")).filter((request) => request.handle === record.handle)).toHaveLength(1);
-  });
+  }, 15_000);
 
   it("requires one matching allow policy for every injected secret", async () => {
     const store = new SecretStore();

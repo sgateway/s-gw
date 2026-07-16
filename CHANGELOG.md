@@ -2,6 +2,12 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
+## 0.1.15 - 2026-07-16
+
+### Fixed
+
+- High-contention approval-request tests now use a scoped timeout that matches their durable locking work, keeping release verification stable without weakening the global test timeout.
+
 ## 0.1.14 - 2026-07-16
 
 ### Fixed
