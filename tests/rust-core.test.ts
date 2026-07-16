@@ -12,7 +12,7 @@ let tmpHome = "";
 const oldEngine = process.env.SGW_EXECUTION_ENGINE;
 const oldAwsSecret = process.env.AWS_SECRET_ACCESS_KEY;
 const coreName = process.platform === "win32" ? "s-gw-core.exe" : "s-gw-core";
-const packagedCore = path.resolve("dist", "native", coreName);
+const packagedCore = path.resolve("dist", "native", `${process.platform}-${process.arch}`, coreName);
 const coreIt = existsSync(packagedCore) ? it : it.skip;
 
 beforeEach(async () => {

@@ -4,9 +4,18 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.13 - 2026-07-15
+
 ### Changed
 
 - Moved the proprietary Rust execution core to a separate private repository. The public repository now contains the broker integration and TypeScript compatibility path, while maintainer release builds package the compiled core from a private checkout.
+
+### Fixed
+
+- High-frequency authorized environment commands now keep their reusable decision in memory, so routine AWS, MCP, and environment-command calls do not churn the ledger or rolling backups.
+- Credential, approval-policy, grant, and settings recovery checkpoints are append-only. s-gw seals a candidate checkpoint before it changes the primary ledger and fails closed if the recovery anchor is missing, malformed, or from another ledger.
+- Automatically approved durable requests now revalidate the original policy or grant before execution, so disabling or revoking that authority takes effect before the command starts.
+- Test runs require disposable, explicitly configured s-gw and recovery homes, preventing test processes from using a real local ledger.
 
 ## 0.1.12 - 2026-07-15
 
