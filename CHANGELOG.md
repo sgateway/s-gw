@@ -2,6 +2,18 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
+## 0.1.16 - 2026-07-16
+
+### Added
+
+- The approval-policy console now supports guided rule creation, editing, scoped request approvals, shadowed-rule visibility, and safe automatic arrangement.
+- Policies can bind the complete credential and environment set for a multi-secret command, so reusable approval remains scoped to exactly that command invocation.
+
+### Fixed
+
+- No-op policy saves and toggles no longer create ledger checkpoints, audit entries, or change policy evaluation order.
+- Invalid policy input and malformed stored rules now fail closed instead of silently broadening an approval rule.
+
 ## 0.1.15 - 2026-07-16
 
 ### Fixed
