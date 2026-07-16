@@ -39,6 +39,7 @@ export interface ApprovalGrant {
 
 export interface ApprovalPolicyConditions {
   handles?: string[];
+  envBindings?: CommandEnvBinding[];
   secretTypes?: SecretType[];
   providers?: string[];
   minSeverity?: SecretSeverity;

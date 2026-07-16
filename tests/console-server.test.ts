@@ -372,7 +372,7 @@ describe("local console server", () => {
     expect(afterRevoke.state).toBe("pending");
   });
 
-  it("manages approval policy rules through the console API", async () => {
+  it("updates and auto-arranges approval policy rules through the console API", async () => {
     running = await startConsoleServer({ port: 0 });
 
     const created = await fetchJson("api/approval/policies", {
@@ -380,16 +380,23 @@ describe("local console server", () => {
       body: {
         name: "Console Codex allow",
         decision: "allow",
-        priority: 10,
-        durationMs: 15 * 60 * 1000,
+        priority: 200,
+        expiresAt: "2030-01-01T00:00:00.000Z",
         agents: ["Codex"],
+        envBindings: [{ handle: "s-gw:api-token:console", injectEnv: "SGW_CONSOLE_POLICY_TOKEN" }],
         actionKinds: ["env_command"],
         commands: [process.execPath],
-        injectEnvs: ["SGW_CONSOLE_POLICY_TOKEN"]
+        injectEnvs: ["SGW_CONSOLE_POLICY_TOKEN"],
+        sshPorts: [2222]
       }
     });
     expect(created.id).toMatch(/^policy_/);
     expect(created.conditions.agents).toEqual(["codex"]);
+    expect(created.conditions.envBindings).toEqual([
+      { handle: "s-gw:api-token:console", injectEnv: "SGW_CONSOLE_POLICY_TOKEN" }
+    ]);
+    expect(created.conditions.sshPorts).toEqual([2222]);
+    const createdAt = created.createdAt;
 
     const state = await fetchJson("api/state");
     expect(state.approvalPolicyRules.map((rule: { id: string }) => rule.id)).toContain(created.id);
@@ -400,6 +407,56 @@ describe("local console server", () => {
     });
     expect(disabled.enabled).toBe(false);
 
+    const updated = await fetchJson(`api/approval/policies/${created.id}`, {
+      method: "PUT",
+      body: {
+        name: "Console Claude deny aws",
+        enabled: true,
+        decision: "deny",
+        agents: ["Claude"],
+        sshPorts: [2200, 2222]
+      }
+    });
+    expect(updated).toMatchObject({
+      id: created.id,
+      createdAt,
+      name: "Console Claude deny aws",
+      enabled: true,
+      decision: "deny"
+    });
+    expect(updated.conditions).toMatchObject({
+      agents: ["claude"],
+      envBindings: [{ handle: "s-gw:api-token:console", injectEnv: "SGW_CONSOLE_POLICY_TOKEN" }],
+      commands: [process.execPath],
+      injectEnvs: ["SGW_CONSOLE_POLICY_TOKEN"],
+      sshPorts: [2200, 2222]
+    });
+    expect(updated.expiresAt).toBe("2030-01-01T00:00:00.000Z");
+
+    const noExpiry = await fetchJson(`api/approval/policies/${created.id}`, {
+      method: "PUT",
+      body: { expiresAt: null }
+    });
+    expect(noExpiry.expiresAt).toBeUndefined();
+    expect(noExpiry.conditions.agents).toEqual(["claude"]);
+
+    const broad = await fetchJson("api/approval/policies", {
+      method: "POST",
+      body: {
+        name: "Console Claude broad ask",
+        decision: "ask",
+        priority: 10,
+        agents: ["Claude"]
+      }
+    });
+    const arranged = await fetchJson("api/approval/policies/arrange", { method: "POST", body: {} });
+    expect(arranged.reordered).toBeGreaterThan(0);
+    expect(arranged.rules.map((rule: { id: string }) => rule.id)).toEqual([created.id, broad.id]);
+
+    const ordered = await fetchJson("api/approval/policies");
+    expect(ordered.map((rule: { id: string }) => rule.id)).toEqual([created.id, broad.id]);
+
+    await fetchJson(`api/approval/policies/${broad.id}`, { method: "DELETE" });
     const deleted = await fetchJson(`api/approval/policies/${created.id}`, {
       method: "DELETE"
     });
@@ -407,6 +464,97 @@ describe("local console server", () => {
 
     const policies = await fetchJson("api/approval/policies");
     expect(policies).toHaveLength(0);
+  });
+
+  it("rejects malformed policy constraints without widening an existing rule", async () => {
+    running = await startConsoleServer({ port: 0 });
+    const created = await fetchJson("api/approval/policies", {
+      method: "POST",
+      body: {
+        name: "Narrow console policy",
+        decision: "allow",
+        commands: [process.execPath],
+        sshPorts: [22]
+      }
+    });
+    const scoped = await fetchJson("api/approval/policies", {
+      method: "POST",
+      body: {
+        name: "Exact binding policy",
+        decision: "allow",
+        envBindings: [{ handle: "s-gw:api-token:exact", injectEnv: "SGW_EXACT_TOKEN" }]
+      }
+    });
+    const before = await fetchJson("api/approval/policies");
+
+    const emptyUpdate = await fetch(consoleUrl(`api/approval/policies/${created.id}`), {
+      method: "PUT",
+      headers: authHeaders(),
+      body: "{}"
+    });
+    expect(emptyUpdate.status).toBe(400);
+    expect((await emptyUpdate.json()).error).toMatch(/at least one change/i);
+
+    const badExpiry = await fetch(consoleUrl(`api/approval/policies/${created.id}`), {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify({ expiresAt: "" })
+    });
+    expect(badExpiry.status).toBe(400);
+    expect((await badExpiry.json()).error).toMatch(/expiresAt/i);
+
+    const badPort = await fetch(consoleUrl("api/approval/policies"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        name: "Invalid port policy",
+        decision: "allow",
+        sshPorts: [0]
+      })
+    });
+    expect(badPort.status).toBe(400);
+    expect((await badPort.json()).error).toMatch(/sshPorts/i);
+
+    const blankCommand = await fetch(consoleUrl("api/approval/policies"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        name: "Blank command policy",
+        decision: "allow",
+        commands: [""]
+      })
+    });
+    expect(blankCommand.status).toBe(400);
+    expect((await blankCommand.json()).error).toMatch(/commands.*non-empty/i);
+
+    const typoedConstraint = await fetch(consoleUrl("api/approval/policies"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        name: "Typoed command policy",
+        decision: "allow",
+        command: process.execPath
+      })
+    });
+    expect(typoedConstraint.status).toBe(400);
+    expect((await typoedConstraint.json()).error).toMatch(/unsupported approval policy field.*command/i);
+
+    const changedBindings = await fetch(consoleUrl(`api/approval/policies/${scoped.id}`), {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify({ envBindings: [] })
+    });
+    expect(changedBindings.status).toBe(409);
+    expect((await changedBindings.json()).error).toMatch(/exact credential bindings/i);
+
+    const clearedByNull = await fetch(consoleUrl(`api/approval/policies/${created.id}`), {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify({ commands: null })
+    });
+    expect(clearedByNull.status).toBe(400);
+    expect((await clearedByNull.json()).error).toMatch(/commands.*array/i);
+    expect(await fetchJson("api/approval/policies")).toEqual(before);
   });
 
   it("builds an agent to credential to action usage flow without exposing secret values", async () => {

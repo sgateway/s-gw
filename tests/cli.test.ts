@@ -90,6 +90,109 @@ describe("CLI unknown-command behavior (end to end)", () => {
     }
   });
 
+  it("updates and auto-arranges approval policies, and documents both commands", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-policy-"));
+    const recoveryHome = `${home}-recovery`;
+    const cargoTarget = `${home}-cargo`;
+    const env = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: recoveryHome,
+      CARGO_TARGET_DIR: cargoTarget,
+      SGW_MASTER_PASSPHRASE: "cli-policy-test-passphrase",
+      SGW_DISABLE_KEYCHAIN: "1",
+      SGW_DISABLE_ONEPASSWORD_BACKUP: "1"
+    };
+    const run = (args: string[]) => execFileSync(tsxBin, ["src/cli.ts", ...args], {
+      cwd: repoRoot,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    try {
+      const broad = JSON.parse(run([
+        "approval",
+        "policy",
+        "add",
+        "--name",
+        "Codex broad ask",
+        "--decision",
+        "ask",
+        "--priority",
+        "10",
+        "--agent",
+        "Codex"
+      ]));
+      const specific = JSON.parse(run([
+        "approval",
+        "policy",
+        "add",
+        "--name",
+        "Codex AWS allow",
+        "--decision",
+        "allow",
+        "--priority",
+        "20",
+        "--agent",
+        "Codex",
+        "--binding",
+        "SGW_CLI_POLICY=s-gw:api-token:cli",
+        "--expires-at",
+        "2030-01-01T00:00:00.000Z"
+      ]));
+
+      let emptyUpdateError: { stderr?: string } | undefined;
+      try {
+        run(["approval", "policy", "update", "--id", specific.id]);
+      } catch (error) {
+        emptyUpdateError = error as { stderr?: string };
+      }
+      expect(emptyUpdateError?.stderr).toContain("at least one change");
+
+      const updated = JSON.parse(run([
+        "approval",
+        "policy",
+        "update",
+        "--id",
+        specific.id,
+        "--name",
+        "Codex AWS deny",
+        "--decision",
+        "deny",
+        "--command",
+        "aws",
+        "--clear-expiry"
+      ]));
+      expect(updated).toMatchObject({
+        id: specific.id,
+        name: "Codex AWS deny",
+        decision: "deny"
+      });
+      expect(updated.conditions).toMatchObject({
+        agents: ["codex"],
+        commands: ["aws"],
+        envBindings: [{ handle: "s-gw:api-token:cli", injectEnv: "SGW_CLI_POLICY" }]
+      });
+      expect(updated.expiresAt).toBeUndefined();
+
+      const arranged = JSON.parse(run(["approval", "policy", "arrange"]));
+      expect(arranged.reordered).toBeGreaterThan(0);
+      expect(arranged.rules.map((rule: { id: string }) => rule.id)).toEqual([specific.id, broad.id]);
+
+      const listed = JSON.parse(run(["approval", "policy", "list"]));
+      expect(listed.map((rule: { id: string }) => rule.id)).toEqual([specific.id, broad.id]);
+
+      const help = run(["help"]);
+      expect(help).toContain("s-gw approval policy update --id POLICY_ID");
+      expect(help).toContain("s-gw approval policy arrange");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(recoveryHome, { recursive: true, force: true });
+      await rm(cargoTarget, { recursive: true, force: true });
+    }
+  });
+
   it("exits non-zero and prints a suggestion to stderr for a typo", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-typo-"));
     let stderr = "";

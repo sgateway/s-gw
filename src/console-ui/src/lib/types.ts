@@ -225,6 +225,7 @@ export interface ApprovalPolicyRuleRecord {
   decision: ApprovalPolicyDecision;
   conditions: {
     handles?: string[];
+    envBindings?: Array<{ handle: string; injectEnv: string }>;
     secretTypes?: string[];
     providers?: string[];
     minSeverity?: SecretSeverity;

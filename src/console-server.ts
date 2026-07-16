@@ -22,7 +22,7 @@ import {
 } from "./gateway.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { readinessForUnlock } from "./install.js";
-import { SecretStore } from "./store.js";
+import { SecretStore, type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput } from "./store.js";
 import { unlockStatus } from "./unlock.js";
 import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
 import { CURRENT_VERSION } from "./version.js";
@@ -31,6 +31,7 @@ import type {
   ApprovalAgentScope,
   ApprovalMode,
   ApprovalPolicyActionKind,
+  ApprovalPolicyConditions,
   ApprovalPolicyDecision,
   CommandEnvBinding,
   HandleSummary,
@@ -273,31 +274,12 @@ async function handleApi(
 
   if (req.method === "POST" && url.pathname === "/api/approval/policies") {
     const body = await readJson(req);
-    sendJson(
-      res,
-      200,
-      await store.addApprovalPolicyRule({
-        name: optionalString(body.name),
-        enabled: body.enabled !== false,
-        priority: optionalNumberValue(body.priority),
-        decision: approvalPolicyDecision(body.decision),
-        expiresAt: optionalString(body.expiresAt),
-        durationMs: optionalNumberValue(body.durationMs),
-        conditions: {
-          handles: stringArray(body.handles),
-          secretTypes: stringArray(body.secretTypes).map(secretType),
-          providers: stringArray(body.providers),
-          minSeverity: optionalSecretSeverity(body.minSeverity),
-          agents: stringArray(body.agents),
-          actionKinds: stringArray(body.actionKinds).map(approvalPolicyActionKind),
-          commands: stringArray(body.commands),
-          injectEnvs: stringArray(body.injectEnvs),
-          workingDirs: stringArray(body.workingDirs),
-          sshTargets: stringArray(body.sshTargets),
-          sshPorts: stringArray(body.sshPorts).map((item) => Number(item))
-        }
-      })
-    );
+    sendJson(res, 200, await store.addApprovalPolicyRule(policyRuleInput(body)));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/approval/policies/arrange") {
+    sendJson(res, 200, await store.arrangeApprovalPolicyRules());
     return;
   }
 
@@ -325,6 +307,11 @@ async function handleApi(
         throw new HttpError(400, "enabled must be a boolean.");
       }
       sendJson(res, 200, await store.setApprovalPolicyRuleEnabled(id, body.enabled));
+      return;
+    }
+    if (req.method === "PUT") {
+      const body = await readJson(req);
+      sendJson(res, 200, await store.updateApprovalPolicyRule(id, policyRuleUpdateInput(body)));
       return;
     }
   }
@@ -409,7 +396,7 @@ async function handleApi(
     return;
   }
 
-  const match = url.pathname.match(/^\/api\/requests\/([^/]+)\/(approve|deny|execute|recover)$/);
+  const match = url.pathname.match(/^\/api\/requests\/([^/]+)\/(approve|approve-policy|deny|execute|recover)$/);
   if (req.method === "POST" && match) {
     const id = decodeURIComponent(match[1]);
     const action = match[2];
@@ -424,6 +411,11 @@ async function handleApi(
           agentScope: optionalApprovalAgentScope(body.agentScope)
         })
       );
+      return;
+    }
+
+    if (action === "approve-policy") {
+      sendJson(res, 200, await store.approveRequestWithScopedPolicy(id));
       return;
     }
 
@@ -1151,15 +1143,37 @@ function optionalSecretSeverity(input: unknown): SecretSeverity | undefined {
   throw new HttpError(400, "minSeverity must be low, medium, high, or critical.");
 }
 
-function stringArray(input: unknown): string[] {
-  if (input === undefined || input === null || input === "") {
+function policyStringArray(body: Record<string, unknown>, field: string): string[] {
+  if (!hasBodyField(body, field)) {
     return [];
   }
-  if (Array.isArray(input) && input.every((item) => typeof item === "string")) {
-    return input;
+  const value = body[field];
+  if (Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim())) {
+    return value;
   }
 
-  throw new HttpError(400, "Expected an array of strings.");
+  throw new HttpError(400, `${field} must be an array of non-empty strings.`);
+}
+
+function policyNumberArray(body: Record<string, unknown>, field: string): number[] {
+  if (!hasBodyField(body, field)) {
+    return [];
+  }
+  return numberArray(body[field], field);
+}
+
+function policyOptionalNumberValue(body: Record<string, unknown>, field: string): number | undefined {
+  if (!hasBodyField(body, field)) {
+    return undefined;
+  }
+  const value = body[field];
+  if (value === null || (typeof value === "string" && !value.trim())) {
+    throw new HttpError(400, `${field} must be a finite number.`);
+  }
+  if (typeof value !== "number" && typeof value !== "string") {
+    throw new HttpError(400, `${field} must be a finite number.`);
+  }
+  return optionalNumberValue(value);
 }
 
 function optionalNumberValue(value: unknown): number | undefined {
@@ -1173,6 +1187,192 @@ function optionalNumberValue(value: unknown): number | undefined {
   }
 
   return parsed;
+}
+
+function policyRuleInput(body: Record<string, unknown>): AddApprovalPolicyRuleInput {
+  assertKnownPolicyFields(body);
+  return {
+    name: hasBodyField(body, "name") ? policyNameValue(body.name) : undefined,
+    enabled: booleanValue(body.enabled, "enabled", true),
+    priority: policyOptionalNumberValue(body, "priority"),
+    decision: approvalPolicyDecision(body.decision),
+    expiresAt: policyExpiresAtValue(body, false) ?? undefined,
+    durationMs: policyOptionalNumberValue(body, "durationMs"),
+    conditions: policyConditionsFromBody(body)
+  };
+}
+
+function policyRuleUpdateInput(body: Record<string, unknown>): UpdateApprovalPolicyRuleInput {
+  assertKnownPolicyFields(body);
+  const input: UpdateApprovalPolicyRuleInput = {};
+  if (hasBodyField(body, "name")) input.name = policyNameValue(body.name);
+  if (hasBodyField(body, "enabled")) input.enabled = booleanValue(body.enabled, "enabled");
+  if (hasBodyField(body, "priority")) input.priority = policyOptionalNumberValue(body, "priority");
+  if (hasBodyField(body, "decision")) input.decision = approvalPolicyDecision(body.decision);
+  if (hasBodyField(body, "expiresAt")) input.expiresAt = policyExpiresAtValue(body, true);
+  if (hasBodyField(body, "durationMs")) input.durationMs = policyOptionalNumberValue(body, "durationMs");
+
+  const conditions = policyConditionPatchFromBody(body);
+  if (conditions) input.conditions = conditions;
+  if (Object.keys(input).length === 0) {
+    throw new HttpError(400, "Approval policy update must include at least one change.");
+  }
+  return input;
+}
+
+function policyConditionsFromBody(body: Record<string, unknown>): ApprovalPolicyConditions {
+  return {
+    handles: policyStringArray(body, "handles"),
+    envBindings: policyEnvBindings(body.envBindings),
+    secretTypes: policyStringArray(body, "secretTypes").map(policySecretType),
+    providers: policyStringArray(body, "providers"),
+    minSeverity: optionalSecretSeverity(body.minSeverity),
+    agents: policyStringArray(body, "agents"),
+    actionKinds: policyStringArray(body, "actionKinds").map(approvalPolicyActionKind),
+    commands: policyStringArray(body, "commands"),
+    injectEnvs: policyStringArray(body, "injectEnvs"),
+    workingDirs: policyStringArray(body, "workingDirs"),
+    sshTargets: policyStringArray(body, "sshTargets"),
+    sshPorts: policyNumberArray(body, "sshPorts")
+  };
+}
+
+function policyConditionPatchFromBody(body: Record<string, unknown>): Partial<ApprovalPolicyConditions> | undefined {
+  const fields = [
+    "handles",
+    "envBindings",
+    "secretTypes",
+    "providers",
+    "minSeverity",
+    "agents",
+    "actionKinds",
+    "commands",
+    "injectEnvs",
+    "workingDirs",
+    "sshTargets",
+    "sshPorts"
+  ];
+  if (!fields.some((field) => hasBodyField(body, field))) {
+    return undefined;
+  }
+
+  const patch: Partial<ApprovalPolicyConditions> = {};
+  if (hasBodyField(body, "handles")) patch.handles = policyStringArray(body, "handles");
+  if (hasBodyField(body, "envBindings")) patch.envBindings = policyEnvBindings(body.envBindings);
+  if (hasBodyField(body, "secretTypes")) patch.secretTypes = policyStringArray(body, "secretTypes").map(policySecretType);
+  if (hasBodyField(body, "providers")) patch.providers = policyStringArray(body, "providers");
+  if (hasBodyField(body, "minSeverity")) patch.minSeverity = body.minSeverity === null ? undefined : optionalSecretSeverity(body.minSeverity);
+  if (hasBodyField(body, "agents")) patch.agents = policyStringArray(body, "agents");
+  if (hasBodyField(body, "actionKinds")) patch.actionKinds = policyStringArray(body, "actionKinds").map(approvalPolicyActionKind);
+  if (hasBodyField(body, "commands")) patch.commands = policyStringArray(body, "commands");
+  if (hasBodyField(body, "injectEnvs")) patch.injectEnvs = policyStringArray(body, "injectEnvs");
+  if (hasBodyField(body, "workingDirs")) patch.workingDirs = policyStringArray(body, "workingDirs");
+  if (hasBodyField(body, "sshTargets")) patch.sshTargets = policyStringArray(body, "sshTargets");
+  if (hasBodyField(body, "sshPorts")) patch.sshPorts = policyNumberArray(body, "sshPorts");
+  return patch;
+}
+
+function policyExpiresAtValue(body: Record<string, unknown>, allowClear: boolean): string | null | undefined {
+  if (!hasBodyField(body, "expiresAt")) {
+    return undefined;
+  }
+  if (body.expiresAt === null && allowClear) {
+    return null;
+  }
+  if (typeof body.expiresAt !== "string") {
+    throw new HttpError(400, "expiresAt must be an ISO timestamp.");
+  }
+  return body.expiresAt;
+}
+
+function policyNameValue(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new HttpError(400, "name must be a string.");
+  }
+  return value;
+}
+
+function assertKnownPolicyFields(body: Record<string, unknown>): void {
+  const known = new Set([
+    "name",
+    "enabled",
+    "priority",
+    "decision",
+    "expiresAt",
+    "durationMs",
+    "handles",
+    "envBindings",
+    "secretTypes",
+    "providers",
+    "minSeverity",
+    "agents",
+    "actionKinds",
+    "commands",
+    "injectEnvs",
+    "workingDirs",
+    "sshTargets",
+    "sshPorts"
+  ]);
+  const unknown = Object.keys(body).filter((field) => !known.has(field));
+  if (unknown.length) {
+    throw new HttpError(400, `Unsupported approval policy field: ${unknown.join(", ")}.`);
+  }
+}
+
+function booleanValue(value: unknown, field: string, fallback?: boolean): boolean {
+  if (value === undefined && fallback !== undefined) {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  throw new HttpError(400, `${field} must be a boolean.`);
+}
+
+function policySecretType(value: string): SecretType {
+  const type = secretType(value);
+  if (type === "unknown" && value !== "unknown") {
+    throw new HttpError(400, `Unsupported secret type: ${value}.`);
+  }
+  return type;
+}
+
+function numberArray(value: unknown, field: string): number[] {
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, `${field} must be an array of numbers.`);
+  }
+
+  return value.map((item) => {
+    const number = typeof item === "number" || typeof item === "string" ? Number(item) : Number.NaN;
+    if (!Number.isFinite(number)) {
+      throw new HttpError(400, `${field} must contain finite numbers.`);
+    }
+    return number;
+  });
+}
+
+function policyEnvBindings(value: unknown): CommandEnvBinding[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "envBindings must be an array of {handle, injectEnv} objects.");
+  }
+
+  return value.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new HttpError(400, "envBindings must be an array of {handle, injectEnv} objects.");
+    }
+    const binding = item as Record<string, unknown>;
+    return {
+      handle: stringValue(binding.handle, "envBindings.handle"),
+      injectEnv: stringValue(binding.injectEnv, "envBindings.injectEnv")
+    };
+  });
+}
+
+function hasBodyField(body: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(body, field);
 }
 
 function providerForType(type: SecretType): string {
@@ -1301,15 +1501,15 @@ function sendError(res: ServerResponse, error: unknown): void {
 }
 
 function statusForErrorMessage(message: string): number {
-  if (/unknown (secret handle|request)/i.test(message)) {
+  if (/unknown (secret handle|request|approval policy)/i.test(message)) {
     return 404;
   }
 
-  if (/approval|approved|pending|denied|executed|failed/i.test(message)) {
+  if (/approval|approved|pending|denied|executed|failed|takes precedence/i.test(message)) {
     return 409;
   }
 
-  if (/not allowed|invalid|required|missing|empty/i.test(message)) {
+  if (/not allowed|invalid|required|missing|empty|must be|must contain|must include|unsupported|expected/i.test(message)) {
     return 400;
   }
 
