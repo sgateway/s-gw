@@ -83,53 +83,57 @@ describe("platform installers", () => {
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);
   }, 20_000);
 
-  it("keeps installer setup local and does not embed credential material", async () => {
-    const [mac, windows] = await Promise.all([
-      readFile(path.join(root, "native/installers/macos/Install s-gw.command"), "utf8"),
+  it("builds a self-contained macOS app with an Applications shortcut", async () => {
+    const [builder, runtimeConfig, nodeEntitlements, verifier, windows] = await Promise.all([
+      readFile(path.join(root, "scripts/build-installers.mjs"), "utf8"),
+      readFile(path.join(root, "native/macos-app/runtime.json"), "utf8"),
+      readFile(path.join(root, "native/macos-app/NodeRuntime.entitlements"), "utf8"),
+      readFile(path.join(root, "scripts/verify-macos-dmg.mjs"), "utf8"),
       readFile(path.join(root, "native/installers/windows/Install-s-gw.ps1"), "utf8")
     ]);
-    const combined = `${mac}\n${windows}`;
+    const runtime = JSON.parse(runtimeConfig) as { node: { version: string; url: string; sha256: string } };
 
-    expect(mac).toContain('"$sgw_bin" setup --port 8718');
-    expect(mac).toContain('PATH="$npm_prefix/bin:$PATH" "$sgw_bin" setup');
-    expect(mac).toContain('persistent_helper="$sgw_home/native/$keychain_target/s-gw-keychain-helper"');
-    expect(mac).toContain('The existing Keychain helper could not be preserved before upgrade.');
-    expect(mac).toContain('archive_keychain_helper "$candidate"');
-    expect(mac).toContain('archive_keychain_helper "$installed_helper"');
-    expect(mac).toContain('/usr/bin/shasum -a 256');
-    expect(mac).toContain('installed_helper="$npm_root/@s-gw/s-gw/dist/native/$keychain_target/s-gw-keychain-helper"');
-    expect(mac).toContain('The stable Keychain helper could not be activated after upgrade.');
+    expect(builder).toContain('resolve(stageRoot, "s-gw.app")');
+    expect(builder).toContain('symlinkSync("/Applications"');
+    expect(builder).toContain('Contents/Resources/s-gw-runtime');
+    expect(builder).toContain('npm", ["ci", "--omit=dev", "--ignore-scripts"');
+    expect(builder).toContain('Contents/Library/LoginItems/s-gw Menu Bar.app');
+    expect(builder).toContain('writeLauncher(resolve(binDir, "s-gw")');
+    expect(builder).toContain('writeLauncher(resolve(binDir, "s-gw-mcp")');
+    expect(builder).toContain("SGW_REQUIRE_NOTARIZATION");
+    expect(builder).toContain("notarytool");
+    expect(builder).toContain("NodeRuntime.entitlements");
+    expect(builder).toContain("com.apple.security.cs.allow-jit");
+    expect(builder).toContain('"--options", "runtime"');
+    expect(builder).toContain('for (const command of ["corepack", "npm", "npx"])');
+    expect(builder).not.toContain("Install s-gw.command");
+    expect(nodeEntitlements).toContain("com.apple.security.cs.allow-jit");
+    expect(verifier).toContain('path.join(runtimeRoot, "bin", "s-gw")');
+    expect(verifier).toContain("runMcpSmoke");
+    expect(verifier).toContain("SGW_TEST_HOME_ROOT");
+    expect(runtime.node.version).toMatch(/^24\./);
+    expect(runtime.node.url).toContain(`v${runtime.node.version}/node-v${runtime.node.version}-darwin-arm64.tar.gz`);
+    expect(runtime.node.sha256).toMatch(/^[a-f0-9]{64}$/);
+
     expect(windows).toContain('$setupArgs = @("setup", "--port", [string]$Port)');
-    expect(combined).toContain("npm");
-    expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");
-    expect(combined).not.toContain("op read");
+    expect(windows).not.toContain("SGW_MASTER_PASSPHRASE");
+    expect(windows).not.toContain("op read");
   });
 
-  it("removes the legacy package before install and clears a partial scoped package only during rollback", async () => {
-    const [mac, windows] = await Promise.all([
-      readFile(path.join(root, "native/installers/macos/Install s-gw.command"), "utf8"),
-      readFile(path.join(root, "native/installers/windows/Install-s-gw.ps1"), "utf8")
-    ]);
+  it("keeps the Windows npm installer rollback-safe", async () => {
+    const windows = await readFile(path.join(root, "native/installers/windows/Install-s-gw.ps1"), "utf8");
 
-    for (const installer of [mac, windows]) {
-      expect(installer).toContain("pack --dry-run --ignore-scripts --json");
-      expect(installer).toContain("pack --ignore-scripts --json --pack-destination");
-      expect(installer).toContain("uninstall --global --prefix");
-      expect(installer).toContain("rollback");
-      expect(installer).toContain("~/.s-gw");
-      const restoreAt = installer.indexOf("Restoring legacy s-gw");
-      const scopedRemovalAt = installer.search(/uninstall[^\n]+@s-gw\/s-gw/);
-      expect(restoreAt).toBeGreaterThan(0);
-      expect(scopedRemovalAt).toBeGreaterThan(restoreAt);
-    }
-
-    expect(mac).toContain("-- s-gw");
-    expect(mac).toContain("item.version === process.argv[1]");
+    expect(windows).toContain("pack --dry-run --ignore-scripts --json");
+    expect(windows).toContain("pack --ignore-scripts --json --pack-destination");
+    expect(windows).toContain("uninstall --global --prefix");
+    expect(windows).toContain("rollback");
+    expect(windows).toContain("~/.s-gw");
+    const restoreAt = windows.indexOf("Restoring legacy s-gw");
+    const scopedRemovalAt = windows.search(/uninstall[^\n]+@s-gw\/s-gw/);
+    expect(restoreAt).toBeGreaterThan(0);
+    expect(scopedRemovalAt).toBeGreaterThan(restoreAt);
     expect(windows).toContain('-- "s-gw"');
     expect(windows).toContain("$rollbackMetadata.version -ne $legacyVersion");
-    if (process.platform === "darwin") {
-      execFileSync("zsh", ["-n", path.join(root, "native/installers/macos/Install s-gw.command")]);
-    }
   });
 
   it("resolves the Windows command from npm without requiring a restart", async () => {
@@ -161,12 +165,17 @@ describe("platform installers", () => {
       readFile(path.join(root, "scripts/build-installers.mjs"), "utf8"),
       readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8")
     ]);
-    const assetJob = workflow.slice(workflow.indexOf("  release-assets:"));
+    const assetJob = workflow.slice(
+      workflow.indexOf("  release-assets:"),
+      workflow.indexOf("  publish-release:")
+    );
 
     expect(assetJob).toContain("runs-on: macos-15");
+    expect(workflow).toContain("workflow_dispatch:");
+    expect(workflow).not.toContain("  release:");
     expect(workflow).toContain("release_tag:");
-    expect(assetJob).toContain("inputs.release_tag != ''");
-    expect(assetJob).toContain("ref: ${{ env.RELEASE_TAG }}");
+    expect(workflow).toContain("publish_release:");
+    expect(assetJob).toContain("ref: ${{ inputs.release_tag }}");
     expect(assetJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
     expect(assetJob).toContain("SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core");
     expect(assetJob).toContain("repository: barryqy/s-gw-rust-core");
@@ -178,6 +187,15 @@ describe("platform installers", () => {
     expect(assetJob).toContain("npm run package:dry-run");
     expect(assetJob).toContain("npm run validate:npm-package");
     expect(assetJob).toContain("npm run build:installers");
+    expect(assetJob).toContain("Configure macOS distribution signing");
+    expect(assetJob).toContain("APPLE_DEVELOPER_ID_P12_BASE64");
+    expect(assetJob).toContain("APPLE_NOTARY_KEY_P8_BASE64");
+    expect(assetJob).toContain("SGW_MACOS_SIGN_IDENTITY=$identity");
+    expect(assetJob).toContain("SGW_REQUIRE_NOTARIZATION=1");
+    expect(assetJob).toContain("spctl --assess");
+    expect(assetJob).toContain("Create or verify a draft release");
+    expect(assetJob).toContain("gh release create \"$RELEASE_TAG\" --draft --verify-tag --generate-notes");
+    expect(assetJob).toContain('select(.state == "uploaded")');
     expect(assetJob).toContain("first_tgz");
     expect(assetJob).not.toContain("needs: publish");
     expect(builder).toContain("buildLegacyBridge");
@@ -193,13 +211,21 @@ describe("platform installers", () => {
     );
     const registryJob = workflow.slice(
       workflow.indexOf("  publish-registry:"),
-      workflow.indexOf("  release-assets:")
+      workflow.length
+    );
+    const releaseJob = workflow.slice(
+      workflow.indexOf("  publish-release:"),
+      workflow.indexOf("  publish-npm:")
     );
 
+    expect(releaseJob).toContain("needs: release-assets");
+    expect(releaseJob).toContain("gh release edit \"$RELEASE_TAG\" --draft=false");
     expect(npmJob).toContain("runs-on: macos-15");
+    expect(npmJob).toContain("needs: publish-release");
     expect(npmJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
     expect(npmJob).toContain("repository: barryqy/s-gw-rust-core");
-    expect(npmJob).toContain("ref: ${{ github.event.release.tag_name }}");
+    expect(npmJob).toContain("ref: ${{ inputs.release_tag }}");
+    expect(npmJob).not.toContain("github.event.release");
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");

@@ -233,6 +233,7 @@ struct AppStateGuardTests {
     await runUpdateAcknowledgementAndReminderTest()
     runUpdateStateClearAfterInstallTest()
     runSharedUpdateStateConsistencyTest()
+    await runBundledRuntimeRefreshTest()
     runSemVerComparisonTest()
     runAtomFallbackParsingTest()
     runChecksumManifestTest()
@@ -620,6 +621,22 @@ struct AppStateGuardTests {
           "build metadata must not affect precedence")
   }
 
+  @MainActor
+  static func runBundledRuntimeRefreshTest() {
+    check(!AppState.needsBundledRuntimeRefresh(
+      previousVersion: "9.3.1",
+      previousPath: "/Applications/s-gw.app",
+      version: "9.3.1",
+      appPath: "/Applications/s-gw.app"
+    ), "the same bundled app version and path should not refresh services")
+    check(AppState.needsBundledRuntimeRefresh(
+      previousVersion: "9.3.1",
+      previousPath: "/Applications/s-gw.app",
+      version: "9.3.1",
+      appPath: "/Users/test/Applications/s-gw.app"
+    ), "moving a bundled app must refresh absolute service and MCP paths")
+  }
+
   static func runAtomFallbackParsingTest() {
     let xml = """
     <?xml version="1.0"?>
@@ -636,8 +653,8 @@ struct AppStateGuardTests {
       fail("the GitHub Atom fallback should parse the newest release entry")
     }
     check(release.version == "9.3.1", "Atom fallback should parse the release version")
-    check(release.assetName == "s-gw-9.3.1.tgz", "Atom fallback should bind the exact package name")
-    check(release.checksumAssetName == "s-gw-9.3.1.tgz.sha256",
+    check(release.assetName == "s-gw-9.3.1-macos.dmg", "Atom fallback should bind the exact installer name")
+    check(release.checksumAssetName == "s-gw-9.3.1-macos.dmg.sha256",
           "Atom fallback should prefer the exact per-file checksum")
   }
 

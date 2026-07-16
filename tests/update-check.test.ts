@@ -2,7 +2,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { isNewerVersion, ReleaseChecker, UPDATE_CHECK_INTERVAL_MS } from "../src/update-check.js";
+import {
+  isNewerVersion,
+  ReleaseChecker,
+  UPDATE_ASSET_RETRY_INTERVAL_MS,
+  UPDATE_CHECK_INTERVAL_MS
+} from "../src/update-check.js";
 import { CURRENT_VERSION } from "../src/version.js";
 
 let tmpDir = "";
@@ -34,7 +39,7 @@ describe("release update checks", () => {
     });
 
     const first = await checker.check();
-    expect(first).toMatchObject({ checked: true, available: true, latestVersion: "0.2.0", prerelease: true });
+    expect(first).toMatchObject({ checked: true, available: true, installerReady: true, latestVersion: "0.2.0", prerelease: true });
     expect(calls).toBe(1);
 
     const cached = await checker.check();
@@ -101,7 +106,8 @@ describe("release update checks", () => {
       checked: true,
       currentVersion: "0.1.0",
       latestVersion: "0.1.2",
-      available: true,
+      available: false,
+      installerReady: false,
       releaseUrl: "https://github.com/sgateway/s-gw/releases/tag/v0.1.2",
       publishedAt: "2026-07-11T12:00:00Z"
     });
@@ -144,6 +150,74 @@ describe("release update checks", () => {
     });
   });
 
+  it("waits for an uploaded installer and checksum before announcing a release", async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-installer-ready-"));
+    const tag = "v0.2.0";
+    const expected = installerName(tag);
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpDir, "update.json"),
+      currentVersion: "0.1.0",
+      enabled: true,
+      fetcher: async () => new Response(JSON.stringify([
+        release(tag, { assets: [{ name: expected, state: "starter" }] })
+      ]), { status: 200 })
+    });
+
+    await expect(checker.check(true)).resolves.toMatchObject({
+      latestVersion: "0.2.0",
+      installerReady: false,
+      available: false
+    });
+
+    const ready = new ReleaseChecker({
+      cachePath: path.join(tmpDir, "ready.json"),
+      currentVersion: "0.1.0",
+      enabled: true,
+      fetcher: async () => new Response(JSON.stringify([
+        release(tag, {
+          assets: [
+            { name: expected, state: "uploaded" },
+            { name: `${expected}.sha256`, state: "uploaded" }
+          ]
+        })
+      ]), { status: 200 })
+    });
+
+    await expect(ready.check(true)).resolves.toMatchObject({ installerReady: true, available: true });
+  });
+
+  it("retries an unready release soon after its installer assets finish uploading", async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-pending-assets-"));
+    let now = Date.parse("2026-07-16T20:00:00.000Z");
+    let calls = 0;
+    const tag = "v0.2.0";
+    const expected = installerName(tag);
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpDir, "update.json"),
+      currentVersion: "0.1.0",
+      enabled: true,
+      now: () => now,
+      fetcher: async () => new Response(JSON.stringify([
+        calls++ === 0
+          ? release(tag, { assets: [{ name: expected, state: "starter" }] })
+          : release(tag, {
+              assets: [
+                { name: expected, state: "uploaded" },
+                { name: `${expected}.sha256`, state: "uploaded" }
+              ]
+            })
+      ]), { status: 200 })
+    });
+
+    await expect(checker.check()).resolves.toMatchObject({ installerReady: false, available: false });
+    await expect(checker.check()).resolves.toMatchObject({ installerReady: false, available: false });
+    expect(calls).toBe(1);
+
+    now += UPDATE_ASSET_RETRY_INTERVAL_MS + 1;
+    await expect(checker.check()).resolves.toMatchObject({ installerReady: true, available: true });
+    expect(calls).toBe(2);
+  });
+
   it("keeps the updater version aligned with the package", async () => {
     const pkg = JSON.parse(await readFile(path.join(process.cwd(), "package.json"), "utf8"));
     expect(CURRENT_VERSION).toBe(pkg.version);
@@ -169,15 +243,31 @@ describe("release update checks", () => {
     expect(helper).toContain('static let command = ["update", "check"]');
     expect(helper).not.toContain('["update", "check", "--force"]');
     expect(helper).toContain("15 * 60");
+    expect(helper).toContain("installerReady");
   });
 });
 
-function release(tag: string, options: { draft?: boolean; prerelease?: boolean } = {}) {
+function release(
+  tag: string,
+  options: { draft?: boolean; prerelease?: boolean; assets?: Array<{ name: string; state: string }> } = {}
+) {
+  const asset = installerName(tag);
   return {
     tag_name: tag,
     html_url: `https://github.com/sgateway/s-gw/releases/tag/${tag}`,
     draft: options.draft ?? false,
     prerelease: options.prerelease ?? false,
-    published_at: "2026-07-03T12:00:00.000Z"
+    published_at: "2026-07-03T12:00:00.000Z",
+    assets: options.assets ?? [
+      { name: asset, state: "uploaded" },
+      { name: `${asset}.sha256`, state: "uploaded" }
+    ]
   };
+}
+
+function installerName(tag: string): string {
+  const version = tag.replace(/^v/i, "");
+  if (process.platform === "darwin") return `s-gw-${version}-macos.dmg`;
+  if (process.platform === "win32") return `s-gw-${version}-windows.zip`;
+  return `s-gw-${version}.tgz`;
 }

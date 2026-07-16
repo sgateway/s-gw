@@ -1,40 +1,209 @@
 name: Publish release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing release tag to rebuild assets for
-        required: false
+        description: Annotated tag to verify and publish
+        required: true
         type: string
+      publish_release:
+        description: Publish the verified draft release after its assets upload
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: publish-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  publish-npm:
-    if: github.repository == 'sgateway/s-gw' && github.event_name == 'release'
+  release-assets:
+    if: github.repository == 'sgateway/s-gw'
     runs-on: macos-15
-    environment: npm
     permissions:
-      contents: read
-      id-token: write
+      contents: write
     env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
       SGW_REQUIRE_RUST_CORE: "1"
       SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ inputs.release_tag }}
 
       - name: Check out private Rust core
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: barryqy/s-gw-rust-core
           token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.release_tag }}
+          path: .private/sgw-core
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+      - run: npm ci --ignore-scripts
+
+      - name: Configure macOS distribution signing
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_DEVELOPER_ID_P12_BASE64"
+          test -n "$APPLE_DEVELOPER_ID_P12_PASSWORD"
+          test -n "$APPLE_NOTARY_KEY_P8_BASE64"
+          test -n "$APPLE_NOTARY_KEY_ID"
+          test -n "$APPLE_NOTARY_ISSUER_ID"
+
+          keychain="$RUNNER_TEMP/s-gw-signing.keychain-db"
+          certificate="$RUNNER_TEMP/s-gw-developer-id.p12"
+          notary_key="$RUNNER_TEMP/s-gw-notary-key.p8"
+          keychain_password="$(uuidgen)"
+          trap 'rm -f "$certificate" "$notary_key"' EXIT
+
+          printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 -D > "$certificate"
+          printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64 -D > "$notary_key"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p')"
+          test -n "$identity"
+          xcrun notarytool store-credentials s-gw-notary \
+            --key "$notary_key" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --keychain "$keychain"
+          {
+            echo "SGW_MACOS_SIGN_IDENTITY=$identity"
+            echo "SGW_NOTARY_PROFILE=s-gw-notary"
+            echo "SGW_REQUIRE_NOTARIZATION=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify release version
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          test "v${package_version}" = "${RELEASE_TAG}"
+
+      - name: Verify release build
+        run: |
+          npm run build
+          npm run check:rust
+          npm run build:rust-core
+          npx vitest run --testTimeout 15000
+          npm audit --audit-level=high
+          npm run package:dry-run
+      - run: npm run validate:npm-package
+      - run: npm run build:installers
+
+      - name: Assess stapled macOS installer
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          spctl --assess --type open --context context:primary-signature "dist/installers/s-gw-${package_version}-macos.dmg"
+
+      - name: Create or verify a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "true"
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes
+
+      - name: Upload verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          bridge="dist/installers/0-s-gw-legacy-${package_version}.tgz"
+
+          for asset in dist/installers/*; do
+            gh release delete-asset "$RELEASE_TAG" "$(basename "$asset")" --yes >/dev/null 2>&1 || true
+          done
+
+          for checksum in dist/installers/*.sha256 dist/installers/SHA256SUMS.txt; do
+            gh release upload "$RELEASE_TAG" "$checksum"
+          done
+
+          gh release upload "$RELEASE_TAG" "$bridge"
+          for asset in dist/installers/*; do
+            case "$asset" in
+              "$bridge"|*.sha256|*/SHA256SUMS.txt) continue ;;
+            esac
+            gh release upload "$RELEASE_TAG" "$asset"
+          done
+
+          first_tgz="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '[.assets[] | select(.name | endswith(".tgz"))][0].name')"
+          test "$first_tgz" = "$(basename "$bridge")"
+
+          uploaded="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.assets[] | select(.state == "uploaded") | .name')"
+          for asset in dist/installers/*; do
+            name="$(basename "$asset")"
+            printf '%s\n' "$uploaded" | grep -Fqx "$name"
+          done
+
+  publish-release:
+    needs: release-assets
+    if: github.repository == 'sgateway/s-gw' && inputs.publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Publish the verified draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "true"
+          gh release edit "$RELEASE_TAG" --draft=false
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "false"
+
+  publish-npm:
+    needs: publish-release
+    if: github.repository == 'sgateway/s-gw' && needs.publish-release.result == 'success'
+    runs-on: macos-15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      SGW_REQUIRE_RUST_CORE: "1"
+      SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.release_tag }}
+
+      - name: Check out private Rust core
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: barryqy/s-gw-rust-core
+          token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
+          ref: ${{ inputs.release_tag }}
           path: .private/sgw-core
           persist-credentials: false
 
@@ -51,7 +220,7 @@ jobs:
       - name: Verify release version
         run: |
           package_version="$(node -p "require('./package.json').version")"
-          test "v${package_version}" = "${GITHUB_REF_NAME}"
+          test "v${package_version}" = "${RELEASE_TAG}"
 
       - name: Validate native npm package
         run: |
@@ -99,19 +268,18 @@ jobs:
 
   publish-registry:
     needs: publish-npm
-    if: >-
-      always() &&
-      github.repository == 'sgateway/s-gw' &&
-      (github.event_name == 'release' || inputs.release_tag == '') &&
-      (github.event_name != 'release' || needs.publish-npm.result == 'success')
+    if: always() && github.repository == 'sgateway/s-gw' && needs.publish-npm.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ inputs.release_tag }}
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -143,77 +311,3 @@ jobs:
         run: |
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish server.json
-
-  release-assets:
-    if: github.repository == 'sgateway/s-gw' && (github.event_name == 'release' || inputs.release_tag != '')
-    runs-on: macos-15
-    permissions:
-      contents: write
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'release' && github.ref_name || inputs.release_tag }}
-      SGW_REQUIRE_RUST_CORE: "1"
-      SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Check out private Rust core
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: barryqy/s-gw-rust-core
-          token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
-          ref: ${{ env.RELEASE_TAG }}
-          path: .private/sgw-core
-          persist-credentials: false
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        with:
-          node-version: 24
-          package-manager-cache: false
-
-      - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
-      - run: npm ci --ignore-scripts
-
-      - name: Verify release asset version
-        run: |
-          package_version="$(node -p "require('./package.json').version")"
-          test "v${package_version}" = "${RELEASE_TAG}"
-
-      - name: Verify release build
-        run: |
-          npm run build
-          npm run check:rust
-          npm run build:rust-core
-          npx vitest run --testTimeout 15000
-          npm audit --audit-level=high
-          npm run package:dry-run
-      - run: npm run validate:npm-package
-      - run: npm run build:installers
-
-      - name: Upload verified release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          package_version="$(node -p "require('./package.json').version")"
-          bridge="dist/installers/0-s-gw-legacy-${package_version}.tgz"
-
-          for asset in dist/installers/*; do
-            gh release delete-asset "$RELEASE_TAG" "$(basename "$asset")" --yes >/dev/null 2>&1 || true
-          done
-
-          for checksum in dist/installers/*.sha256 dist/installers/SHA256SUMS.txt; do
-            gh release upload "$RELEASE_TAG" "$checksum"
-          done
-
-          gh release upload "$RELEASE_TAG" "$bridge"
-          for asset in dist/installers/*; do
-            case "$asset" in
-              "$bridge"|*.sha256|*/SHA256SUMS.txt) continue ;;
-            esac
-            gh release upload "$RELEASE_TAG" "$asset"
-          done
-
-          first_tgz="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '[.assets[] | select(.name | endswith(".tgz"))][0].name')"
-          test "$first_tgz" = "$(basename "$bridge")"

@@ -189,6 +189,37 @@ describe("unlock passphrase provider", () => {
     expect((await stat(archivedPackageHelper)).mode & 0o777).toBe(0o700);
   });
 
+  it("never rewrites a signed self-contained app runtime", async () => {
+    if (process.platform !== "darwin") return;
+
+    const app = path.join(tmpDir, "s-gw.app");
+    const runtime = path.join(app, "Contents", "Resources", "s-gw-runtime");
+    const packageRoot = path.join(runtime, "package");
+    const helper = path.join(
+      packageRoot,
+      "dist",
+      "native",
+      `${process.platform}-${process.arch}`,
+      "s-gw-keychain-helper"
+    );
+    await mkdir(path.join(app, "Contents", "MacOS"), { recursive: true });
+    await writeFile(path.join(app, "Contents", "MacOS", "s-gw"), "app\n");
+    await chmod(path.join(app, "Contents", "MacOS", "s-gw"), 0o755);
+    await mkdir(path.join(runtime, "node", "bin"), { recursive: true });
+    await writeFile(path.join(runtime, "runtime.json"), "{}\n");
+    await writeFile(path.join(runtime, "node", "bin", "node"), "node\n");
+    await chmod(path.join(runtime, "node", "bin", "node"), 0o755);
+    await mkdir(path.join(packageRoot, "dist"), { recursive: true });
+    await writeFile(path.join(packageRoot, "dist", "cli.js"), "export {};\n");
+    await writeFile(path.join(packageRoot, "dist", "mcp-server.js"), "export {};\n");
+    await mkdir(path.dirname(helper), { recursive: true });
+    await writeFile(helper, "sealed helper identity\n");
+    await chmod(helper, 0o755);
+
+    expect(pinPackagedKeychainHelper(packageRoot)).toBeUndefined();
+    expect(await readFile(helper, "utf8")).toBe("sealed helper identity\n");
+  });
+
   it("rebinds a legacy Keychain item to the persistent helper without prompting", async () => {
     if (process.platform !== "darwin") return;
 

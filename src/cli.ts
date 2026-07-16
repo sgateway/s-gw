@@ -2,7 +2,13 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { stdin } from "node:process";
-import { agentIntegrationStatus, installAgentIntegrations, uninstallAgentIntegrations } from "./agent-install.js";
+import {
+  agentIntegrationStatus,
+  installAgentIntegrations,
+  refreshManagedAgentIntegrations,
+  resolvePackagedMcpCommand,
+  uninstallAgentIntegrations
+} from "./agent-install.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { unknownCommandMessage } from "./command-suggest.js";
 import { startConsoleServer } from "./console-server.js";
@@ -17,6 +23,7 @@ import {
 } from "./gateway.js";
 import { guardStatus, prepareGuardedRun, runGuardedAgent } from "./guard.js";
 import {
+  assertMacRuntimeForManagedSurfaces,
   getPackageLayout,
   installMacAppBundle,
   installConsoleLaunchAgent,
@@ -28,6 +35,7 @@ import {
   openWindowsClient,
   openWindowsHelper,
   packageHealth,
+  refreshMacRuntimeServices,
   restartWindowsSurfaces,
   startInstalledLaunchAgent,
   stopInstalledLaunchAgent,
@@ -40,7 +48,7 @@ import {
 import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "./onepassword.js";
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
-import { SecretStore } from "./store.js";
+import { normalizeCommandGrant, SecretStore } from "./store.js";
 import {
   deleteKeychainPassphrase,
   installPersistentKeychainHelper,
@@ -95,6 +103,16 @@ async function main(): Promise<void> {
     if (second === "check") {
       printJson(await releaseChecker.check(hasFlag(parsed.flags, "force")));
       return;
+    }
+
+    if (process.platform === "darwin") {
+      const layout = getPackageLayout();
+      if (layout.isSelfContainedMacApp) {
+        throw new Error("This self-contained s-gw.app updates through the signed macOS installer. Download the current DMG from the release page, quit s-gw, replace the app in Applications, then reopen it.");
+      }
+      if (layout.standaloneMacAppInstalled) {
+        throw new Error("A self-contained s-gw.app is already installed. Open that app to update it instead of using the npm package updater.");
+      }
     }
 
     const updateOptions = {
@@ -400,6 +418,7 @@ async function main(): Promise<void> {
   }
 
   if (first === "agent" && second === "install") {
+    assertMacRuntimeForAgentConfiguration();
     const results = installAgentIntegrations({
       agentIds: third ? [third] : undefined,
       dryRun: hasFlag(parsed.flags, "dry-run")
@@ -411,6 +430,7 @@ async function main(): Promise<void> {
   }
 
   if (first === "agent" && second === "uninstall") {
+    assertMacRuntimeForAgentConfiguration();
     const results = uninstallAgentIntegrations({
       agentIds: third ? [third] : undefined,
       dryRun: hasFlag(parsed.flags, "dry-run")
@@ -426,6 +446,7 @@ async function main(): Promise<void> {
       throw new Error("agent show requires an agent name.");
     }
 
+    assertMacRuntimeForAgentConfiguration();
     const profile = resolveAgentProfile(third);
     printJson({
       ...profile,
@@ -449,6 +470,7 @@ async function main(): Promise<void> {
       throw new Error("agent mcp-snippet requires an agent name.");
     }
 
+    assertMacRuntimeForAgentConfiguration();
     process.stdout.write(`${renderAgentMcpSnippet(third, mcpSnippetOptions(parsed.flags))}\n`);
     return;
   }
@@ -956,12 +978,42 @@ function parseDurationMs(input: string): number {
 }
 
 function mcpSnippetOptions(flags: Record<string, string | boolean | string[]>) {
+  const command = getFlag(flags, "command");
+  const args = getFlagList(flags, "arg");
+  const env = {
+    ...(process.env.SGW_HOME ? { SGW_HOME: process.env.SGW_HOME } : {}),
+    ...parseEnvFlags(getFlagList(flags, "env"))
+  };
+  if (process.platform === "darwin") {
+    const layout = getPackageLayout();
+    if (layout.isSelfContainedMacApp && !command) {
+      const bundled = resolvePackagedMcpCommand(layout, {
+        platform: process.platform,
+        pathEnv: process.env.PATH || "",
+        env: process.env,
+        mcpServerPath: layout.mcpPath
+      });
+      return {
+        serverName: getFlag(flags, "server-name"),
+        command: bundled.command,
+        args: args.length > 0 ? args : bundled.args,
+        env
+      };
+    }
+  }
+
   return {
     serverName: getFlag(flags, "server-name"),
-    command: getFlag(flags, "command"),
-    args: getFlagList(flags, "arg"),
-    env: parseEnvFlags(getFlagList(flags, "env"))
+    command,
+    args,
+    env
   };
+}
+
+function assertMacRuntimeForAgentConfiguration(): void {
+  if (process.platform === "darwin") {
+    assertMacRuntimeForManagedSurfaces(getPackageLayout());
+  }
 }
 
 function parseEnvFlags(values: string[]): Record<string, string> {
@@ -987,6 +1039,11 @@ async function handleSetupCommand(
   store: SecretStore,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  if (process.platform === "darwin") {
+    const layout = getPackageLayout();
+    assertMacRuntimeForManagedSurfaces(layout);
+  }
+
   const port = numericFlag(flags, "port", 8718);
   const keychainHelper = process.platform === "darwin" ? installPersistentKeychainHelper() : undefined;
   const keychainCompatibility = process.platform === "darwin" ? pinPackagedKeychainHelper() : undefined;
@@ -1508,7 +1565,7 @@ async function handleAwsCommand(
   positionalArgs: string[] = []
 ): Promise<void> {
   if (!action && hasFlag(flags, "version")) {
-    throw new Error("`s-gw aws --version` does not run the AWS CLI. Use `aws --version`, or `s-gw aws run --raw -- --version` when testing the configured AWS wrapper.");
+    throw new Error("`s-gw aws --version` does not run the AWS CLI. Use `aws --version`, or choose a configured wrapper with `s-gw aws plan --wrapper PATH` and run `s-gw aws run --raw --wrapper PATH -- --version`.");
   }
 
   const handles = await resolveAwsHandles(store, flags);
@@ -1524,8 +1581,8 @@ async function handleAwsCommand(
       secretEnv: handles.secret.policy.injectEnv || "AWS_SECRET_ACCESS_KEY",
       accessKeyHandle: handles.access.handle,
       accessKeyEnv: handles.access.policy.injectEnv || "AWS_ACCESS_KEY_ID",
-      sampleRequestCommand: awsCommandLine("request", sampleArgs, { wrapper }),
-      sampleRunCommand: awsCommandLine("run", sampleArgs, { wrapper })
+      sampleRequestCommand: awsCommandLine("request", sampleArgs, { wrapper, handles }),
+      sampleRunCommand: awsCommandLine("run", sampleArgs, { wrapper, handles })
     });
     return;
   }
@@ -1562,7 +1619,7 @@ async function handleAwsCommand(
 
   printJson({
     approvalRequired: false,
-    repeatCommand: awsCommandLine("run", awsArgs, { wrapper }),
+    repeatCommand: awsCommandLine("run", awsArgs, { wrapper, handles }),
     wrapper,
     secretHandle: handles.secret.handle,
     accessKeyHandle: handles.access.handle,
@@ -1642,19 +1699,20 @@ function findAwsAccessHandle(handles: HandleSummary[], secretHandle: string): Ha
 }
 
 function chooseAwsWrapper(secret: HandleSummary, access: HandleSummary, requested?: string): string {
-  const secretAllowed = secret.policy.allowedCommands || [];
-  const accessAllowed = new Set(access.policy.allowedCommands || []);
-  const common = [...new Set(secretAllowed.filter((command) => accessAllowed.has(command)))];
+  const secretAllowed = new Set((secret.policy.allowedCommands || []).map(normalizeCommandGrant));
+  const accessAllowed = new Set((access.policy.allowedCommands || []).map(normalizeCommandGrant));
+  const common = [...secretAllowed].filter((command) => accessAllowed.has(command));
 
   if (common.length === 0) {
-    throw new Error("No shared AWS wrapper command is allowed for the AWS secret/access handles. Pass --wrapper or update both handle policies.");
+    throw new Error("No shared AWS wrapper command is allowed for the AWS secret/access handles. Update both handle policies to allow the same wrapper.");
   }
 
   if (requested) {
-    if (!common.includes(requested)) {
+    const normalizedRequested = normalizeCommandGrant(requested);
+    if (!common.includes(normalizedRequested)) {
       throw new Error(`AWS wrapper is not allowed by both credential handles: ${requested}`);
     }
-    return requested;
+    return normalizedRequested;
   }
 
   if (common.length > 1) {
@@ -1707,7 +1765,7 @@ function awsRequestResponse(
       ? undefined
       : `s-gw approve ${request.id} --mode timed-session --duration 8h --agent-scope any-agent`,
     localRunCommand: `s-gw execute ${request.id}`,
-    repeatCommand: awsCommandLine("run", awsArgs, { wrapper }),
+    repeatCommand: awsCommandLine("run", awsArgs, { wrapper, handles }),
     wrapper,
     secretHandle: handles.secret.handle,
     accessKeyHandle: handles.access.handle,
@@ -1715,8 +1773,16 @@ function awsRequestResponse(
   };
 }
 
-function awsCommandLine(action: "request" | "run", args: string[], options: { wrapper?: string } = {}): string {
+function awsCommandLine(
+  action: "request" | "run",
+  args: string[],
+  options: { wrapper?: string; handles?: AwsHandles } = {}
+): string {
   const parts = ["s-gw", "aws", action];
+  if (options.handles) {
+    parts.push("--secret-handle", options.handles.secret.handle);
+    parts.push("--access-handle", options.handles.access.handle);
+  }
   if (options.wrapper) {
     parts.push("--wrapper", options.wrapper);
   }
@@ -1975,6 +2041,18 @@ async function handleAppCommand(
     return;
   }
 
+  if (action === "refresh-services") {
+    if (process.platform !== "darwin") {
+      throw new Error("app refresh-services is only available on macOS.");
+    }
+    const services = await refreshMacRuntimeServices();
+    const agents = refreshManagedAgentIntegrations();
+    const ok = agents.every((agent) => agent.state !== "conflict");
+    printJson({ ok, services, agents });
+    if (!ok) process.exitCode = 1;
+    return;
+  }
+
   if (action === "open") {
     if (process.platform === "win32") {
       printJson(
@@ -1995,7 +2073,7 @@ async function handleAppCommand(
     return;
   }
 
-  throw new Error("app requires app-path, install, or open.");
+  throw new Error("app requires app-path, install, open, or refresh-services.");
 }
 
 async function handleGuardCommand(
@@ -2119,6 +2197,7 @@ Commands:
   s-gw app app-path
   s-gw app install
   s-gw app open [--port 8718] [--console-url URL]
+  s-gw app refresh-services
   s-gw guard status
   s-gw guard run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
@@ -2191,7 +2270,7 @@ async function printUpdateNotice(): Promise<void> {
   if (command !== "status" && command !== "doctor") return;
 
   const update = await releaseChecker.check();
-  if (!update.available || !update.latestVersion || !update.releaseUrl) return;
+  if (!update.available || !update.installerReady || !update.latestVersion || !update.releaseUrl) return;
   process.stderr.write(
     `\ns-gw ${update.latestVersion} is available. Run \`s-gw update check\` or visit ${update.releaseUrl}\n`
   );

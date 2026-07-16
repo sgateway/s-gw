@@ -291,6 +291,29 @@ export function installAgentIntegrations(options: AgentIntegrationOptions = {}):
   return withAgentIntegrationLock(options, () => installAgentIntegrationsUnlocked(options));
 }
 
+export function refreshManagedAgentIntegrations(options: AgentIntegrationOptions = {}): AgentIntegrationResult[] {
+  if (options.dryRun) return refreshManagedAgentIntegrationsUnlocked(options);
+  return withAgentIntegrationLock(options, () => refreshManagedAgentIntegrationsUnlocked(options));
+}
+
+function refreshManagedAgentIntegrationsUnlocked(options: AgentIntegrationOptions): AgentIntegrationResult[] {
+  const ctx = loadContext(options);
+  if (ctx.manifestError) {
+    throw new Error(`Cannot refresh managed agent integrations: ${ctx.manifestError}`);
+  }
+
+  const agentIds = Object.keys(ctx.manifest.agents);
+  if (agentIds.length === 0) return [];
+
+  const results: AgentIntegrationResult[] = [];
+  for (const agentId of agentIds) {
+    const current = loadContext(options);
+    const sgwHome = managedAgentSgwHome(current, agentId) || options.sgwHome;
+    results.push(...installAgentIntegrationsUnlocked({ ...options, agentIds: [agentId], sgwHome }));
+  }
+  return results;
+}
+
 function installAgentIntegrationsUnlocked(options: AgentIntegrationOptions): AgentIntegrationResult[] {
   const ctx = loadContext(options);
   const explicit = Boolean(options.agentIds?.length);
@@ -373,8 +396,9 @@ function loadContext(options: AgentIntegrationOptions): WorkContext {
   const homeDir = integrationHome(options);
   const pathEnv = options.pathEnv ?? env.PATH ?? "";
   const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
-  const windowsMcp = platform === "win32";
-  const mcpServerPath = path.resolve(options.mcpServerPath || getPackageLayout().mcpPath);
+  const layout = getPackageLayout();
+  const mcpServerPath = path.resolve(options.mcpServerPath || layout.mcpPath);
+  const mcpLaunch = resolvePackagedMcpCommand(layout, { platform, pathEnv, env, mcpServerPath });
   let manifest: AgentManifest = { version: 1, agents: {} };
   let manifestError: string | undefined;
   try {
@@ -389,14 +413,35 @@ function loadContext(options: AgentIntegrationOptions): WorkContext {
     env,
     platform,
     includeSystemApps: !options.homeDir,
-    mcpCommand: windowsMcp
-      ? path.resolve(process.execPath)
-      : commandPath("s-gw-mcp", pathEnv, platform, env) || "s-gw-mcp",
-    mcpArgs: windowsMcp ? [mcpServerPath] : [],
+    mcpCommand: mcpLaunch.command,
+    mcpArgs: mcpLaunch.args,
     skillSourcePath: options.skillSourcePath || fileURLToPath(new URL("../skills/s-gw/SKILL.md", import.meta.url)),
     manifestPath,
     manifest,
     manifestError
+  };
+}
+
+export function resolvePackagedMcpCommand(
+  layout: Pick<ReturnType<typeof getPackageLayout>, "isSelfContainedMacApp" | "nodePath">,
+  options: {
+    platform: NodeJS.Platform;
+    pathEnv: string;
+    env: NodeJS.ProcessEnv;
+    mcpServerPath: string;
+  }
+): { command: string; args: string[] } {
+  const bundledMacMcp = options.platform === "darwin" && layout.isSelfContainedMacApp;
+  if (options.platform === "win32" || bundledMacMcp) {
+    return {
+      command: path.resolve(bundledMacMcp ? layout.nodePath : process.execPath),
+      args: [options.mcpServerPath]
+    };
+  }
+
+  return {
+    command: commandPath("s-gw-mcp", options.pathEnv, options.platform, options.env) || "s-gw-mcp",
+    args: []
   };
 }
 
@@ -656,6 +701,43 @@ function statusForProfile(profile: AgentProfile, ctx: WorkContext): AgentIntegra
     reason,
     plannedChanges
   };
+}
+
+function managedAgentSgwHome(ctx: WorkContext, agentId: string): string | undefined {
+  const ownership = ctx.manifest.agents[agentId];
+  if (!ownership?.mcp) return undefined;
+  const adapter = adapters.find((candidate) => candidate.id === agentId);
+  if (!adapter) return undefined;
+  return readManagedSgwHome(adapter, ownership.mcp.path);
+}
+
+function readManagedSgwHome(adapter: AgentAdapter, configPath: string): string | undefined {
+  if (adapter.configKind !== "toml") {
+    const info = inspectJsonConfig(configPath, adapter.jsonContainer || "mcpServers", adapter.configKind);
+    return sgwHomeFromEntry(info.entry);
+  }
+
+  const current = readTextIfPresent(configPath);
+  if (!current.value) return undefined;
+  const section = findCodexSection(current.value);
+  if (!section) return undefined;
+  const match = /\bSGW_HOME\s*=\s*("(?:[^"\\]|\\.)*")/.exec(section.text);
+  if (!match) return undefined;
+  try {
+    return normalizeManagedSgwHome(JSON.parse(match[1]));
+  } catch {
+    return undefined;
+  }
+}
+
+function sgwHomeFromEntry(entry: Record<string, unknown> | undefined): string | undefined {
+  if (!entry || !isPlainObject(entry.env)) return undefined;
+  return normalizeManagedSgwHome(entry.env.SGW_HOME);
+}
+
+function normalizeManagedSgwHome(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim() || !path.isAbsolute(value)) return undefined;
+  return path.resolve(value);
 }
 
 function detectProfile(profile: AgentProfile, adapter: AgentAdapter | undefined, ctx: WorkContext): boolean {

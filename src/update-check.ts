@@ -5,12 +5,14 @@ import { CURRENT_VERSION } from "./version.js";
 
 export const UPDATE_REPOSITORY = "sgateway/s-gw";
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+export const UPDATE_ASSET_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface UpdateCheckResult {
   checked: boolean;
   currentVersion: string;
   latestVersion: string | null;
   available: boolean;
+  installerReady: boolean;
   releaseUrl: string | null;
   prerelease: boolean;
   publishedAt: string | null;
@@ -24,6 +26,12 @@ interface GitHubRelease {
   draft: boolean;
   prerelease: boolean;
   published_at?: string | null;
+  assets?: GitHubReleaseAsset[];
+}
+
+interface GitHubReleaseAsset {
+  name: string;
+  state?: string;
 }
 
 interface UpdateCache {
@@ -107,7 +115,8 @@ export class ReleaseChecker {
         checked: true,
         currentVersion: this.currentVersion,
         latestVersion: cleanVersion(release.tag_name),
-        available: isNewerVersion(release.tag_name, this.currentVersion),
+        available: isNewerVersion(release.tag_name, this.currentVersion) && releaseHasVerifiedInstaller(release),
+        installerReady: releaseHasVerifiedInstaller(release),
         releaseUrl: release.html_url,
         prerelease: release.prerelease,
         publishedAt: release.published_at ?? null,
@@ -237,6 +246,7 @@ function emptyResult(currentVersion: string): UpdateCheckResult {
     currentVersion,
     latestVersion: null,
     available: false,
+    installerReady: false,
     releaseUrl: null,
     prerelease: false,
     publishedAt: null,
@@ -307,7 +317,13 @@ function compareNumericIdentifier(left: string, right: string): number {
 function cacheIsFresh(result: UpdateCheckResult, now: number): boolean {
   if (!result.checkedAt) return false;
   const checkedAt = Date.parse(result.checkedAt);
-  return Number.isFinite(checkedAt) && now - checkedAt < UPDATE_CHECK_INTERVAL_MS;
+  if (!Number.isFinite(checkedAt)) return false;
+
+  const waitingForInstaller = Boolean(result.latestVersion) &&
+    isNewerVersion(result.latestVersion!, result.currentVersion) &&
+    !result.installerReady;
+  const interval = waitingForInstaller ? UPDATE_ASSET_RETRY_INTERVAL_MS : UPDATE_CHECK_INTERVAL_MS;
+  return now - checkedAt < interval;
 }
 
 function validResult(value: unknown): value is UpdateCheckResult {
@@ -315,7 +331,29 @@ function validResult(value: unknown): value is UpdateCheckResult {
   const result = value as Partial<UpdateCheckResult>;
   return typeof result.currentVersion === "string" &&
     typeof result.available === "boolean" &&
+    typeof result.installerReady === "boolean" &&
     (result.latestVersion === null || typeof result.latestVersion === "string") &&
     (result.releaseUrl === null || typeof result.releaseUrl === "string") &&
     (result.checkedAt === null || typeof result.checkedAt === "string");
+}
+
+function releaseHasVerifiedInstaller(release: GitHubRelease): boolean {
+  const expected = expectedInstallerName(release.tag_name);
+  const uploaded = (release.assets || []).filter((asset) => asset.state?.toLowerCase() === "uploaded");
+  const installer = uploaded.find((asset) => asset.name.toLowerCase() === expected.toLowerCase());
+  if (!installer) return false;
+
+  const lower = installer.name.toLowerCase();
+  const base = lower.replace(/\.[^.]+$/, "");
+  return uploaded.some((asset) => {
+    const name = asset.name.toLowerCase();
+    return name === `${lower}.sha256` || name === `${base}.sha256` || name === "sha256sums.txt" || name === "sha256sums";
+  });
+}
+
+function expectedInstallerName(version: string): string {
+  const clean = cleanVersion(version);
+  if (process.platform === "darwin") return `s-gw-${clean}-macos.dmg`;
+  if (process.platform === "win32") return `s-gw-${clean}-windows.zip`;
+  return `s-gw-${clean}.tgz`;
 }

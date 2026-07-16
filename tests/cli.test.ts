@@ -524,7 +524,9 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(plan.secretHandle).toBe(secret.handle);
       expect(plan.accessKeyHandle).toBe(access.handle);
       expect(plan.wrapper).toBe(wrapper);
-      expect(plan.sampleRunCommand).toBe(`s-gw aws run --wrapper ${wrapper} -- sts get-caller-identity`);
+      expect(plan.sampleRunCommand).toBe(
+        `s-gw aws run --secret-handle ${secret.handle} --access-handle ${access.handle} --wrapper ${wrapper} -- sts get-caller-identity`
+      );
 
       expect(() => execFileSync(tsxBin, ["src/cli.ts", "aws", "--version"], {
         cwd: repoRoot,
@@ -552,7 +554,9 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(request.approvalRequired).toBe(true);
       expect(request.localApprovalCommand).toContain("--duration 8h");
       expect(request.localRunCommand).toBe(`s-gw execute ${request.request.id}`);
-      expect(request.repeatCommand).toBe(`s-gw aws run --wrapper ${wrapper} -- sts get-caller-identity`);
+      expect(request.repeatCommand).toBe(
+        `s-gw aws run --secret-handle ${secret.handle} --access-handle ${access.handle} --wrapper ${wrapper} -- sts get-caller-identity`
+      );
       expect(request.request.handle).toBe(secret.handle);
       expect(request.request.action.env).toEqual([{ handle: access.handle, injectEnv: "SGW_AWS_DEV_ACCESS_KEY_ID" }]);
       expect(request.request.action.command).toBe(wrapper);
@@ -635,6 +639,8 @@ describe("CLI unknown-command behavior (end to end)", () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-aws-wrapper-"));
     const firstWrapper = path.join(home, "project-a-aws");
     const secondWrapper = path.join(home, "project-b-aws");
+    const unapprovedWrapper = path.join(home, "other-aws");
+    const wrapperRuns = path.join(home, "wrapper-runs.log");
     const env = {
       ...process.env,
       SGW_HOME: home,
@@ -644,8 +650,8 @@ describe("CLI unknown-command behavior (end to end)", () => {
     };
 
     try {
-      for (const wrapperPath of [firstWrapper, secondWrapper]) {
-        await writeFile(wrapperPath, "#!/bin/sh\nexit 0\n");
+      for (const wrapperPath of [firstWrapper, secondWrapper, unapprovedWrapper]) {
+        await writeFile(wrapperPath, `#!/bin/sh\nprintf '%s\\n' invoked >> '${wrapperRuns}'\nexit 0\n`);
         await chmod(wrapperPath, 0o700);
       }
 
@@ -681,6 +687,23 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
+      const beforeAmbiguousRuns = await readFile(path.join(home, "store.json"), "utf8");
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        expect(() => execFileSync(tsxBin, [
+          "src/cli.ts", "aws", "run",
+          "--secret-handle", secret.handle,
+          "--access-handle", access.handle,
+          "--", "sts", "get-caller-identity"
+        ], {
+          cwd: repoRoot,
+          env,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"]
+        })).toThrow(/Multiple AWS wrappers/);
+      }
+      expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(beforeAmbiguousRuns);
+      expect(await readFile(wrapperRuns, "utf8").catch(() => "")).toBe("");
+
       expect(() => execFileSync(tsxBin, [
         "src/cli.ts", "aws", "plan",
         "--secret-handle", secret.handle,
@@ -691,6 +714,18 @@ describe("CLI unknown-command behavior (end to end)", () => {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       })).toThrow(/Multiple AWS wrappers/);
+
+      expect(() => execFileSync(tsxBin, [
+        "src/cli.ts", "aws", "plan",
+        "--secret-handle", secret.handle,
+        "--access-handle", access.handle,
+        "--wrapper", unapprovedWrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      })).toThrow(/not allowed by both credential handles/);
 
       const plan = JSON.parse(execFileSync(tsxBin, [
         "src/cli.ts", "aws", "plan",
@@ -705,7 +740,144 @@ describe("CLI unknown-command behavior (end to end)", () => {
       }));
 
       expect(plan.wrapper).toBe(secondWrapper);
+      expect(plan.sampleRequestCommand).toContain(`--secret-handle ${secret.handle}`);
+      expect(plan.sampleRequestCommand).toContain(`--access-handle ${access.handle}`);
       expect(plan.sampleRunCommand).toContain(`--wrapper ${secondWrapper}`);
+      expect(plan.sampleRunCommand).toContain(`--secret-handle ${secret.handle}`);
+      expect(plan.sampleRunCommand).toContain(`--access-handle ${access.handle}`);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("uses the canonical shared AWS wrapper path", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-aws-wrapper-normalized-"));
+    const wrapper = path.join(home, "aws");
+    const equivalent = `${home}/./aws`;
+    const env = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
+      SGW_MASTER_PASSPHRASE: "cli-aws-wrapper-normalized-test-passphrase",
+      SGW_DISABLE_KEYCHAIN: "1"
+    };
+
+    try {
+      await writeFile(wrapper, "#!/bin/sh\nexit 0\n");
+      await chmod(wrapper, 0o700);
+
+      const secret = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "secret", "add",
+        "--name", "AWS secret with normalized wrapper",
+        "--type", "credential",
+        "--value-stdin",
+        "--inject-env", "AWS_SECRET_ACCESS_KEY",
+        "--allow-command", wrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        input: "aws-secret-normalized-wrapper-value-123456789",
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+
+      const access = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "secret", "add",
+        "--name", "AWS access key with normalized wrapper",
+        "--type", "credential",
+        "--value-stdin",
+        "--inject-env", "AWS_ACCESS_KEY_ID",
+        "--allow-command", equivalent
+      ], {
+        cwd: repoRoot,
+        env,
+        input: fakeAwsAccessKey(),
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+
+      const plan = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "aws", "plan",
+        "--secret-handle", secret.handle,
+        "--access-handle", access.handle,
+        "--wrapper", equivalent
+      ], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+
+      expect(plan.wrapper).toBe(wrapper);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("rejects AWS handles with no shared wrapper without creating a request", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-aws-no-wrapper-"));
+    const secretWrapper = path.join(home, "secret-aws");
+    const accessWrapper = path.join(home, "access-aws");
+    const env = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
+      SGW_MASTER_PASSPHRASE: "cli-aws-no-wrapper-test-passphrase",
+      SGW_DISABLE_KEYCHAIN: "1"
+    };
+
+    try {
+      for (const wrapperPath of [secretWrapper, accessWrapper]) {
+        await writeFile(wrapperPath, "#!/bin/sh\nexit 0\n");
+        await chmod(wrapperPath, 0o700);
+      }
+
+      const secret = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "secret", "add",
+        "--name", "AWS secret without shared wrapper",
+        "--type", "credential",
+        "--value-stdin",
+        "--inject-env", "AWS_SECRET_ACCESS_KEY",
+        "--allow-command", secretWrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        input: "aws-secret-no-shared-wrapper-value-123456789",
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+
+      const access = JSON.parse(execFileSync(tsxBin, [
+        "src/cli.ts", "secret", "add",
+        "--name", "AWS access key without shared wrapper",
+        "--type", "credential",
+        "--value-stdin",
+        "--inject-env", "AWS_ACCESS_KEY_ID",
+        "--allow-command", accessWrapper
+      ], {
+        cwd: repoRoot,
+        env,
+        input: fakeAwsAccessKey(),
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+
+      const before = await readFile(path.join(home, "store.json"), "utf8");
+      expect(() => execFileSync(tsxBin, [
+        "src/cli.ts", "aws", "run",
+        "--secret-handle", secret.handle,
+        "--access-handle", access.handle,
+        "--wrapper", secretWrapper,
+        "--", "sts", "get-caller-identity"
+      ], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      })).toThrow(/Update both handle policies to allow the same wrapper/);
+      expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(before);
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });

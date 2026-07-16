@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +26,18 @@ await verifyReleasePackageChecksum(
   await readFile(path.join(directory, `${legacyBridgeName}.sha256`), "utf8"),
   "per-file"
 );
+
+const macDmg = path.join(directory, `s-gw-${packageInfo.version}-macos.dmg`);
+if (process.platform === "darwin" && existsSync(macDmg)) {
+  const verification = spawnSync(process.execPath, [path.join(root, "scripts/verify-macos-dmg.mjs"), macDmg], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (verification.status !== 0) {
+    throw new Error(verification.stderr.trim() || verification.stdout.trim() || "macOS DMG verification failed.");
+  }
+  process.stdout.write(verification.stdout);
+}
 
 process.stdout.write(
   `Validated ${selected.packageAsset.name}, ${legacyBridgeName}, and their checksums.\n`

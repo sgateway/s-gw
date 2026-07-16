@@ -608,55 +608,6 @@ describe("scoped package migration", () => {
     expect(calls.find((args) => args[0] === "install")?.at(-1)).toBe(`@s-gw/s-gw@${CURRENT_VERSION}`);
   });
 
-  it("runs the macOS release installer through the legacy binary collision in an isolated prefix", async () => {
-    if (process.platform !== "darwin") return;
-
-    const tmp = await tempDir("sgw-macos-installer-");
-    const npmPrefix = path.join(tmp, "npm-prefix");
-    const tarballs = path.join(tmp, "installer");
-    const home = path.join(tmp, "home");
-    await mkdir(tarballs, { recursive: true });
-    await mkdir(home, { recursive: true });
-    const legacyTarball = await packageFixture(tmp, tarballs, "legacy", "s-gw", "0.1.0");
-    const scopedTarball = await packageFixture(tmp, tarballs, "scoped", "@s-gw/s-gw", CURRENT_VERSION);
-    await npm(["install", "--global", "--prefix", npmPrefix, "--ignore-scripts", "--", legacyTarball]);
-
-    const template = await readFile(path.join(
-      process.cwd(),
-      "native",
-      "installers",
-      "macos",
-      "Install s-gw.command"
-    ), "utf8");
-    const installer = path.join(tarballs, "Install s-gw.command");
-    await writeFile(
-      installer,
-      template
-        .replaceAll("__PACKAGE_FILE__", path.basename(scopedTarball))
-        .replaceAll("__VERSION__", CURRENT_VERSION)
-    );
-    await chmod(installer, 0o755);
-
-    const binDir = path.join(npmPrefix, "bin");
-    const output = await execFileAsync("zsh", [installer], {
-      env: {
-        ...process.env,
-        HOME: home,
-        NPM_CONFIG_PREFIX: npmPrefix,
-        SGW_HOME: path.join(home, ".s-gw"),
-        SGW_RECOVERY_HOME: path.join(home, ".s-gw-recovery"),
-        SGW_SKIP_APP_STOP: "1",
-        PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ""}`
-      },
-      timeout: 30_000
-    });
-
-    expect(output.stdout).toContain("Migrating legacy s-gw 0.1.0");
-    expect(output.stdout).toContain("Existing ~/.s-gw data was preserved");
-    const installed = await inspectGlobalSgwInstall({ npmPrefix });
-    expect(installed.legacy).toBeNull();
-    expect(installed.scoped?.version).toBe(CURRENT_VERSION);
-  }, 40_000);
 });
 
 describe("release package assets", () => {

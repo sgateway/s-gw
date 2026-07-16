@@ -1,6 +1,6 @@
 {
   "name": "@s-gw/s-gw",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "mcpName": "io.github.sgateway/s-gw",
   "description": "Local credential control for AI coding agents.",
   "type": "module",

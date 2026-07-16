@@ -144,6 +144,7 @@ final class AppState {
       return
     }
     Task {
+      await refreshBundledRuntimeAfterReplacement()
       await refresh()
     }
     Task {
@@ -685,11 +686,11 @@ final class AppState {
         availableUpdate = releaseInfo(from: snapshot.release)
         updateBannerDismissed = snapshot.acknowledgedAt != nil
       }
-      if !release.canInstallPackage {
+      if !release.hasVerifiedAsset {
         defaults.removeObject(forKey: UpdateChecker.lastCheckDefaultsKey)
         updateState = .idle
         if force {
-          operationMessage = "s-gw \(release.version) is published; its verified package is still being uploaded"
+          operationMessage = "s-gw \(release.version) is published; its verified installer is still being uploaded"
         }
         return
       }
@@ -746,6 +747,17 @@ final class AppState {
       return
     }
 
+    guard release.hasVerifiedAsset else {
+      operationMessage = "The signed installer for s-gw \(release.version) is still being uploaded. Try again shortly."
+      return
+    }
+
+    if release.isMacInstaller {
+      openAvailableRelease()
+      operationMessage = "Download the signed s-gw installer, quit s-gw, replace the app in Applications, then reopen it."
+      return
+    }
+
     Task {
       updateState = .downloading
       let failure = await updater.downloadAndInstall(release) { [weak self] state in
@@ -759,6 +771,52 @@ final class AppState {
         operationMessage = failure
       }
     }
+  }
+
+  private func refreshBundledRuntimeAfterReplacement() async {
+    guard UpdateChecker.usesSelfContainedRuntime else {
+      return
+    }
+
+    let version = UpdateChecker.currentVersion
+    let previousVersion = defaults.string(forKey: UpdateChecker.bundledRuntimeVersionDefaultsKey)
+    let appPath = UpdateChecker.bundledAppPath
+    let previousPath = defaults.string(forKey: UpdateChecker.bundledRuntimePathDefaultsKey)
+    guard Self.needsBundledRuntimeRefresh(
+      previousVersion: previousVersion,
+      previousPath: previousPath,
+      version: version,
+      appPath: appPath
+    ) else {
+      return
+    }
+
+    let result = await cli.run(arguments: ["app", "refresh-services"])
+    guard result.succeeded else {
+      operationMessage = result.output.isEmpty
+        ? "Move s-gw.app to Applications before completing setup."
+        : result.output
+      return
+    }
+
+    defaults.set(version, forKey: UpdateChecker.bundledRuntimeVersionDefaultsKey)
+    defaults.set(appPath, forKey: UpdateChecker.bundledRuntimePathDefaultsKey)
+    if previousVersion == nil {
+      operationMessage = "Existing background services and agent connections now use this bundled s-gw runtime."
+    } else if previousVersion != version {
+      operationMessage = "Background services and agent connections now use s-gw \(version)."
+    } else {
+      operationMessage = "Background services and agent connections now use s-gw from its new app location."
+    }
+  }
+
+  static func needsBundledRuntimeRefresh(
+    previousVersion: String?,
+    previousPath: String?,
+    version: String,
+    appPath: String
+  ) -> Bool {
+    previousVersion != version || previousPath != appPath
   }
 
   private func shouldCheckForUpdates() -> Bool {

@@ -60,6 +60,9 @@ afterEach(async () => {
 
 describeBrowser("React local console (real headless Chrome)", () => {
   it("shows a release notification from the public update feed", async () => {
+    const installer = process.platform === "darwin"
+      ? "s-gw-0.1.1-macos.dmg"
+      : process.platform === "win32" ? "s-gw-0.1.1-windows.zip" : "s-gw-0.1.1.tgz";
     const checker = new ReleaseChecker({
       cachePath: path.join(tmpHome, "update.json"),
       currentVersion: "0.1.0",
@@ -69,7 +72,11 @@ describeBrowser("React local console (real headless Chrome)", () => {
         html_url: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
         draft: false,
         prerelease: true,
-        published_at: "2026-07-04T00:00:00.000Z"
+        published_at: "2026-07-04T00:00:00.000Z",
+        assets: [
+          { name: installer, state: "uploaded" },
+          { name: `${installer}.sha256`, state: "uploaded" }
+        ]
       }]), { status: 200 })
     });
     await checker.check(true);
