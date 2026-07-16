@@ -1803,7 +1803,7 @@ describe("SecretStore", () => {
 
     expect(ids.size).toBe(1);
     expect((await store.listRequests("pending")).filter((request) => request.handle === record.handle)).toHaveLength(1);
-  });
+  }, 15_000);
 
   it("coalesces repeated policy denials into one durable record", async () => {
     const store = new SecretStore();

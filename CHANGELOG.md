@@ -2,7 +2,7 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
-## Unreleased
+## 0.1.14 - 2026-07-16
 
 ### Fixed
 
