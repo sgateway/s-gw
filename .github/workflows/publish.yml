@@ -181,7 +181,14 @@ jobs:
           package_version="$(node -p "require('./package.json').version")"
           test "v${package_version}" = "${RELEASE_TAG}"
 
-      - run: npm run verify
+      - name: Verify release build
+        run: |
+          npm run build
+          npm run check:rust
+          npm run build:rust-core
+          npx vitest run --testTimeout 15000
+          npm audit --audit-level=high
+          npm run package:dry-run
       - run: npm run validate:npm-package
       - run: npm run build:installers
 
