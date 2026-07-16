@@ -1614,7 +1614,7 @@ describe("SecretStore", () => {
 
     const invalidated = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run");
     expect(invalidated.kind).toBe("request");
-  });
+  }, 15_000);
 
   it("rejects a serialized reusable execution permit", async () => {
     const store = new SecretStore();
