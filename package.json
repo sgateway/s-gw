@@ -64,7 +64,7 @@
     "package:dry-run": "npm pack --dry-run",
     "validate:npm-package": "node scripts/validate-npm-package.mjs",
     "validate:release-assets": "node scripts/validate-release-assets.mjs dist/installers",
-    "check:rust": "cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -p sgw-core",
+    "check:rust": "node scripts/check-rust-core.mjs",
     "pretest": "npm run build:rust-core",
     "test": "vitest run",
     "test:watch": "vitest",

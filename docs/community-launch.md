@@ -43,7 +43,7 @@ I built s-gw because coding agents increasingly need to run real commands that t
 
 The idea is simple: the agent sees typed handles, not raw secrets. When it needs to do something, it creates a scoped local action request. You approve the command, handle, env binding, working directory, and target on your machine. s-gw injects the credential only into that child process, then sanitizes output before returning it to the agent.
 
-It is a preview, not a hardened enterprise secrets platform. macOS is the primary path today, Windows is preview, and Linux is experimental. The standalone endpoint is open source.
+It is a preview, not a hardened enterprise secrets platform. macOS is the primary path today, Windows is preview, and Linux is experimental. The broker and clients are open source; distributed packages include a proprietary compiled Rust execution core.
 
 Repo: https://github.com/sgateway/s-gw
 Demo: https://s-gw.com

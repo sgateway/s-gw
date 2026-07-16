@@ -21,7 +21,11 @@ Update `package.json` and `package-lock.json` together. Add user-visible changes
 
 ## Verification
 
+Maintainer releases require a private `barryqy/s-gw-rust-core` checkout. Set `SGW_RUST_CORE_DIR` to that checkout and `SGW_REQUIRE_RUST_CORE=1` so packaging fails closed when the proprietary runner is unavailable.
+
 ```bash
+export SGW_RUST_CORE_DIR=../s-gw-rust-core
+export SGW_REQUIRE_RUST_CORE=1
 npm ci
 npm run verify
 npm run build:installers

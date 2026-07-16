@@ -4,17 +4,34 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const coreRoot = resolve(
+  process.env.SGW_RUST_CORE_DIR || resolve(root, "..", "s-gw-rust-core")
+);
+const manifest = resolve(coreRoot, "Cargo.toml");
 const extension = process.platform === "win32" ? ".exe" : "";
 const target = `${process.platform}-${process.arch}`;
-const built = resolve(root, "target", "release", `sgw-core${extension}`);
+const built = resolve(coreRoot, "target", "release", `sgw-core${extension}`);
 const output = resolve(root, "dist", "native", target, `s-gw-core${extension}`);
 const legacyOutputs = [
   resolve(root, "dist", "native", "s-gw-core"),
   resolve(root, "dist", "native", "s-gw-core.exe")
 ];
 
-const cargo = spawnSync("cargo", ["build", "--release", "--locked", "-p", "sgw-core"], {
-  cwd: root,
+if (!existsSync(manifest)) {
+  rmSync(output, { force: true });
+  for (const legacyOutput of legacyOutputs) {
+    rmSync(legacyOutput, { force: true });
+  }
+  if (process.env.SGW_REQUIRE_RUST_CORE === "1") {
+    console.error(`Private s-gw Rust core checkout is required: ${coreRoot}`);
+    process.exit(1);
+  }
+  console.log(`Skipping private Rust core build; checkout not found: ${coreRoot}`);
+  process.exit(0);
+}
+
+const cargo = spawnSync("cargo", ["build", "--release", "--locked"], {
+  cwd: coreRoot,
   encoding: "utf8",
   stdio: ["ignore", "pipe", "pipe"]
 });

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,9 @@ import { SecretStore } from "../src/store.js";
 let tmpHome = "";
 const oldEngine = process.env.SGW_EXECUTION_ENGINE;
 const oldAwsSecret = process.env.AWS_SECRET_ACCESS_KEY;
+const coreName = process.platform === "win32" ? "s-gw-core.exe" : "s-gw-core";
+const packagedCore = path.resolve("dist", "native", coreName);
+const coreIt = existsSync(packagedCore) ? it : it.skip;
 
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-rust-core-test-"));
@@ -34,7 +38,7 @@ afterAll(() => {
 });
 
 describe("Rust execution core", () => {
-  it("isolates parent credentials and sanitizes consecutive approved executions", async () => {
+  coreIt("isolates parent credentials and sanitizes consecutive approved executions", async () => {
     process.env.AWS_SECRET_ACCESS_KEY = "parent-credential-must-not-reach-child";
     const store = new SecretStore();
     const first = await addCredential(store, "first", "rust-first-secret-value-123456789");
@@ -113,7 +117,7 @@ describe("Rust execution core", () => {
     expect(failed.error).not.toContain(secret);
   });
 
-  it("terminates commands at the approved timeout", async () => {
+  coreIt("terminates commands at the approved timeout", async () => {
     const store = new SecretStore();
     const record = await addCredential(store, "timeout", "rust-timeout-secret-value-123456789");
     const request = await createRequest(

@@ -4,6 +4,10 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Changed
+
+- Moved the proprietary Rust execution core to a separate private repository. The public repository now contains the broker integration and TypeScript compatibility path, while maintainer release builds package the compiled core from a private checkout.
+
 ## 0.1.12 - 2026-07-15
 
 ### Fixed
