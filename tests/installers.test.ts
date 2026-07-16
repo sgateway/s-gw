@@ -171,7 +171,11 @@ describe("platform installers", () => {
     expect(assetJob).toContain("SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core");
     expect(assetJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(assetJob).toContain("path: .private/sgw-core");
-    expect(assetJob).toContain("npm run verify");
+    expect(assetJob).toContain("npm run build");
+    expect(assetJob).toContain("npm run check:rust");
+    expect(assetJob).toContain("npx vitest run --testTimeout 15000");
+    expect(assetJob).toContain("npm audit --audit-level=high");
+    expect(assetJob).toContain("npm run package:dry-run");
     expect(assetJob).toContain("npm run validate:npm-package");
     expect(assetJob).toContain("npm run build:installers");
     expect(assetJob).toContain("first_tgz");
