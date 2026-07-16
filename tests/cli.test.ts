@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -69,7 +69,12 @@ describe("CLI unknown-command behavior (end to end)", () => {
     try {
       const result = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "update", "check"], {
         cwd: repoRoot,
-        env: { ...process.env, SGW_HOME: home, SGW_DISABLE_UPDATE_CHECK: "1" },
+        env: {
+          ...process.env,
+          SGW_HOME: home,
+          SGW_RECOVERY_HOME: `${home}-recovery`,
+          SGW_DISABLE_UPDATE_CHECK: "1"
+        },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       }));
@@ -81,6 +86,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       });
     } finally {
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   });
 
@@ -91,7 +97,12 @@ describe("CLI unknown-command behavior (end to end)", () => {
     try {
       execFileSync(tsxBin, ["src/cli.ts", "statu"], {
         cwd: repoRoot,
-        env: { ...process.env, SGW_HOME: home, SGW_DISABLE_KEYCHAIN: "1" },
+        env: {
+          ...process.env,
+          SGW_HOME: home,
+          SGW_RECOVERY_HOME: `${home}-recovery`,
+          SGW_DISABLE_KEYCHAIN: "1"
+        },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       });
@@ -101,6 +112,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       stderr = err.stderr ?? "";
     } finally {
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
 
     expect(code).toBe(1);
@@ -126,6 +138,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         env: {
           ...process.env,
           SGW_HOME: home,
+          SGW_RECOVERY_HOME: `${home}-recovery`,
           SGW_DISABLE_KEYCHAIN: "1",
           SGW_MASTER_PASSPHRASE: "throwaway-eaddr-test"
         },
@@ -139,6 +152,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     } finally {
       await new Promise<void>((resolve) => occupier.close(() => resolve()));
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
 
     expect(code).toBe(1);
@@ -154,6 +168,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     const env = {
       ...process.env,
       SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
       SGW_MASTER_PASSPHRASE: "cli-arg-test-passphrase",
       SGW_DISABLE_KEYCHAIN: "1"
     };
@@ -244,6 +259,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(request.action.timeoutMs).toBe(1_800_000);
     } finally {
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   });
 
@@ -252,6 +268,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     const env = {
       ...process.env,
       SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
       SGW_MASTER_PASSPHRASE: "cli-next-test-passphrase",
       SGW_DISABLE_KEYCHAIN: "1"
     };
@@ -323,6 +340,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(executed.summary.stdout).toContain(`<<SGW_SECRET:${secret.handle}>>`);
     } finally {
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   });
 
@@ -332,6 +350,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     const env = {
       ...process.env,
       SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
       SGW_MASTER_PASSPHRASE: "cli-aws-test-passphrase",
       SGW_DISABLE_KEYCHAIN: "1"
     };
@@ -448,6 +467,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["ignore", "pipe", "pipe"]
       });
 
+      const beforeRun = await readFile(path.join(home, "store.json"), "utf8");
       const run = JSON.parse(execFileSync(tsxBin, [
         "src/cli.ts",
         "aws",
@@ -467,11 +487,13 @@ describe("CLI unknown-command behavior (end to end)", () => {
       }));
 
       expect(run.approvalRequired).toBe(false);
+      expect(run.reusableAuthorization).toMatchObject({ kind: "grant" });
       expect(run.summary.stdout).toContain(`<<SGW_SECRET:${secret.handle}>>`);
       expect(run.summary.stdout).toContain(`<<SGW_SECRET:${access.handle}>>`);
       expect(run.summary.stdout).not.toContain("aws-secret-shortcut-value-123456789");
       expect(run.summary.stdout).not.toContain(fakeAwsAccessKey());
       expect(run.summary.stdout).toContain("args=ec2 describe-instances --region us-west-2");
+      expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(beforeRun);
 
       const raw = execFileSync(tsxBin, [
         "src/cli.ts",
@@ -497,6 +519,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(raw).not.toContain(fakeAwsAccessKey());
     } finally {
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   }, 15_000);
 });

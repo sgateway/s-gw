@@ -25,9 +25,11 @@ afterEach(async () => {
   delete process.env.SGW_OP_CLI;
   delete process.env.SGW_REAL_OP_PATH;
   delete process.env.SGW_HOME;
+  delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
   }
 });
 
@@ -72,6 +74,7 @@ describe("1Password metadata importer", () => {
   it("captures scanned text into a 1Password-backed handle without storing the raw value locally", async () => {
     process.env.SGW_OP_CLI = await writeFakeOp();
     process.env.SGW_HOME = tmpHome;
+    process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
     process.env.SGW_MASTER_PASSPHRASE = "unit-test-passphrase";
     const store = new SecretStore(tmpHome);
     await store.init();

@@ -56,9 +56,11 @@ describe("Windows client packaging", () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-restart-"));
     const port = await freePort();
     const oldHome = process.env.SGW_HOME;
+    const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
     const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
     const oldUpdateCheck = process.env.SGW_DISABLE_UPDATE_CHECK;
     process.env.SGW_HOME = home;
+    process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
     process.env.SGW_MASTER_PASSPHRASE = "windows restart test passphrase";
     process.env.SGW_DISABLE_UPDATE_CHECK = "1";
 
@@ -74,9 +76,11 @@ describe("Windows client packaging", () => {
     } finally {
       stopWindowsSurfaces();
       restoreEnv("SGW_HOME", oldHome);
+      restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
       restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
       restoreEnv("SGW_DISABLE_UPDATE_CHECK", oldUpdateCheck);
       await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   }, 30_000);
 });

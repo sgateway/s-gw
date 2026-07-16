@@ -758,6 +758,7 @@ describe("agent integration installation", () => {
       USERPROFILE: homeDir,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       SGW_HOME: path.join(homeDir, ".s-gw"),
+      SGW_RECOVERY_HOME: path.join(homeDir, ".s-gw-recovery"),
       SGW_DISABLE_UPDATE_CHECK: "1"
     };
 
@@ -784,7 +785,8 @@ describe("agent integration installation", () => {
         HOME: conflictHome,
         USERPROFILE: conflictHome,
         PATH: `${conflictBin}${path.delimiter}${process.env.PATH || ""}`,
-        SGW_HOME: path.join(conflictHome, ".s-gw")
+        SGW_HOME: path.join(conflictHome, ".s-gw"),
+        SGW_RECOVERY_HOME: path.join(conflictHome, ".s-gw-recovery")
       },
       encoding: "utf8"
     });
@@ -843,6 +845,7 @@ describe("agent integration installation", () => {
         USERPROFILE: homeDir,
         PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
         SGW_HOME: path.join(homeDir, ".s-gw"),
+        SGW_RECOVERY_HOME: path.join(homeDir, ".s-gw-recovery"),
         SGW_DISABLE_UPDATE_CHECK: "1"
       };
       const deadProcess = spawnSync(process.execPath, ["-e", ""]);
@@ -900,6 +903,7 @@ describe("agent integration installation", () => {
         XDG_CONFIG_HOME: path.join(homeDir, ".config"),
         PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
         SGW_HOME: path.join(homeDir, ".s-gw"),
+        SGW_RECOVERY_HOME: path.join(homeDir, ".s-gw-recovery"),
         SGW_MASTER_PASSPHRASE: "test-only-passphrase",
         SGW_DISABLE_KEYCHAIN: "1",
         SGW_DISABLE_UPDATE_CHECK: "1",

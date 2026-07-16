@@ -7,7 +7,7 @@ import { agentIntegrationStatus, installAgentIntegrations, uninstallAgentIntegra
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { unknownCommandMessage } from "./command-suggest.js";
 import { startConsoleServer } from "./console-server.js";
-import { executeApprovedRequest } from "./executor.js";
+import { executeApprovedRequest, executeReusablePermit } from "./executor.js";
 import {
   buildEnvCommandAction,
   buildSshSessionAction,
@@ -212,6 +212,11 @@ async function main(): Promise<void> {
 
   if (first === "guard") {
     await handleGuardCommand(store, second, third, parsed.flags);
+    return;
+  }
+
+  if (first === "run" && second === "env-command") {
+    await handleOneShotEnvCommand(store, third, parsed.flags);
     return;
   }
 
@@ -1392,6 +1397,49 @@ async function handleOnePasswordCommand(
   throw new Error("onepassword requires status, import, or capture.");
 }
 
+async function handleOneShotEnvCommand(
+  store: SecretStore,
+  handleArg: string | undefined,
+  flags: Record<string, string | boolean | string[]>
+): Promise<void> {
+  const handle = handleArg || requireFlag(flags, "handle");
+  const action = buildEnvCommandAction({
+    command: requireFlag(flags, "command"),
+    args: commandArgsFromFlags(flags),
+    injectEnv: requireFlag(flags, "inject-env"),
+    env: envBindingsFromFlags(flags),
+    workingDir: getFlag(flags, "cwd"),
+    timeoutMs: numericFlag(flags, "timeout-ms", 30_000)
+  });
+  const admission = await store.prepareOneShotExecution(
+    handle,
+    action,
+    getFlag(flags, "reason") || "Local CLI one-shot execution"
+  );
+
+  if (admission.kind === "request") {
+    printJson({
+      approvalRequired: admission.request.state !== "approved",
+      localApprovalCommand: admission.request.state === "approved" ? undefined : `s-gw approve ${admission.request.id}`,
+      localRunCommand: `s-gw execute ${admission.request.id}`,
+      request: admission.request
+    });
+    return;
+  }
+
+  const summary = await executeReusablePermit(store, admission.permit);
+  if (hasFlag(flags, "raw")) {
+    printRawSummary(summary);
+    return;
+  }
+
+  printJson({
+    approvalRequired: false,
+    reusableAuthorization: admission.permit.authorization,
+    summary
+  });
+}
+
 async function handleSshCommand(
   store: SecretStore,
   action: string | undefined,
@@ -1426,8 +1474,8 @@ async function handleSshCommand(
       workingDir: getFlag(flags, "cwd"),
       timeoutMs: numericFlag(flags, "timeout-ms", 30_000)
     });
-    const request = await store.createRequest(handle, sshAction, getFlag(flags, "reason") || "s-gw-owned SSH session request");
-
+    const reason = getFlag(flags, "reason") || "s-gw-owned SSH session request";
+    const request = await store.createRequest(handle, sshAction, reason);
     if (action === "request" || request.state !== "approved") {
       printJson({
         approvalRequired: request.state !== "approved",
@@ -1477,26 +1525,36 @@ async function handleAwsCommand(
     throw new Error("aws request/run needs AWS CLI arguments after `--`, for example `s-gw aws run -- sts get-caller-identity`.");
   }
 
-  const request = await createAwsRequest(store, handles, wrapper, awsArgs, flags);
-  const response = awsRequestResponse(request, wrapper, awsArgs, handles);
-
-  if (action === "request" || request.state !== "approved") {
-    printJson(response);
+  if (action === "request") {
+    const request = await createAwsRequest(store, handles, wrapper, awsArgs, flags);
+    printJson(awsRequestResponse(request, wrapper, awsArgs, handles));
     return;
   }
 
-  const summary = await executeApprovedRequest(store, request.id);
+  const awsAction = buildAwsAction(handles, wrapper, awsArgs, flags);
+  const admission = await store.prepareOneShotExecution(
+    handles.secret.handle,
+    awsAction,
+    getFlag(flags, "reason") || "s-gw AWS command request"
+  );
+  if (admission.kind === "request") {
+    printJson(awsRequestResponse(admission.request, wrapper, awsArgs, handles));
+    return;
+  }
+
+  const summary = await executeReusablePermit(store, admission.permit);
   if (hasFlag(flags, "raw")) {
-    process.stdout.write(summary.stdout);
-    if (summary.stderr) {
-      process.stderr.write(summary.stderr);
-    }
-    process.exitCode = summary.exitCode ?? (summary.signal ? 1 : 0);
+    printRawSummary(summary);
     return;
   }
 
   printJson({
-    ...response,
+    approvalRequired: false,
+    repeatCommand: awsCommandLine("run", awsArgs),
+    wrapper,
+    secretHandle: handles.secret.handle,
+    accessKeyHandle: handles.access.handle,
+    reusableAuthorization: admission.permit.authorization,
     summary
   });
 }
@@ -1591,7 +1649,17 @@ async function createAwsRequest(
   awsArgs: string[],
   flags: Record<string, string | boolean | string[]>
 ): Promise<RequestRecord> {
-  const action = buildEnvCommandAction({
+  const action = buildAwsAction(handles, wrapper, awsArgs, flags);
+  return store.createRequest(handles.secret.handle, action, getFlag(flags, "reason") || "s-gw AWS command request");
+}
+
+function buildAwsAction(
+  handles: AwsHandles,
+  wrapper: string,
+  awsArgs: string[],
+  flags: Record<string, string | boolean | string[]>
+) {
+  return buildEnvCommandAction({
     command: wrapper,
     args: awsArgs,
     injectEnv: handles.secret.policy.injectEnv || "AWS_SECRET_ACCESS_KEY",
@@ -1602,8 +1670,6 @@ async function createAwsRequest(
     workingDir: getFlag(flags, "cwd"),
     timeoutMs: numericFlag(flags, "timeout-ms", 30_000)
   });
-
-  return store.createRequest(handles.secret.handle, action, getFlag(flags, "reason") || "s-gw AWS command request");
 }
 
 function awsRequestResponse(
@@ -1880,6 +1946,14 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function printRawSummary(summary: { stdout: string; stderr: string; exitCode: number | null; signal: NodeJS.Signals | null }): void {
+  process.stdout.write(summary.stdout);
+  if (summary.stderr) {
+    process.stderr.write(summary.stderr);
+  }
+  process.exitCode = summary.exitCode ?? (summary.signal ? 1 : 0);
+}
+
 function printHelp(): void {
   process.stdout.write(`s-gw local credential gateway
 
@@ -1901,6 +1975,7 @@ Commands:
   s-gw guard status
   s-gw guard run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
   s-gw service install [--port 8718] [--start]
   s-gw service start|stop|status|uninstall
   s-gw menubar app-path

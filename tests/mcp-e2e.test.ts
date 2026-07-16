@@ -17,6 +17,7 @@ beforeEach(async () => {
   testEnv = {
     ...process.env,
     SGW_HOME: tmpHome,
+    SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
     SGW_MASTER_PASSPHRASE: "mcp e2e passphrase",
     SGW_DISABLE_KEYCHAIN: "1"
   };
@@ -25,6 +26,7 @@ beforeEach(async () => {
 afterEach(async () => {
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
   }
 });
 
@@ -43,6 +45,7 @@ describe("MCP end-to-end flow", () => {
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toContain("sgw_request_execution");
+      expect(tools.tools.map((tool) => tool.name)).toContain("sgw_run_execution");
     } finally {
       await client.close();
     }
@@ -82,7 +85,7 @@ describe("MCP end-to-end flow", () => {
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toEqual(
-        expect.arrayContaining(["sgw_list_handles", "sgw_request_execution", "sgw_execute_request"])
+        expect.arrayContaining(["sgw_list_handles", "sgw_request_execution", "sgw_run_execution", "sgw_execute_request"])
       );
 
       const handlesRes = await client.callTool({ name: "sgw_list_handles", arguments: {} });

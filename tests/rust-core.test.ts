@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import { executeApprovedRequest } from "../src/executor.js";
+import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { SecretStore } from "../src/store.js";
@@ -18,6 +18,7 @@ const coreIt = existsSync(packagedCore) ? it : it.skip;
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-rust-core-test-"));
   process.env.SGW_HOME = tmpHome;
+  process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "rust core test passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
   process.env.SGW_EXECUTION_ENGINE = "rust";
@@ -25,11 +26,13 @@ beforeEach(async () => {
 
 afterEach(async () => {
   delete process.env.SGW_HOME;
+  delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
   delete process.env.SGW_DISABLE_KEYCHAIN;
   delete process.env.SGW_EXECUTION_ENGINE;
   delete process.env.AWS_SECRET_ACCESS_KEY;
   await rm(tmpHome, { recursive: true, force: true });
+  await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
 });
 
 afterAll(() => {
@@ -239,6 +242,37 @@ describe("Rust execution core", () => {
     });
     expect(summary.stdout).toContain(tokenForHandle(record.handle));
     expect(summary.stdout).not.toContain("launch-fallback-secret-value");
+  });
+
+  it("re-enters the authorization fence before a reusable auto fallback", async () => {
+    if (process.platform === "win32") return;
+    const brokenCore = path.join(tmpHome, "reusable-missing-interpreter-core");
+    await writeFile(brokenCore, "#!/definitely/missing/s-gw-interpreter\n", { mode: 0o700 });
+    await chmod(brokenCore, 0o700);
+
+    const store = new SecretStore();
+    const secret = "reusable-launch-fallback-secret-value-123456789";
+    const record = await addCredential(store, "reusable launch fallback", secret);
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "console.log(process.env.SGW_REUSABLE_LAUNCH_FALLBACK)"],
+      injectEnv: "SGW_REUSABLE_LAUNCH_FALLBACK"
+    });
+    await store.addApprovalPolicyRule({
+      name: "Allow reusable launch fallback",
+      decision: "allow",
+      conditions: { handles: [record.handle], commands: [process.execPath] }
+    });
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex reusable launch fallback");
+    expect(admission.kind).toBe("reusable");
+    if (admission.kind !== "reusable") throw new Error("Expected a reusable execution permit.");
+
+    const summary = await executeReusablePermit(store, admission.permit, {
+      engine: "auto",
+      coreBinary: brokenCore
+    });
+    expect(summary.stdout).toContain(tokenForHandle(record.handle));
+    expect(summary.stdout).not.toContain(secret);
   });
 
   it("does not retry an already launched core failure through TypeScript", async () => {
