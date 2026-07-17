@@ -24,7 +24,7 @@ The raw credential is written through the bundled helper on stdin. The encrypted
 
 Use `--service SERVICE` or `SGW_SECRET_KEYCHAIN_SERVICE` when you want a separate credential-store namespace for testing, work, or isolated profiles.
 
-On macOS, setup copies the first working Keychain helper to `~/.s-gw/native/darwin-arm64/s-gw-keychain-helper` with owner-only permissions. A Keychain ACL records the creating helper's path and code-signing requirement; macOS grants access only when the executing helper satisfies that requirement. The updater preserves the existing helper before replacing a package, and later releases do not overwrite it silently.
+On macOS, setup copies the first working Keychain helper to `~/.s-gw/native/darwin-arm64/s-gw-keychain-helper` with owner-only permissions. A Keychain ACL records the creating helper's path and code-signing requirement; macOS grants access only when the executing helper satisfies that requirement. npm updates preserve the existing helper before replacing a package, and later releases do not overwrite it silently. The self-contained app also copies its helper to that persistent path, but never modifies the signed app bundle itself.
 
 After an upgrade, s-gw checks each item's trusted-application metadata before any credential read. An item tied to an older package path is copied through a verified temporary Keychain backup and recreated for the persistent helper. The original is not deleted until the recovery copy has been verified. Run the same repair explicitly at any time:
 
@@ -34,7 +34,7 @@ s-gw unlock keychain repair
 
 The command reports counts and per-handle errors, but never prints credential values. If no trusted legacy helper can be verified, s-gw stops before invoking a helper and leaves the item unchanged.
 
-Already-running MCP servers may keep an older s-gw module in memory across an application upgrade. Setup and the updater therefore pin the preserved helper at both the persistent path and the package compatibility path used by those sessions. New agent sessions use the persistent path directly.
+Already-running MCP servers may keep an older s-gw module in memory across an npm application upgrade. Setup and the npm updater therefore pin the preserved helper at both the persistent path and the package compatibility path used by those sessions. New agent sessions use the persistent path directly. A self-contained app keeps its sealed runtime untouched and refreshes its background services after an app replacement.
 
 Automatic capture paths, including guard mode and the local console API, prefer the OS credential store on macOS and Windows. Set `SGW_SECRET_BACKEND=local` only for compatibility testing or environments without the native helper.
 

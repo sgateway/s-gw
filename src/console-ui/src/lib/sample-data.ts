@@ -87,6 +87,7 @@ export const sampleState: ConsoleState = {
     currentVersion: "0.1.0",
     latestVersion: "0.1.0",
     available: false,
+    installerReady: true,
     releaseUrl: "https://github.com/sgateway/s-gw/releases/tag/v0.1.0",
     prerelease: true,
     publishedAt: null,

@@ -4078,7 +4078,7 @@ function commandAllowsSshSession(command: string): boolean {
   return command === SGW_SSH_SESSION_COMMAND || path.basename(command) === "ssh";
 }
 
-function normalizeCommandGrant(command: string): string {
+export function normalizeCommandGrant(command: string): string {
   const trimmed = command.trim();
   if (!trimmed) {
     throw new Error("Command grant cannot be empty.");

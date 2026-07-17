@@ -2,7 +2,8 @@
 
 ## Start Here
 
-- [Quick start](quickstart.md): install s-gw from npm and run the disposable trust-loop demo.
+- [macOS app install](deployment.md#macos-app-apple-silicon): drag the self-contained Apple Silicon app to Applications.
+- [Quick start](quickstart.md): npm/source installation and the disposable trust-loop demo.
 - [Architecture](architecture.md): components, data flow, and local process boundaries.
 - [Threat model](threat-model.md): intended guarantees, attacker assumptions, and non-goals.
 - [Deployment](deployment.md): platform support, setup, packaging, upgrade, and uninstall.

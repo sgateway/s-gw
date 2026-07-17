@@ -59,7 +59,9 @@ struct MainWindow: View {
         Text("Installed \(UpdateChecker.currentVersion)")
           .font(.caption)
           .foregroundStyle(.secondary)
-        Text("This update stays available here until you dismiss it or install it.")
+        Text(release.isMacInstaller
+          ? "Download the signed installer, quit s-gw, replace the app in Applications, then reopen it."
+          : "This update stays available here until you dismiss it or install it.")
           .font(.caption)
           .foregroundStyle(.secondary)
       }
@@ -67,10 +69,10 @@ struct MainWindow: View {
       Button("Release Notes") {
         releaseNotesOpen = true
       }
-      Button(appState.updateState.isBusy ? appState.updateState.label : "Upgrade") {
+      Button(appState.updateState.isBusy ? appState.updateState.label : (release.isMacInstaller ? "Download" : "Upgrade")) {
         appState.installAvailableUpdate()
       }
-      .disabled(!release.canInstallPackage || appState.updateState.isBusy)
+      .disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)
       Button {
         appState.dismissUpdateBanner()
       } label: {
@@ -144,12 +146,12 @@ private struct UpdateReleaseSheet: View {
           appState.dismissUpdateBanner()
           dismiss()
         }
-        Button(appState.updateState.isBusy ? appState.updateState.label : "Upgrade") {
+        Button(appState.updateState.isBusy ? appState.updateState.label : (release.isMacInstaller ? "Download" : "Upgrade")) {
           dismiss()
           appState.installAvailableUpdate()
         }
         .keyboardShortcut(.defaultAction)
-        .disabled(!release.canInstallPackage || appState.updateState.isBusy)
+        .disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)
       }
     }
     .padding(24)

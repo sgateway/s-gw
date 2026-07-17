@@ -56,6 +56,7 @@ export interface UpdateCheckResult {
   currentVersion: string;
   latestVersion: string | null;
   available: boolean;
+  installerReady: boolean;
   releaseUrl: string | null;
   prerelease: boolean;
   publishedAt: string | null;

@@ -202,7 +202,8 @@ describe("React console source contracts", () => {
     expect(app).toContain("document.execCommand(\"copy\")");
     expect(app).toContain("Guard mode");
     expect(app).toContain("CodeGuard integration");
-    expect(server).toContain("renderAgentMcpSnippet(profile.id)");
+    expect(server).toContain("renderAgentMcpSnippet(profile.id, mcp.options)");
+    expect(server).toContain("consoleMcpSnippet(agentOptions)");
     expect(server).toContain("getAgentCodeGuardPlan(profile.id)");
   });
 

@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSgwHome } from "./paths.js";
+import { resolveSelfContainedMacRuntime } from "./self-contained-runtime.js";
 
 const defaultService = "com.s-gw.sgw.master-passphrase";
 const defaultSecretService = "com.s-gw.sgw.secret";
@@ -416,6 +417,7 @@ export function pinPackagedKeychainHelper(
   sgwHome = getSgwHome()
 ): PackagedKeychainHelperPin | undefined {
   if (process.platform !== "darwin") return undefined;
+  if (resolveSelfContainedMacRuntime(packageRoot)) return undefined;
 
   assertUsableHelper(sourcePath);
   const nativeTarget = `${process.platform}-${process.arch}`;

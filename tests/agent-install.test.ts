@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
+  refreshManagedAgentIntegrations,
+  resolvePackagedMcpCommand,
   uninstallAgentIntegrations
 } from "../src/agent-install.js";
 import { getPackageLayout } from "../src/install.js";
@@ -87,6 +89,86 @@ function runAgentCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: 
 }
 
 describe("agent integration installation", () => {
+  it.skipIf(process.platform === "win32")("uses the bundled Node runtime for a self-contained macOS app", () => {
+    const nodePath = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime/node/bin/node";
+    const mcpPath = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime/package/dist/mcp-server.js";
+
+    const launch = resolvePackagedMcpCommand({
+      isSelfContainedMacApp: true,
+      nodePath
+    }, {
+      platform: "darwin",
+      pathEnv: "/usr/bin:/bin",
+      env: {},
+      mcpServerPath: mcpPath
+    });
+
+    expect(launch).toEqual({ command: nodePath, args: [mcpPath] });
+  });
+
+  it("keeps an inherited ledger home in manual MCP snippets", () => {
+    const cli = readFileSync(path.join(process.cwd(), "src", "cli.ts"), "utf8");
+
+    expect(cli).toContain("...(process.env.SGW_HOME ? { SGW_HOME: process.env.SGW_HOME } : {})");
+    expect(cli).toContain("...parseEnvFlags(getFlagList(flags, \"env\"))");
+  });
+
+  it("refreshes only agent integrations that s-gw already owns", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    fakeCommand(homeDir, "claude");
+
+    const initial = installAgentIntegrations(opts(homeDir, binDir, ["codex"]));
+    expect(initial[0]).toMatchObject({ agentId: "codex", changed: true });
+
+    const refreshed = refreshManagedAgentIntegrations(opts(homeDir, binDir));
+    expect(refreshed.map((item) => item.agentId)).toEqual(["codex"]);
+    expect(refreshed[0].changed).toBe(false);
+  });
+
+  it("keeps the owned agent ledger home during a runtime refresh", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    const customHome = path.join(homeDir, "critical-ledger");
+    const initialOptions = { ...opts(homeDir, binDir, ["codex"]), sgwHome: customHome };
+
+    installAgentIntegrations(initialOptions);
+    const configPath = path.join(homeDir, ".codex", "config.toml");
+    expect(readFileSync(configPath, "utf8")).toContain(`SGW_HOME = ${JSON.stringify(customHome)}`);
+
+    const refreshed = refreshManagedAgentIntegrations({
+      ...opts(homeDir, binDir),
+      sgwHome: path.join(homeDir, "wrong-ledger")
+    });
+
+    expect(refreshed[0]).toMatchObject({ agentId: "codex", changed: false });
+    const config = readFileSync(configPath, "utf8");
+    expect(config).toContain(`SGW_HOME = ${JSON.stringify(customHome)}`);
+    expect(config).not.toContain("wrong-ledger");
+  });
+
+  it("keeps each managed agent connected to its own ledger during a runtime refresh", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    fakeCommand(homeDir, "claude");
+    const codexHome = path.join(homeDir, "codex-ledger");
+    const claudeHome = path.join(homeDir, "claude-ledger");
+
+    installAgentIntegrations({ ...opts(homeDir, binDir, ["codex"]), sgwHome: codexHome });
+    installAgentIntegrations({ ...opts(homeDir, binDir, ["claudecode"]), sgwHome: claudeHome });
+
+    const refreshed = refreshManagedAgentIntegrations({
+      ...opts(homeDir, binDir),
+      sgwHome: path.join(homeDir, "wrong-ledger")
+    });
+
+    expect(refreshed.map((item) => item.agentId).sort()).toEqual(["claudecode", "codex"]);
+    expect(readFileSync(path.join(homeDir, ".codex", "config.toml"), "utf8"))
+      .toContain(`SGW_HOME = ${JSON.stringify(codexHome)}`);
+    const claude = JSON.parse(readFileSync(path.join(homeDir, ".claude.json"), "utf8"));
+    expect(claude.mcpServers["s-gw"].env.SGW_HOME).toBe(claudeHome);
+  });
+
   it("connects detected Codex and Claude while preserving unrelated config", () => {
     const homeDir = testHome();
     const binDir = fakeCommand(homeDir, "codex");

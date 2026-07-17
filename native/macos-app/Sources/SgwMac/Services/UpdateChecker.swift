@@ -13,8 +13,14 @@ struct ReleaseInfo: Identifiable, Equatable, Sendable {
     let notes: String
 
     var id: String { tag }
+    var hasVerifiedAsset: Bool {
+        !assetURL.isEmpty && !checksumAssetURL.isEmpty
+    }
+    var isMacInstaller: Bool {
+        assetName.lowercased().hasSuffix(".dmg")
+    }
     var canInstallPackage: Bool {
-        assetName.lowercased().hasSuffix(".tgz") && !assetURL.isEmpty && !checksumAssetURL.isEmpty
+        assetName.lowercased().hasSuffix(".tgz") && hasVerifiedAsset
     }
 }
 
@@ -61,10 +67,25 @@ actor UpdateChecker: UpdateChecking {
     static let defaultRepository = "sgateway/s-gw"
     static let repositoryDefaultsKey = "updateRepository"
     static let lastCheckDefaultsKey = "lastUpdateCheckAt"
+    static let bundledRuntimeVersionDefaultsKey = "bundledRuntimeVersion"
+    static let bundledRuntimePathDefaultsKey = "bundledRuntimePath"
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.16"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.17"
+    }
+
+    static var usesSelfContainedRuntime: Bool {
+        guard let resources = Bundle.main.resourceURL else {
+            return false
+        }
+        return FileManager.default.fileExists(
+            atPath: resources.appendingPathComponent("s-gw-runtime/runtime.json").path
+        )
+    }
+
+    static var bundledAppPath: String {
+        Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     static func isNewer(_ candidate: String, than current: String) -> Bool {
@@ -102,7 +123,7 @@ actor UpdateChecker: UpdateChecking {
                 .first else {
                 return nil
             }
-            return releaseInfo(from: release)
+            return await releaseInfo(from: release)
         } catch {
             return try await latestReleaseFromAtom(repository: trimmed)
         }
@@ -177,7 +198,7 @@ actor UpdateChecker: UpdateChecking {
         let version = parseVersion(tag)
         guard !tag.isEmpty, semanticVersion(version) != nil else { return nil }
 
-        let packageName = "s-gw-\(version).tgz"
+        let packageName = releaseAssetName(for: version)
         let downloadBase = "https://github.com/\(repository)/releases/download/\(tag)"
         return ReleaseInfo(
             tag: tag,
@@ -259,20 +280,21 @@ actor UpdateChecker: UpdateChecking {
         }
     }
 
-    private func releaseInfo(from release: GitHubRelease) -> ReleaseInfo? {
+    private func releaseInfo(from release: GitHubRelease) async -> ReleaseInfo? {
         let version = Self.parseVersion(release.tagName)
         guard !version.isEmpty else { return nil }
 
-        let preferredName = Self.packageAssetName(
+        let uploadedAssets = release.assets.filter { $0.state?.lowercased() == "uploaded" }
+        let preferredName = Self.preferredAssetName(
             for: version,
-            assetNames: release.assets.map(\.name)
+            assetNames: uploadedAssets.map(\.name)
         )
         let preferredAsset = preferredName.flatMap { name in
-            release.assets.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            uploadedAssets.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
         }
-        let checksumAsset = checksumAsset(for: preferredAsset, in: release.assets)
+        let checksumAsset = checksumAsset(for: preferredAsset, in: uploadedAssets)
 
-        return ReleaseInfo(
+        let candidate = ReleaseInfo(
             tag: release.tagName,
             version: version,
             assetName: preferredAsset?.name ?? "",
@@ -282,6 +304,14 @@ actor UpdateChecker: UpdateChecking {
             htmlURL: release.htmlURL,
             notes: release.body ?? ""
         )
+        guard candidate.hasVerifiedAsset,
+              let assetURL = URL(string: candidate.assetURL),
+              let checksumURL = URL(string: candidate.checksumAssetURL),
+              await assetExists(assetURL),
+              await assetExists(checksumURL) else {
+            return Self.withoutInstallAssets(candidate)
+        }
+        return candidate
     }
 
     private func checksumAsset(for package: GitHubAsset?, in assets: [GitHubAsset]) -> GitHubAsset? {
@@ -339,6 +369,16 @@ actor UpdateChecker: UpdateChecking {
     static func packageAssetName(for version: String, assetNames: [String]) -> String? {
         let expected = "s-gw-\(parseVersion(version)).tgz"
         return assetNames.first { $0.caseInsensitiveCompare(expected) == .orderedSame }
+    }
+
+    static func preferredAssetName(for version: String, assetNames: [String]) -> String? {
+        let expected = releaseAssetName(for: version)
+        return assetNames.first { $0.caseInsensitiveCompare(expected) == .orderedSame }
+    }
+
+    static func releaseAssetName(for version: String) -> String {
+        let cleanVersion = parseVersion(version)
+        return "s-gw-\(cleanVersion)-macos.dmg"
     }
 
     static func verifyChecksum(
@@ -603,10 +643,12 @@ private struct GitHubRelease: Decodable {
 private struct GitHubAsset: Decodable {
     let name: String
     let browserDownloadURL: String
+    let state: String?
 
     enum CodingKeys: String, CodingKey {
         case name
         case browserDownloadURL = "browser_download_url"
+        case state
     }
 }
 

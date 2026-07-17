@@ -111,11 +111,12 @@ final class UpdateMonitor {
 private struct CliUpdateCheck: Decodable {
   let currentVersion: String
   let available: Bool
+  let installerReady: Bool
   let latestVersion: String?
   let releaseUrl: String?
 
   var availableUpdate: HelperUpdate? {
-    guard available,
+    guard available, installerReady,
           let version = latestVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
           !version.isEmpty,
           let urlText = releaseUrl,

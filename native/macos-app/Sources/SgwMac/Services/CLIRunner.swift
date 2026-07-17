@@ -3,7 +3,14 @@ import Foundation
 actor CLIRunner {
   static let binaryOverrideKey = "sgwBinaryPath"
 
+  private struct BundledRuntime {
+    let packageRoot: String
+    let nodePath: String
+    let cliPath: String
+  }
+
   private var cachedCommand: (path: String, prefix: [String])?
+  private var cachedManagedEnvironment: [String: String]?
   private var runningProcesses: [String: Process] = [:]
   private var cancellationRequests = Set<String>()
 
@@ -95,6 +102,12 @@ actor CLIRunner {
       return cachedCommand
     }
 
+    if let runtime = bundledRuntime() {
+      let command = (path: runtime.nodePath, prefix: [runtime.cliPath])
+      cachedCommand = command
+      return command
+    }
+
     if let override = UserDefaults.standard.string(forKey: Self.binaryOverrideKey), !override.isEmpty {
       if override.hasSuffix(".js"), let command = commandForJavascriptCli(override) {
         cachedCommand = command
@@ -157,7 +170,35 @@ actor CLIRunner {
     return candidates
   }
 
+  private func bundledRuntime() -> BundledRuntime? {
+    guard let resources = Bundle.main.resourceURL else {
+      return nil
+    }
+
+    let runtime = resources.appendingPathComponent("s-gw-runtime", isDirectory: true)
+    let marker = runtime.appendingPathComponent("runtime.json")
+    let packageRoot = runtime.appendingPathComponent("package", isDirectory: true)
+    let node = runtime.appendingPathComponent("node/bin/node")
+    let cli = packageRoot.appendingPathComponent("dist/cli.js")
+
+    guard FileManager.default.isReadableFile(atPath: marker.path),
+          FileManager.default.isExecutableFile(atPath: node.path),
+          FileManager.default.isReadableFile(atPath: cli.path) else {
+      return nil
+    }
+
+    return BundledRuntime(
+      packageRoot: packageRoot.path,
+      nodePath: node.path,
+      cliPath: cli.path
+    )
+  }
+
   private func locateNode() -> (path: String, prefix: [String]) {
+    if let runtime = bundledRuntime() {
+      return (runtime.nodePath, [])
+    }
+
     let env = ProcessInfo.processInfo.environment
     if let node = env["SGW_NODE_PATH"], FileManager.default.isExecutableFile(atPath: node) {
       return (node, [])
@@ -189,6 +230,19 @@ actor CLIRunner {
     var env = ProcessInfo.processInfo.environment
     env["NO_COLOR"] = "1"
 
+    for (key, value) in managedRuntimeEnvironment() {
+      if env[key]?.isEmpty ?? true {
+        env[key] = value
+      }
+    }
+
+    if let runtime = bundledRuntime() {
+      env["SGW_REPO_ROOT"] = runtime.packageRoot
+      env["SGW_CLI_PATH"] = runtime.cliPath
+      env["SGW_NODE_PATH"] = runtime.nodePath
+      env["SGW_APP_PATH"] = Bundle.main.bundleURL.path
+    }
+
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     let fallbackPaths = [
       "\(home)/.local/bin",
@@ -215,6 +269,37 @@ actor CLIRunner {
     }
     env["PATH"] = pathParts.joined(separator: ":")
     return env
+  }
+
+  private func managedRuntimeEnvironment() -> [String: String] {
+    if let cachedManagedEnvironment {
+      return cachedManagedEnvironment
+    }
+
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let launchAgents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+    let labels = ["com.s-gw.sgw.console", "com.s-gw.sgw.menubar"]
+    let allowedKeys = ["SGW_HOME", "SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT"]
+    var values: [String: String] = [:]
+
+    for label in labels {
+      let plist = launchAgents.appendingPathComponent("\(label).plist")
+      guard let data = try? Data(contentsOf: plist),
+            let raw = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+            let root = raw as? [String: Any],
+            let environment = root["EnvironmentVariables"] as? [String: String] else {
+        continue
+      }
+
+      for key in allowedKeys where values[key] == nil {
+        if let value = environment[key], !value.isEmpty {
+          values[key] = value
+        }
+      }
+    }
+
+    cachedManagedEnvironment = values
+    return values
   }
 
   private func emitLines(from output: String, to onLine: (@Sendable (String) -> Void)?) {

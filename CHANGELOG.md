@@ -2,6 +2,22 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
+## 0.1.17 - 2026-07-16
+
+### Added
+
+- The macOS download is now a self-contained `s-gw.app` DMG: drag it to Applications and run it without installing Node or npm. The app embeds its CLI, MCP server, native helpers, and menu helper.
+
+### Changed
+
+- Existing services and owned agent integrations migrate to the Applications copy without changing their selected ledger homes. Mounted and Translocated app copies cannot install managed services or agent configuration.
+- Release automation now builds, signs, notarizes, verifies, and uploads assets to a draft release before publication. npm and MCP Registry publication begin only after the verified GitHub release is public.
+
+### Fixed
+
+- The AWS shortcut now requires an explicit wrapper when credentials share more than one allowed wrapper and retains the selected handles and wrapper in generated repeat commands.
+- Update availability waits for the matching platform installer and checksum to be uploaded, preventing users from being notified about an incomplete release.
+
 ## 0.1.16 - 2026-07-16
 
 ### Added

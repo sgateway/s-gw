@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
+import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { ReleaseChecker } from "../src/update-check.js";
 
 let tmpHome = "";
@@ -75,6 +75,23 @@ describe("local console server", () => {
     expect(omnigent.mcp.snippet).toBeNull();
   });
 
+  it("renders self-contained MCP snippets without relying on PATH", () => {
+    const runtime = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime";
+    const mcp = consoleMcpSnippet({ sgwHome: "/secure/s-gw", platform: "darwin" }, {
+      packageRoot: path.join(runtime, "package"),
+      nodePath: path.join(runtime, "node", "bin", "node"),
+      mcpPath: path.join(runtime, "package", "dist", "mcp-server.js"),
+      isSelfContainedMacApp: true
+    });
+
+    expect(mcp.options).toEqual({
+      command: path.join(runtime, "node", "bin", "node"),
+      args: [path.join(runtime, "package", "dist", "mcp-server.js")],
+      env: { SGW_HOME: "/secure/s-gw" }
+    });
+    expect(mcp.cliCommand).toBe(path.join(runtime, "bin", "s-gw"));
+  });
+
   it("installs and uninstalls a detected agent through the console API", async () => {
     const binDir = path.join(tmpHome, "bin");
     mkdirSync(binDir, { recursive: true });
@@ -126,6 +143,9 @@ describe("local console server", () => {
   });
 
   it("publishes an available release to console clients", async () => {
+    const installer = process.platform === "darwin"
+      ? "s-gw-0.1.1-macos.dmg"
+      : process.platform === "win32" ? "s-gw-0.1.1-windows.zip" : "s-gw-0.1.1.tgz";
     const checker = new ReleaseChecker({
       cachePath: path.join(tmpHome, "update.json"),
       currentVersion: "0.1.0",
@@ -135,7 +155,11 @@ describe("local console server", () => {
         html_url: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
         draft: false,
         prerelease: true,
-        published_at: "2026-07-04T00:00:00.000Z"
+        published_at: "2026-07-04T00:00:00.000Z",
+        assets: [
+          { name: installer, state: "uploaded" },
+          { name: `${installer}.sha256`, state: "uploaded" }
+        ]
       }]), { status: 200 })
     });
     await checker.check(true);
@@ -146,6 +170,7 @@ describe("local console server", () => {
       currentVersion: "0.1.0",
       latestVersion: "0.1.1",
       available: true,
+      installerReady: true,
       prerelease: true
     });
   });

@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  assertMacRuntimeForManagedSurfaces,
   buildConsoleLaunchAgentPlist,
   buildMenuBarLaunchAgentPlist,
   consoleLabel,
@@ -16,6 +17,26 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 
 describe("customer package layout", () => {
+  it("keeps managed surfaces inside one durable self-contained app", () => {
+    expect(() => assertMacRuntimeForManagedSurfaces({
+      isSelfContainedMacApp: true,
+      standaloneMacAppInstalled: true,
+      macAppPath: "/Volumes/s-gw/s-gw.app"
+    })).toThrow(/Move s-gw\.app to \/Applications or ~\/Applications/);
+
+    expect(() => assertMacRuntimeForManagedSurfaces({
+      isSelfContainedMacApp: false,
+      standaloneMacAppInstalled: true,
+      macAppPath: "/Applications/s-gw.app"
+    })).toThrow(/self-contained s-gw\.app is already installed/);
+
+    expect(() => assertMacRuntimeForManagedSurfaces({
+      isSelfContainedMacApp: true,
+      standaloneMacAppInstalled: true,
+      macAppPath: "/Applications/s-gw.app"
+    })).not.toThrow();
+  });
+
   it("finds package artifacts from the runtime module location", () => {
     const layout = getPackageLayout();
 
@@ -47,9 +68,12 @@ describe("customer package layout", () => {
     );
 
     expect(menuBarHandler).not.toContain("installMacAppBundle");
+    expect(menuBarHandler).not.toContain("refreshMacRuntimeServices");
     expect(appHandler).toContain("installMacAppBundle");
+    expect(appHandler).toContain("refreshMacRuntimeServices");
     expect(cliSource).toContain("const appInstall = process.platform === \"darwin\" ? installMacAppBundle() : undefined");
     expect(cliSource).toContain("installPersistentKeychainHelper()");
+    expect(cliSource).toContain("assertMacRuntimeForManagedSurfaces(layout)");
   });
 
   it("tracks a running native app so open focuses instead of relaunching", async () => {
@@ -75,6 +99,8 @@ describe("customer package layout", () => {
     expect(stopSource).not.toContain("valueForKey");
     expect(stopSource).not.toContain("macAppBinaryPath");
     expect(installSource).toContain("assertMacExecutableCompatible");
+    expect(installSource).toContain("assertMacRuntimeForManagedSurfaces()");
+    expect(installSource).toContain("refreshMacRuntimeServices");
     expect(installSource).toContain('"-verify_arch", arch');
     expect(installSource).toContain("Intel Macs must build them from source");
   });
@@ -189,5 +215,32 @@ describe("launch-agent packaging", () => {
 
     expect(plist).toContain("<string>--no-notify</string>");
     expect(plist).not.toContain("<string>--notify-on-launch</string>");
+  });
+
+  it("preserves the existing ledger namespace while rebinding a migrated runtime", () => {
+    const oldHelper = process.env.SGW_KEYCHAIN_HELPER;
+    delete process.env.SGW_KEYCHAIN_HELPER;
+
+    try {
+      const inherited = {
+        PATH: "/custom/bin:/usr/bin:/bin",
+        SGW_HOME: "/secure/s-gw-home",
+        SGW_KEYCHAIN_SERVICE: "com.example.s-gw",
+        SGW_KEYCHAIN_ACCOUNT: "primary",
+        SGW_KEYCHAIN_HELPER: "/old/npm/s-gw-keychain-helper"
+      };
+      const console = buildConsoleLaunchAgentPlist(9123, "/secure/s-gw-home/logs", inherited);
+      const menu = buildMenuBarLaunchAgentPlist({ port: 9123 }, "/secure/s-gw-home/logs", inherited);
+
+      for (const value of ["/custom/bin:/usr/bin:/bin", "/secure/s-gw-home", "com.example.s-gw", "primary"]) {
+        expect(console).toContain(value);
+        expect(menu).toContain(value);
+      }
+      expect(console).not.toContain("/old/npm/s-gw-keychain-helper");
+      expect(menu).not.toContain("/old/npm/s-gw-keychain-helper");
+    } finally {
+      if (oldHelper === undefined) delete process.env.SGW_KEYCHAIN_HELPER;
+      else process.env.SGW_KEYCHAIN_HELPER = oldHelper;
+    }
   });
 });

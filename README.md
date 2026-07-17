@@ -96,7 +96,9 @@ The agent never needs the unlock passphrase or raw credential. Approval is scope
 
 ## Quick Start
 
-Requirements: Node.js 20 or newer.
+On an Apple Silicon Mac, download the signed `s-gw-VERSION-macos.dmg` from [GitHub Releases](https://github.com/sgateway/s-gw/releases), drag `s-gw.app` to **Applications**, then open it and complete setup. The app includes its own Node runtime, CLI, MCP server, native helpers, and menu-bar helper; it does not require Node.js or npm on the host. Setup is intentionally blocked until the app is in `/Applications` or `~/Applications`.
+
+For terminal-first, Linux, Windows, or source installs, use Node.js 20 or newer:
 
 ```bash
 npm install -g @s-gw/s-gw
@@ -106,7 +108,7 @@ s-gw status
 
 The public source builds the TypeScript compatibility path. Building the native macOS surfaces also requires a Swift toolchain. Maintainer release builds additionally require access to the private Rust core checkout.
 
-Preview desktop builds are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The current macOS and Windows downloads are unsigned preview artifacts. The npm package is the recommended installation path. It includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs; Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; the npm package and DMG reject their arm64-only helpers with a clear compatibility error.
+The Apple Silicon Mac DMG is the preferred desktop path. Published macOS DMGs are Developer ID signed and notarized; local `npm run build:installers` output is ad-hoc signed for local verification only. The npm package remains the terminal-first path and includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs. Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; packaged arm64-only helpers are rejected before launch.
 
 ```bash
 git clone https://github.com/sgateway/s-gw.git
@@ -118,7 +120,7 @@ s-gw setup
 s-gw status
 ```
 
-`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. On macOS it installs `s-gw.app` in `/Applications`, falling back to `~/Applications` when needed. It backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
+`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. The self-contained macOS app runs its bundled runtime in place; npm installs copy the thin app into `/Applications`, falling back to `~/Applications` when needed. Setup backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
 
 Add a credential from your terminal without placing the value in chat or a process argument:
 
@@ -213,7 +215,7 @@ The model can complete the task without receiving the raw access key.
 | Windows 10/11 | Preview | Credential Manager | PowerShell client, tray helper, local web console |
 | Linux | Experimental CLI | Environment-provided unlock material | Local web console |
 
-Preview installers are available from [GitHub Releases](https://github.com/sgateway/s-gw/releases). The Apple Silicon macOS DMG is ad-hoc signed and unnotarized, and the Windows package is unsigned preview software. Build the same artifacts locally with `npm run build:installers`.
+Published Apple Silicon macOS DMGs are self-contained, Developer ID signed, and notarized. The Windows package remains unsigned preview software. Build locally with `npm run build:installers`; local DMGs are ad-hoc signed and deliberately not publishable.
 
 ## Security Model
 
@@ -227,7 +229,7 @@ Read the [threat model](docs/threat-model.md) before relying on s-gw for sensiti
 - macOS is the primary development and test platform.
 - Windows Credential Manager support is present but still needs broader native QA.
 - Linux currently depends on environment-provided unlock material.
-- Desktop preview downloads are unsigned and intended for evaluation.
+- The Windows desktop package remains an unsigned preview. Published macOS DMGs must pass Developer ID signing and notarization.
 - The repository is prepared for open-source collaboration, but security-sensitive changes should come with focused tests and threat-model updates when behavior changes.
 
 ## Documentation

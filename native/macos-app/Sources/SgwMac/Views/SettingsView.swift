@@ -192,17 +192,19 @@ struct SettingsView: View {
             Button("Notify Again") {
               appState.requestUpdateReminder()
             }
-            Button(appState.updateState.isBusy ? appState.updateState.label : "Install Package") {
+            Button(appState.updateState.isBusy ? appState.updateState.label : (release.isMacInstaller ? "Download Installer" : "Install Package")) {
               appState.installAvailableUpdate()
             }
-            .disabled(!release.canInstallPackage || appState.updateState.isBusy)
+            .disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)
           }
         }
 
         if let release = appState.availableUpdate {
-          Text("Available: \(release.version)\(release.canInstallPackage ? "" : " · checksum required for automatic install")")
+          Text(release.isMacInstaller
+            ? "Available: \(release.version) · download the signed installer to update this app"
+            : "Available: \(release.version)\(release.canInstallPackage ? "" : " · checksum required for automatic install")")
             .font(.caption)
-            .foregroundStyle(release.canInstallPackage ? SGWTheme.teal : SGWTheme.orange)
+            .foregroundStyle(release.hasVerifiedAsset ? SGWTheme.teal : SGWTheme.orange)
         } else {
           Text(appState.updateState.label)
             .font(.caption)
@@ -221,10 +223,17 @@ struct SettingsView: View {
   private var connectionTab: some View {
     Form {
       Section("CLI") {
-        TextField("s-gw CLI path", text: $cliPath)
-        Text("Leave blank to auto-detect `/opt/homebrew/bin/s-gw`, `/usr/local/bin/s-gw`, compatibility `sgw`, or the bundled `dist/cli.js`.")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        if UpdateChecker.usesSelfContainedRuntime {
+          LabeledContent("Runtime", value: "Bundled with this app")
+          Text("This signed app always uses its bundled CLI and Node runtime so background services and agent registrations stay on the same version.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else {
+          TextField("s-gw CLI path", text: $cliPath)
+          Text("Leave blank to auto-detect `/opt/homebrew/bin/s-gw`, `/usr/local/bin/s-gw`, compatibility `sgw`, or the bundled `dist/cli.js`.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         Button("Refresh Now") {
           Task { await appState.refresh() }
         }

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
+  resolvePackagedMcpCommand,
   uninstallAgentIntegrations,
   type AgentIntegrationOptions
 } from "./agent-install.js";
@@ -21,7 +22,7 @@ import {
   type LocalSecretBackend
 } from "./gateway.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
-import { readinessForUnlock } from "./install.js";
+import { assertMacRuntimeForManagedSurfaces, getPackageLayout, readinessForUnlock } from "./install.js";
 import { SecretStore, type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput } from "./store.js";
 import { unlockStatus } from "./unlock.js";
 import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
@@ -144,6 +145,7 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   const agentOptions: AgentIntegrationOptions = {
     homeDir: options.agentHomeDir,
     pathEnv: options.agentPathEnv,
+    sgwHome: process.env.SGW_HOME,
     skillSourcePath: options.agentSkillSourcePath
   };
 
@@ -239,6 +241,7 @@ async function handleApi(
 
   const agentMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/(install|uninstall)$/);
   if (req.method === "POST" && agentMatch) {
+    if (process.platform === "darwin") assertMacRuntimeForManagedSurfaces();
     const body = await readJson(req);
     const options = {
       ...agentOptions,
@@ -452,6 +455,7 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null, 
   const unlock = unlockStatus();
   const readiness = readinessForUnlock(unlock.activeSource !== "none");
   const usageFlow = buildUsageFlow(requests, handles);
+  const mcp = consoleMcpSnippet(agentOptions);
 
   return {
     version,
@@ -493,7 +497,7 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null, 
           writeMode: profile.mcp.writeMode,
           configPaths: profile.mcp.configPaths,
           notes: profile.mcp.notes,
-          snippet: profile.mcp.supported ? renderAgentMcpSnippet(profile.id) : null
+          snippet: profile.mcp.supported ? renderAgentMcpSnippet(profile.id, mcp.options) : null
         },
         skills: profile.skills,
         plugins: profile.plugins,
@@ -506,11 +510,44 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null, 
         },
         limitations: profile.limitations,
         codeGuard: getAgentCodeGuardPlan(profile.id),
-        snippetCommand: `s-gw agent mcp-snippet ${profile.id}`,
-        guardCommand: `s-gw run ${profile.id}`
+        snippetCommand: `${mcp.cliCommand} agent mcp-snippet ${profile.id}`,
+        guardCommand: `${mcp.cliCommand} run ${profile.id}`
       };
     })
   };
+}
+
+export function consoleMcpSnippet(
+  agentOptions: AgentIntegrationOptions,
+  layout: Pick<ReturnType<typeof getPackageLayout>, "packageRoot" | "nodePath" | "isSelfContainedMacApp" | "mcpPath"> = getPackageLayout()
+): {
+  options: { command: string; args: string[]; env?: Record<string, string> };
+  cliCommand: string;
+} {
+  const launch = resolvePackagedMcpCommand(layout, {
+    platform: agentOptions.platform || process.platform,
+    pathEnv: agentOptions.pathEnv || process.env.PATH || "",
+    env: process.env,
+    mcpServerPath: layout.mcpPath
+  });
+  const sgwHome = agentOptions.sgwHome || process.env.SGW_HOME;
+  const launcher = layout.isSelfContainedMacApp
+    ? path.join(path.dirname(layout.packageRoot), "bin", "s-gw")
+    : "s-gw";
+
+  return {
+    options: {
+      command: launch.command,
+      args: launch.args,
+      env: sgwHome ? { SGW_HOME: sgwHome } : undefined
+    },
+    cliCommand: shellCommandArg(launcher)
+  };
+}
+
+function shellCommandArg(value: string): string {
+  if (/^[A-Za-z0-9_./:=@%+-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function groupHandles(handles: HandleSummary[]): ProviderSummary[] {

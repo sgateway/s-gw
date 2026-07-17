@@ -40,9 +40,13 @@ private final class FakeHelperUpdateRunner: @unchecked Sendable {
   }
 }
 
-private func helperUpdateResult(_ version: String, available: Bool = true) -> CliRunResult {
+private func helperUpdateResult(
+  _ version: String,
+  available: Bool = true,
+  installerReady: Bool = true
+) -> CliRunResult {
   let json = """
-  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"releaseUrl":"https://example.test/releases/v\(version)"}
+  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"installerReady":\(installerReady),"releaseUrl":"https://example.test/releases/v\(version)"}
   """
   return CliRunResult(ok: true, stdout: json, stderr: nil)
 }

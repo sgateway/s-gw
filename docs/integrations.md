@@ -19,6 +19,18 @@ s-gw setup
 
 Contributors working from source can use `npm ci`, `npm run build`, and `npm link` from a repository checkout.
 
+### Self-Contained macOS App
+
+After dragging the Apple Silicon app to Applications, run setup from the app; it writes supported agent entries with the bundled Node runtime and MCP server. A manual configuration must use absolute bundle paths instead of a host `node` command:
+
+```text
+node: /Applications/s-gw.app/Contents/Resources/s-gw-runtime/node/bin/node
+mcp:  /Applications/s-gw.app/Contents/Resources/s-gw-runtime/package/dist/mcp-server.js
+cli:  /Applications/s-gw.app/Contents/Resources/s-gw-runtime/bin/s-gw
+```
+
+The CLI wrapper is useful for tools such as Kubernetes `exec` credential plugins that need to invoke `s-gw` outside an agent configuration.
+
 If you skipped `s-gw setup`, store a local unlock passphrase in the OS credential store before starting the MCP server:
 
 ```bash
@@ -50,6 +62,14 @@ Install as a local plugin by pointing Codex at a marketplace that includes this 
 codex mcp add s-gw -- node /path/to/s-gw/dist/mcp-server.js
 ```
 
+For the self-contained macOS app:
+
+```bash
+codex mcp add s-gw -- \
+  /Applications/s-gw.app/Contents/Resources/s-gw-runtime/node/bin/node \
+  /Applications/s-gw.app/Contents/Resources/s-gw-runtime/package/dist/mcp-server.js
+```
+
 Equivalent `~/.codex/config.toml` snippet:
 
 ```toml
@@ -66,6 +86,14 @@ default_tools_approval_mode = "prompt"
 
 ```bash
 claude mcp add --transport stdio --scope user s-gw -- node /path/to/s-gw/dist/mcp-server.js
+```
+
+For the self-contained macOS app:
+
+```bash
+claude mcp add --transport stdio --scope user s-gw -- \
+  /Applications/s-gw.app/Contents/Resources/s-gw-runtime/node/bin/node \
+  /Applications/s-gw.app/Contents/Resources/s-gw-runtime/package/dist/mcp-server.js
 ```
 
 Project-scoped `.mcp.json`:

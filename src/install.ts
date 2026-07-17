@@ -14,6 +14,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSgwHome, getStorePath } from "./paths.js";
+import {
+  isInstalledMacAppLocation,
+  isSelfContainedMacApp,
+  resolveSelfContainedMacRuntime
+} from "./self-contained-runtime.js";
 import { unlockStatus } from "./unlock.js";
 
 export const consoleLabel = "com.s-gw.sgw.console";
@@ -21,6 +26,9 @@ export const menuBarLabel = "com.s-gw.sgw.menubar";
 
 export interface PackageLayout {
   packageRoot: string;
+  nodePath: string;
+  isSelfContainedMacApp: boolean;
+  standaloneMacAppInstalled: boolean;
   cliPath: string;
   mcpPath: string;
   keychainHelperPath: string;
@@ -128,25 +136,29 @@ export function getPackageLayout(): PackageLayout {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const packageRoot = path.basename(here) === "dist" ? path.dirname(here) : path.dirname(here);
   const nativeTarget = `${process.platform}-${process.arch}`;
-  const packagedMacAppPath = path.join(packageRoot, "dist", "s-gw.app");
-  const installedMacAppPath = path.join(macApplicationsDirectory(), "s-gw.app");
-  const macAppPath = existsSync(installedMacAppPath) ? installedMacAppPath : packagedMacAppPath;
+  const runtime = resolveSelfContainedMacRuntime(packageRoot);
+  const packagedMacAppPath = runtime?.appPath || path.join(packageRoot, "dist", "s-gw.app");
+  const standaloneAppPath = runtime ? undefined : findInstalledSelfContainedMacApp();
+  const installedMacAppPath = runtime?.appPath || standaloneAppPath || path.join(macApplicationsDirectory(), "s-gw.app");
+  const macAppPath = runtime?.appPath || (existsSync(installedMacAppPath) ? installedMacAppPath : packagedMacAppPath);
+  const menuBarAppPath = runtime?.menuBarAppPath || path.join(packageRoot, "dist", "s-gw Menu Bar.app");
 
   return {
     packageRoot,
-    cliPath: path.join(packageRoot, "dist", "cli.js"),
-    mcpPath: path.join(packageRoot, "dist", "mcp-server.js"),
+    nodePath: runtime?.nodePath || process.execPath,
+    isSelfContainedMacApp: runtime !== undefined,
+    standaloneMacAppInstalled: runtime !== undefined || standaloneAppPath !== undefined,
+    cliPath: runtime?.cliPath || path.join(packageRoot, "dist", "cli.js"),
+    mcpPath: runtime?.mcpPath || path.join(packageRoot, "dist", "mcp-server.js"),
     keychainHelperPath: path.join(packageRoot, "dist", "native", nativeTarget, "s-gw-keychain-helper"),
     packagedMacAppPath,
     packagedMacAppBinaryPath: macAppBinaryPath(packagedMacAppPath),
     installedMacAppPath,
     macAppPath,
     macAppBinaryPath: macAppBinaryPath(macAppPath),
-    menuBarAppPath: path.join(packageRoot, "dist", "s-gw Menu Bar.app"),
+    menuBarAppPath,
     menuBarBinaryPath: path.join(
-      packageRoot,
-      "dist",
-      "s-gw Menu Bar.app",
+      menuBarAppPath,
       "Contents",
       "MacOS",
       "s-gw-menu-bar-helper"
@@ -173,6 +185,8 @@ export function packageHealth(port = 8718) {
 
   return {
     packageRoot: layout.packageRoot,
+    selfContainedMacApp: layout.isSelfContainedMacApp,
+    nodePath: pathStatus(layout.nodePath),
     ready,
     readiness: buildReadiness({ unlockConfigured, cli: cli.exists, mcp: mcp.exists }),
     cliPath: cli,
@@ -233,6 +247,7 @@ function buildReadiness(checks: { unlockConfigured: boolean; cli: boolean; mcp: 
 
 export async function installConsoleLaunchAgent(options: ServiceInstallOptions = {}): Promise<LaunchAgentStatus> {
   requireMac("launchd service install");
+  assertMacRuntimeForManagedSurfaces();
   const port = options.port || 8718;
   const plistPath = launchAgentPath(consoleLabel);
   const logs = await ensureLogDir();
@@ -254,6 +269,7 @@ export async function uninstallConsoleLaunchAgent(): Promise<LaunchAgentStatus> 
 
 export async function installMenuBarLaunchAgent(options: MenuBarOptions = {}): Promise<LaunchAgentStatus> {
   requireMac("menu-bar install");
+  assertMacRuntimeForManagedSurfaces();
   assertMenuBarExists();
   const plistPath = launchAgentPath(menuBarLabel);
   const logs = await ensureLogDir();
@@ -275,6 +291,7 @@ export async function uninstallMenuBarLaunchAgent(): Promise<LaunchAgentStatus> 
 
 export function startInstalledLaunchAgent(kind: "console" | "menubar"): LaunchAgentStatus {
   requireMac("launch-agent start");
+  assertMacRuntimeForManagedSurfaces();
   const label = kind === "console" ? consoleLabel : menuBarLabel;
   const plistPath = launchAgentPath(label);
   if (!existsSync(plistPath)) {
@@ -285,10 +302,87 @@ export function startInstalledLaunchAgent(kind: "console" | "menubar"): LaunchAg
   return launchAgentStatus(kind);
 }
 
+export async function refreshMacRuntimeServices(): Promise<{
+  console: LaunchAgentStatus;
+  menuBar: LaunchAgentStatus;
+}> {
+  requireMac("macOS runtime refresh");
+  assertMacRuntimeForManagedSurfaces();
+  const console = launchAgentStatus("console");
+  const menuBar = launchAgentStatus("menubar");
+  return {
+    console: await refreshConsoleLaunchAgent(console),
+    menuBar: await refreshMenuBarLaunchAgent(menuBar)
+  };
+}
+
 export function stopInstalledLaunchAgent(kind: "console" | "menubar"): LaunchAgentStatus {
   requireMac("launch-agent stop");
   stopLaunchAgent(kind === "console" ? consoleLabel : menuBarLabel);
   return launchAgentStatus(kind);
+}
+
+async function refreshConsoleLaunchAgent(status: LaunchAgentStatus): Promise<LaunchAgentStatus> {
+  if (!status.installed) return status;
+
+  const args = launchAgentProgramArguments(status.plistPath);
+  const env = launchAgentEnvironment(status.plistPath);
+  const port = numberAfter(args, "--port") || 8718;
+  const logs = await ensureLogDir(env.SGW_HOME);
+  if (status.loaded) stopLaunchAgent(consoleLabel);
+  await writeFile(status.plistPath, buildConsoleLaunchAgentPlist(port, logs, env), { mode: 0o644 });
+  if (status.loaded) startLaunchAgent(consoleLabel, status.plistPath);
+  return launchAgentStatus("console");
+}
+
+async function refreshMenuBarLaunchAgent(status: LaunchAgentStatus): Promise<LaunchAgentStatus> {
+  if (!status.installed) return status;
+
+  const args = launchAgentProgramArguments(status.plistPath);
+  const env = launchAgentEnvironment(status.plistPath);
+  const logs = await ensureLogDir(env.SGW_HOME);
+  if (status.loaded) stopLaunchAgent(menuBarLabel);
+  await writeFile(status.plistPath, buildMenuBarLaunchAgentPlist({
+    consoleUrl: env.SGW_CONSOLE_URL,
+    countMode: normalizeMenuBarCountMode(env.SGW_MENU_BAR_COUNT_MODE),
+    notify: !args.includes("--no-notify")
+  }, logs, env), { mode: 0o644 });
+  if (status.loaded) startLaunchAgent(menuBarLabel, status.plistPath);
+  return launchAgentStatus("menubar");
+}
+
+function launchAgentProgramArguments(plistPath: string): string[] {
+  const plist = readLaunchAgentPlist(plistPath);
+  const match = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist);
+  if (!match) return [];
+  return [...match[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((item) => xmlUnescape(item[1]));
+}
+
+function launchAgentEnvironment(plistPath: string): Record<string, string> {
+  const plist = readLaunchAgentPlist(plistPath);
+  const match = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(plist);
+  if (!match) return {};
+
+  const env: Record<string, string> = {};
+  for (const item of match[1].matchAll(/<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g)) {
+    env[xmlUnescape(item[1])] = xmlUnescape(item[2]);
+  }
+  return env;
+}
+
+function readLaunchAgentPlist(plistPath: string): string {
+  try {
+    return readFileSync(plistPath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function numberAfter(values: string[], flag: string): number | undefined {
+  const index = values.indexOf(flag);
+  if (index === -1) return undefined;
+  const value = Number(values[index + 1]);
+  return Number.isInteger(value) && value > 0 && value <= 65_535 ? value : undefined;
 }
 
 export function stopMacApp(): MacAppProcessInfo | undefined {
@@ -470,6 +564,7 @@ export function launchAgentStatus(kind: "console" | "menubar"): LaunchAgentStatu
 
 export function openMenuBarHelper(options: MenuBarOptions = {}): { appPath: string; consoleUrl: string } {
   requireMac("menu-bar open");
+  assertMacRuntimeForManagedSurfaces();
   assertMenuBarExists();
   const layout = getPackageLayout();
   const url = options.consoleUrl || consoleUrl(options.port || 8718);
@@ -533,6 +628,7 @@ export function openMacApp(options: MenuBarOptions = {}): MacAppOpenResult {
 export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppInstallResult {
   requireMac("mac app install");
   const layout = getPackageLayout();
+  assertMacRuntimeForManagedSurfaces(layout);
   const sourcePath = layout.packagedMacAppPath;
   const sourceBinary = layout.packagedMacAppBinaryPath;
   if (!existsSync(sourcePath) || !existsSync(sourceBinary)) {
@@ -540,10 +636,18 @@ export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppI
   }
   assertMacExecutableCompatible(sourceBinary, "macOS app");
 
+  if (layout.isSelfContainedMacApp) {
+    return { appPath: sourcePath, sourcePath, changed: false };
+  }
+
   const applicationsDir = path.resolve(options.applicationsDir || macApplicationsDirectory());
   const appPath = path.join(applicationsDir, "s-gw.app");
   const registerCliPath = options.registerCliPath !== false
     && process.env.SGW_SKIP_MAC_APP_CLI_REGISTRATION !== "1";
+  if (isSelfContainedMacApp(appPath)) {
+    return { appPath, sourcePath, changed: false };
+  }
+
   if (path.resolve(sourcePath) === path.resolve(appPath)) {
     if (registerCliPath) registerMacAppCliPath(layout.cliPath);
     return { appPath, sourcePath, changed: false };
@@ -809,12 +913,16 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-export function buildConsoleLaunchAgentPlist(port: number, logsDir: string): string {
+export function buildConsoleLaunchAgentPlist(
+  port: number,
+  logsDir: string,
+  inheritedEnvironment: Record<string, string> = {}
+): string {
   const layout = getPackageLayout();
   return buildLaunchAgentPlist({
     label: consoleLabel,
     programArguments: [
-      process.execPath,
+      layout.nodePath,
       layout.cliPath,
       "console",
       "--host",
@@ -823,7 +931,7 @@ export function buildConsoleLaunchAgentPlist(port: number, logsDir: string): str
       String(port),
       "--no-open"
     ],
-    environment: launchdBaseEnvironment(),
+    environment: launchdBaseEnvironment(inheritedEnvironment),
     runAtLoad: true,
     keepAlive: true,
     stdoutPath: path.join(logsDir, "console.log"),
@@ -831,7 +939,11 @@ export function buildConsoleLaunchAgentPlist(port: number, logsDir: string): str
   });
 }
 
-export function buildMenuBarLaunchAgentPlist(options: MenuBarOptions, logsDir: string): string {
+export function buildMenuBarLaunchAgentPlist(
+  options: MenuBarOptions,
+  logsDir: string,
+  inheritedEnvironment: Record<string, string> = {}
+): string {
   const layout = getPackageLayout();
   const args = [layout.menuBarBinaryPath];
   if (options.notify !== false) {
@@ -843,7 +955,7 @@ export function buildMenuBarLaunchAgentPlist(options: MenuBarOptions, logsDir: s
   return buildLaunchAgentPlist({
     label: menuBarLabel,
     programArguments: args,
-    environment: menuBarEnvironment(options.consoleUrl || consoleUrl(options.port || 8718), options.countMode),
+    environment: menuBarEnvironment(options.consoleUrl || consoleUrl(options.port || 8718), options.countMode, inheritedEnvironment),
     runAtLoad: true,
     keepAlive: true,
     stdoutPath: path.join(logsDir, "menubar.log"),
@@ -946,23 +1058,26 @@ function launchAgentPath(label: string): string {
   return path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`);
 }
 
-async function ensureLogDir(): Promise<string> {
-  const logs = path.join(getSgwHome(), "logs");
+async function ensureLogDir(sgwHome?: string): Promise<string> {
+  const logs = path.join(path.resolve(sgwHome || getSgwHome()), "logs");
   await mkdir(logs, { recursive: true, mode: 0o700 });
   await mkdir(path.dirname(launchAgentPath(consoleLabel)), { recursive: true });
   return logs;
 }
 
-function launchdBaseEnvironment(): Record<string, string> {
+function launchdBaseEnvironment(inherited: Record<string, string> = {}): Record<string, string> {
+  const layout = getPackageLayout();
   const env: Record<string, string> = {
-    PATH: process.env.PATH || "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-    SGW_NODE_PATH: process.execPath
+    PATH: inherited.PATH || process.env.PATH || "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+    SGW_NODE_PATH: layout.nodePath
   };
 
-  copyEnv(env, "SGW_HOME");
-  copyEnv(env, "SGW_KEYCHAIN_SERVICE");
-  copyEnv(env, "SGW_KEYCHAIN_ACCOUNT");
-  copyEnv(env, "SGW_KEYCHAIN_HELPER");
+  for (const key of ["SGW_HOME", "SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT"]) {
+    copyEnvironmentValue(env, inherited, key);
+  }
+  if (process.env.SGW_KEYCHAIN_HELPER) {
+    env.SGW_KEYCHAIN_HELPER = process.env.SGW_KEYCHAIN_HELPER;
+  }
   return env;
 }
 
@@ -996,10 +1111,14 @@ export function normalizeMenuBarCountMode(value?: string): MenuBarCountMode | un
   }
 }
 
-function menuBarEnvironment(url: string, countMode?: MenuBarCountMode): Record<string, string> {
+function menuBarEnvironment(
+  url: string,
+  countMode?: MenuBarCountMode,
+  inheritedEnvironment: Record<string, string> = {}
+): Record<string, string> {
   const layout = getPackageLayout();
   const env: Record<string, string> = {
-    ...launchdBaseEnvironment(),
+    ...launchdBaseEnvironment(inheritedEnvironment),
     SGW_REPO_ROOT: layout.packageRoot,
     SGW_CLI_PATH: layout.cliPath,
     SGW_CONSOLE_URL: url,
@@ -1024,8 +1143,12 @@ function windowsEnvironment(url: string): NodeJS.ProcessEnv {
   };
 }
 
-function copyEnv(target: Record<string, string>, key: string): void {
-  const value = process.env[key];
+function copyEnvironmentValue(
+  target: Record<string, string>,
+  inherited: Record<string, string>,
+  key: string
+): void {
+  const value = inherited[key] || process.env[key];
   if (value) {
     target[key] = value;
   }
@@ -1055,6 +1178,35 @@ function macApplicationsDirectory(): string {
     }
   }
   return path.join(os.homedir(), "Applications");
+}
+
+function findInstalledSelfContainedMacApp(): string | undefined {
+  const candidates = [
+    path.join(macApplicationsDirectory(), "s-gw.app"),
+    "/Applications/s-gw.app",
+    path.join(os.homedir(), "Applications", "s-gw.app")
+  ];
+
+  for (const candidate of new Set(candidates.map((item) => path.resolve(item)))) {
+    if (isSelfContainedMacApp(candidate)) return candidate;
+  }
+
+  return undefined;
+}
+
+export function assertMacRuntimeForManagedSurfaces(
+  layout: Pick<PackageLayout, "isSelfContainedMacApp" | "standaloneMacAppInstalled" | "macAppPath"> = getPackageLayout()
+): void {
+  if (layout.isSelfContainedMacApp) {
+    if (!isInstalledMacAppLocation(layout.macAppPath)) {
+      throw new Error("Move s-gw.app to /Applications or ~/Applications before setup. Services and agent connections cannot safely run from a mounted disk image, App Translocation path, or other temporary location.");
+    }
+    return;
+  }
+
+  if (layout.standaloneMacAppInstalled) {
+    throw new Error("A self-contained s-gw.app is already installed. Open that app to manage s-gw services, the menu bar, agents, or updates.");
+  }
 }
 
 function macAppBinaryPath(appPath: string): string {
@@ -1162,4 +1314,13 @@ function xmlEscape(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
+}
+
+function xmlUnescape(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
 }
