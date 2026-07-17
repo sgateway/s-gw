@@ -24,7 +24,7 @@ The raw credential is written through the bundled helper on stdin. The encrypted
 
 Use `--service SERVICE` or `SGW_SECRET_KEYCHAIN_SERVICE` when you want a separate credential-store namespace for testing, work, or isolated profiles.
 
-On macOS, setup copies the first working Keychain helper to `~/.s-gw/native/darwin-arm64/s-gw-keychain-helper` with owner-only permissions. A Keychain ACL records the creating helper's path and code-signing requirement; macOS grants access only when the executing helper satisfies that requirement. npm updates preserve the existing helper before replacing a package, and later releases do not overwrite it silently. The self-contained app also copies its helper to that persistent path, but never modifies the signed app bundle itself.
+On macOS, setup copies the first working Keychain helper to `~/.s-gw/native/darwin-arm64/s-gw-keychain-helper` with owner-only permissions. A Keychain ACL records the creating helper's path and code-signing requirement; macOS grants access only when the executing helper satisfies that requirement. npm updates preserve the existing helper before replacing a package, and later releases do not overwrite it silently. The self-contained app also copies its helper to that persistent path, but never modifies the installed app bundle itself.
 
 After an upgrade, s-gw checks each item's trusted-application metadata before any credential read. An item tied to an older package path is copied through a verified temporary Keychain backup and recreated for the persistent helper. The original is not deleted until the recovery copy has been verified. Run the same repair explicitly at any time:
 

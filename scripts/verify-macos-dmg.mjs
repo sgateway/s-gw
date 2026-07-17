@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdtempSync, readlinkSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -24,6 +24,7 @@ try {
 
   const appPath = path.join(mountPoint, "s-gw.app");
   const applicationsLink = path.join(mountPoint, "Applications");
+  const readmePath = path.join(mountPoint, "README.txt");
   const runtimeRoot = path.join(appPath, "Contents", "Resources", "s-gw-runtime");
   const packageRoot = path.join(runtimeRoot, "package");
   const expected = [
@@ -51,6 +52,17 @@ try {
   }
   if (existsSync(path.join(mountPoint, "Install s-gw.command"))) {
     throw new Error("The DMG must not include a clickable shell installer.");
+  }
+  if (!existsSync(readmePath)) {
+    throw new Error("The DMG must include installation guidance.");
+  }
+  const readme = readFileSync(readmePath, "utf8");
+  const packageVersion = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
+  const npmInstall = packageVersion.includes("-unsigned.")
+    ? `npm install -g https://github.com/sgateway/s-gw/releases/download/unsigned-macos-preview-v${packageVersion}/s-gw-${packageVersion}.tgz`
+    : "npm install -g @s-gw/s-gw";
+  if (!readme.includes(npmInstall) || !readme.includes("s-gw setup")) {
+    throw new Error("The DMG installation guidance must include the matching npm alternative.");
   }
 
   run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath]);

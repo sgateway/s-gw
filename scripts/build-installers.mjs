@@ -28,6 +28,8 @@ const version = packageInfo.version;
 const packedFile = `${packageInfo.name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`;
 const packageFile = `s-gw-${version}.tgz`;
 const legacyBridgeFile = `0-s-gw-legacy-${version}.tgz`;
+const macInstallerFile = `s-gw-${version}-macos.dmg`;
+const unsignedPreviewMacInstallerFile = `s-gw-${version}-macos-unsigned-preview.dmg`;
 const outputDir = resolve(root, "dist/installers");
 const workDir = mkdtempSync(resolve(tmpdir(), "s-gw-installers-"));
 
@@ -52,7 +54,7 @@ try {
   copyFileSync(packed, resolve(outputDir, packageFile));
   buildLegacyBridge(packed, resolve(outputDir, legacyBridgeFile), version);
 
-  const artifacts = [legacyBridgeFile, packageFile, basename(macArtifact), basename(windowsArtifact)];
+  const artifacts = [legacyBridgeFile, packageFile, basename(macArtifact.path), basename(windowsArtifact)];
   const checksumLines = artifacts.map((name) => `${sha256(resolve(outputDir, name))}  ${name}`);
   writeFileSync(resolve(outputDir, "SHA256SUMS.txt"), `${checksumLines.join("\n")}\n`);
 
@@ -64,6 +66,9 @@ try {
     name: packageInfo.name,
     version,
     generatedAt: new Date().toISOString(),
+    releaseTag: macArtifact.releaseTag,
+    macosDistribution: macArtifact.distribution,
+    notarized: macArtifact.notarized,
     artifacts
   }, null, 2)}\n`);
 
@@ -79,13 +84,66 @@ function buildMacInstaller(packed) {
   mkdirSync(stageRoot, { recursive: true });
   buildSelfContainedMacApp(packed, appRoot);
   symlinkSync("/Applications", resolve(stageRoot, "Applications"));
+  writeFileSync(resolve(stageRoot, "README.txt"), macInstallReadme(signing));
 
   signMacApp(appRoot, signing);
-  const target = resolve(outputDir, `s-gw-${version}-macos.dmg`);
+  const target = resolve(outputDir, macInstallerFileName(signing));
   run("hdiutil", ["create", "-volname", `s-gw ${version}`, "-srcfolder", stageRoot, "-ov", "-format", "UDZO", target], root);
   signMacDmg(target, signing);
   notarizeMacDmg(target, signing);
-  return target;
+  return {
+    path: target,
+    releaseTag: releaseTagFor(signing),
+    distribution: signing.distribution,
+    notarized: signing.requireNotarization
+  };
+}
+
+function macInstallerFileName(signing) {
+  return signing.distribution === "unsigned-preview" ? unsignedPreviewMacInstallerFile : macInstallerFile;
+}
+
+function macInstallReadme(signing) {
+  const releaseTag = releaseTagFor(signing);
+  const npmInstall = signing.distribution === "unsigned-preview"
+    ? `npm install -g https://github.com/sgateway/s-gw/releases/download/${releaseTag}/s-gw-${version}.tgz`
+    : "npm install -g @s-gw/s-gw";
+  const trustNotice = signing.distribution === "unsigned-preview"
+    ? [
+      "This is an unsigned macOS preview. It is not signed with an Apple Developer ID or notarized.",
+      "macOS will require an explicit Gatekeeper override before it opens."
+    ]
+    : signing.distribution === "notarized"
+      ? ["This installer is Developer ID signed and notarized by Apple."]
+      : ["This is a local ad-hoc build. It is not intended for public distribution."];
+
+  return `${[
+    `s-gw ${version} for Apple silicon`,
+    "",
+    "1. Drag s-gw.app to Applications.",
+    "2. Open s-gw from Applications and complete setup.",
+    "",
+    ...trustNotice,
+    "",
+    "Prefer not to use a macOS security override? Install the CLI package instead (Node.js 20+ required):",
+    npmInstall,
+    "s-gw setup",
+    ...(signing.distribution === "unsigned-preview" ? [] : [
+      "",
+      "For an unsigned preview that is not in npm yet, use the exact .tgz link in the GitHub release notes."
+    ])
+  ].join("\n")}\n`;
+}
+
+function releaseTagFor(signing) {
+  const expected = signing.distribution === "unsigned-preview"
+    ? `unsigned-macos-preview-v${version}`
+    : `v${version}`;
+  const configured = process.env.SGW_RELEASE_TAG?.trim();
+  if (configured && configured !== expected) {
+    throw new Error(`SGW_RELEASE_TAG must be ${expected} for this distribution.`);
+  }
+  return expected;
 }
 
 function buildSelfContainedMacApp(packed, appRoot) {
@@ -250,6 +308,20 @@ function signingConfiguration() {
   const identity = process.env.SGW_MACOS_SIGN_IDENTITY?.trim() || "-";
   const requireNotarization = process.env.SGW_REQUIRE_NOTARIZATION === "1";
   const notaryProfile = process.env.SGW_NOTARY_PROFILE?.trim();
+  const distribution = process.env.SGW_MACOS_DISTRIBUTION?.trim() || "local";
+
+  if (!["local", "notarized", "unsigned-preview"].includes(distribution)) {
+    throw new Error("SGW_MACOS_DISTRIBUTION must be local, notarized, or unsigned-preview.");
+  }
+  if (distribution === "notarized" && !requireNotarization) {
+    throw new Error("A notarized distribution requires SGW_REQUIRE_NOTARIZATION=1.");
+  }
+  if (distribution === "unsigned-preview" && (identity !== "-" || requireNotarization)) {
+    throw new Error("An unsigned preview must use the ad-hoc signing identity and no notarization.");
+  }
+  if (distribution === "unsigned-preview" && !/^\d+\.\d+\.\d+-unsigned\.\d+$/.test(version)) {
+    throw new Error("An unsigned preview requires a package version such as 0.1.18-unsigned.1.");
+  }
 
   if (requireNotarization && identity === "-") {
     throw new Error("SGW_REQUIRE_NOTARIZATION=1 requires SGW_MACOS_SIGN_IDENTITY.");
@@ -261,7 +333,7 @@ function signingConfiguration() {
     throw new Error("SGW_REQUIRE_NOTARIZATION=1 requires SGW_NOTARY_PROFILE.");
   }
 
-  return { identity, requireNotarization, notaryProfile };
+  return { identity, requireNotarization, notaryProfile, distribution };
 }
 
 function signCode(target, signing, options = {}) {

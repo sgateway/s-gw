@@ -33,6 +33,7 @@ describe("platform installers", () => {
     expect(pkg.files).not.toContain("native/menu-bar-helper/Sources");
     expect(builder).toContain("hdiutil");
     expect(builder).toContain("s-gw-${version}-macos.dmg");
+    expect(builder).toContain("s-gw-${version}-macos-unsigned-preview.dmg");
     expect(builder).toContain("s-gw-${version}-windows.zip");
     expect(builder).toContain('const packageFile = `s-gw-${version}.tgz`');
     expect(builder).toContain("SHA256SUMS.txt");
@@ -101,6 +102,11 @@ describe("platform installers", () => {
     expect(builder).toContain('writeLauncher(resolve(binDir, "s-gw")');
     expect(builder).toContain('writeLauncher(resolve(binDir, "s-gw-mcp")');
     expect(builder).toContain("SGW_REQUIRE_NOTARIZATION");
+    expect(builder).toContain("SGW_MACOS_DISTRIBUTION");
+    expect(builder).toContain("unsigned-preview");
+    expect(builder).toContain("README.txt");
+    expect(builder).toContain("npm install -g https://github.com/sgateway/s-gw/releases/download");
+    expect(builder).toContain("Prefer not to use a macOS security override?");
     expect(builder).toContain("notarytool");
     expect(builder).toContain("NodeRuntime.entitlements");
     expect(builder).toContain("com.apple.security.cs.allow-jit");
@@ -111,6 +117,8 @@ describe("platform installers", () => {
     expect(verifier).toContain('path.join(runtimeRoot, "bin", "s-gw")');
     expect(verifier).toContain("runMcpSmoke");
     expect(verifier).toContain("SGW_TEST_HOME_ROOT");
+    expect(verifier).toContain("const npmInstall = packageVersion.includes");
+    expect(verifier).toContain("readme.includes(npmInstall)");
     expect(runtime.node.version).toMatch(/^24\./);
     expect(runtime.node.url).toContain(`v${runtime.node.version}/node-v${runtime.node.version}-darwin-arm64.tar.gz`);
     expect(runtime.node.sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -175,6 +183,8 @@ describe("platform installers", () => {
     expect(workflow).not.toContain("  release:");
     expect(workflow).toContain("release_tag:");
     expect(workflow).toContain("publish_release:");
+    expect(workflow).toContain("macos_distribution:");
+    expect(workflow).toContain("unsigned-preview");
     expect(assetJob).toContain("ref: ${{ inputs.release_tag }}");
     expect(assetJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
     expect(assetJob).toContain("SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core");
@@ -192,7 +202,14 @@ describe("platform installers", () => {
     expect(assetJob).toContain("APPLE_NOTARY_KEY_P8_BASE64");
     expect(assetJob).toContain("SGW_MACOS_SIGN_IDENTITY=$identity");
     expect(assetJob).toContain("SGW_REQUIRE_NOTARIZATION=1");
+    expect(assetJob).toContain("SGW_MACOS_DISTRIBUTION=notarized");
+    expect(assetJob).toContain("SGW_MACOS_DISTRIBUTION=unsigned-preview");
     expect(assetJob).toContain("spctl --assess");
+    expect(assetJob).toContain("s-gw-${package_version}-macos-unsigned-preview.dmg");
+    expect(assetJob).toContain("--prerelease --latest=false");
+    expect(assetJob).toContain("unsigned-macos-preview-v${package_version}");
+    expect(assetJob).toContain("npm install -g https://github.com/${GITHUB_REPOSITORY}");
+    expect(assetJob).toContain("If you prefer not to override Gatekeeper");
     expect(assetJob).toContain("Create or verify a draft release");
     expect(assetJob).toContain("gh release create \"$RELEASE_TAG\" --draft --verify-tag --generate-notes");
     expect(assetJob).toContain('select(.state == "uploaded")');
@@ -201,6 +218,7 @@ describe("platform installers", () => {
     expect(builder).toContain("buildLegacyBridge");
     expect(builder).toContain("0-s-gw-legacy-${version}.tgz");
     expect(validator).toContain('bridgeMetadata.name !== "s-gw"');
+    expect(validator).toContain("macosDistribution");
   });
 
   it("publishes the native npm package on Apple Silicon and keeps Registry publishing on Linux", async () => {
@@ -222,6 +240,7 @@ describe("platform installers", () => {
     expect(releaseJob).toContain("gh release edit \"$RELEASE_TAG\" --draft=false");
     expect(npmJob).toContain("runs-on: macos-15");
     expect(npmJob).toContain("needs: publish-release");
+    expect(npmJob).toContain("inputs.macos_distribution == 'notarized'");
     expect(npmJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
     expect(npmJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(npmJob).toContain("ref: ${{ inputs.release_tag }}");
@@ -234,6 +253,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain('s-gw-core" --version');
     expect(npmJob).toContain('test ! -e "$package_root/dist/native/s-gw-core"');
     expect(registryJob).toContain("needs: publish-npm");
+    expect(registryJob).toContain("inputs.macos_distribution == 'notarized'");
     expect(registryJob).toContain("runs-on: ubuntu-latest");
     expect(registryJob).toContain("mcp-publisher_linux_amd64.tar.gz");
     expect(registryJob).not.toContain("npm publish --access public");

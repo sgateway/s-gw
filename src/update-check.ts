@@ -5,7 +5,6 @@ import { CURRENT_VERSION } from "./version.js";
 
 export const UPDATE_REPOSITORY = "sgateway/s-gw";
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-export const UPDATE_ASSET_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface UpdateCheckResult {
   checked: boolean;
@@ -165,7 +164,10 @@ export class ReleaseChecker {
           signal: AbortSignal.timeout(5_000)
         });
         if (!response.ok) throw new Error(`GitHub release feed returned HTTP ${response.status}.`);
-        return releaseFromAtom(await response.text());
+        const release = releaseFromAtom(await response.text());
+        if (!release) return null;
+        const assets = await atomReleaseAssets(release, this.fetcher);
+        return assets ? { ...release, assets } : null;
       } catch (feedError) {
         const apiMessage = apiError instanceof Error ? apiError.message : String(apiError);
         const feedMessage = feedError instanceof Error ? feedError.message : String(feedError);
@@ -200,14 +202,18 @@ export class ReleaseChecker {
 export const releaseChecker = new ReleaseChecker();
 
 function newestRelease(releases: GitHubRelease[]): GitHubRelease | null {
-  let newest: GitHubRelease | null = null;
-  for (const release of releases) {
-    if (release.draft || !parseSemanticVersion(release.tag_name)) continue;
-    if (!newest || isNewerVersion(release.tag_name, newest.tag_name)) {
-      newest = release;
-    }
+  const candidates = releases
+    .filter((release) => !release.draft && !release.prerelease && Boolean(parseSemanticVersion(release.tag_name)))
+    .sort((left, right) => {
+      if (isNewerVersion(left.tag_name, right.tag_name)) return -1;
+      if (isNewerVersion(right.tag_name, left.tag_name)) return 1;
+      return 0;
+    });
+
+  for (const release of candidates) {
+    if (releaseHasVerifiedInstaller(release)) return release;
   }
-  return newest;
+  return null;
 }
 
 function releaseFromAtom(xml: string): GitHubRelease | null {
@@ -229,6 +235,46 @@ function releaseFromAtom(xml: string): GitHubRelease | null {
     prerelease: parsed.prerelease.length > 0,
     published_at: entry.match(/<updated>([^<]+)<\/updated>/i)?.[1] || null
   };
+}
+
+async function atomReleaseAssets(
+  release: GitHubRelease,
+  fetcher: typeof fetch
+): Promise<GitHubReleaseAsset[] | null> {
+  const version = cleanVersion(release.tag_name);
+  const installer = expectedInstallerName(version);
+  const prefix = `https://github.com/${UPDATE_REPOSITORY}/releases/download/${release.tag_name}`;
+  const installerUrl = `${prefix}/${installer}`;
+  const checksumUrl = `${installerUrl}.sha256`;
+  const manifestUrl = `${prefix}/SHA256SUMS.txt`;
+
+  const installerResponse = await fetcher(installerUrl, {
+    method: "HEAD",
+    headers: { "User-Agent": "s-gw-updater" },
+    signal: AbortSignal.timeout(5_000)
+  });
+  if (!installerResponse.ok) return null;
+
+  const checksumResponse = await fetcher(checksumUrl, {
+    method: "HEAD",
+    headers: { "User-Agent": "s-gw-updater" },
+    signal: AbortSignal.timeout(5_000)
+  });
+  if (checksumResponse.ok) {
+    return [
+      { name: installer, state: "uploaded" },
+      { name: `${installer}.sha256`, state: "uploaded" }
+    ];
+  }
+
+  const manifestResponse = await fetcher(manifestUrl, {
+    method: "HEAD",
+    headers: { "User-Agent": "s-gw-updater" },
+    signal: AbortSignal.timeout(5_000)
+  });
+  return manifestResponse.ok
+    ? [{ name: installer, state: "uploaded" }, { name: "SHA256SUMS.txt", state: "uploaded" }]
+    : null;
 }
 
 function decodeXml(value: string): string {
@@ -319,11 +365,7 @@ function cacheIsFresh(result: UpdateCheckResult, now: number): boolean {
   const checkedAt = Date.parse(result.checkedAt);
   if (!Number.isFinite(checkedAt)) return false;
 
-  const waitingForInstaller = Boolean(result.latestVersion) &&
-    isNewerVersion(result.latestVersion!, result.currentVersion) &&
-    !result.installerReady;
-  const interval = waitingForInstaller ? UPDATE_ASSET_RETRY_INTERVAL_MS : UPDATE_CHECK_INTERVAL_MS;
-  return now - checkedAt < interval;
+  return now - checkedAt < UPDATE_CHECK_INTERVAL_MS;
 }
 
 function validResult(value: unknown): value is UpdateCheckResult {

@@ -154,7 +154,7 @@ describe("local console server", () => {
         tag_name: "v0.1.1",
         html_url: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
         draft: false,
-        prerelease: true,
+        prerelease: false,
         published_at: "2026-07-04T00:00:00.000Z",
         assets: [
           { name: installer, state: "uploaded" },
@@ -171,7 +171,7 @@ describe("local console server", () => {
       latestVersion: "0.1.1",
       available: true,
       installerReady: true,
-      prerelease: true
+      prerelease: false
     });
   });
 

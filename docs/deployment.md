@@ -69,11 +69,20 @@ npm run build
 npm link
 ```
 
-### Signed macOS Installer
+### macOS Installer
 
-The macOS DMG contains only `s-gw.app` and an `Applications` shortcut. The app includes the runtime and all macOS components, so users drag one bundle into Applications instead of double-clicking a shell installer. Release CI signs every executable with a Developer ID Application certificate, enables the hardened runtime, applies the Node JIT entitlement required by V8, submits the DMG to Apple notarization, staples the result, and assesses it with Gatekeeper before upload.
+The macOS DMG contains `s-gw.app`, an `Applications` shortcut, and a short README with the npm installation alternative. The app includes the runtime and all macOS components, so users drag one bundle into Applications instead of double-clicking a shell installer. The default release mode signs every executable with a Developer ID Application certificate, enables the hardened runtime, applies the Node JIT entitlement required by V8, submits the DMG to Apple notarization, staples the result, and assesses it with Gatekeeper before upload.
 
-Local builds use ad-hoc signing only; they are useful for package verification but are not publishable. The installer never pre-seeds passphrases, credentials, `SGW_HOME`, or policy templates.
+When Developer ID signing is unavailable, the explicit `unsigned-preview` mode produces `s-gw-VERSION-macos-unsigned-preview.dmg` under the non-version GitHub prerelease tag `unsigned-macos-preview-vVERSION`. It is not notarized, requires a Gatekeeper override, is ignored by current and older automatic updaters, and does not publish npm or the MCP Registry. Users who prefer not to override Gatekeeper can install the matching `.tgz` release asset with Node.js 20 or newer:
+
+```bash
+npm install -g https://github.com/sgateway/s-gw/releases/download/unsigned-macos-preview-vVERSION/s-gw-VERSION.tgz
+s-gw setup
+```
+
+Replace `VERSION` with the version in that preview's filename, or copy the exact command from the preview release notes or DMG README.
+
+The installer never pre-seeds passphrases, credentials, `SGW_HOME`, or policy templates.
 
 ### Homebrew
 
@@ -382,7 +391,7 @@ Supported means s-gw has a documented standard MCP stdio path. Profiled means `s
 
 ## Upgrade
 
-The CLI and local console cache ordinary successful responses from the public `sgateway/s-gw` GitHub Releases feed for six hours. A newer release whose expected installer or checksum is still uploading is retried after five minutes instead. Drafts are ignored; preview releases are included while s-gw is in preview. If GitHub's unauthenticated Releases API is rate-limited, clients fall back to the repository's public Atom release feed; the macOS app then checks the deterministic package and checksum URLs before offering an upgrade. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The login-started macOS menu helper checks immediately and every 15 minutes, while the main app performs one startup check and supports manual checks. Both otherwise reuse the six-hour release-feed cache, so the helper's poll does not force a GitHub request or create a new update record each time. A failed request does not advance that timestamp, so the helper retries on its next poll. The main app persists the available release and its banner across restarts in a locked, atomic state file shared with the helper. The menu helper is the only automatic macOS-alert sender: it first confirms that macOS alerts are enabled, reserves a queue attempt, and records an accepted request as a bounded attempt—not proof that macOS displayed it. It retries an unacknowledged update after one day and then one week, stopping after three accepted queue attempts. Dismissing the app banner or opening the notification acknowledges that version; **Notify Again** in the app's Updates settings deliberately starts a new bounded reminder sequence.
+The CLI and local console cache ordinary successful responses from the public `sgateway/s-gw` GitHub Releases feed for six hours. Drafts, prereleases, and incomplete asset uploads are ignored by the automatic update channel. If GitHub's unauthenticated Releases API is rate-limited, clients fall back to the repository's public Atom release feed; the macOS app then checks the deterministic package and checksum URLs before offering an upgrade. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The login-started macOS menu helper checks immediately and every 15 minutes, while the main app performs one startup check and supports manual checks. Both otherwise reuse the six-hour release-feed cache, so the helper's poll does not force a GitHub request or create a new update record each time. A failed request does not advance that timestamp, so the helper retries on its next poll. The main app persists the available release and its banner across restarts in a locked, atomic state file shared with the helper. The menu helper is the only automatic macOS-alert sender: it first confirms that macOS alerts are enabled, reserves a queue attempt, and records an accepted request as a bounded attempt—not proof that macOS displayed it. It retries an unacknowledged update after one day and then one week, stopping after three accepted queue attempts. Dismissing the app banner or opening the notification acknowledges that version; **Notify Again** in the app's Updates settings deliberately starts a new bounded reminder sequence.
 
 The release workflow runs the full verification suite, then builds the scoped package, legacy bridge, platform installers, `SHA256SUMS.txt`, and per-file `.sha256` assets. It refuses to upload an update package whose identity or checksum cannot be verified, uploads only to a draft release, verifies every remote asset, and makes the release public afterward. A self-contained macOS app verifies that the release includes the matching DMG and checksum, then opens the release page. Download the DMG, quit s-gw, replace the copy in Applications, and reopen it. On first launch after the version or bundle location changes, the app restarts any running console and menu-bar LaunchAgents so they use the new bundled runtime. npm installs retain the verified tarball update flow. The original `0.1.0` app can take the legacy bridge on its next update check; once that fixed app is installed, later releases migrate it to the scoped package automatically. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
 
@@ -457,7 +466,7 @@ For macOS production packages, also verify:
 - `s-gw doctor` finds the installed CLI, MCP server, native Keychain helper, and menu-bar app bundle;
 - `s-gw service install --start` loads the console LaunchAgent;
 - `s-gw menubar open` launches the menu-bar helper and sees pending requests;
-- package or installer is signed and notarized;
+- normal macOS package or installer is signed and notarized, or an unsigned preview is explicitly labelled and manually installed;
 - install/uninstall leaves no raw secrets in logs or shell history.
 
 For Windows preview packages, also verify:

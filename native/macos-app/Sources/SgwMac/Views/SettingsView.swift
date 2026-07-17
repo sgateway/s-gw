@@ -201,7 +201,7 @@ struct SettingsView: View {
 
         if let release = appState.availableUpdate {
           Text(release.isMacInstaller
-            ? "Available: \(release.version) · download the signed installer to update this app"
+            ? "Available: \(release.version) · download the installer to update this app"
             : "Available: \(release.version)\(release.canInstallPackage ? "" : " · checksum required for automatic install")")
             .font(.caption)
             .foregroundStyle(release.hasVerifiedAsset ? SGWTheme.teal : SGWTheme.orange)
@@ -225,7 +225,7 @@ struct SettingsView: View {
       Section("CLI") {
         if UpdateChecker.usesSelfContainedRuntime {
           LabeledContent("Runtime", value: "Bundled with this app")
-          Text("This signed app always uses its bundled CLI and Node runtime so background services and agent registrations stay on the same version.")
+          Text("This app always uses its bundled CLI and Node runtime so background services and agent registrations stay on the same version.")
             .font(.caption)
             .foregroundStyle(.secondary)
         } else {

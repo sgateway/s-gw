@@ -37,7 +37,7 @@ Exercise the [quick-start trust loop](docs/quickstart.md) with a disposable stor
 
 `npm run build:installers` writes versioned files and SHA-256 checksums under `dist/installers`.
 
-The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. Public releases require Developer ID signing, hardened runtime, Apple notarization, stapling, and Gatekeeper assessment. The `release-assets` workflow fails closed unless these repository secrets are present:
+The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. The default `notarized` release mode requires Developer ID signing, hardened runtime, Apple notarization, stapling, and Gatekeeper assessment. The `release-assets` workflow fails closed unless these repository secrets are present:
 
 - `APPLE_DEVELOPER_ID_P12_BASE64`
 - `APPLE_DEVELOPER_ID_P12_PASSWORD`
@@ -45,17 +45,17 @@ The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. Publ
 - `APPLE_NOTARY_KEY_ID`
 - `APPLE_NOTARY_ISSUER_ID`
 
-Local builds use ad-hoc signatures only and must not be uploaded as releases. Do not describe the Windows package as a production download until it is signed and validated on supported Windows versions.
+`unsigned-preview` is the only exception: it produces `s-gw-VERSION-macos-unsigned-preview.dmg`, marks the GitHub release as a prerelease under the non-version tag `unsigned-macos-preview-vVERSION`, omits npm and MCP Registry publication, and keeps it out of automatic updates in both current and older clients. Its release notes include the exact `.tgz` npm command for users who prefer not to override Gatekeeper. Local builds use ad-hoc signatures only. Do not describe the Windows package as a production download until it is signed and validated on supported Windows versions.
 
 ## Publish
 
-1. Create an annotated `vX.Y.Z` tag from a green `main` commit.
-2. Ensure private `barryqy/s-gw-rust-core` has the matching immutable tag.
-3. Run **Publish release** with `release_tag=vX.Y.Z` and `publish_release=true`.
-4. The workflow verifies the tag/version pair, builds, signs, notarizes, staples, and Gatekeeper-assesses the DMG before it creates or updates a **draft** GitHub release.
-5. It uploads every installer and checksum, confirms their GitHub asset state is `uploaded`, then publishes the draft. Only after that succeeds does it publish npm and the MCP Registry.
+1. Create an annotated `vX.Y.Z` tag from a green `main` commit, or `unsigned-macos-preview-vX.Y.Z-unsigned.N` for the explicit unsigned preview channel.
+2. Ensure private `barryqy/s-gw-rust-core` has the same immutable tag.
+3. Run **Publish release** with `release_tag=vX.Y.Z`, `publish_release=true`, and `macos_distribution=notarized` for a normal release. For an unsigned preview, use the matching non-version preview tag and `macos_distribution=unsigned-preview`.
+4. The normal workflow verifies the tag/version pair, builds, signs, notarizes, staples, and Gatekeeper-assesses the DMG before it creates or updates a **draft** GitHub release.
+5. It uploads every installer and checksum, confirms their GitHub asset state is `uploaded`, then publishes the draft. Only after a normal release succeeds does it publish npm and the MCP Registry.
 6. To inspect assets without notifying users, run the workflow with `publish_release=false`; the release remains a draft. Re-run with `true` only after review.
 7. Verify checksums from a clean download and install the release on clean macOS and Windows test accounts.
 8. Confirm the update checker sees the release and opens the correct notes.
 
-Do not publish a macOS DMG when signing or notarization is unavailable. The Windows package may still be labeled as a preview artifact with its limitations stated in the release notes.
+When signing is unavailable, run the explicit `unsigned-preview` mode only. It creates a prerelease under a non-version tag, so current and older clients ignore it rather than treating it as an automatic update. It intentionally does not publish to npm or the MCP Registry. The Windows package may still be labeled as a preview artifact with its limitations stated in the release notes.

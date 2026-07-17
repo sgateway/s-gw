@@ -9,6 +9,14 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageInfo = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
 const directory = path.resolve(process.argv[2] || path.join(root, "dist", "installers"));
 const selected = await validateReleaseDirectory(directory, packageInfo.version);
+const releaseMetadata = JSON.parse(await readFile(path.join(directory, "RELEASE.json"), "utf8"));
+const distributions = new Set(["local", "notarized", "unsigned-preview"]);
+if (!distributions.has(releaseMetadata.macosDistribution) || typeof releaseMetadata.notarized !== "boolean" || typeof releaseMetadata.releaseTag !== "string") {
+  throw new Error("RELEASE.json must declare the macOS distribution and notarization state.");
+}
+if (releaseMetadata.macosDistribution === "unsigned-preview" && releaseMetadata.notarized) {
+  throw new Error("An unsigned macOS preview cannot claim notarization.");
+}
 const legacyBridgeName = `0-s-gw-legacy-${packageInfo.version}.tgz`;
 const legacyBridgePath = path.join(directory, legacyBridgeName);
 const bridgeMetadata = inspectPackage(legacyBridgePath);
@@ -27,7 +35,28 @@ await verifyReleasePackageChecksum(
   "per-file"
 );
 
-const macDmg = path.join(directory, `s-gw-${packageInfo.version}-macos.dmg`);
+const macSuffix = releaseMetadata.macosDistribution === "unsigned-preview" ? "-unsigned-preview" : "";
+const macDmgName = `s-gw-${packageInfo.version}-macos${macSuffix}.dmg`;
+const expectedReleaseTag = releaseMetadata.macosDistribution === "unsigned-preview"
+  ? `unsigned-macos-preview-v${packageInfo.version}`
+  : `v${packageInfo.version}`;
+if (releaseMetadata.releaseTag !== expectedReleaseTag) {
+  throw new Error(`RELEASE.json must use ${expectedReleaseTag} for this distribution.`);
+}
+if (!Array.isArray(releaseMetadata.artifacts) || !releaseMetadata.artifacts.includes(macDmgName)) {
+  throw new Error(`RELEASE.json does not list ${macDmgName}.`);
+}
+const macDmg = path.join(directory, macDmgName);
+await verifyReleasePackageChecksum(
+  macDmg,
+  await readFile(path.join(directory, "SHA256SUMS.txt"), "utf8"),
+  "sha256sums"
+);
+await verifyReleasePackageChecksum(
+  macDmg,
+  await readFile(path.join(directory, `${macDmgName}.sha256`), "utf8"),
+  "per-file"
+);
 if (process.platform === "darwin" && existsSync(macDmg)) {
   const verification = spawnSync(process.execPath, [path.join(root, "scripts/verify-macos-dmg.mjs"), macDmg], {
     encoding: "utf8",
