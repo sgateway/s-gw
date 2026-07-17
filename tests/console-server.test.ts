@@ -77,7 +77,7 @@ describe("local console server", () => {
 
   it("renders self-contained MCP snippets without relying on PATH", () => {
     const runtime = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime";
-    const mcp = consoleMcpSnippet({ sgwHome: "/secure/s-gw" }, {
+    const mcp = consoleMcpSnippet({ sgwHome: "/secure/s-gw", platform: "darwin" }, {
       packageRoot: path.join(runtime, "package"),
       nodePath: path.join(runtime, "node", "bin", "node"),
       mcpPath: path.join(runtime, "package", "dist", "mcp-server.js"),

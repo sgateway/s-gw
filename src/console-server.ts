@@ -525,7 +525,7 @@ export function consoleMcpSnippet(
   cliCommand: string;
 } {
   const launch = resolvePackagedMcpCommand(layout, {
-    platform: process.platform,
+    platform: agentOptions.platform || process.platform,
     pathEnv: agentOptions.pathEnv || process.env.PATH || "",
     env: process.env,
     mcpServerPath: layout.mcpPath

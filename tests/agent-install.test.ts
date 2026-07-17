@@ -89,7 +89,7 @@ function runAgentCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: 
 }
 
 describe("agent integration installation", () => {
-  it("uses the bundled Node runtime for a self-contained macOS app", () => {
+  it.skipIf(process.platform === "win32")("uses the bundled Node runtime for a self-contained macOS app", () => {
     const nodePath = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime/node/bin/node";
     const mcpPath = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime/package/dist/mcp-server.js";
 
