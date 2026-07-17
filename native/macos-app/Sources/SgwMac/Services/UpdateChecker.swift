@@ -73,7 +73,7 @@ actor UpdateChecker: UpdateChecking {
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.18-unsigned.2"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.18-unsigned.3"
     }
 
     static var usesSelfContainedRuntime: Bool {
