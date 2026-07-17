@@ -92,6 +92,10 @@ final class AppState {
     status?.readiness?.summary
   }
 
+  var installedVersion: String {
+    status?.version ?? UpdateChecker.currentVersion
+  }
+
   var highRiskCount: Int {
     handles.filter { $0.severityValue >= .high }.count
   }
@@ -187,6 +191,7 @@ final class AppState {
       async let auditList = store.auditEvents(storePath: newStatus.storePath)
 
       status = newStatus
+      restoreAvailableUpdate()
       handles = try await handleList.sorted { $0.updatedAt > $1.updatedAt }
       requests = try await requestList.sorted { requestSortKey($0) > requestSortKey($1) }
       agents = (try? await agentList.sorted { $0.name < $1.name }) ?? []
@@ -678,10 +683,11 @@ final class AppState {
       return
     }
 
-    if UpdateChecker.isNewer(release.version, than: UpdateChecker.currentVersion) {
+    let currentVersion = installedVersion
+    if UpdateChecker.isNewer(release.version, than: currentVersion) {
       if let snapshot = updateNotice.observe(
         noticeRelease(from: release),
-        installedVersion: UpdateChecker.currentVersion
+        installedVersion: currentVersion
       ) {
         availableUpdate = releaseInfo(from: snapshot.release)
         updateBannerDismissed = snapshot.acknowledgedAt != nil
@@ -828,7 +834,7 @@ final class AppState {
   }
 
   private func restoreAvailableUpdate() {
-    guard let snapshot = updateNotice.available(installedVersion: UpdateChecker.currentVersion) else {
+    guard let snapshot = updateNotice.available(installedVersion: installedVersion) else {
       availableUpdate = nil
       updateBannerDismissed = false
       return

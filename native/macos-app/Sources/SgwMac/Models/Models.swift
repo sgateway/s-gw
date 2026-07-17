@@ -333,6 +333,7 @@ struct Readiness: Decodable, Hashable {
 }
 
 struct StatusPayload: Decodable, Hashable {
+  var version: String?
   var packageRoot: String
   // `ready`/`readiness` were added to the CLI health payload later; keep them optional so a
   // freshly built app still decodes status from an older `s-gw` on PATH instead of erroring.
