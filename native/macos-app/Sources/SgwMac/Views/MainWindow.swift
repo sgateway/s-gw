@@ -60,7 +60,7 @@ struct MainWindow: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Text(release.isMacInstaller
-          ? "Download the signed installer, quit s-gw, replace the app in Applications, then reopen it."
+          ? "Download the installer, quit s-gw, replace the app in Applications, then reopen it."
           : "This update stays available here until you dismiss it or install it.")
           .font(.caption)
           .foregroundStyle(.secondary)

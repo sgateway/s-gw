@@ -748,13 +748,13 @@ final class AppState {
     }
 
     guard release.hasVerifiedAsset else {
-      operationMessage = "The signed installer for s-gw \(release.version) is still being uploaded. Try again shortly."
+      operationMessage = "The installer for s-gw \(release.version) is still being uploaded. Try again shortly."
       return
     }
 
     if release.isMacInstaller {
       openAvailableRelease()
-      operationMessage = "Download the signed s-gw installer, quit s-gw, replace the app in Applications, then reopen it."
+      operationMessage = "Download the s-gw installer, quit s-gw, replace the app in Applications, then reopen it."
       return
     }
 

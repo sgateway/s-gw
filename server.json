@@ -15,13 +15,13 @@
     "url": "https://github.com/sgateway/s-gw",
     "source": "github"
   },
-  "version": "0.1.17",
+  "version": "0.1.18-unsigned.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@s-gw/s-gw",
-      "version": "0.1.17",
+      "version": "0.1.18-unsigned.1",
       "runtimeHint": "npx",
       "runtimeArguments": [
         {

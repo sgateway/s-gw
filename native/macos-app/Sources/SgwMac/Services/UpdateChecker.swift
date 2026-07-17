@@ -72,7 +72,7 @@ actor UpdateChecker: UpdateChecking {
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.17"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.18-unsigned.1"
     }
 
     static var usesSelfContainedRuntime: Bool {
@@ -116,14 +116,17 @@ actor UpdateChecker: UpdateChecking {
                 throw UpdateError.releaseCheckFailed
             }
             let releases = try JSONDecoder().decode([GitHubRelease].self, from: data)
-            guard let release = releases
+            let candidates = releases
                 .filter({ !$0.draft })
+                .filter({ !$0.preRelease })
                 .filter({ Self.semanticVersion($0.tagName) != nil })
                 .sorted(by: { Self.isNewer($0.tagName, than: $1.tagName) })
-                .first else {
-                return nil
+            for release in candidates {
+                if let info = await releaseInfo(from: release), info.hasVerifiedAsset {
+                    return info
+                }
             }
-            return await releaseInfo(from: release)
+            return nil
         } catch {
             return try await latestReleaseFromAtom(repository: trimmed)
         }
@@ -170,7 +173,7 @@ actor UpdateChecker: UpdateChecking {
                 notes: parsed.notes
             )
         }
-        return Self.withoutInstallAssets(parsed)
+        return nil
     }
 
     private func assetExists(_ url: URL) async -> Bool {
@@ -630,6 +633,7 @@ private struct GitHubRelease: Decodable {
     let body: String?
     let assets: [GitHubAsset]
     let draft: Bool
+    let preRelease: Bool
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
@@ -637,6 +641,7 @@ private struct GitHubRelease: Decodable {
         case body
         case assets
         case draft
+        case preRelease = "prerelease"
     }
 }
 

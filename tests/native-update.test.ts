@@ -73,6 +73,9 @@ describe("native macOS update lifecycle", () => {
     expect(checker).toContain('return "s-gw-\\(cleanVersion)-macos.dmg"');
     expect(checker).toContain("static var usesSelfContainedRuntime");
     expect(checker).toContain('$0.state?.lowercased() == "uploaded"');
+    expect(checker).toContain("for release in candidates");
+    expect(checker).toContain(".filter({ !$0.preRelease })");
+    expect(checker).toContain("if let info = await releaseInfo(from: release), info.hasVerifiedAsset");
     expect(checker).toContain("await assetExists(assetURL)");
     expect(checker).toContain("await assetExists(checksumURL)");
     expect(checker).toContain('"update", "install", "--package", downloadURL.path');
@@ -103,7 +106,8 @@ describe("native macOS update lifecycle", () => {
     expect(state).not.toContain("guard let previousVersion");
     expect(checker).toContain("var isMacInstaller");
     expect(checker).toContain("static var bundledAppPath");
-    expect(checker).toContain("return await releaseInfo(from: release)");
+    expect(checker).toContain("for release in candidates");
+    expect(checker).toContain("return nil");
     expect(window).toContain(".disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)");
     expect(settings).toContain(".disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)");
     expect(window).toContain("release.isMacInstaller ? \"Download\" : \"Upgrade\"");

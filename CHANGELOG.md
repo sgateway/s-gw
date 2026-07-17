@@ -2,6 +2,17 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
+## 0.1.18-unsigned.1 - 2026-07-16
+
+### Added
+
+- An explicit unsigned macOS preview channel for the self-contained app. Its distinctly named DMG includes installation guidance and an npm alternative for users who prefer not to override Gatekeeper.
+
+### Changed
+
+- Unsigned macOS previews are GitHub prereleases under non-version tags: they do not publish npm or the MCP Registry and are excluded from automatic update notices, including in older clients.
+- Automatic update checks select only stable releases with the normal installer and checksum, preventing incomplete or unsigned-preview assets from causing repeated retry checks.
+
 ## 0.1.17 - 2026-07-16
 
 ### Added

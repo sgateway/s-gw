@@ -12,6 +12,14 @@ on:
         required: true
         default: true
         type: boolean
+      macos_distribution:
+        description: macOS release channel. Unsigned previews are manual-download only.
+        required: true
+        default: notarized
+        type: choice
+        options:
+          - notarized
+          - unsigned-preview
 
 concurrency:
   group: publish-${{ inputs.release_tag }}
@@ -28,6 +36,8 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
+      MACOS_DISTRIBUTION: ${{ inputs.macos_distribution }}
+      SGW_RELEASE_TAG: ${{ inputs.release_tag }}
       SGW_REQUIRE_RUST_CORE: "1"
       SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
@@ -55,6 +65,7 @@ jobs:
       - run: npm ci --ignore-scripts
 
       - name: Configure macOS distribution signing
+        if: inputs.macos_distribution == 'notarized'
         env:
           APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
           APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
@@ -96,12 +107,22 @@ jobs:
             echo "SGW_MACOS_SIGN_IDENTITY=$identity"
             echo "SGW_NOTARY_PROFILE=s-gw-notary"
             echo "SGW_REQUIRE_NOTARIZATION=1"
+            echo "SGW_MACOS_DISTRIBUTION=notarized"
           } >> "$GITHUB_ENV"
+
+      - name: Configure unsigned macOS preview
+        if: inputs.macos_distribution == 'unsigned-preview'
+        run: echo "SGW_MACOS_DISTRIBUTION=unsigned-preview" >> "$GITHUB_ENV"
 
       - name: Verify release version
         run: |
           package_version="$(node -p "require('./package.json').version")"
-          test "v${package_version}" = "${RELEASE_TAG}"
+          if [ "$MACOS_DISTRIBUTION" = "unsigned-preview" ]; then
+            case "$package_version" in *-unsigned.[0-9]*) ;; *) exit 1 ;; esac
+            test "$RELEASE_TAG" = "unsigned-macos-preview-v${package_version}"
+          else
+            test "v${package_version}" = "$RELEASE_TAG"
+          fi
 
       - name: Verify release build
         run: |
@@ -114,10 +135,47 @@ jobs:
       - run: npm run validate:npm-package
       - run: npm run build:installers
 
-      - name: Assess stapled macOS installer
+      - name: Verify macOS installer distribution
         run: |
+          set -euo pipefail
           package_version="$(node -p "require('./package.json').version")"
-          spctl --assess --type open --context context:primary-signature "dist/installers/s-gw-${package_version}-macos.dmg"
+          distribution="$(node -p "require('./dist/installers/RELEASE.json').macosDistribution")"
+          notarized="$(node -p "require('./dist/installers/RELEASE.json').notarized")"
+          test "$distribution" = "$MACOS_DISTRIBUTION"
+          if [ "$MACOS_DISTRIBUTION" = "notarized" ]; then
+            test "$notarized" = "true"
+            spctl --assess --type open --context context:primary-signature "dist/installers/s-gw-${package_version}-macos.dmg"
+          else
+            test "$notarized" = "false"
+            test -f "dist/installers/s-gw-${package_version}-macos-unsigned-preview.dmg"
+          fi
+
+      - name: Prepare release notes
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          notes="$RUNNER_TEMP/release-notes.md"
+          if [ "$MACOS_DISTRIBUTION" = "unsigned-preview" ]; then
+            cat > "$notes" <<EOF
+          ## Unsigned macOS preview
+
+          The Apple Silicon DMG in this release is an unsigned preview. It is not Developer ID signed or notarized, so macOS will require an explicit Gatekeeper override to open it. It is deliberately not used by s-gw's automatic macOS update channel.
+
+          If you prefer not to override Gatekeeper, install this exact release through npm instead (Node.js 20+):
+
+          \`\`\`bash
+          npm install -g https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/s-gw-${package_version}.tgz
+          s-gw setup
+          \`\`\`
+          EOF
+          else
+            cat > "$notes" <<EOF
+          ## macOS installation
+
+          Drag \`s-gw.app\` from the Apple Silicon DMG to Applications, then open it to complete setup.
+          EOF
+          fi
+          echo "SGW_RELEASE_NOTES=$notes" >> "$GITHUB_ENV"
 
       - name: Create or verify a draft release
         env:
@@ -126,9 +184,20 @@ jobs:
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "true"
+            expected_prerelease=false
+            if [ "$MACOS_DISTRIBUTION" = "unsigned-preview" ]; then expected_prerelease=true; fi
+            test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = "$expected_prerelease"
             exit 0
           fi
-          gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes
+          if [ "$MACOS_DISTRIBUTION" = "unsigned-preview" ]; then
+            package_version="$(node -p "require('./package.json').version")"
+            gh release create "$RELEASE_TAG" --draft --prerelease --latest=false --verify-tag \
+              --title "s-gw ${package_version} unsigned macOS preview" \
+              --notes-file "$SGW_RELEASE_NOTES"
+          else
+            gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes \
+              --notes "$(cat "$SGW_RELEASE_NOTES")"
+          fi
 
       - name: Upload verified release assets
         env:
@@ -170,6 +239,7 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
+      MACOS_DISTRIBUTION: ${{ inputs.macos_distribution }}
     steps:
       - name: Publish the verified draft release
         env:
@@ -177,12 +247,15 @@ jobs:
         run: |
           set -euo pipefail
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "true"
+          expected_prerelease=false
+          if [ "$MACOS_DISTRIBUTION" = "unsigned-preview" ]; then expected_prerelease=true; fi
+          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = "$expected_prerelease"
           gh release edit "$RELEASE_TAG" --draft=false
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "false"
 
   publish-npm:
     needs: publish-release
-    if: github.repository == 'sgateway/s-gw' && needs.publish-release.result == 'success'
+    if: github.repository == 'sgateway/s-gw' && needs.publish-release.result == 'success' && inputs.macos_distribution == 'notarized'
     runs-on: macos-15
     environment: npm
     permissions:
@@ -268,7 +341,7 @@ jobs:
 
   publish-registry:
     needs: publish-npm
-    if: always() && github.repository == 'sgateway/s-gw' && needs.publish-npm.result == 'success'
+    if: always() && github.repository == 'sgateway/s-gw' && inputs.macos_distribution == 'notarized' && needs.publish-npm.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read

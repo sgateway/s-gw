@@ -108,7 +108,7 @@ async function main(): Promise<void> {
     if (process.platform === "darwin") {
       const layout = getPackageLayout();
       if (layout.isSelfContainedMacApp) {
-        throw new Error("This self-contained s-gw.app updates through the signed macOS installer. Download the current DMG from the release page, quit s-gw, replace the app in Applications, then reopen it.");
+        throw new Error("This self-contained s-gw.app updates through the macOS installer. Download the current DMG from the release page, quit s-gw, replace the app in Applications, then reopen it.");
       }
       if (layout.standaloneMacAppInstalled) {
         throw new Error("A self-contained s-gw.app is already installed. Open that app to update it instead of using the npm package updater.");

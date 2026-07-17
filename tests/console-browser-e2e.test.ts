@@ -71,7 +71,7 @@ describeBrowser("React local console (real headless Chrome)", () => {
         tag_name: "v0.1.1",
         html_url: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
         draft: false,
-        prerelease: true,
+        prerelease: false,
         published_at: "2026-07-04T00:00:00.000Z",
         assets: [
           { name: installer, state: "uploaded" },
