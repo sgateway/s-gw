@@ -551,8 +551,20 @@ struct AppStateGuardTests {
     ) == asset, "release selection should bind the package name to the release version")
     check(UpdateChecker.packageAssetName(
       for: "9.4.0",
-      assetNames: ["unrelated.tgz"]
-    ) == nil, "an unrelated tarball must not be selected for installation")
+      assetNames: ["0-s-gw-legacy-9.4.0.tgz", "unrelated.tgz"]
+    ) == nil, "the legacy bridge and unrelated tarballs must not be selected for installation")
+    let bridgeRelease = ReleaseInfo(
+      tag: "v9.4.0",
+      version: "9.4.0",
+      assetName: "0-s-gw-legacy-9.4.0.tgz",
+      assetURL: "https://example.com/0-s-gw-legacy-9.4.0.tgz",
+      checksumAssetName: "0-s-gw-legacy-9.4.0.tgz.sha256",
+      checksumAssetURL: "https://example.com/0-s-gw-legacy-9.4.0.tgz.sha256",
+      htmlURL: "https://example.com/release",
+      notes: ""
+    )
+    check(!bridgeRelease.canInstallPackage,
+          "a preselected legacy bridge must still fail closed before download")
     check(UpdateChecker.checksumAssetName(for: asset, assetNames: [manifest]) == manifest,
           "SHA256SUMS.txt should be accepted when no per-file checksum is present")
     check(UpdateChecker.checksumAssetName(for: asset, assetNames: ["SHA256SUMS"]) == "SHA256SUMS",

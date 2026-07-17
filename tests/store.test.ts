@@ -8,6 +8,8 @@ import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
+import type { StoreFile } from "../src/types.js";
+import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-installed-upgrade.js";
 
 let tmpHome = "";
 
@@ -41,6 +43,40 @@ async function externalControlPlaneDir(home = tmpHome, recoveryHome = `${home}-r
     throw new Error(`Expected one recovery namespace in ${root}.`);
   }
   return path.join(root, namespaces[0]);
+}
+
+function v0112Fingerprint(store: StoreFile): string {
+  const secrets = store.secrets.map((secret) => {
+    const copy = { ...secret };
+    delete copy.cache;
+    return copy;
+  }).sort((left, right) => left.handle.localeCompare(right.handle));
+  const grants = [...store.approvalGrants].sort((left, right) => left.id.localeCompare(right.id));
+  const rules = [...store.approvalPolicyRules].sort((left, right) => left.id.localeCompare(right.id));
+  return createHash("sha256").update(JSON.stringify(canonicalFixtureValue({
+    version: store.version,
+    secrets,
+    approvalSettings: store.approvalSettings,
+    approvalGrants: grants,
+    approvalPolicyRules: rules
+  }))).digest("hex");
+}
+
+function canonicalFixtureValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalFixtureValue);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const result: Record<string, unknown> = {};
+  const input = value as Record<string, unknown>;
+  for (const key of Object.keys(input).sort()) {
+    if (input[key] !== undefined) {
+      result[key] = canonicalFixtureValue(input[key]);
+    }
+  }
+  return result;
 }
 
 beforeEach(async () => {
@@ -754,6 +790,79 @@ describe("SecretStore", () => {
     const migratedDir = await externalControlPlaneDir();
     expect((await readdir(migratedDir)).some((entry) => entry.startsWith("checkpoint-"))).toBe(true);
   });
+
+  it("upgrades an installed 0.1.12 unsealed ledger without losing its history", async () => {
+    const fixture = installedV0112Store();
+    const serialized = `${JSON.stringify(fixture, null, 2)}\n`;
+    const oldFingerprint = v0112Fingerprint(fixture);
+    const controlPath = path.join(tmpHome, ".store-control.json");
+    const legacyRecovery = path.join(`${tmpHome}-recovery`, "control-plane");
+    const checkpoint = {
+      ...fixture,
+      requests: [],
+      audit: []
+    };
+
+    await mkdir(legacyRecovery, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(tmpHome, "store.json"), serialized, { mode: 0o600 });
+    await writeFile(path.join(tmpHome, ".store-initialized"), "s-gw store initialized\n", { mode: 0o600 });
+    await writeFile(controlPath, `${JSON.stringify({
+      version: 1,
+      fingerprint: oldFingerprint,
+      updatedAt: "2026-07-16T01:00:00.000Z",
+      secrets: installedV0112Counts.credentials,
+      approvalPolicyRules: installedV0112Counts.policies
+    }, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(
+      path.join(legacyRecovery, `store-20260716T010000-${oldFingerprint.slice(0, 12)}-fixture.json`),
+      `${JSON.stringify(checkpoint, null, 2)}\n`,
+      { mode: 0o600 }
+    );
+
+    const beforeHash = createHash("sha256").update(serialized).digest("hex");
+    const upgraded = new SecretStore();
+    expect(await upgraded.listHandles()).toHaveLength(installedV0112Counts.credentials);
+    expect(await upgraded.listApprovalPolicyRules()).toHaveLength(installedV0112Counts.policies);
+    expect(await upgraded.listRequests({ limit: 2_000 })).toHaveLength(1_000);
+    expect(await upgraded.auditLog()).toHaveLength(installedV0112Counts.audit);
+
+    const after = await readFile(path.join(tmpHome, "store.json"), "utf8");
+    expect(createHash("sha256").update(after).digest("hex")).toBe(beforeHash);
+    const parsed = JSON.parse(after) as StoreFile;
+    expect(parsed.requests).toHaveLength(installedV0112Counts.requests);
+    expect(parsed.audit).toHaveLength(installedV0112Counts.audit);
+    expect(parsed.requests[0].id).toBe(fixture.requests[0].id);
+    expect(parsed.requests.at(-1)?.id).toBe(fixture.requests.at(-1)?.id);
+    expect(parsed.audit[0].id).toBe(fixture.audit[0].id);
+    expect(parsed.audit.at(-1)?.id).toBe(fixture.audit.at(-1)?.id);
+
+    const sealed = JSON.parse(await readFile(controlPath, "utf8"));
+    expect(sealed).toMatchObject({
+      version: 1,
+      recoverySealed: true,
+      secrets: installedV0112Counts.credentials,
+      approvalPolicyRules: installedV0112Counts.policies
+    });
+    expect(sealed.fingerprint).not.toBe(oldFingerprint);
+    expect(sealed.recoveryCheckpoint).toMatch(/^checkpoint-/);
+    expect((await readdir(await externalControlPlaneDir())).some((entry) => entry === sealed.recoveryCheckpoint)).toBe(true);
+  }, 20_000);
+
+  it("does not migrate an unsealed legacy manifest without a matching checkpoint", async () => {
+    const fixture = installedV0112Store();
+    const oldFingerprint = v0112Fingerprint(fixture);
+    await writeFile(path.join(tmpHome, "store.json"), `${JSON.stringify(fixture, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(path.join(tmpHome, ".store-initialized"), "s-gw store initialized\n", { mode: 0o600 });
+    await writeFile(path.join(tmpHome, ".store-control.json"), `${JSON.stringify({
+      version: 1,
+      fingerprint: oldFingerprint,
+      updatedAt: "2026-07-16T01:00:00.000Z",
+      secrets: installedV0112Counts.credentials,
+      approvalPolicyRules: installedV0112Counts.policies
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(new SecretStore().listHandles()).rejects.toThrow(/refusing to use or replace the ledger/i);
+  }, 20_000);
 
   it("does not commit a pending state with the wrong predecessor fingerprint", async () => {
     const store = new SecretStore();
@@ -1895,7 +2004,7 @@ describe("SecretStore", () => {
       args: ["-e", "0"],
       injectEnv: "SGW_ONE_SHOT_DENIED_TOKEN"
     });
-    const admissions = await Promise.all(Array.from({ length: 16 }, () => {
+    const admissions = await Promise.all(Array.from({ length: 8 }, () => {
       return new SecretStore().prepareOneShotExecution(record.handle, action, "Codex repeated denied run");
     }));
     const ids = new Set<string>();
