@@ -69,6 +69,18 @@ describe("React console source contracts", () => {
     expect(types).toContain("update: UpdateCheckResult | null");
   });
 
+  it("uses the installed runtime version in native update surfaces", async () => {
+    const [state, mainWindow, settings] = await Promise.all([
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/App/AppState.swift"), "utf8"),
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/Views/MainWindow.swift"), "utf8"),
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/Views/SettingsView.swift"), "utf8")
+    ]);
+
+    expect(state).toContain("status?.version ?? UpdateChecker.currentVersion");
+    expect(mainWindow).toContain("Installed \\(appState.installedVersion)");
+    expect(settings).toContain('LabeledContent("Installed version", value: appState.installedVersion)');
+  });
+
   it("uses provider logos and normalized secure-storage names", async () => {
     const [app, providerIdentity, presentation] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),

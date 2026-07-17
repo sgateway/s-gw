@@ -226,6 +226,7 @@ struct AppStateGuardTests {
     await runInFlightGuardTest(scratch)
     await runGuardReleaseTest(scratch)
     await runReadinessDerivationTest()
+    await runInstalledVersionTest()
     await runCommandOutputCaptureTest()
     await runUpdateRetryTest()
     await runIncompleteReleaseRetryTest()
@@ -376,6 +377,35 @@ struct AppStateGuardTests {
           "the retry should publish the newly available release")
     check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == now.timeIntervalSince1970,
           "the successful retry should persist its timestamp")
+  }
+
+  @MainActor
+  static func runInstalledVersionTest() async {
+    let defaults = isolatedDefaults("installed-version")
+    let notice = UpdateNoticeStore(defaults: defaults)
+    notice.clear()
+    defer { notice.clear() }
+    let app = AppState(
+      updater: FakeUpdateChecker([.release(makeRelease("9.4.0"))]),
+      defaults: defaults
+    )
+
+    check(app.installedVersion == UpdateChecker.currentVersion,
+          "the app bundle version should remain the fallback before CLI status loads")
+    app.status = statusPayload(
+      ready: true,
+      summary: "Ready",
+      blockers: [],
+      activeSource: "environment",
+      consoleLoaded: true,
+      version: "9.5.0"
+    )
+    check(app.installedVersion == "9.5.0",
+          "the installed CLI runtime version must override a stale app bundle version")
+
+    await app.checkForUpdates(force: true)
+    check(app.availableUpdate == nil,
+          "a release older than the installed CLI runtime must not be offered as an update")
   }
 
   @MainActor
@@ -671,10 +701,13 @@ struct AppStateGuardTests {
   }
 
   static func statusPayload(ready: Bool, summary: String, blockers: [String],
-                            activeSource: String, consoleLoaded: Bool) -> StatusPayload {
+                            activeSource: String, consoleLoaded: Bool,
+                            version: String? = nil) -> StatusPayload {
     let blockerJson = blockers.map { "\"\($0)\"" }.joined(separator: ",")
+    let versionJson = version.map { "\"version\":\"\($0)\"," } ?? ""
     let json = """
     {
+      \(versionJson)
       "packageRoot": "/tmp/sgw",
       "ready": \(ready),
       "readiness": {"ok": \(ready), "summary": "\(summary)", "blockers": [\(blockerJson)]},
