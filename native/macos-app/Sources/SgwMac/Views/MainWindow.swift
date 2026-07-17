@@ -56,7 +56,7 @@ struct MainWindow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text("s-gw \(release.version) is available")
           .font(.callout.weight(.semibold))
-        Text("Installed \(UpdateChecker.currentVersion)")
+        Text("Installed \(appState.installedVersion)")
           .font(.caption)
           .foregroundStyle(.secondary)
         Text(release.isMacInstaller
@@ -122,7 +122,7 @@ private struct UpdateReleaseSheet: View {
         VStack(alignment: .leading, spacing: 4) {
           Text("s-gw \(release.version)")
             .font(.title2.weight(.semibold))
-          Text("Installed \(UpdateChecker.currentVersion)")
+          Text("Installed \(appState.installedVersion)")
             .foregroundStyle(.secondary)
         }
       }

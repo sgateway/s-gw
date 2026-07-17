@@ -6,7 +6,14 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ### Added
 
+- A local **Demo data** toggle fills the Sankey, activity and audit logs, credentials, policies, and requests with clearly labeled display-only records that can be removed in one click.
 - An explicit unsigned macOS preview channel for the self-contained app. Its distinctly named DMG includes installation guidance and an npm alternative for users who prefer not to override Gatekeeper.
+
+### Fixed
+
+- The macOS package updater now accepts only the exact scoped `s-gw-<version>.tgz` asset and rejects the legacy compatibility bridge before download or installation.
+- Native update banners and Settings now report the active installed CLI/runtime version instead of a stale development app bundle version.
+- Valid 0.1.12 unsealed control manifests migrate to the current sealed recovery format only when the live ledger and a trusted legacy checkpoint both match the legacy fingerprint. Credentials, policies, requests, and audit history remain intact, while unexplained mismatches continue to fail closed.
 
 ### Changed
 

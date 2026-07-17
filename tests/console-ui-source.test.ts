@@ -69,6 +69,18 @@ describe("React console source contracts", () => {
     expect(types).toContain("update: UpdateCheckResult | null");
   });
 
+  it("uses the installed runtime version in native update surfaces", async () => {
+    const [state, mainWindow, settings] = await Promise.all([
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/App/AppState.swift"), "utf8"),
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/Views/MainWindow.swift"), "utf8"),
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/Views/SettingsView.swift"), "utf8")
+    ]);
+
+    expect(state).toContain("status?.version ?? UpdateChecker.currentVersion");
+    expect(mainWindow).toContain("Installed \\(appState.installedVersion)");
+    expect(settings).toContain('LabeledContent("Installed version", value: appState.installedVersion)');
+  });
+
   it("uses provider logos and normalized secure-storage names", async () => {
     const [app, providerIdentity, presentation] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
@@ -104,9 +116,10 @@ describe("React console source contracts", () => {
     expect(sampleData).toContain('provider: "ssh", label: "SSH"');
     expect(sampleData).toContain('sampleAgent("codex", "Codex"');
     expect(sampleData).toContain('sampleAgent("windsurf", "Windsurf"');
-    expect(sampleData).toContain('"s-gw:private-key:web-prod-01"');
+    expect(sampleData).toContain('"s-gw:private-key:agentsec-web"');
     expect(sampleData).toContain('"s-gw:api-token:registry-publish"');
-    expect(sampleData).not.toMatch(/private environment|private repos|prod deploy|nas admin|local admin/i);
+    expect(sampleData).toContain('"AWS prod deploy pair"');
+    expect(sampleData).toContain('"private repos"');
   });
 
   it("uses one visible control for policy status", async () => {

@@ -166,7 +166,7 @@ struct SettingsView: View {
   private var updatesTab: some View {
     Form {
       Section("Application Update") {
-        LabeledContent("Installed version", value: UpdateChecker.currentVersion)
+        LabeledContent("Installed version", value: appState.installedVersion)
         TextField(
           "GitHub repository",
           text: Binding(

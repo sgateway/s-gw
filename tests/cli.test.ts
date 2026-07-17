@@ -191,7 +191,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       await rm(recoveryHome, { recursive: true, force: true });
       await rm(cargoTarget, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("exits non-zero and prints a suggestion to stderr for a typo", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-typo-"));

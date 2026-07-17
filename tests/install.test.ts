@@ -12,6 +12,7 @@ import {
   menuBarLabel,
   packageHealth
 } from "../src/install.js";
+import { CURRENT_VERSION } from "../src/version.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
@@ -116,6 +117,7 @@ describe("customer package layout", () => {
       expect(health).toContain("s-gw-client.ps1");
       expect(health).toContain("s-gw-helper.ps1");
       expect(health).not.toContain("do not serialize this value");
+      expect(packageHealth().version).toBe(CURRENT_VERSION);
     } finally {
       if (oldValue === undefined) {
         delete process.env.SGW_MASTER_PASSPHRASE;

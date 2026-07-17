@@ -20,6 +20,7 @@ import {
   resolveSelfContainedMacRuntime
 } from "./self-contained-runtime.js";
 import { unlockStatus } from "./unlock.js";
+import { CURRENT_VERSION } from "./version.js";
 
 export const consoleLabel = "com.s-gw.sgw.console";
 export const menuBarLabel = "com.s-gw.sgw.menubar";
@@ -184,6 +185,7 @@ export function packageHealth(port = 8718) {
   const ready = unlockConfigured && cli.exists && mcp.exists;
 
   return {
+    version: CURRENT_VERSION,
     packageRoot: layout.packageRoot,
     selfContainedMacApp: layout.isSelfContainedMacApp,
     nodePath: pathStatus(layout.nodePath),
