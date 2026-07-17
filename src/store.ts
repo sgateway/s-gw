@@ -48,7 +48,8 @@ const defaultApprovalSettings: ApprovalSettings = {
 };
 
 const maxApprovalDurationMs = 30 * 24 * 60 * 60 * 1000;
-const lockTimeoutMs = 5_000;
+// Concurrent clients may need to serialize a durable control-plane write on a slow disk.
+const lockTimeoutMs = 30_000;
 
 // A request gets claimed into "executing" right before its secret is revealed. If the
 // runner is killed, sleeps, or crashes before markExecuted/markFailed, that request is
