@@ -240,7 +240,8 @@ describe("platform installers", () => {
     );
 
     expect(releaseJob).toContain("needs: release-assets");
-    expect(releaseJob).toContain("gh release edit \"$RELEASE_TAG\" --draft=false");
+    expect(releaseJob).toContain('gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"');
+    expect(releaseJob).toContain("gh release edit \"$RELEASE_TAG\" --repo \"$GITHUB_REPOSITORY\" --draft=false");
     expect(npmJob).toContain("runs-on: macos-15");
     expect(npmJob).toContain("needs: publish-release");
     expect(npmJob).toContain("inputs.macos_distribution == 'notarized'");
