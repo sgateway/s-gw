@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide covers the npm/source path and exercises its approval boundary with disposable data. It does not require a real credential. For the self-contained Apple Silicon macOS app, see the [macOS app installation](deployment.md#macos-app-apple-silicon) first.
+This guide covers the recommended npm installation and exercises its approval boundary with disposable data. It does not require a real credential. For the self-contained Apple Silicon macOS desktop alternative, see the [macOS app installation](deployment.md#macos-app-apple-silicon).
 
 The supported npm installation requires Node.js 20 or newer.
 

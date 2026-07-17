@@ -105,8 +105,10 @@ describe("platform installers", () => {
     expect(builder).toContain("SGW_MACOS_DISTRIBUTION");
     expect(builder).toContain('signing.distribution === "unsigned"');
     expect(builder).toContain("README.txt");
-    expect(builder).toContain("npm install -g https://github.com/sgateway/s-gw/releases/download");
-    expect(builder).toContain("Prefer not to use a macOS security override?");
+    expect(builder).toContain("Recommended installation (Node.js 20+):");
+    expect(builder).toContain("npm install -g @s-gw/s-gw");
+    expect(builder).toContain("Self-contained desktop alternative:");
+    expect(builder).not.toContain("github.com/sgateway/s-gw/releases/download");
     expect(builder).toContain("notarytool");
     expect(builder).toContain("NodeRuntime.entitlements");
     expect(builder).toContain("com.apple.security.cs.allow-jit");
@@ -117,7 +119,7 @@ describe("platform installers", () => {
     expect(verifier).toContain('path.join(runtimeRoot, "bin", "s-gw")');
     expect(verifier).toContain("runMcpSmoke");
     expect(verifier).toContain("SGW_TEST_HOME_ROOT");
-    expect(verifier).toContain("const releaseNpmInstall");
+    expect(verifier).toContain('const npmInstall = "npm install -g @s-gw/s-gw"');
     expect(verifier).toContain("readme.includes(npmInstall)");
     expect(runtime.node.version).toMatch(/^24\./);
     expect(runtime.node.url).toContain(`v${runtime.node.version}/node-v${runtime.node.version}-darwin-arm64.tar.gz`);
@@ -183,6 +185,7 @@ describe("platform installers", () => {
     expect(workflow).not.toContain("  release:");
     expect(workflow).toContain("release_tag:");
     expect(workflow).toContain("publish_release:");
+    expect(workflow).toContain("publish_npm_only:");
     expect(workflow).toContain("macos_distribution:");
     expect(workflow).toContain("- unsigned");
     expect(assetJob).toContain("ref: ${{ inputs.release_tag }}");
@@ -209,8 +212,10 @@ describe("platform installers", () => {
     expect(assetJob).toContain('"dist/installers/s-gw-${package_version}-macos.dmg"');
     expect(assetJob).not.toContain("--prerelease --latest=false");
     expect(assetJob).not.toContain("unsigned-macos-preview-v${package_version}");
-    expect(assetJob).toContain("npm install -g https://github.com/${GITHUB_REPOSITORY}");
-    expect(assetJob).toContain("If you prefer not to override Gatekeeper");
+    expect(assetJob).toContain("npm install -g @s-gw/s-gw");
+    expect(assetJob).toContain("The recommended installation path on macOS, Windows, and Linux");
+    expect(assetJob).toContain("Use the npm installation above if you do not want to use that override");
+    expect(assetJob).not.toContain("releases/download/${RELEASE_TAG}");
     expect(assetJob).toContain("Create or verify a draft release");
     expect(assetJob).toContain("gh release create \"$RELEASE_TAG\" --draft --verify-tag --generate-notes");
     expect(assetJob).toContain('select(.state == "uploaded")');
@@ -225,7 +230,7 @@ describe("platform installers", () => {
     expect(validator).toContain("macosDistribution");
   });
 
-  it("publishes the native npm package on Apple Silicon and keeps Registry publishing on Linux", async () => {
+  it("publishes the native npm package before the GitHub release and keeps Registry publishing on Linux", async () => {
     const workflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
     const npmJob = workflow.slice(
       workflow.indexOf("  publish-npm:"),
@@ -240,17 +245,23 @@ describe("platform installers", () => {
       workflow.indexOf("  publish-npm:")
     );
 
-    expect(releaseJob).toContain("needs: release-assets");
+    expect(releaseJob).toContain("needs: [release-assets, publish-npm]");
+    expect(releaseJob).toContain("needs.publish-npm.result == 'success'");
     expect(releaseJob).toContain('gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"');
     expect(releaseJob).toContain("gh release edit \"$RELEASE_TAG\" --repo \"$GITHUB_REPOSITORY\" --draft=false");
     expect(npmJob).toContain("runs-on: macos-15");
-    expect(npmJob).toContain("needs: publish-release");
-    expect(npmJob).toContain("inputs.macos_distribution == 'notarized'");
+    expect(npmJob).toContain("needs: release-assets");
+    expect(npmJob).toContain("inputs.publish_npm_only");
+    expect(npmJob).toContain("inputs.publish_release");
+    expect(npmJob).not.toContain("inputs.macos_distribution");
     expect(npmJob).toContain('SGW_REQUIRE_RUST_CORE: "1"');
     expect(npmJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(npmJob).toContain("ref: ${{ inputs.release_tag }}");
     expect(npmJob).not.toContain("github.event.release");
     expect(npmJob).toContain("npm run validate:npm-package");
+    expect(npmJob).toContain("Record local npm package integrity");
+    expect(npmJob).toContain("SGW_NPM_PACKAGE_INTEGRITY");
+    expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");
     expect(npmJob).toContain('npm install --global --prefix "$prefix"');
@@ -258,10 +269,54 @@ describe("platform installers", () => {
     expect(npmJob).toContain('s-gw-core" --version');
     expect(npmJob).toContain('test ! -e "$package_root/dist/native/s-gw-core"');
     expect(registryJob).toContain("needs: publish-npm");
-    expect(registryJob).toContain("inputs.macos_distribution == 'notarized'");
+    expect(registryJob).toContain("inputs.publish_release");
+    expect(registryJob).toContain("!inputs.publish_npm_only");
+    expect(registryJob).not.toContain("inputs.macos_distribution");
     expect(registryJob).toContain("runs-on: ubuntu-latest");
     expect(registryJob).toContain("mcp-publisher_linux_amd64.tar.gz");
     expect(registryJob).not.toContain("npm publish --access public");
+  });
+
+  it("supports an npm-only recovery without rebuilding or changing a GitHub release", async () => {
+    const workflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
+    const assetJob = workflow.slice(
+      workflow.indexOf("  release-assets:"),
+      workflow.indexOf("  publish-release:")
+    );
+    const releaseJob = workflow.slice(
+      workflow.indexOf("  publish-release:"),
+      workflow.indexOf("  publish-npm:")
+    );
+    const npmJob = workflow.slice(
+      workflow.indexOf("  publish-npm:"),
+      workflow.indexOf("  publish-registry:")
+    );
+    const registryJob = workflow.slice(
+      workflow.indexOf("  publish-registry:"),
+      workflow.length
+    );
+
+    expect(workflow).toContain("publish_npm_only:");
+    expect(assetJob).toContain("!inputs.publish_npm_only");
+    expect(npmJob).toContain("always()");
+    expect(npmJob).toContain("inputs.publish_npm_only ||");
+    expect(releaseJob).toContain("!inputs.publish_npm_only");
+    expect(registryJob).toContain("!inputs.publish_npm_only");
+  });
+
+  it("makes the registry package the primary public installation", async () => {
+    const [readme, deployment, releaseGuide] = await Promise.all([
+      readFile(path.join(root, "README.md"), "utf8"),
+      readFile(path.join(root, "docs/deployment.md"), "utf8"),
+      readFile(path.join(root, "RELEASING.md"), "utf8")
+    ]);
+
+    expect(readme.indexOf("npm install -g @s-gw/s-gw")).toBeLessThan(readme.indexOf("For an Apple Silicon Mac desktop bundle"));
+    expect(readme).not.toContain("releases/download/vVERSION/s-gw-VERSION.tgz");
+    expect(deployment.indexOf("### npm Registry (Recommended)")).toBeLessThan(deployment.indexOf("### macOS App (Apple Silicon)"));
+    expect(deployment).not.toContain("releases/download/vVERSION/s-gw-VERSION.tgz");
+    expect(releaseGuide).toContain("publish_npm_only=true");
+    expect(releaseGuide).toContain("npm install -g @s-gw/s-gw");
   });
 });
 
