@@ -20,7 +20,8 @@ struct ReleaseInfo: Identifiable, Equatable, Sendable {
         assetName.lowercased().hasSuffix(".dmg")
     }
     var canInstallPackage: Bool {
-        assetName.lowercased().hasSuffix(".tgz") && hasVerifiedAsset
+        let expected = "s-gw-\(UpdateChecker.parseVersion(version)).tgz"
+        return assetName.caseInsensitiveCompare(expected) == .orderedSame && hasVerifiedAsset
     }
 }
 
@@ -245,7 +246,7 @@ actor UpdateChecker: UpdateChecking {
     }
 
     func downloadAndInstall(_ release: ReleaseInfo, progress: @Sendable @escaping (UpdateState) -> Void) async -> String? {
-        guard release.assetName.lowercased().hasSuffix(".tgz"), let assetURL = URL(string: release.assetURL) else {
+        guard release.canInstallPackage, let assetURL = URL(string: release.assetURL) else {
             return "This release does not include an installable s-gw package asset."
         }
         guard let checksumURL = URL(string: release.checksumAssetURL) else {
@@ -509,7 +510,7 @@ actor UpdateChecker: UpdateChecking {
         }
     }
 
-    private static func parseVersion(_ tag: String) -> String {
+    static func parseVersion(_ tag: String) -> String {
         var cleaned = tag.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleaned.lowercased().hasPrefix("v") {
             cleaned.removeFirst()

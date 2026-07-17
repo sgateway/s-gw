@@ -136,6 +136,11 @@ export function UsageFlowSankey({
       data-sankey-wrap
       data-compact={compact ? "true" : "false"}
     >
+      {flow.demo ? (
+        <Badge variant="outline" className="absolute left-3 top-3 z-10 h-5 bg-background/85 px-1.5 text-[9px] uppercase tracking-wide">
+          Demo
+        </Badge>
+      ) : null}
       {onExpand ? (
         <Button
           type="button"

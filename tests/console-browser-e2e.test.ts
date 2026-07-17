@@ -59,6 +59,48 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it("adds and completely removes display-only demo data from the native menu", async () => {
+    running = await startConsoleServer({ port: 0 });
+    const url = new URL("overview", running.url);
+    url.searchParams.set("native-shell", "1");
+    const launched = await launchChrome(url.toString());
+    cdp = launched.cdp;
+
+    await waitFor(() => cdp!.eval<boolean>("Boolean(window.SGW_CONSOLE_LIVE)"), "live console flag");
+    await waitFor(
+      () => cdp!.eval<boolean>('Boolean(document.querySelector("[data-native-more-actions]"))'),
+      "native more actions"
+    );
+    await clickElement(cdp, "[data-native-more-actions]");
+    await waitFor(
+      () => cdp!.eval<boolean>('Boolean(document.querySelector("[data-demo-data-toggle]"))'),
+      "demo data menu item"
+    );
+    await clickElement(cdp, "[data-demo-data-toggle]");
+
+    await waitFor(
+      () => cdp!.eval<boolean>(`localStorage.getItem("sgw.demo-data") === "1" && document.body.innerText.includes("Demo")`),
+      "demo data"
+    );
+    await cdp.eval('history.pushState({}, "", "/policies?native-shell=1"); window.dispatchEvent(new PopStateEvent("popstate"))');
+    await waitFor(
+      () => cdp!.eval<boolean>('document.querySelectorAll("[data-policy-row]").length === 17'),
+      "demo policies"
+    );
+    expect(await cdp.eval<boolean>('Array.from(document.querySelectorAll("[data-policy-row] button")).every((button) => button.disabled)')).toBe(true);
+
+    await clickElement(cdp, "[data-native-more-actions]");
+    await waitFor(
+      () => cdp!.eval<boolean>('document.querySelector("[data-demo-data-toggle]")?.innerText.includes("Remove demo data")'),
+      "remove demo data menu item"
+    );
+    await clickElement(cdp, "[data-demo-data-toggle]");
+    await waitFor(
+      () => cdp!.eval<boolean>('localStorage.getItem("sgw.demo-data") === null && document.querySelectorAll("[data-policy-row]").length === 0'),
+      "removed demo data"
+    );
+  }, 45_000);
+
   it("shows a release notification from the public update feed", async () => {
     const installer = process.platform === "darwin"
       ? "s-gw-0.1.1-macos.dmg"

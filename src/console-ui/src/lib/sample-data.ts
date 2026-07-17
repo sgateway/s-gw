@@ -11,7 +11,7 @@ import type {
   UsageFlowLink,
   UsageFlowNode,
   UsageFlowRow
-} from "@/lib/types";
+} from "./types";
 
 const now = "2026-07-02T05:30:00.000Z";
 
@@ -27,37 +27,37 @@ const providerSummaries: ProviderSummary[] = [
 ];
 
 const usageRows = [
-  usageFlowRow("Codex", "AWS access key", "AWS API", 82, "s-gw:credential:aws-production-readonly", "AWS production read-only pair", "aws cloudfront create-invalidation", "cloudfront"),
-  usageFlowRow("Codex", "SSH private key", "SSH server", 27, "s-gw:private-key:web-prod-01", "Web production deploy key", "ssh web-prod-01", "web-prod-01"),
-  usageFlowRow("Codex", "SSH private key", "NAS / appliance", 15, "s-gw:private-key:nas-maintenance", "NAS maintenance key", "ssh nas-maintenance", "nas-maintenance"),
+  usageFlowRow("Codex", "AWS access key", "AWS API", 82, "s-gw:credential:aws-prod-deploy", "AWS prod deploy pair", "aws cloudfront create-invalidation", "cloudfront"),
+  usageFlowRow("Codex", "SSH private key", "SSH server", 27, "s-gw:private-key:agentsec-web", "AgentSec deploy key", "ssh agentsec-web", "agentsec-web"),
+  usageFlowRow("Codex", "SSH private key", "NAS / appliance", 15, "s-gw:private-key:nas-admin", "NAS maintenance key", "ssh nas-admin", "nas-admin"),
   usageFlowRow("Codex", "AI API key", "Model API", 34, "s-gw:api-token:model-eval", "Model eval token", "npm run eval", "eval runner"),
-  usageFlowRow("Codex", "GitHub token", "GitHub repository", 24, "s-gw:api-token:release-bot", "Release bot token", "gh release create", "s-gw repository"),
+  usageFlowRow("Codex", "GitHub token", "GitHub repository", 24, "s-gw:api-token:release-bot", "Release bot token", "gh release create", "sgateway/s-gw"),
   usageFlowRow("Codex", "MCP session token", "Local command", 22, "s-gw:api-token:mcp-tools", "MCP tool token", "codex mcp list", "local console"),
   usageFlowRow("Claude Code", "AWS access key", "AWS API", 38, "s-gw:credential:aws-dev", "AWS dev pair", "aws sts get-caller-identity", "sts"),
-  usageFlowRow("Claude Code", "SSH private key", "SSH server", 58, "s-gw:private-key:nas-maintenance", "NAS maintenance key", "ssh nas-maintenance", "nas-maintenance"),
-  usageFlowRow("Claude Code", "Database password", "Database", 30, "s-gw:password:staging-pg", "Staging database admin", "psql migration smoke", "staging-postgres"),
+  usageFlowRow("Claude Code", "SSH private key", "SSH server", 58, "s-gw:private-key:nas-admin", "NAS maintenance key", "ssh nas-admin", "nas-admin"),
+  usageFlowRow("Claude Code", "Database password", "Database", 30, "s-gw:password:staging-pg", "Staging Postgres admin", "psql migration smoke", "staging-postgres"),
   usageFlowRow("Claude Code", "Service account key", "Local command", 12, "s-gw:credential:launchd-helper", "LaunchAgent helper", "launchctl kickstart", "local profile"),
-  usageFlowRow("Claude Code", "Service account key", "NAS / appliance", 8, "s-gw:credential:appliance-maintenance", "Appliance maintenance identity", "appliance deploy", "local appliance"),
-  usageFlowRow("Cursor", "GitHub token", "GitHub repository", 54, "s-gw:api-token:repo-read", "Repo read token", "gh repo view", "repo group"),
+  usageFlowRow("Claude Code", "Service account key", "NAS / appliance", 8, "s-gw:credential:qnap-admin", "QNAP maintenance identity", "qnap deploy", "qnap"),
+  usageFlowRow("Cursor", "GitHub token", "GitHub repository", 54, "s-gw:api-token:repo-read", "Repo read token", "gh repo view", "private repos"),
   usageFlowRow("Cursor", "AI API key", "Model API", 32, "s-gw:api-token:openai-eval", "OpenAI eval key", "node eval-runner", "model endpoint"),
-  usageFlowRow("Cursor", "SSH private key", "SSH server", 16, "s-gw:private-key:preview-host", "Preview host key", "ssh frontend", "frontend host"),
+  usageFlowRow("Cursor", "SSH private key", "SSH server", 16, "s-gw:private-key:xdr-asset", "XDR asset key", "ssh frontend", "frontend host"),
   usageFlowRow("Cursor", "MCP session token", "Web API", 10, "s-gw:api-token:browser-mcp", "Browser MCP session", "node smoke", "browser endpoint"),
   usageFlowRow("OpenCode", "AWS access key", "AWS API", 30, "s-gw:credential:aws-ci", "AWS CI pair", "aws s3 sync", "s3"),
-  usageFlowRow("OpenCode", "Database password", "Database", 25, "s-gw:password:local-db-admin", "Local database password", "psql local check", "local-postgres"),
+  usageFlowRow("OpenCode", "Database password", "Database", 25, "s-gw:password:local-admin", "Local admin password", "psql local check", "local-postgres"),
   usageFlowRow("OpenCode", "Docker registry token", "Container runtime", 17, "s-gw:api-token:registry-publish", "Registry publish token", "docker push", "registry"),
-  usageFlowRow("OpenCode", "GitHub token", "GitHub repository", 12, "s-gw:api-token:repo-write", "Repo write token", "gh pr checks", "s-gw repository"),
+  usageFlowRow("OpenCode", "GitHub token", "GitHub repository", 12, "s-gw:api-token:repo-write", "Repo write token", "gh pr checks", "sgateway/s-gw"),
   usageFlowRow("Gemini CLI", "AI API key", "Model API", 16, "s-gw:api-token:gemini-eval", "Model comparison token", "npm run bench", "model endpoint"),
   usageFlowRow("Gemini CLI", "Service account key", "Local command", 8, "s-gw:credential:lab-runner", "Lab runner identity", "python3 scripts/check_repo.py", "local repo"),
   usageFlowRow("Gemini CLI", "Service account key", "Container runtime", 5, "s-gw:credential:lab-runner", "Lab runner identity", "docker compose ps", "compose"),
   usageFlowRow("Gemini CLI", "Database password", "Database", 7, "s-gw:password:analytics-readonly", "Analytics read-only password", "psql usage rollup", "analytics"),
   usageFlowRow("Gemini CLI", "MCP session token", "Web API", 5, "s-gw:api-token:browser-mcp", "Browser MCP session", "browser fetch", "local endpoint"),
   usageFlowRow("Gemini CLI", "MCP session token", "Local command", 2, "s-gw:api-token:mcp-tools", "MCP tool token", "agent inspect", "local console"),
-  usageFlowRow("Gemini CLI", "GitHub token", "GitHub repository", 5, "s-gw:api-token:repo-read", "Repo read token", "gh issue list", "repo group"),
+  usageFlowRow("Gemini CLI", "GitHub token", "GitHub repository", 5, "s-gw:api-token:repo-read", "Repo read token", "gh issue list", "private repos"),
   usageFlowRow("Windsurf", "SSH private key", "SSH server", 11, "s-gw:private-key:preview-box", "Preview box key", "ssh preview", "preview host"),
-  usageFlowRow("Windsurf", "SSH private key", "NAS / appliance", 7, "s-gw:private-key:nas-maintenance", "NAS maintenance key", "ssh nas-maintenance", "nas-maintenance"),
+  usageFlowRow("Windsurf", "SSH private key", "NAS / appliance", 7, "s-gw:private-key:nas-admin", "NAS maintenance key", "ssh nas-admin", "nas-admin"),
   usageFlowRow("Windsurf", "Docker registry token", "Container runtime", 5, "s-gw:api-token:registry-publish", "Registry publish token", "docker pull", "registry"),
   usageFlowRow("Windsurf", "Docker registry token", "Local command", 5, "s-gw:api-token:registry-read", "Registry read token", "docker login", "local shell"),
-  usageFlowRow("Windsurf", "GitHub token", "GitHub repository", 8, "s-gw:api-token:repo-read", "Repo read token", "gh repo clone", "repo group")
+  usageFlowRow("Windsurf", "GitHub token", "GitHub repository", 8, "s-gw:api-token:repo-read", "Repo read token", "gh repo clone", "private repos")
 ];
 
 const demoUsageFlow = buildUsageFlow(usageRows);
@@ -124,7 +124,19 @@ export const sampleState: ConsoleState = {
     policyRule("policy_known_ssh_hosts", "Known SSH hosts", "ask", ["codex", "cursor", "windsurf"], ["ssh"], ["ssh_session"], 20),
     policyRule("policy_release_checks", "Release checks", "allow", ["codex"], ["github"], ["env_command"], 30, 60 * 60 * 1000),
     policyRule("policy_database_admin", "Database admin commands", "ask", ["claude code", "opencode"], ["database"], ["env_command"], 40),
-    policyRule("policy_no_unknown_registry", "Unknown registry publish", "deny", ["opencode", "windsurf"], ["docker"], ["env_command"], 50)
+    policyRule("policy_no_unknown_registry", "Unknown registry publish", "deny", ["opencode", "windsurf"], ["docker"], ["env_command"], 50),
+    policyRule("policy_model_evaluations", "Model evaluation jobs", "allow", ["codex", "cursor"], ["openai"], ["env_command"], 60),
+    policyRule("policy_repo_read", "Repository read access", "allow", ["cursor", "gemini cli"], ["github"], ["env_command"], 70),
+    policyRule("policy_local_lab", "Local lab runner", "allow", ["gemini cli"], ["service-account"], ["env_command"], 80),
+    policyRule("policy_mcp_tools", "Local MCP tools", "allow", ["codex"], ["mcp"], ["env_command"], 90),
+    policyRule("policy_ci_sync", "CI artifact sync", "allow", ["opencode"], ["aws"], ["env_command"], 100),
+    policyRule("policy_registry_read", "Registry read access", "allow", ["windsurf"], ["docker"], ["env_command"], 110),
+    policyRule("policy_analytics_read", "Analytics read only", "allow", ["gemini cli"], ["database"], ["env_command"], 120),
+    policyRule("policy_preview_ssh", "Preview host SSH", "ask", ["windsurf", "cursor"], ["ssh"], ["ssh_session"], 130),
+    policyRule("policy_mcp_web", "Browser MCP sessions", "ask", ["cursor", "gemini cli"], ["mcp"], ["env_command"], 140),
+    policyRule("policy_block_prod_db", "Production database changes", "deny", ["claude code", "opencode"], ["database"], ["env_command"], 150),
+    policyRule("policy_block_unknown_ssh", "Unknown SSH targets", "deny", ["codex", "cursor", "windsurf"], ["ssh"], ["ssh_session"], 160),
+    policyRule("policy_release_publish", "Release publishing", "allow", ["codex"], ["github"], ["env_command"], 170)
   ],
   usageFlow: demoUsageFlow,
   credentials: providerSummaries,
@@ -271,22 +283,22 @@ function detailForTarget(targetType: string): string {
 
 function buildDemoHandles(): HandleSummary[] {
   const seeds: HandleSummary[] = [
-    handle("s-gw:credential:aws-production-readonly", "AWS production read-only pair", "access-key", "aws", "medium", "AWS_ACCESS_KEY_ID", ["aws"]),
-    handle("s-gw:private-key:web-prod-01", "Web production deploy key", "private-key", "ssh", "high", "SGW_SSH_KEY", ["s-gw:ssh-session"]),
-    handle("s-gw:private-key:nas-maintenance", "NAS maintenance key", "private-key", "ssh", "high", "SGW_SSH_KEY", ["s-gw:ssh-session"]),
+    handle("s-gw:credential:aws-prod-deploy", "AWS prod deploy pair", "access-key", "aws", "medium", "AWS_ACCESS_KEY_ID", ["aws"]),
+    handle("s-gw:private-key:agentsec-web", "AgentSec deploy key", "private-key", "ssh", "high", "SGW_SSH_KEY", ["s-gw:ssh-session"]),
+    handle("s-gw:private-key:nas-admin", "NAS maintenance key", "private-key", "ssh", "high", "SGW_SSH_KEY", ["s-gw:ssh-session"]),
     handle("s-gw:api-token:model-eval", "Model eval token", "api-token", "openai", "medium", "MODEL_API_KEY", ["npm"]),
     handle("s-gw:api-token:release-bot", "Release bot token", "api-token", "github", "low", "GITHUB_TOKEN", ["gh"]),
     handle("s-gw:api-token:mcp-tools", "MCP tool token", "api-token", "mcp", "medium", "MCP_SESSION_TOKEN", ["codex"]),
     handle("s-gw:credential:aws-dev", "AWS dev pair", "access-key", "aws", "medium", "AWS_ACCESS_KEY_ID", ["aws"]),
     handle("s-gw:password:staging-pg", "Staging database admin", "password", "database", "high", "PGPASSWORD", ["psql"]),
     handle("s-gw:credential:launchd-helper", "LaunchAgent helper", "credential", "service-account", "medium", "LAUNCHD_IDENTITY", ["launchctl"]),
-    handle("s-gw:credential:appliance-maintenance", "Appliance maintenance identity", "credential", "service-account", "medium", "APPLIANCE_TOKEN", ["appliance"]),
+    handle("s-gw:credential:qnap-admin", "QNAP maintenance identity", "credential", "service-account", "medium", "QNAP_TOKEN", ["qnap"]),
     handle("s-gw:api-token:repo-read", "Repo read token", "api-token", "github", "low", "GITHUB_TOKEN", ["gh"]),
     handle("s-gw:api-token:openai-eval", "OpenAI eval key", "api-token", "openai", "medium", "OPENAI_API_KEY", ["node"]),
-    handle("s-gw:private-key:preview-host", "Preview host key", "private-key", "ssh", "high", "SGW_SSH_KEY", ["s-gw:ssh-session"]),
+    handle("s-gw:private-key:xdr-asset", "XDR asset key", "private-key", "ssh", "high", "SGW_SSH_KEY", ["s-gw:ssh-session"]),
     handle("s-gw:api-token:browser-mcp", "Browser MCP session", "api-token", "mcp", "medium", "BROWSER_MCP_TOKEN", ["node"]),
     handle("s-gw:credential:aws-ci", "AWS CI pair", "access-key", "aws", "medium", "AWS_ACCESS_KEY_ID", ["aws"]),
-    handle("s-gw:password:local-db-admin", "Local database password", "password", "database", "high", "PGPASSWORD", ["psql"]),
+    handle("s-gw:password:local-admin", "Local admin password", "password", "database", "high", "PGPASSWORD", ["psql"]),
     handle("s-gw:api-token:registry-publish", "Registry publish token", "api-token", "docker", "medium", "DOCKER_TOKEN", ["docker"]),
     handle("s-gw:api-token:repo-write", "Repo write token", "api-token", "github", "medium", "GITHUB_TOKEN", ["gh"]),
     handle("s-gw:api-token:gemini-eval", "Model comparison token", "api-token", "openai", "medium", "MODEL_API_KEY", ["npm"]),
@@ -377,8 +389,8 @@ function commandsForProvider(provider: string): string[] {
 
 function buildDemoRequests(): RequestRecord[] {
   return [
-    request("req_demo_codex_aws", "s-gw:credential:aws-production-readonly", "Codex requests production AWS validation", "Codex", "env_command", "aws", ["sts", "get-caller-identity"], "AWS_ACCESS_KEY_ID", "approved", "AWS API"),
-    request("req_demo_codex_ssh", "s-gw:private-key:web-prod-01", "Codex requests deploy host SSH", "Codex", "ssh_session", "ssh", [], "SGW_SSH_KEY", "pending", "web-prod-01", { target: "web-prod-01", port: 22 }),
+    request("req_demo_codex_aws", "s-gw:credential:aws-prod-deploy", "Codex requests production AWS validation", "Codex", "env_command", "aws", ["sts", "get-caller-identity"], "AWS_ACCESS_KEY_ID", "approved", "AWS API"),
+    request("req_demo_codex_ssh", "s-gw:private-key:agentsec-web", "Codex requests deploy host SSH", "Codex", "ssh_session", "ssh", [], "SGW_SSH_KEY", "pending", "agentsec-web", { target: "agentsec-web", port: 22 }),
     request("req_demo_claude_db", "s-gw:password:staging-pg", "Claude Code requests migration smoke test", "Claude Code", "env_command", "psql", ["--command", "select version()"], "PGPASSWORD", "executed", "staging-postgres"),
     request("req_demo_cursor_repo", "s-gw:api-token:repo-read", "Cursor requests repository metadata", "Cursor", "env_command", "gh", ["repo", "view", "s-gw"], "GITHUB_TOKEN", "executed", "GitHub repository"),
     request("req_demo_opencode_registry", "s-gw:api-token:registry-publish", "OpenCode requests registry publish", "OpenCode", "env_command", "docker", ["push", "registry.example/s-gw:preview"], "DOCKER_TOKEN", "denied", "Container runtime"),
@@ -426,10 +438,10 @@ function request(
 
 function buildDemoAudit(requests: RequestRecord[]) {
   return [
-    { ts: now, type: "request.pending", handle: "s-gw:private-key:web-prod-01", requestId: "req_demo_codex_ssh", message: "Approval requested by Codex" },
+    { ts: now, type: "request.pending", handle: "s-gw:private-key:agentsec-web", requestId: "req_demo_codex_ssh", message: "Approval requested by Codex" },
     { ts: now, type: "request.executed", handle: "s-gw:password:staging-pg", requestId: "req_demo_claude_db", message: "Database smoke test executed locally" },
     { ts: now, type: "request.denied", handle: "s-gw:api-token:registry-publish", requestId: "req_demo_opencode_registry", message: "Registry publish blocked by policy" },
-    { ts: now, type: "request.approved", handle: "s-gw:credential:aws-production-readonly", requestId: "req_demo_codex_aws", message: "AWS read-only request approved" },
+    { ts: now, type: "request.approved", handle: "s-gw:credential:aws-prod-deploy", requestId: "req_demo_codex_aws", message: "AWS read-only request approved" },
     { ts: now, type: "request.executed", handle: "s-gw:api-token:repo-read", requestId: "req_demo_cursor_repo", message: "Repository metadata command executed" },
     { ts: now, type: "request.pending", handle: "s-gw:api-token:gemini-eval", requestId: "req_demo_gemini_model", message: "Model comparison request is waiting for approval" },
     { ts: now, type: "request.pending", handle: "s-gw:private-key:preview-box", requestId: "req_demo_windsurf_preview", message: "Preview host SSH request is waiting for approval" }

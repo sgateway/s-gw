@@ -1430,6 +1430,13 @@ export class SecretStore {
       return store;
     }
 
+    if (
+      !pending &&
+      await migrateLegacyUnsealedControlState(this.home, store, manifest, fingerprint, lock)
+    ) {
+      return store;
+    }
+
     if (pending?.nextFingerprint === fingerprint && pending.previousFingerprint === manifest.fingerprint) {
       const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
       await lock.assertOwned();
@@ -1617,6 +1624,24 @@ function controlPlaneFingerprint(store: StoreFile): string {
   return createHash("sha256").update(JSON.stringify(canonicalValue(control))).digest("hex");
 }
 
+function legacyControlPlaneFingerprint(store: StoreFile): string {
+  const secrets = store.secrets.map((secret) => {
+    const copy = { ...secret };
+    delete copy.cache;
+    return copy;
+  }).sort((a, b) => a.handle.localeCompare(b.handle));
+  const grants = [...store.approvalGrants].sort((a, b) => a.id.localeCompare(b.id));
+  const rules = [...store.approvalPolicyRules].sort((a, b) => a.id.localeCompare(b.id));
+  const control = {
+    version: store.version,
+    secrets,
+    approvalSettings: store.approvalSettings,
+    approvalGrants: grants,
+    approvalPolicyRules: rules
+  };
+  return createHash("sha256").update(JSON.stringify(canonicalValue(control))).digest("hex");
+}
+
 function controlPlaneSnapshot(store: StoreFile): StoreFile {
   const secrets = store.secrets.map((secret) => {
     const copy = { ...secret };
@@ -1779,6 +1804,41 @@ async function initializeControlState(home: string, store: StoreFile, lock: Stor
   await ensureStoreMarker(home);
 }
 
+async function migrateLegacyUnsealedControlState(
+  home: string,
+  store: StoreFile,
+  manifest: StoreControlState,
+  fingerprint: string,
+  lock: StoreLock
+): Promise<boolean> {
+  if (manifest.recoverySealed ||
+      manifest.secrets !== store.secrets.length ||
+      manifest.approvalPolicyRules !== store.approvalPolicyRules.length ||
+      legacyControlPlaneFingerprint(store) !== manifest.fingerprint) {
+    return false;
+  }
+
+  const candidate = await findLegacyFingerprintCandidate(
+    await listLegacyControlPlaneCandidates(home),
+    manifest.fingerprint
+  );
+  if (!candidate) {
+    return false;
+  }
+
+  const checkpointStore = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+  if (controlPlaneFingerprint(checkpointStore) !== fingerprint) {
+    return false;
+  }
+
+  const checkpoint = await ensureSealedControlPlaneCheckpoint(home, store, fingerprint, lock);
+  await lock.assertOwned();
+  await writeControlState(home, controlStateFor(home, store, fingerprint, checkpoint));
+  await unlink(pendingControlStatePath(home)).catch(() => undefined);
+  await ensureStoreMarker(home);
+  return true;
+}
+
 async function ensureSealedControlPlaneCheckpoint(
   home: string,
   store: StoreFile,
@@ -1914,6 +1974,41 @@ async function listLegacyExternalControlPlaneCheckpoints(home: string): Promise<
     }
   }
   return candidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+}
+
+async function listLegacyControlPlaneCandidates(home: string): Promise<RecoveryCandidate[]> {
+  const candidates: RecoveryCandidate[] = [];
+  for (const dir of [controlPlaneBackupDir(home), legacyExternalControlPlaneBackupDir(home)]) {
+    const entries = await readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      if (!/^store-.*\.json$/.test(entry)) {
+        continue;
+      }
+      const candidatePath = path.join(dir, entry);
+      const info = await regularFileInfo(candidatePath);
+      if (info) {
+        candidates.push({ path: candidatePath, modifiedAtMs: info.mtimeMs });
+      }
+    }
+  }
+  return candidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+}
+
+async function findLegacyFingerprintCandidate(
+  candidates: RecoveryCandidate[],
+  requiredFingerprint: string
+): Promise<RecoveryCandidate | undefined> {
+  for (const candidate of candidates) {
+    try {
+      const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+      if (legacyControlPlaneFingerprint(store) === requiredFingerprint) {
+        return candidate;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
 }
 
 async function listSealedControlPlaneCheckpoints(dir: string): Promise<SealedControlPlaneCheckpoint[]> {
