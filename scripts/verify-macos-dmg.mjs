@@ -58,9 +58,8 @@ try {
   }
   const readme = readFileSync(readmePath, "utf8");
   const packageVersion = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
-  const npmInstall = packageVersion.includes("-unsigned.")
-    ? `npm install -g https://github.com/sgateway/s-gw/releases/download/unsigned-macos-preview-v${packageVersion}/s-gw-${packageVersion}.tgz`
-    : "npm install -g @s-gw/s-gw";
+  const releaseNpmInstall = `npm install -g https://github.com/sgateway/s-gw/releases/download/v${packageVersion}/s-gw-${packageVersion}.tgz`;
+  const npmInstall = readme.includes(releaseNpmInstall) ? releaseNpmInstall : "npm install -g @s-gw/s-gw";
   if (!readme.includes(npmInstall) || !readme.includes("s-gw setup")) {
     throw new Error("The DMG installation guidance must include the matching npm alternative.");
   }

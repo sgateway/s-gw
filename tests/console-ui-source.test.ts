@@ -181,6 +181,24 @@ describe("React console source contracts", () => {
     expect(store).toContain("exactBindingsWouldConflict");
   });
 
+  it("shows policy details without replacing hardened policy evaluation", async () => {
+    const [app, policyOrder] = await Promise.all([
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
+      readFile(path.join(repoRoot, "src/policy-order.ts"), "utf8")
+    ]);
+
+    expect(app).toContain("function PolicyDetailPanel");
+    expect(app).toContain("data-policy-detail={rule.id}");
+    expect(app).toContain("data-policy-expand={rule.id}");
+    expect(app).toContain("function PolicyShadowBadge");
+    expect(app).toContain("findShadowingPolicyRule(state.approvalPolicyRules, rule)");
+    expect(app).toContain("conditions.envBindings");
+    expect(app).toContain("conditions.sshPorts");
+    expect(app).toContain("<PolicyEditorDialog");
+    expect(policyOrder).toContain("bindingSetCovers");
+    expect(policyOrder).toContain("compareApprovalPolicyRules");
+  });
+
   it("keeps settings sections compact and approval durations readable", async () => {
     const [app, tabs] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),
