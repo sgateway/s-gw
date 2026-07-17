@@ -18,9 +18,22 @@ Raw credentials stay in the local encrypted ledger and are decrypted only inside
 
 ## Distribution Options
 
+### npm Registry (Recommended)
+
+The public npm package is the recommended installation path on macOS, Windows, and Linux. It installs the `s-gw`, `sgw`, `s-gw-mcp`, and `secret-gateway-mcp` commands. Releases are built on macOS arm64 so Apple Silicon users also receive the native app, menu helper, Keychain helper, and matching Rust core. Linux and Windows use the TypeScript execution path when the package has no matching native core. Intel Macs must build the native Keychain and desktop surfaces from source; packaged arm64-only helpers are rejected before launch.
+
+```bash
+npm install -g @s-gw/s-gw
+s-gw setup
+```
+
+On Windows, run the same commands in PowerShell. Windows 10/11 support is preview software, but npm is the expected install path for the PowerShell client, tray helper, and local web console.
+
+For an npm-based Apple Silicon Mac installation, `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs `s-gw.app` in `/Applications` (or `~/Applications` when required), installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI. Do not use npm setup to manage a machine that already has the self-contained app installed.
+
 ### macOS App (Apple Silicon)
 
-The preferred Mac installation is the self-contained DMG from [GitHub Releases](https://github.com/sgateway/s-gw/releases):
+The self-contained DMG from [GitHub Releases](https://github.com/sgateway/s-gw/releases) is a desktop alternative for users who prefer an app bundle instead of an npm installation:
 
 1. Open `s-gw.dmg`.
 2. Drag `s-gw.app` onto the **Applications** shortcut.
@@ -35,17 +48,6 @@ For an external configuration that needs an executable path, such as a Kubernete
 ```
 
 The equivalent bundled MCP command is `.../bin/s-gw-mcp`; setup writes the absolute bundled Node and MCP paths into supported agent configurations automatically.
-
-### npm Registry
-
-The public npm package is the terminal-first installation path. It installs the `s-gw`, `sgw`, `s-gw-mcp`, and `secret-gateway-mcp` commands. Releases are built on macOS arm64 so Apple Silicon users also receive the native app, menu helper, Keychain helper, and matching Rust core. Linux and Windows use the TypeScript execution path when the package has no matching native core. Intel Macs must build the native Keychain and desktop surfaces from source; packaged arm64-only helpers are rejected before launch.
-
-```bash
-npm install -g @s-gw/s-gw
-s-gw setup
-```
-
-For an npm-based Apple Silicon Mac installation, `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs `s-gw.app` in `/Applications` (or `~/Applications` when required), installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI. Do not use npm setup to manage a machine that already has the self-contained app installed.
 
 ### Local Tarball Or Source
 
@@ -71,16 +73,14 @@ npm link
 
 ### macOS Installer
 
-The macOS DMG contains `s-gw.app`, an `Applications` shortcut, and a short README with the npm installation alternative. The app includes the runtime and all macOS components, so users drag one bundle into Applications instead of double-clicking a shell installer. The default release mode signs every executable with a Developer ID Application certificate, enables the hardened runtime, applies the Node JIT entitlement required by V8, submits the DMG to Apple notarization, staples the result, and assesses it with Gatekeeper before upload.
+The macOS DMG contains `s-gw.app`, an `Applications` shortcut, and a short README that identifies npm as the recommended installation and the DMG as a self-contained desktop alternative. The app includes the runtime and all macOS components, so users drag one bundle into Applications instead of double-clicking a shell installer. The default release mode signs every executable with a Developer ID Application certificate, enables the hardened runtime, applies the Node JIT entitlement required by V8, submits the DMG to Apple notarization, staples the result, and assesses it with Gatekeeper before upload.
 
-When Developer ID signing is unavailable, the `unsigned` mode produces the primary `s-gw.dmg` plus a versioned compatibility copy under the ordinary `vVERSION` release tag. It is not notarized, requires a Gatekeeper override, remains visible to automatic updaters, and does not publish npm or the MCP Registry. Users who prefer not to override Gatekeeper can install the matching `.tgz` release asset with Node.js 20 or newer:
+When Developer ID signing is unavailable, the `unsigned` mode still publishes `@s-gw/s-gw` before its GitHub release. The DMG is not notarized and requires a Gatekeeper override; use the normal npm installation instead when that override is not appropriate:
 
 ```bash
-npm install -g https://github.com/sgateway/s-gw/releases/download/vVERSION/s-gw-VERSION.tgz
+npm install -g @s-gw/s-gw
 s-gw setup
 ```
-
-Replace `VERSION` with the release version, or copy the exact command from the release notes or DMG README.
 
 The installer never pre-seeds passphrases, credentials, `SGW_HOME`, or policy templates.
 

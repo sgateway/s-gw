@@ -12,6 +12,11 @@ on:
         required: true
         default: true
         type: boolean
+      publish_npm_only:
+        description: Publish the tagged npm package without rebuilding or changing an existing GitHub release
+        required: true
+        default: false
+        type: boolean
       macos_distribution:
         description: macOS distribution. Unsigned releases remain discoverable but require a Gatekeeper override.
         required: true
@@ -30,7 +35,7 @@ permissions:
 
 jobs:
   release-assets:
-    if: github.repository == 'sgateway/s-gw'
+    if: github.repository == 'sgateway/s-gw' && !inputs.publish_npm_only
     runs-on: macos-15
     permissions:
       contents: write
@@ -149,26 +154,25 @@ jobs:
       - name: Prepare release notes
         run: |
           set -euo pipefail
-          package_version="$(node -p "require('./package.json').version")"
           notes="$RUNNER_TEMP/release-notes.md"
-          if [ "$MACOS_DISTRIBUTION" = "unsigned" ]; then
-            cat > "$notes" <<EOF
-          ## macOS installation
+          cat > "$notes" <<EOF
+          ## Install
 
-          The Apple Silicon DMG in this release is not Developer ID signed or notarized, so macOS will require an explicit Gatekeeper override to open it. Drag \`s-gw.app\` from \`s-gw.dmg\` to Applications, then open it to complete setup.
-
-          If you prefer not to override Gatekeeper, install this exact release through npm instead (Node.js 20+):
+          The recommended installation path on macOS, Windows, and Linux is the public npm package (Node.js 20+):
 
           \`\`\`bash
-          npm install -g https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/s-gw-${package_version}.tgz
+          npm install -g @s-gw/s-gw
           s-gw setup
           \`\`\`
-          EOF
-          else
-            cat > "$notes" <<EOF
-          ## macOS installation
 
-          Drag \`s-gw.app\` from the Apple Silicon DMG to Applications, then open it to complete setup.
+          ## macOS desktop alternative
+
+          The Apple Silicon DMG is self-contained. Drag \`s-gw.app\` from \`s-gw.dmg\` to Applications, then open it to complete setup.
+          EOF
+          if [ "$MACOS_DISTRIBUTION" = "unsigned" ]; then
+            cat >> "$notes" <<EOF
+
+          This DMG is not Developer ID signed or notarized, so macOS requires an explicit Gatekeeper override to open it. Use the npm installation above if you do not want to use that override.
           EOF
           fi
           echo "SGW_RELEASE_NOTES=$notes" >> "$GITHUB_ENV"
@@ -224,8 +228,8 @@ jobs:
           done
 
   publish-release:
-    needs: release-assets
-    if: github.repository == 'sgateway/s-gw' && inputs.publish_release
+    needs: [release-assets, publish-npm]
+    if: always() && github.repository == 'sgateway/s-gw' && !inputs.publish_npm_only && inputs.publish_release && needs.release-assets.result == 'success' && needs.publish-npm.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -244,8 +248,8 @@ jobs:
           test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "false"
 
   publish-npm:
-    needs: publish-release
-    if: github.repository == 'sgateway/s-gw' && needs.publish-release.result == 'success' && inputs.macos_distribution == 'notarized'
+    needs: release-assets
+    if: always() && github.repository == 'sgateway/s-gw' && (inputs.publish_npm_only || (inputs.publish_release && needs.release-assets.result == 'success'))
     runs-on: macos-15
     environment: npm
     permissions:
@@ -297,23 +301,45 @@ jobs:
             lipo "$binary" -verify_arch arm64
           done
 
+      - name: Record local npm package integrity
+        run: |
+          set -euo pipefail
+          pack_dir="$RUNNER_TEMP/s-gw-npm-pack"
+          mkdir -p "$pack_dir"
+          npm pack --json --ignore-scripts --pack-destination "$pack_dir" > "$pack_dir/pack.json"
+          package_integrity="$(node -e 'const fs = require("node:fs"); const [{ integrity }] = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(integrity || "");' "$pack_dir/pack.json")"
+          test -n "$package_integrity"
+          echo "SGW_NPM_PACKAGE_INTEGRITY=$package_integrity" >> "$GITHUB_ENV"
+
       - name: Publish to npm
-        run: npm publish --access public --ignore-scripts
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          published_integrity="$(npm view "@s-gw/s-gw@${package_version}" dist.integrity 2>/dev/null || true)"
+          if [ -n "$published_integrity" ]; then
+            test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
+            echo "@s-gw/s-gw@${package_version} is already published with the verified package integrity."
+            exit 0
+          fi
+          npm publish --access public --ignore-scripts
 
       - name: Verify published npm package
         run: |
           package_version="$(node -p "require('./package.json').version")"
           prefix="${RUNNER_TEMP}/s-gw-npm-${package_version}"
+          published_integrity=""
           installed=0
           for _ in 1 2 3 4 5 6; do
             rm -rf "$prefix"
-            if npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
+            published_integrity="$(npm view "@s-gw/s-gw@${package_version}" dist.integrity 2>/dev/null || true)"
+            if [ "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY" ] && npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
               installed=1
               break
             fi
             sleep 10
           done
           test "$installed" = 1
+          test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
 
           package_root="$prefix/lib/node_modules/@s-gw/s-gw"
           test -x "$prefix/bin/s-gw"
@@ -331,7 +357,7 @@ jobs:
 
   publish-registry:
     needs: publish-npm
-    if: always() && github.repository == 'sgateway/s-gw' && inputs.macos_distribution == 'notarized' && needs.publish-npm.result == 'success'
+    if: always() && github.repository == 'sgateway/s-gw' && !inputs.publish_npm_only && inputs.publish_release && needs.publish-npm.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -2,6 +2,13 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
+## Unreleased
+
+### Changed
+
+- `npm install -g @s-gw/s-gw` is now the primary documented installation path on macOS, Windows, and Linux. The self-contained Apple Silicon DMG remains a desktop alternative.
+- Release automation publishes and verifies the npm package before it makes the GitHub release public, regardless of whether the macOS DMG is notarized. A recovery-only npm publish mode can repair a previously released version without changing its GitHub release.
+
 ## 0.1.18 - 2026-07-17
 
 ### Added

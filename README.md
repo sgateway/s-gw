@@ -96,18 +96,7 @@ The agent never needs the unlock passphrase or raw credential. Approval is scope
 
 ## Quick Start
 
-On an Apple Silicon Mac, download the macOS DMG from [GitHub Releases](https://github.com/sgateway/s-gw/releases), drag `s-gw.app` to **Applications**, then open it and complete setup. The app includes its own Node runtime, CLI, MCP server, native helpers, and menu-bar helper; it does not require Node.js or npm on the host. Setup is intentionally blocked until the app is in `/Applications` or `~/Applications`.
-
-macOS releases provide `s-gw.dmg` and a versioned compatibility copy for existing update clients. A release built without an Apple Developer ID is clearly documented as unsigned and requires a Gatekeeper override. If you prefer not to override Gatekeeper, install the matching release package with Node.js 20 or newer instead:
-
-```bash
-npm install -g https://github.com/sgateway/s-gw/releases/download/vVERSION/s-gw-VERSION.tgz
-s-gw setup
-```
-
-Replace `VERSION` with the release version, or copy the exact command from the release notes or DMG README.
-
-For terminal-first, Linux, Windows, or source installs, use Node.js 20 or newer:
+The public npm package is the recommended installation path on macOS, Windows 10/11, and Linux. Install Node.js 20 or newer, then run:
 
 ```bash
 npm install -g @s-gw/s-gw
@@ -115,9 +104,15 @@ s-gw setup
 s-gw status
 ```
 
+On Windows, run the same commands in PowerShell. Windows support is preview software: it uses the TypeScript execution path and includes the PowerShell client, tray helper, and local web console.
+
+For an Apple Silicon Mac desktop bundle, [GitHub Releases](https://github.com/sgateway/s-gw/releases) also provides a self-contained `s-gw.dmg`. Drag `s-gw.app` to **Applications**, then open it and complete setup. The app includes its own Node runtime, CLI, MCP server, native helpers, and menu-bar helper; it does not require Node.js or npm on the host. Setup is intentionally blocked until the app is in `/Applications` or `~/Applications`.
+
+An unsigned DMG requires a Gatekeeper override. Use the npm installation above instead if you do not want to use that override.
+
 The public source builds the TypeScript compatibility path. Building the native macOS surfaces also requires a Swift toolchain. Maintainer release builds additionally require access to the private Rust core checkout.
 
-The Apple Silicon Mac DMG is the preferred desktop path. Published macOS DMGs are either Developer ID signed and notarized or explicitly documented as unsigned; unsigned builds require a Gatekeeper override but retain the standard release tag and update path. Local `npm run build:installers` output is ad-hoc signed for local verification. The npm package remains the terminal-first path and includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs. Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; packaged arm64-only helpers are rejected before launch.
+The Apple Silicon Mac DMG is a self-contained desktop alternative. Published macOS DMGs are either Developer ID signed and notarized or explicitly documented as unsigned; unsigned builds require a Gatekeeper override but retain the standard release tag and update path. Local `npm run build:installers` output is ad-hoc signed for local verification. The npm package is the primary install and includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs. Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; packaged arm64-only helpers are rejected before launch.
 
 ```bash
 git clone https://github.com/sgateway/s-gw.git

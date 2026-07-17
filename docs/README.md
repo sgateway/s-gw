@@ -2,8 +2,8 @@
 
 ## Start Here
 
-- [macOS app install](deployment.md#macos-app-apple-silicon): drag the self-contained Apple Silicon app to Applications.
-- [Quick start](quickstart.md): npm/source installation and the disposable trust-loop demo.
+- [Quick start](quickstart.md): the recommended npm installation for macOS, Windows, and Linux, plus the disposable trust-loop demo.
+- [macOS app install](deployment.md#macos-app-apple-silicon): self-contained Apple Silicon desktop alternative.
 - [Architecture](architecture.md): components, data flow, and local process boundaries.
 - [Threat model](threat-model.md): intended guarantees, attacker assumptions, and non-goals.
 - [Deployment](deployment.md): platform support, setup, packaging, upgrade, and uninstall.

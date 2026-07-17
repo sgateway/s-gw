@@ -102,10 +102,6 @@ function buildMacInstaller(packed) {
 }
 
 function macInstallReadme(signing) {
-  const releaseTag = releaseTagFor(signing);
-  const npmInstall = signing.distribution === "unsigned"
-    ? `npm install -g https://github.com/sgateway/s-gw/releases/download/${releaseTag}/s-gw-${version}.tgz`
-    : "npm install -g @s-gw/s-gw";
   const trustNotice = signing.distribution === "unsigned"
     ? [
       "This macOS release is not signed with an Apple Developer ID or notarized.",
@@ -118,14 +114,18 @@ function macInstallReadme(signing) {
   return `${[
     `s-gw ${version} for Apple silicon`,
     "",
+    "Recommended installation (Node.js 20+):",
+    "npm install -g @s-gw/s-gw",
+    "s-gw setup",
+    "",
+    "Self-contained desktop alternative:",
     "1. Drag s-gw.app to Applications.",
     "2. Open s-gw from Applications and complete setup.",
     "",
     ...trustNotice,
-    "",
-    "Prefer not to use a macOS security override? Install the CLI package instead (Node.js 20+ required):",
-    npmInstall,
-    "s-gw setup"
+    signing.distribution === "unsigned"
+      ? "Use the npm installation above if you do not want to use a macOS security override."
+      : ""
   ].join("\n")}\n`;
 }
 
