@@ -2,6 +2,17 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
+## 0.1.18 - 2026-07-16
+
+### Added
+
+- A local **Demo data** toggle fills the Sankey, activity and audit logs, credentials, policies, and requests with clearly labeled display-only records that can be removed in one click.
+
+### Fixed
+
+- The macOS package updater now accepts only the exact scoped `s-gw-<version>.tgz` asset and rejects the legacy compatibility bridge before download or installation.
+- Valid 0.1.12 unsealed control manifests migrate to the current sealed recovery format only when the live ledger and a trusted legacy checkpoint both match the legacy fingerprint. Credentials, policies, requests, and audit history remain intact, while unexplained mismatches continue to fail closed.
+
 ## 0.1.17 - 2026-07-16
 
 ### Added
