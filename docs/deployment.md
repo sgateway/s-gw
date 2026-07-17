@@ -22,7 +22,7 @@ Raw credentials stay in the local encrypted ledger and are decrypted only inside
 
 The preferred Mac installation is the self-contained DMG from [GitHub Releases](https://github.com/sgateway/s-gw/releases):
 
-1. Open `s-gw-VERSION-macos.dmg`.
+1. Open `s-gw.dmg`.
 2. Drag `s-gw.app` onto the **Applications** shortcut.
 3. Open `s-gw.app` from `/Applications` or `~/Applications` and complete setup.
 
@@ -73,14 +73,14 @@ npm link
 
 The macOS DMG contains `s-gw.app`, an `Applications` shortcut, and a short README with the npm installation alternative. The app includes the runtime and all macOS components, so users drag one bundle into Applications instead of double-clicking a shell installer. The default release mode signs every executable with a Developer ID Application certificate, enables the hardened runtime, applies the Node JIT entitlement required by V8, submits the DMG to Apple notarization, staples the result, and assesses it with Gatekeeper before upload.
 
-When Developer ID signing is unavailable, the explicit `unsigned-preview` mode produces `s-gw-VERSION-macos-unsigned-preview.dmg` under the non-version GitHub prerelease tag `unsigned-macos-preview-vVERSION`. It is not notarized, requires a Gatekeeper override, is ignored by current and older automatic updaters, and does not publish npm or the MCP Registry. Users who prefer not to override Gatekeeper can install the matching `.tgz` release asset with Node.js 20 or newer:
+When Developer ID signing is unavailable, the `unsigned` mode produces the primary `s-gw.dmg` plus a versioned compatibility copy under the ordinary `vVERSION` release tag. It is not notarized, requires a Gatekeeper override, remains visible to automatic updaters, and does not publish npm or the MCP Registry. Users who prefer not to override Gatekeeper can install the matching `.tgz` release asset with Node.js 20 or newer:
 
 ```bash
-npm install -g https://github.com/sgateway/s-gw/releases/download/unsigned-macos-preview-vVERSION/s-gw-VERSION.tgz
+npm install -g https://github.com/sgateway/s-gw/releases/download/vVERSION/s-gw-VERSION.tgz
 s-gw setup
 ```
 
-Replace `VERSION` with the version in that preview's filename, or copy the exact command from the preview release notes or DMG README.
+Replace `VERSION` with the release version, or copy the exact command from the release notes or DMG README.
 
 The installer never pre-seeds passphrases, credentials, `SGW_HOME`, or policy templates.
 
@@ -265,7 +265,8 @@ npm run build:installers
 
 The command rebuilds the native clients and console, then writes these files under `dist/installers`:
 
-- `s-gw-VERSION-macos.dmg`, containing the self-contained `s-gw.app` and an `Applications` shortcut;
+- `s-gw.dmg`, containing the self-contained `s-gw.app` and an `Applications` shortcut;
+- `s-gw-VERSION-macos.dmg`, a versioned compatibility copy for existing update clients;
 - `s-gw-VERSION-windows.zip`, containing the local npm package plus PowerShell and CMD setup launchers;
 - `s-gw-VERSION.tgz`, used by both installers and the in-app updater;
 - `0-s-gw-legacy-VERSION.tgz`, a release-only unscoped bridge for the original `0.1.0` updater;
@@ -466,7 +467,7 @@ For macOS production packages, also verify:
 - `s-gw doctor` finds the installed CLI, MCP server, native Keychain helper, and menu-bar app bundle;
 - `s-gw service install --start` loads the console LaunchAgent;
 - `s-gw menubar open` launches the menu-bar helper and sees pending requests;
-- normal macOS package or installer is signed and notarized, or an unsigned preview is explicitly labelled and manually installed;
+- macOS installers are signed and notarized, or explicitly documented as unsigned with the required Gatekeeper override;
 - install/uninstall leaves no raw secrets in logs or shell history.
 
 For Windows preview packages, also verify:

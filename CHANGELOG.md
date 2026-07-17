@@ -2,25 +2,26 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
-## 0.1.18-unsigned.3 - 2026-07-17
+## 0.1.18 - 2026-07-17
 
 ### Added
 
 - A local **Demo data** toggle fills the Sankey, activity and audit logs, credentials, policies, and requests with clearly labeled display-only records that can be removed in one click.
-- An explicit unsigned macOS preview channel for the self-contained app. Its distinctly named DMG includes installation guidance and an npm alternative for users who prefer not to override Gatekeeper.
+- A self-contained Apple Silicon macOS DMG named `s-gw.dmg`, with a versioned compatibility copy so existing clients can discover the update.
+- An expandable policy view that shows evaluation order, policy flow, complete matching conditions, and richer shadow explanations without changing policy evaluation or editing semantics.
 
 ### Fixed
 
 - Concurrent credential clients now wait up to 30 seconds for a durable store write to finish, rather than failing while another verified control-plane update is still being committed.
-- The release workflow now verifies draft assets by release ID, so an unsigned preview remains private until every asset is confirmed rather than failing on GitHub's published-release-by-tag endpoint.
+- The release workflow now verifies draft assets by release ID, so an unsigned release remains private until every asset is confirmed rather than failing on GitHub's published-release-by-tag endpoint.
 - The macOS package updater now accepts only the exact scoped `s-gw-<version>.tgz` asset and rejects the legacy compatibility bridge before download or installation.
 - Native update banners and Settings now report the active installed CLI/runtime version instead of a stale development app bundle version.
 - Valid 0.1.12 unsealed control manifests migrate to the current sealed recovery format only when the live ledger and a trusted legacy checkpoint both match the legacy fingerprint. Credentials, policies, requests, and audit history remain intact, while unexplained mismatches continue to fail closed.
 
 ### Changed
 
-- Unsigned macOS previews are GitHub prereleases under non-version tags: they do not publish npm or the MCP Registry and are excluded from automatic update notices, including in older clients.
-- Automatic update checks select only stable releases with the normal installer and checksum, preventing incomplete or unsigned-preview assets from causing repeated retry checks.
+- The unsigned macOS release uses the standard SemVer tag and remains discoverable by existing clients. It is not Developer ID signed or notarized, so macOS will require a Gatekeeper override. The exact release tarball remains the npm fallback for users who prefer not to override Gatekeeper.
+- Automatic update checks select only stable releases with a verified installer and checksum, preventing incomplete uploads from causing repeated retry checks.
 
 ## 0.1.17 - 2026-07-16
 

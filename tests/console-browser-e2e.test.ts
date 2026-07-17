@@ -101,6 +101,44 @@ describeBrowser("React local console (real headless Chrome)", () => {
     );
   }, 45_000);
 
+  it("expands a policy without changing its hardened edit path", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "policy-detail-browser-passphrase";
+    running = await startConsoleServer({ port: 0 });
+    const policy = await api<{ id: string }>("api/approval/policies", {
+      name: "Detailed SSH policy",
+      decision: "ask",
+      priority: 7,
+      agents: ["Codex"],
+      actionKinds: ["ssh_session"],
+      commands: ["ssh"],
+      sshTargets: ["git@github.com"],
+      sshPorts: [2222]
+    });
+    const launched = await launchChrome(new URL("policies", running.url).toString());
+    cdp = launched.cdp;
+
+    await waitFor(
+      () => cdp!.eval<boolean>(`Boolean(document.querySelector('[data-policy-expand="${policy.id}"]'))`),
+      "policy detail control"
+    );
+    await clickElement(cdp, `[data-policy-expand="${policy.id}"]`);
+    await waitFor(
+      () => cdp!.eval<boolean>(`Boolean(document.querySelector('[data-policy-detail="${policy.id}"]'))`),
+      "expanded policy detail"
+    );
+    const detail = await cdp.eval<string>(`document.querySelector('[data-policy-detail="${policy.id}"]').innerText`);
+    expect(detail).toContain("Evaluation order");
+    expect(detail).toContain("git@github.com");
+    expect(detail).toContain("2222");
+
+    await clickElement(cdp, `[data-policy-edit="${policy.id}"]`);
+    await waitFor(
+      () => cdp!.eval<boolean>("Boolean(document.querySelector('[role=dialog]'))"),
+      "policy editor"
+    );
+    expect(await cdp.eval<boolean>(`Boolean(document.querySelector('[data-policy-detail="${policy.id}"]'))`)).toBe(true);
+  }, 45_000);
+
   it("shows a release notification from the public update feed", async () => {
     const installer = process.platform === "darwin"
       ? "s-gw-0.1.1-macos.dmg"

@@ -28,8 +28,8 @@ const version = packageInfo.version;
 const packedFile = `${packageInfo.name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`;
 const packageFile = `s-gw-${version}.tgz`;
 const legacyBridgeFile = `0-s-gw-legacy-${version}.tgz`;
-const macInstallerFile = `s-gw-${version}-macos.dmg`;
-const unsignedPreviewMacInstallerFile = `s-gw-${version}-macos-unsigned-preview.dmg`;
+const macInstallerFile = "s-gw.dmg";
+const versionedMacInstallerFile = `s-gw-${version}-macos.dmg`;
 const outputDir = resolve(root, "dist/installers");
 const workDir = mkdtempSync(resolve(tmpdir(), "s-gw-installers-"));
 
@@ -54,7 +54,7 @@ try {
   copyFileSync(packed, resolve(outputDir, packageFile));
   buildLegacyBridge(packed, resolve(outputDir, legacyBridgeFile), version);
 
-  const artifacts = [legacyBridgeFile, packageFile, basename(macArtifact.path), basename(windowsArtifact)];
+  const artifacts = [legacyBridgeFile, packageFile, ...macArtifact.paths.map((file) => basename(file)), basename(windowsArtifact)];
   const checksumLines = artifacts.map((name) => `${sha256(resolve(outputDir, name))}  ${name}`);
   writeFileSync(resolve(outputDir, "SHA256SUMS.txt"), `${checksumLines.join("\n")}\n`);
 
@@ -87,30 +87,28 @@ function buildMacInstaller(packed) {
   writeFileSync(resolve(stageRoot, "README.txt"), macInstallReadme(signing));
 
   signMacApp(appRoot, signing);
-  const target = resolve(outputDir, macInstallerFileName(signing));
+  const target = resolve(outputDir, macInstallerFile);
   run("hdiutil", ["create", "-volname", `s-gw ${version}`, "-srcfolder", stageRoot, "-ov", "-format", "UDZO", target], root);
   signMacDmg(target, signing);
   notarizeMacDmg(target, signing);
+  const compatibilityTarget = resolve(outputDir, versionedMacInstallerFile);
+  copyFileSync(target, compatibilityTarget);
   return {
-    path: target,
+    paths: [target, compatibilityTarget],
     releaseTag: releaseTagFor(signing),
     distribution: signing.distribution,
     notarized: signing.requireNotarization
   };
 }
 
-function macInstallerFileName(signing) {
-  return signing.distribution === "unsigned-preview" ? unsignedPreviewMacInstallerFile : macInstallerFile;
-}
-
 function macInstallReadme(signing) {
   const releaseTag = releaseTagFor(signing);
-  const npmInstall = signing.distribution === "unsigned-preview"
+  const npmInstall = signing.distribution === "unsigned"
     ? `npm install -g https://github.com/sgateway/s-gw/releases/download/${releaseTag}/s-gw-${version}.tgz`
     : "npm install -g @s-gw/s-gw";
-  const trustNotice = signing.distribution === "unsigned-preview"
+  const trustNotice = signing.distribution === "unsigned"
     ? [
-      "This is an unsigned macOS preview. It is not signed with an Apple Developer ID or notarized.",
+      "This macOS release is not signed with an Apple Developer ID or notarized.",
       "macOS will require an explicit Gatekeeper override before it opens."
     ]
     : signing.distribution === "notarized"
@@ -127,18 +125,12 @@ function macInstallReadme(signing) {
     "",
     "Prefer not to use a macOS security override? Install the CLI package instead (Node.js 20+ required):",
     npmInstall,
-    "s-gw setup",
-    ...(signing.distribution === "unsigned-preview" ? [] : [
-      "",
-      "For an unsigned preview that is not in npm yet, use the exact .tgz link in the GitHub release notes."
-    ])
+    "s-gw setup"
   ].join("\n")}\n`;
 }
 
 function releaseTagFor(signing) {
-  const expected = signing.distribution === "unsigned-preview"
-    ? `unsigned-macos-preview-v${version}`
-    : `v${version}`;
+  const expected = `v${version}`;
   const configured = process.env.SGW_RELEASE_TAG?.trim();
   if (configured && configured !== expected) {
     throw new Error(`SGW_RELEASE_TAG must be ${expected} for this distribution.`);
@@ -310,17 +302,14 @@ function signingConfiguration() {
   const notaryProfile = process.env.SGW_NOTARY_PROFILE?.trim();
   const distribution = process.env.SGW_MACOS_DISTRIBUTION?.trim() || "local";
 
-  if (!["local", "notarized", "unsigned-preview"].includes(distribution)) {
-    throw new Error("SGW_MACOS_DISTRIBUTION must be local, notarized, or unsigned-preview.");
+  if (!["local", "notarized", "unsigned"].includes(distribution)) {
+    throw new Error("SGW_MACOS_DISTRIBUTION must be local, notarized, or unsigned.");
   }
   if (distribution === "notarized" && !requireNotarization) {
     throw new Error("A notarized distribution requires SGW_REQUIRE_NOTARIZATION=1.");
   }
-  if (distribution === "unsigned-preview" && (identity !== "-" || requireNotarization)) {
-    throw new Error("An unsigned preview must use the ad-hoc signing identity and no notarization.");
-  }
-  if (distribution === "unsigned-preview" && !/^\d+\.\d+\.\d+-unsigned\.\d+$/.test(version)) {
-    throw new Error("An unsigned preview requires a package version such as 0.1.18-unsigned.1.");
+  if (distribution === "unsigned" && (identity !== "-" || requireNotarization)) {
+    throw new Error("An unsigned distribution must use the ad-hoc signing identity and no notarization.");
   }
 
   if (requireNotarization && identity === "-") {

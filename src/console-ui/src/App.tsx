@@ -8,11 +8,13 @@ import {
   Bell,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   Circle,
   Clock3,
   Command as CommandIcon,
   Copy,
   Download,
+  EyeOff,
   ExternalLink,
   FileKey2,
   Gauge,
@@ -1411,10 +1413,56 @@ function UsageFlowView({ state }: { state: ConsoleState }) {
   );
 }
 
+function PolicyShadowBadge({
+  rule,
+  shadowedBy
+}: {
+  rule: ApprovalPolicyRuleRecord;
+  shadowedBy?: ApprovalPolicyRuleRecord;
+}) {
+  if (!shadowedBy) return null;
+  const unreachable = shadowedBy.decision !== rule.decision;
+  const label = unreachable ? "Never runs" : "Redundant";
+  const description = unreachable
+    ? `“${shadowedBy.name}” matches first with a different decision.`
+    : `“${shadowedBy.name}” already covers this rule with the same decision.`;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={unreachable ? "destructive" : "secondary"} className="shrink-0 gap-1">
+          <EyeOff className="h-3 w-3" />
+          {label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent>{description}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function PolicyConditionsCell({ conditions }: { conditions: ApprovalPolicyRuleRecord["conditions"] }) {
+  const agents = conditions.agents || [];
+  const restSummary = policyConditionSummary({ ...conditions, agents: undefined });
+  const hasRest = restSummary !== "All matching credential requests" || agents.length === 0;
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {agents.map((agent) => (
+        <span key={agent} className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-xs">
+          <AgentIcon name={agent} className="h-4 w-4" />
+          {titleCase(agent)}
+        </span>
+      ))}
+      {hasRest ? <span className="truncate text-sm text-muted-foreground">{restSummary}</span> : null}
+    </div>
+  );
+}
+
 function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: () => void; search: string }) {
   const [editing, setEditing] = React.useState<ApprovalPolicyRuleRecord | null>(null);
   const [adding, setAdding] = React.useState(false);
   const [deleting, setDeleting] = React.useState<ApprovalPolicyRuleRecord | null>(null);
+  const [expandedId, setExpandedId] = React.useState<string | null>(null);
   const [arranging, setArranging] = React.useState(false);
   const rows = filterText(state.approvalPolicyRules, search, (rule) => `${rule.name} ${rule.decision} ${policyConditionSummary(rule.conditions)}`);
   const shadowedBy = React.useMemo(() => {
@@ -1454,11 +1502,15 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
     }
   }
 
+  function toggleDetails(id: string) {
+    setExpandedId((current) => current === id ? null : id);
+  }
+
   return (
     <PageFrame title="Policies" description="Define when agents may use credentials without interrupting you, and when s-gw should always ask or deny.">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-3xl text-sm text-muted-foreground">
-          Rules run in priority order. Auto-arrange moves narrower rules ahead of broader ask and allow rules; deny rules stay ahead as guardrails.
+          Rules run in the order shown. Auto-arrange moves narrower rules ahead of broader ask and allow rules; deny rules stay ahead as guardrails.
         </p>
         <div className="flex gap-2">
           <Button variant="outline" disabled={arranging} onClick={() => void arrange()} data-policy-arrange>
@@ -1495,47 +1547,84 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
                 </TableCell>
               </TableRow>
             ) : null}
-            {rows.map((rule) => (
-              <TableRow key={rule.id} data-policy-row={rule.id} className={cn(shadowedBy.has(rule.id) && "bg-amber-500/5")}>
-                <TableCell>
-                  <PolicyStatusControl rule={rule} onDone={onDone} />
-                </TableCell>
-                <TableCell className="font-medium">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="truncate">{rule.name}</span>
-                    {rule.demo ? <DemoBadge /> : null}
-                    {shadowedBy.get(rule.id) ? (
-                      <Badge variant="secondary" className="shrink-0 text-amber-700 dark:text-amber-300" title={`Covered by ${shadowedBy.get(rule.id)?.name}`}>
-                        Shadowed
-                      </Badge>
-                    ) : null}
-                  </div>
-                </TableCell>
-                <TableCell><DecisionBadge decision={rule.decision} /></TableCell>
-                <TableCell className="max-w-[560px] truncate">{policyConditionSummary(rule.conditions)}</TableCell>
-                <TableCell className="text-right whitespace-nowrap">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={`Edit ${rule.name}`}
-                    onClick={() => setEditing(rule)}
-                    disabled={rule.demo}
-                    data-policy-edit={rule.id}
+            {rows.map((rule) => {
+              const coveringRule = shadowedBy.get(rule.id);
+              const expanded = expandedId === rule.id;
+              return (
+                <React.Fragment key={rule.id}>
+                  <TableRow
+                    data-policy-row={rule.id}
+                    aria-expanded={expanded}
+                    tabIndex={0}
+                    onClick={() => toggleDetails(rule.id)}
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      toggleDetails(rule.id);
+                    }}
+                    className={cn("cursor-pointer", coveringRule && "bg-amber-500/5", expanded && "bg-muted/40")}
                   >
-                    <Pencil className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={`Delete ${rule.name}`}
-                    onClick={() => setDeleting(rule)}
-                    disabled={rule.demo}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
+                    <TableCell onClick={(event) => event.stopPropagation()}>
+                      <PolicyStatusControl rule={rule} onDone={onDone} />
+                    </TableCell>
+                    <TableCell className="font-medium">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="truncate">{rule.name}</span>
+                        {rule.demo ? <DemoBadge /> : null}
+                        <PolicyShadowBadge rule={rule} shadowedBy={coveringRule} />
+                      </div>
+                    </TableCell>
+                    <TableCell><DecisionBadge decision={rule.decision} /></TableCell>
+                    <TableCell className="max-w-[560px]"><PolicyConditionsCell conditions={rule.conditions} /></TableCell>
+                    <TableCell className="text-right whitespace-nowrap" onClick={(event) => event.stopPropagation()}>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={expanded ? `Hide details for ${rule.name}` : `Show details for ${rule.name}`}
+                        onClick={() => toggleDetails(rule.id)}
+                        disabled={rule.demo}
+                        data-policy-expand={rule.id}
+                      >
+                        <ChevronRight className={cn("h-4 w-4 transition-transform", expanded && "rotate-90")} />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={`Edit ${rule.name}`}
+                        onClick={() => setEditing(rule)}
+                        disabled={rule.demo}
+                        data-policy-edit={rule.id}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={`Delete ${rule.name}`}
+                        onClick={() => setDeleting(rule)}
+                        disabled={rule.demo}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                  {expanded ? (
+                    <TableRow className="bg-muted/20 hover:bg-muted/20">
+                      <TableCell colSpan={5} className="p-0">
+                        <PolicyDetailPanel
+                          rule={rule}
+                          state={state}
+                          shadowedBy={coveringRule}
+                          onEdit={() => setEditing(rule)}
+                          onDelete={() => setDeleting(rule)}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </React.Fragment>
+              );
+            })}
           </TableBody>
         </Table>
       </DataCard>
@@ -1566,6 +1655,78 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
       </AlertDialog>
     </PageFrame>
   );
+}
+
+function PolicyDetailPanel({
+  rule,
+  state,
+  shadowedBy,
+  onEdit,
+  onDelete
+}: {
+  rule: ApprovalPolicyRuleRecord;
+  state: ConsoleState;
+  shadowedBy?: ApprovalPolicyRuleRecord;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const conditions = rule.conditions;
+  const bindings = (conditions.envBindings || []).map((binding) => {
+    const handle = state.handles.find((item) => item.handle === binding.handle);
+    return `${binding.injectEnv} → ${handle?.name || shortHandle(binding.handle)}`;
+  });
+  const coveredBySameDecision = shadowedBy?.decision === rule.decision;
+
+  return (
+    <div className="space-y-5 px-4 py-5 lg:px-6" data-policy-detail={rule.id}>
+      <PolicyFlowPreview form={policyFormFromRule(rule)} state={state} />
+      {shadowedBy ? (
+        <Alert variant={coveredBySameDecision ? "default" : "destructive"}>
+          <EyeOff className="h-4 w-4" />
+          <AlertTitle>{coveredBySameDecision ? "Redundant rule" : "Rule never runs"}</AlertTitle>
+          <AlertDescription>
+            {coveredBySameDecision
+              ? `“${shadowedBy.name}” already covers the same requests with the same decision.`
+              : `“${shadowedBy.name}” runs first with a different decision, so this rule cannot take effect.`}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {rule.demo ? (
+        <Alert>
+          <AlertTitle>Demo policy</AlertTitle>
+          <AlertDescription>Demo policies are read-only and never evaluated.</AlertDescription>
+        </Alert>
+      ) : null}
+      <DetailGrid
+        rows={[
+          ["Evaluation order", `Priority ${rule.priority} · ${rule.enabled ? "Enabled" : "Disabled"}`],
+          ["Decision", titleCase(rule.decision)],
+          ["Agents", policyDetailValue(conditions.agents)],
+          ["Credentials", bindings.length > 0 ? bindings.join(", ") : policyDetailValue(conditions.handles, (handle) => state.handles.find((item) => item.handle === handle)?.name || shortHandle(handle))],
+          ["Action", policyDetailValue([...(conditions.actionKinds || []), ...(conditions.commands || [])])],
+          ["Scope", policyDetailValue([...(conditions.providers || []), ...(conditions.secretTypes || []), conditions.minSeverity ? `${conditions.minSeverity} and above` : ""])],
+          ["Environment", policyDetailValue([...(conditions.injectEnvs || []), ...(conditions.workingDirs || [])])],
+          ["SSH", policyDetailValue([...(conditions.sshTargets || []), ...(conditions.sshPorts || []).map(String)])],
+          ["Expires", rule.expiresAt ? new Date(rule.expiresAt).toLocaleString() : "Never"],
+          ["Updated", relativeTime(rule.updatedAt)]
+        ]}
+      />
+      <div className="flex flex-wrap items-center justify-end gap-2 border-t pt-4">
+        <Button variant="outline" onClick={onEdit} disabled={rule.demo}>
+          <Pencil className="mr-2 h-4 w-4" />Edit rule
+        </Button>
+        <Button variant="outline" className="text-destructive hover:text-destructive" onClick={onDelete} disabled={rule.demo}>
+          <Trash2 className="mr-2 h-4 w-4" />Delete rule
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function policyDetailValue(values: Array<string | number> | undefined, label?: (value: string) => string): string {
+  if (!values || values.length === 0) return "Any";
+  const labels = values.map((value) => label ? label(String(value)) : String(value)).filter(Boolean);
+  return labels.length > 0 ? labels.join(", ") : "Any";
 }
 
 function PolicyStatusControl({

@@ -70,7 +70,7 @@ describe("native macOS update lifecycle", () => {
     expect(state).not.toContain("updateRetryInterval");
     expect(checker).toContain('"sha256sums.txt"');
     expect(checker).toContain("entry.fileName == assetName");
-    expect(checker).toContain('return "s-gw-\\(cleanVersion)-macos.dmg"');
+    expect(checker).toContain('return "s-gw.dmg"');
     expect(checker).toContain("static var usesSelfContainedRuntime");
     expect(checker).toContain('$0.state?.lowercased() == "uploaded"');
     expect(checker).toContain("for release in candidates");

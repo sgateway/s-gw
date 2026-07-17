@@ -695,8 +695,8 @@ struct AppStateGuardTests {
       fail("the GitHub Atom fallback should parse the newest release entry")
     }
     check(release.version == "9.3.1", "Atom fallback should parse the release version")
-    check(release.assetName == "s-gw-9.3.1-macos.dmg", "Atom fallback should bind the exact installer name")
-    check(release.checksumAssetName == "s-gw-9.3.1-macos.dmg.sha256",
+    check(release.assetName == "s-gw.dmg", "Atom fallback should bind the primary installer name")
+    check(release.checksumAssetName == "s-gw.dmg.sha256",
           "Atom fallback should prefer the exact per-file checksum")
   }
 

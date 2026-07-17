@@ -73,7 +73,7 @@ actor UpdateChecker: UpdateChecking {
     private let cli = CLIRunner()
 
     static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.18-unsigned.3"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.18"
     }
 
     static var usesSelfContainedRuntime: Bool {
@@ -381,8 +381,7 @@ actor UpdateChecker: UpdateChecking {
     }
 
     static func releaseAssetName(for version: String) -> String {
-        let cleanVersion = parseVersion(version)
-        return "s-gw-\(cleanVersion)-macos.dmg"
+        return "s-gw.dmg"
     }
 
     static func verifyChecksum(
