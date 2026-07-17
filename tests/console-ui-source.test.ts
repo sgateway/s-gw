@@ -104,9 +104,10 @@ describe("React console source contracts", () => {
     expect(sampleData).toContain('provider: "ssh", label: "SSH"');
     expect(sampleData).toContain('sampleAgent("codex", "Codex"');
     expect(sampleData).toContain('sampleAgent("windsurf", "Windsurf"');
-    expect(sampleData).toContain('"s-gw:private-key:web-prod-01"');
+    expect(sampleData).toContain('"s-gw:private-key:agentsec-web"');
     expect(sampleData).toContain('"s-gw:api-token:registry-publish"');
-    expect(sampleData).not.toMatch(/private environment|private repos|prod deploy|nas admin|local admin/i);
+    expect(sampleData).toContain('"AWS prod deploy pair"');
+    expect(sampleData).toContain('"private repos"');
   });
 
   it("uses one visible control for policy status", async () => {

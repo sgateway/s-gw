@@ -162,6 +162,7 @@ import {
   type PanelId
 } from "@/lib/layout";
 import { credentialBackendLabel, credentialProviderPresentation } from "@/lib/credential-presentation";
+import { addDemoData, DEMO_DATA_STORAGE_KEY } from "@/lib/demo-data";
 import { findShadowingPolicyRule } from "../../policy-order";
 import {
   commandName,
@@ -332,6 +333,7 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
   const [approval, setApproval] = React.useState<RequestRecord | null>(null);
   const [credential, setCredential] = React.useState<HandleSummary | null>(null);
   const [overviewLayouts, setOverviewLayouts] = React.useState<Layouts>(() => readSavedLayouts());
+  const [demoEnabled, setDemoEnabled] = React.useState(() => localStorage.getItem(DEMO_DATA_STORAGE_KEY) === "1");
   const nativeShell = isNativeShellRoute();
 
   React.useEffect(() => {
@@ -341,7 +343,7 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
   }, []);
 
   React.useEffect(() => {
-    if (!approval || !ctx.state) return;
+    if (!approval || approval.demo || !ctx.state) return;
     const current = ctx.state.requests.find((request) => request.id === approval.id);
     if (current?.state === "pending") {
       if (current !== approval) setApproval(current);
@@ -374,7 +376,20 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
     window.history.pushState({}, "", `${path}${shellQuery}`);
   }, []);
 
-  const state = ctx.state;
+  const state = React.useMemo(
+    () => ctx.state && demoEnabled ? addDemoData(ctx.state) : ctx.state,
+    [ctx.state, demoEnabled]
+  );
+  const displayCtx = React.useMemo(() => ({ ...ctx, state }), [ctx, state]);
+  const toggleDemoData = React.useCallback(() => {
+    setDemoEnabled((current) => {
+      const next = !current;
+      if (next) localStorage.setItem(DEMO_DATA_STORAGE_KEY, "1");
+      else localStorage.removeItem(DEMO_DATA_STORAGE_KEY);
+      toast.success(next ? "Demo data added" : "Demo data removed");
+      return next;
+    });
+  }, []);
   const resetOverviewLayout = React.useCallback(() => {
     const next = resetLayouts();
     setOverviewLayouts(next);
@@ -388,7 +403,7 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
       <SidebarInset className="sgw-console-main min-w-0 bg-transparent">
         {nativeShell ? (
           <NativeWindowActions
-            ctx={ctx}
+            ctx={displayCtx}
             state={state}
             theme={theme}
             setTheme={setTheme}
@@ -396,10 +411,12 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
             view={view}
             onResetLayout={resetOverviewLayout}
             setCommandOpen={setCommandOpen}
+            demoEnabled={demoEnabled}
+            onToggleDemoData={toggleDemoData}
           />
         ) : (
           <ConsoleTopbar
-            ctx={ctx}
+            ctx={displayCtx}
             state={state}
             theme={theme}
             setTheme={setTheme}
@@ -434,7 +451,7 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
             </Alert>
           ) : null}
           <ViewContent
-            ctx={ctx}
+            ctx={displayCtx}
             view={view}
             setView={setView}
             setApproval={setApproval}
@@ -520,7 +537,9 @@ function NativeWindowActions({
   setView,
   view,
   onResetLayout,
-  setCommandOpen
+  setCommandOpen,
+  demoEnabled,
+  onToggleDemoData
 }: {
   ctx: ConsoleContext;
   state: ConsoleState | null;
@@ -530,6 +549,8 @@ function NativeWindowActions({
   view: ViewId;
   onResetLayout: () => void;
   setCommandOpen: (open: boolean) => void;
+  demoEnabled: boolean;
+  onToggleDemoData: () => void;
 }) {
   const pendingCount = state?.metrics.pendingApprovals || 0;
   const nextTheme = theme === "light" ? "dark" : "light";
@@ -558,7 +579,7 @@ function NativeWindowActions({
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="icon" className="sgw-native-action-button">
+          <Button variant="outline" size="icon" className="sgw-native-action-button" data-native-more-actions>
             <MoreVertical className="h-4 w-4" />
             <span className="sr-only">More actions</span>
           </Button>
@@ -566,6 +587,9 @@ function NativeWindowActions({
         <DropdownMenuContent align="end">
           <DropdownMenuLabel>s-gw</DropdownMenuLabel>
           <DropdownMenuItem onSelect={() => setView("settings")}>Settings</DropdownMenuItem>
+          <DropdownMenuItem onSelect={onToggleDemoData} data-demo-data-toggle>
+            {demoEnabled ? "Remove demo data" : "Demo data"}
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setTheme(nextTheme)}>
             Use {nextTheme} theme
           </DropdownMenuItem>
@@ -979,7 +1003,12 @@ function CredentialHandlesPanel({
         <TableBody>
           {state.credentials.slice(0, 5).map((item) => (
             <TableRow key={item.provider} className="cursor-pointer" onClick={() => setView("credentials")}>
-              <TableCell className="font-medium"><ProviderIdentity provider={item.provider} /></TableCell>
+              <TableCell className="font-medium">
+                <span className="flex items-center gap-2">
+                  {item.demo ? item.label : <ProviderIdentity provider={item.provider} />}
+                  {item.demo ? <DemoBadge /> : null}
+                </span>
+              </TableCell>
               <TableCell className="text-right">{item.secrets}</TableCell>
               <TableCell><SeverityBadge severity={item.severity} /></TableCell>
             </TableRow>
@@ -1122,6 +1151,7 @@ function RecentActivityPanel({ state, setView }: { state: ConsoleState; setView:
                 <span className="sgw-event-source-cell">
                   <AgentIcon name={flow.sourceLabel} className="h-6 w-6" />
                   <span>{flow.sourceLabel}</span>
+                  {event.demo ? <DemoBadge /> : null}
                 </span>
                 <span className="sgw-event-type-pill">{recentEventKind(event.type)}</span>
                 <EventStatusLabel tone={flow.tone} status={flow.status} />
@@ -1165,6 +1195,7 @@ function ApprovalsView({ state, setApproval, search }: { state: ConsoleState; se
                   <span className="flex items-center gap-2">
                     <AgentIcon name={request.agentName} className="h-7 w-7" />
                     <span>{request.agentName || "Agent"}</span>
+                    {request.demo ? <DemoBadge /> : null}
                   </span>
                 </TableCell>
                 <TableCell>{commandName(request)}</TableCell>
@@ -1283,7 +1314,12 @@ function CredentialsView({
                   data-credential-row
                   onClick={() => setCredential(handle)}
                 >
-                  <TableCell className="truncate font-medium" data-credential-column="name" data-credential-name title={handle.name}>{handle.name}</TableCell>
+                  <TableCell className="font-medium" data-credential-column="name" data-credential-name title={handle.name}>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="truncate">{handle.name}</span>
+                      {handle.demo ? <DemoBadge /> : null}
+                    </span>
+                  </TableCell>
                   <TableCell data-credential-column="provider"><ProviderIdentity provider={handle.provider} backend={handle.backend} /></TableCell>
                   <TableCell className="text-xs sm:text-sm" data-credential-column="backend">{credentialBackendLabel(handle.backend)}</TableCell>
                   <TableCell className="truncate font-mono text-xs" data-credential-column="handle" title={handle.handle}>{shortHandle(handle.handle)}</TableCell>
@@ -1467,6 +1503,7 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
                 <TableCell className="font-medium">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="truncate">{rule.name}</span>
+                    {rule.demo ? <DemoBadge /> : null}
                     {shadowedBy.get(rule.id) ? (
                       <Badge variant="secondary" className="shrink-0 text-amber-700 dark:text-amber-300" title={`Covered by ${shadowedBy.get(rule.id)?.name}`}>
                         Shadowed
@@ -1482,6 +1519,7 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
                     size="icon-sm"
                     aria-label={`Edit ${rule.name}`}
                     onClick={() => setEditing(rule)}
+                    disabled={rule.demo}
                     data-policy-edit={rule.id}
                   >
                     <Pencil className="h-4 w-4" />
@@ -1491,6 +1529,7 @@ function PoliciesView({ state, onDone, search }: { state: ConsoleState; onDone: 
                     size="icon-sm"
                     aria-label={`Delete ${rule.name}`}
                     onClick={() => setDeleting(rule)}
+                    disabled={rule.demo}
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -1540,7 +1579,7 @@ function PolicyStatusControl({
   const enabled = rule.enabled;
 
   async function togglePolicy() {
-    if (busy) return;
+    if (busy || rule.demo) return;
     const nextEnabled = !enabled;
     setBusy(true);
     try {
@@ -1560,12 +1599,12 @@ function PolicyStatusControl({
       role="switch"
       aria-checked={enabled}
       aria-label={`${enabled ? "Disable" : "Enable"} ${rule.name}`}
-      disabled={busy}
+      disabled={busy || rule.demo}
       onClick={() => void togglePolicy()}
       data-policy-status
       className={cn(
         "inline-flex min-w-[92px] items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium outline-none transition-colors",
-        "hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-wait disabled:opacity-65",
+        "hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-default disabled:opacity-65",
         enabled ? "text-emerald-700 dark:text-emerald-300" : "text-muted-foreground hover:text-foreground"
       )}
     >
@@ -2239,7 +2278,12 @@ function renderEventColumn(row: EventLogRow, column: EventColumnId, mode: "activ
       </span>
     );
   }
-  if (column === "eventType") return <span className="sgw-event-type-pill">{row.flow.eventType}</span>;
+  if (column === "eventType") return (
+    <span className="flex items-center gap-1.5">
+      <span className="sgw-event-type-pill">{row.flow.eventType}</span>
+      {row.event.demo ? <DemoBadge /> : null}
+    </span>
+  );
   if (column === "status") return <EventStatusLabel tone={row.flow.tone} status={row.flow.status} />;
   return eventColumnValue(row, column);
 }
@@ -2751,6 +2795,10 @@ function MiniMetric({ label, value }: { label: string; value: number }) {
   );
 }
 
+function DemoBadge() {
+  return <Badge variant="outline" className="h-4 px-1 text-[9px] font-medium uppercase tracking-wide">Demo</Badge>;
+}
+
 function ApprovalSheet({
   request,
   state,
@@ -2826,6 +2874,7 @@ function ApprovalSheet({
           <SheetTitle className="flex items-center gap-2">
             <AgentIcon name={request?.agentName} className="h-9 w-9" />
             Approval needed
+            {request?.demo ? <DemoBadge /> : null}
           </SheetTitle>
           <SheetDescription>{request?.agentName || "Agent"} wants to use a local credential handle.</SheetDescription>
         </SheetHeader>
@@ -2851,7 +2900,12 @@ function ApprovalSheet({
             <Textarea placeholder="Optional note for this decision..." />
           </div>
         ) : null}
-        <SheetFooter>
+        {request?.demo ? (
+          <div className="mx-4 rounded-md border border-primary/25 bg-primary/5 p-3 text-sm text-muted-foreground">
+            Demo requests are read-only and cannot be approved, denied, or executed.
+          </div>
+        ) : null}
+        {!request?.demo ? <SheetFooter>
           <Button disabled={busy} onClick={() => approve({ mode: "per-transaction", agentScope: "same-agent" })} data-approve={request?.id}>
             {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Approve once
@@ -2876,7 +2930,7 @@ function ApprovalSheet({
             </PopoverContent>
           </Popover>
           <Button disabled={busy} variant="destructive" onClick={deny}>Deny</Button>
-        </SheetFooter>
+        </SheetFooter> : null}
       </SheetContent>
     </Sheet>
   );
@@ -2897,7 +2951,10 @@ function CredentialSheet({
       <Sheet open={Boolean(credential)} onOpenChange={onOpenChange}>
         <SheetContent className="w-[min(560px,calc(100vw-24px))] sm:max-w-none">
           <SheetHeader>
-            <SheetTitle>{credential?.name || "Credential"}</SheetTitle>
+            <SheetTitle className="flex items-center gap-2">
+              {credential?.name || "Credential"}
+              {credential?.demo ? <DemoBadge /> : null}
+            </SheetTitle>
             <SheetDescription>{credential ? shortHandle(credential.handle) : ""}</SheetDescription>
           </SheetHeader>
           {credential ? (
@@ -2913,10 +2970,14 @@ function CredentialSheet({
                   ["Updated", relativeTime(credential.updatedAt)]
                 ]}
               />
-              <Button variant="destructive" onClick={() => setConfirm(true)}>
+              {credential.demo ? (
+                <div className="rounded-md border border-primary/25 bg-primary/5 p-3 text-sm text-muted-foreground">
+                  Demo credentials are display-only and cannot be used or deleted.
+                </div>
+              ) : <Button variant="destructive" onClick={() => setConfirm(true)}>
                 <Trash2 className="mr-2 h-4 w-4" />
                 Delete credential
-              </Button>
+              </Button>}
             </div>
           ) : null}
         </SheetContent>
@@ -3475,7 +3536,9 @@ function FlowRowsTable({ rows }: { rows: UsageFlowRow[] }) {
       <TableBody>
         {rows.map((row) => (
           <TableRow key={`${row.agentId}-${row.authTypeId}-${row.targetTypeId}-${row.lastSeen}`}>
-            <TableCell>{row.agent}</TableCell>
+            <TableCell>
+              <span className="flex items-center gap-2">{row.agent}{row.demo ? <DemoBadge /> : null}</span>
+            </TableCell>
             <TableCell>{row.authType}</TableCell>
             <TableCell>{row.targetType}</TableCell>
             <TableCell className="text-right">{row.count}</TableCell>

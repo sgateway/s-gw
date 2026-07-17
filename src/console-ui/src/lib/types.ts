@@ -71,6 +71,7 @@ export interface SecretPolicy {
 }
 
 export interface HandleSummary {
+  demo?: boolean;
   handle: string;
   name: string;
   type: string;
@@ -87,6 +88,7 @@ export interface HandleSummary {
 }
 
 export interface ProviderSummary {
+  demo?: boolean;
   provider: string;
   label: string;
   prefix: string;
@@ -96,6 +98,7 @@ export interface ProviderSummary {
 }
 
 export interface RequestRecord {
+  demo?: boolean;
   id: string;
   handle: string;
   reason: string;
@@ -122,6 +125,7 @@ export interface RequestRecord {
 }
 
 export interface AuditEvent {
+  demo?: boolean;
   id?: string;
   ts: string;
   type: string;
@@ -219,6 +223,7 @@ export interface ApprovalGrantRecord {
 }
 
 export interface ApprovalPolicyRuleRecord {
+  demo?: boolean;
   id: string;
   name: string;
   enabled: boolean;
@@ -245,6 +250,7 @@ export interface ApprovalPolicyRuleRecord {
 }
 
 export interface UsageFlowNode {
+  demo?: boolean;
   id: string;
   kind: "agent" | "auth" | "target";
   label: string;
@@ -253,12 +259,14 @@ export interface UsageFlowNode {
 }
 
 export interface UsageFlowLink {
+  demo?: boolean;
   source: string;
   target: string;
   value: number;
 }
 
 export interface UsageFlowRow {
+  demo?: boolean;
   agentId: string;
   agent: string;
   authTypeId: string;
@@ -280,6 +288,7 @@ export interface UsageFlowRow {
 }
 
 export interface UsageFlowEntry {
+  demo?: boolean;
   requestId: string;
   agentId: string;
   agent: string;
@@ -296,6 +305,7 @@ export interface UsageFlowEntry {
 }
 
 export interface UsageFlow {
+  demo?: boolean;
   generatedAt: string;
   totalRequests: number;
   nodes: UsageFlowNode[];
