@@ -2,7 +2,7 @@
 
 Notable changes to s-gw are documented here. The project follows [Semantic Versioning](https://semver.org/) once public releases begin.
 
-## 0.1.18-unsigned.1 - 2026-07-16
+## 0.1.18-unsigned.2 - 2026-07-17
 
 ### Added
 
@@ -11,6 +11,7 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ### Fixed
 
+- Concurrent credential clients now wait up to 30 seconds for a durable store write to finish, rather than failing while another verified control-plane update is still being committed.
 - The macOS package updater now accepts only the exact scoped `s-gw-<version>.tgz` asset and rejects the legacy compatibility bridge before download or installation.
 - Native update banners and Settings now report the active installed CLI/runtime version instead of a stale development app bundle version.
 - Valid 0.1.12 unsealed control manifests migrate to the current sealed recovery format only when the live ledger and a trusted legacy checkpoint both match the legacy fingerprint. Credentials, policies, requests, and audit history remain intact, while unexplained mismatches continue to fail closed.
