@@ -214,6 +214,9 @@ describe("platform installers", () => {
     expect(assetJob).toContain("gh release create \"$RELEASE_TAG\" --draft --verify-tag --generate-notes");
     expect(assetJob).toContain('select(.state == "uploaded")');
     expect(assetJob).toContain("first_tgz");
+    expect(assetJob).toContain('gh release view "$RELEASE_TAG" --json databaseId');
+    expect(assetJob).toContain("releases/${release_id}");
+    expect(assetJob).not.toContain("releases/tags/${RELEASE_TAG}");
     expect(assetJob).not.toContain("needs: publish");
     expect(builder).toContain("buildLegacyBridge");
     expect(builder).toContain("0-s-gw-legacy-${version}.tgz");

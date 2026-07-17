@@ -222,10 +222,13 @@ jobs:
             gh release upload "$RELEASE_TAG" "$asset"
           done
 
-          first_tgz="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '[.assets[] | select(.name | endswith(".tgz"))][0].name')"
+          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')"
+          test -n "$release_id"
+
+          first_tgz="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '[.assets[] | select(.name | endswith(".tgz"))][0].name')"
           test "$first_tgz" = "$(basename "$bridge")"
 
-          uploaded="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.assets[] | select(.state == "uploaded") | .name')"
+          uploaded="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '.assets[] | select(.state == "uploaded") | .name')"
           for asset in dist/installers/*; do
             name="$(basename "$asset")"
             printf '%s\n' "$uploaded" | grep -Fqx "$name"
