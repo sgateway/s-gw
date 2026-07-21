@@ -270,14 +270,14 @@ describe("platform installers", () => {
     expect(npmJob).toContain('test ! -e "$package_root/dist/native/s-gw-core"');
     expect(registryJob).toContain("needs: publish-npm");
     expect(registryJob).toContain("inputs.publish_release");
-    expect(registryJob).toContain("!inputs.publish_npm_only");
+    expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
     expect(registryJob).not.toContain("inputs.macos_distribution");
     expect(registryJob).toContain("runs-on: ubuntu-latest");
     expect(registryJob).toContain("mcp-publisher_linux_amd64.tar.gz");
     expect(registryJob).not.toContain("npm publish --access public");
   });
 
-  it("supports an npm-only recovery without rebuilding or changing a GitHub release", async () => {
+  it("repairs npm and Registry publication without rebuilding or changing a GitHub release", async () => {
     const workflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
     const assetJob = workflow.slice(
       workflow.indexOf("  release-assets:"),
@@ -301,7 +301,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain("always()");
     expect(npmJob).toContain("inputs.publish_npm_only ||");
     expect(releaseJob).toContain("!inputs.publish_npm_only");
-    expect(registryJob).toContain("!inputs.publish_npm_only");
+    expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
   });
 
   it("makes the registry package the primary public installation", async () => {

@@ -72,6 +72,7 @@ export interface AgentIntegrationOptions {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   mcpServerPath?: string;
+  lockTimeoutMs?: number;
 }
 
 type JsonContainer = "mcpServers" | "mcp" | "servers";
@@ -461,10 +462,14 @@ function withAgentIntegrationLock<T>(options: AgentIntegrationOptions, body: () 
   };
   const markerName = agentLockMarkerName(owner.token);
   const started = Date.now();
+  const timeoutMs = options.lockTimeoutMs ?? agentLockTimeoutMs;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error("Agent integration lock timeout must be a non-negative number.");
+  }
   const waiter = new Int32Array(new SharedArrayBuffer(4));
 
   while (!publishAgentIntegrationLock(lockPath, markerName, owner)) {
-    if (Date.now() - started >= agentLockTimeoutMs) {
+    if (Date.now() - started >= timeoutMs) {
       throw new Error(`Timed out waiting for the agent integration lock at ${lockPath}. Another install or uninstall may still be running.`);
     }
     if (removeAbandonedAgentLock(lockPath)) continue;

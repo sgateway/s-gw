@@ -7,7 +7,12 @@ struct MainWindow: View {
   var body: some View {
     @Bindable var state = appState
     ZStack {
-      if appState.daemonRunning, let url = appState.consoleURL() {
+      if !appState.initialStatusResolved {
+        InitialStatusView()
+      } else if appState.status == nil {
+        StatusUnavailableView()
+          .environment(appState)
+      } else if appState.daemonRunning, let url = appState.consoleURL() {
         ConsoleWebAppView(url: url)
           .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
@@ -105,6 +110,41 @@ struct MainWindow: View {
     .background(SGWTheme.raised, in: RoundedRectangle(cornerRadius: 8))
     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(tint.opacity(0.5)))
     .padding(.horizontal)
+  }
+}
+
+private struct InitialStatusView: View {
+  var body: some View {
+    VStack(spacing: 12) {
+      ProgressView()
+      Text("Checking the local runtime")
+        .font(.headline)
+      Text("s-gw is reading status before it updates background services or agent connections.")
+        .foregroundStyle(.secondary)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(SGWTheme.surface)
+  }
+}
+
+private struct StatusUnavailableView: View {
+  @Environment(AppState.self) private var appState
+
+  var body: some View {
+    VStack(spacing: 12) {
+      Image(systemName: "exclamationmark.triangle")
+        .font(.title)
+        .foregroundStyle(SGWTheme.orange)
+      Text("Status is unavailable")
+        .font(.headline)
+      Text("s-gw could not inspect the local runtime. No component is being reported as missing.")
+        .foregroundStyle(.secondary)
+      Button("Try Again") {
+        Task { await appState.refresh() }
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(SGWTheme.surface)
   }
 }
 

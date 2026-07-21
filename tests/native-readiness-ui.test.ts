@@ -47,6 +47,10 @@ describe("native readiness UI contract", () => {
 
     expect(mainWindow).toContain("if appState.daemonRunning, let url = appState.consoleURL()");
     expect(mainWindow).toContain("SetupView()");
+    expect(mainWindow).toContain("if !appState.initialStatusResolved");
+    expect(mainWindow).toContain("Checking the local runtime");
+    expect(mainWindow).toContain("Status is unavailable");
+    expect(mainWindow).not.toContain("status == nil ? \"s-gw CLI not found\"");
     expect(consoleWebApp).toContain("webView.navigationDelegate = context.coordinator");
     expect(consoleWebApp).toContain("didFailProvisionalNavigation");
     expect(consoleWebApp).toContain("try await Task.sleep(for: .milliseconds(500))");

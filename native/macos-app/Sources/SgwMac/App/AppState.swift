@@ -15,6 +15,7 @@ final class AppState {
   var selectedPanel: PanelID = .overview
   var commandPalettePresented = false
   var status: StatusPayload?
+  var initialStatusResolved = false
   var handles: [HandleSummary] = []
   var requests: [RequestRecord] = []
   var audit: [AuditEvent] = []
@@ -143,12 +144,13 @@ final class AppState {
     return .healthy
   }
 
-  func start() {
+  func start(refreshBundledRuntime: Bool = UpdateChecker.usesSelfContainedRuntime) {
     if refreshTask != nil {
       return
     }
     Task {
-      await refreshBundledRuntimeAfterReplacement()
+      await refreshInitialStatus()
+      await refreshBundledRuntimeAfterReplacement(enabled: refreshBundledRuntime)
       await refresh()
     }
     Task {
@@ -171,12 +173,24 @@ final class AppState {
     await refresh(showSpinner: false)
   }
 
+  func refreshInitialStatus() async {
+    defer { initialStatusResolved = true }
+    do {
+      status = try await cli.runJSON(StatusPayload.self, arguments: ["status"])
+      restoreAvailableUpdate()
+      lastError = nil
+    } catch {
+      lastError = error.localizedDescription
+    }
+  }
+
   func refresh(showSpinner: Bool = true) async {
     if showSpinner {
       isRefreshing = true
     }
     defer {
       isRefreshing = false
+      initialStatusResolved = true
       lastUpdated = Date()
     }
 
@@ -779,8 +793,8 @@ final class AppState {
     }
   }
 
-  private func refreshBundledRuntimeAfterReplacement() async {
-    guard UpdateChecker.usesSelfContainedRuntime else {
+  private func refreshBundledRuntimeAfterReplacement(enabled: Bool) async {
+    guard enabled else {
       return
     }
 
@@ -797,7 +811,7 @@ final class AppState {
       return
     }
 
-    let result = await cli.run(arguments: ["app", "refresh-services"])
+    let result = await cli.run(arguments: ["app", "refresh-services", "--no-agents"])
     guard result.succeeded else {
       operationMessage = result.output.isEmpty
         ? "Move s-gw.app to Applications before completing setup."
@@ -807,12 +821,23 @@ final class AppState {
 
     defaults.set(version, forKey: UpdateChecker.bundledRuntimeVersionDefaultsKey)
     defaults.set(appPath, forKey: UpdateChecker.bundledRuntimePathDefaultsKey)
+    let serviceMessage: String
     if previousVersion == nil {
-      operationMessage = "Existing background services and agent connections now use this bundled s-gw runtime."
+      serviceMessage = "Existing background services now use this bundled s-gw runtime."
     } else if previousVersion != version {
-      operationMessage = "Background services and agent connections now use s-gw \(version)."
+      serviceMessage = "Background services now use s-gw \(version)."
     } else {
-      operationMessage = "Background services and agent connections now use s-gw from its new app location."
+      serviceMessage = "Background services now use s-gw from its new app location."
+    }
+
+    let agents = await cli.run(arguments: ["app", "refresh-agents", "--lock-timeout-ms", "5000"])
+    if agents.succeeded {
+      operationMessage = "\(serviceMessage) Managed agent connections were refreshed."
+    } else {
+      let detail = agents.output.trimmingCharacters(in: .whitespacesAndNewlines)
+      operationMessage = detail.isEmpty
+        ? "\(serviceMessage) Agent connections could not be refreshed yet."
+        : "\(serviceMessage) Agent connections were not changed: \(detail)"
     }
   }
 

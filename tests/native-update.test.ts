@@ -99,7 +99,9 @@ describe("native macOS update lifecycle", () => {
 
     expect(state).toContain("guard release.hasVerifiedAsset else");
     expect(state).toContain("if release.isMacInstaller");
-    expect(state).toContain('cli.run(arguments: ["app", "refresh-services"])');
+    expect(state).toContain("await refreshInitialStatus()");
+    expect(state).toContain('cli.run(arguments: ["app", "refresh-services", "--no-agents"])');
+    expect(state).toContain('cli.run(arguments: ["app", "refresh-agents", "--lock-timeout-ms", "5000"])');
     expect(state).toContain("bundledRuntimeVersionDefaultsKey");
     expect(state).toContain("bundledRuntimePathDefaultsKey");
     expect(state).toContain("needsBundledRuntimeRefresh");

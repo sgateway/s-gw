@@ -113,6 +113,7 @@ fileprivate struct Scratch {
   let fakeCli: URL
   let invocationLog: URL
   let gate: URL  // FIFO the fake CLI reads from to stay "in flight"
+  let migrationGate: URL
 
   init() {
     let base = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -122,17 +123,19 @@ fileprivate struct Scratch {
     fakeCli = base.appendingPathComponent("fake-s-gw.sh")
     invocationLog = base.appendingPathComponent("invocations.log")
     gate = base.appendingPathComponent("gate.fifo")
+    migrationGate = base.appendingPathComponent("migration-gate.fifo")
 
     // Named pipe: the fake CLI blocks reading from it for approve/deny, so the
     // decision stays in flight until the test writes a release token.
     mkfifo(gate.path, 0o600)
+    mkfifo(migrationGate.path, 0o600)
 
     // The fake CLI logs every invocation (one line per call, by verb) and, for
     // approve/deny, blocks on the FIFO before exiting 0. Read verbs return at once.
     let script = """
     #!/bin/zsh
     verb="$1"
-    print -- "$verb" >> "\(invocationLog.path)"
+    print -- "$*" >> "\(invocationLog.path)"
     case "$verb" in
       approve|deny)
         # Block until the test releases us, so the decision is genuinely in flight.
@@ -145,6 +148,31 @@ fileprivate struct Scratch {
         exit 0
         ;;
       silent)
+        exit 0
+        ;;
+      status)
+        print -- '{"version":"0.1.18","packageRoot":"/tmp/sgw","ready":true,"readiness":{"ok":true,"summary":"ready","blockers":[]},"cliPath":{"path":"/tmp/cli.js","exists":true},"mcpPath":{"path":"/tmp/mcp.js","exists":true},"keychainHelperPath":{"path":"/tmp/helper","exists":true},"menuBarAppPath":{"path":"/tmp/mb.app","exists":true},"menuBarBinaryPath":{"path":"/tmp/mb","exists":true},"storePath":"/tmp/store.json","consoleUrl":"http://127.0.0.1:8718/","unlock":{"activeSource":"env"},"launchAgents":{"console":{"label":"c","plistPath":"/tmp/c.plist","installed":true,"loaded":true},"menuBar":{"label":"m","plistPath":"/tmp/m.plist","installed":true,"loaded":true}}}'
+        exit 0
+        ;;
+      app)
+        if [[ "$2" == "refresh-services" ]]; then
+          read _line < "\(migrationGate.path)"
+          print -- '{"ok":true,"services":{}}'
+          exit 0
+        fi
+        print -- '{"ok":true,"agents":[]}'
+        exit 0
+        ;;
+      secret|requests|agent)
+        print -- '[]'
+        exit 0
+        ;;
+      approval)
+        if [[ "$2" == "settings" ]]; then
+          print -- '{"mode":"per-transaction","durationMs":900000}'
+        else
+          print -- '[]'
+        fi
         exit 0
         ;;
       *)
@@ -169,6 +197,10 @@ fileprivate struct Scratch {
   }
 
   func verbs() -> [String] {
+    commands().compactMap { $0.split(separator: " ").first.map(String.init) }
+  }
+
+  func commands() -> [String] {
     guard let text = try? String(contentsOf: invocationLog, encoding: .utf8) else { return [] }
     return text.split(whereSeparator: \.isNewline).map { String($0) }
   }
@@ -176,6 +208,13 @@ fileprivate struct Scratch {
   func releaseOneInFlight() {
     // Open for writing unblocks the fake CLI's `read`.
     if let handle = FileHandle(forWritingAtPath: gate.path) {
+      handle.write(Data("go\n".utf8))
+      try? handle.close()
+    }
+  }
+
+  func releaseRuntimeMigration() {
+    if let handle = FileHandle(forWritingAtPath: migrationGate.path) {
       handle.write(Data("go\n".utf8))
       try? handle.close()
     }
@@ -223,6 +262,7 @@ struct AppStateGuardTests {
     // Point the real CLIRunner at the fake CLI via the documented override key.
     UserDefaults.standard.set(scratch.fakeCli.path, forKey: CLIRunner.binaryOverrideKey)
 
+    await runStartupOrderingTest(scratch)
     await runInFlightGuardTest(scratch)
     await runGuardReleaseTest(scratch)
     await runReadinessDerivationTest()
@@ -240,6 +280,27 @@ struct AppStateGuardTests {
     runChecksumManifestTest()
 
     print("ALL_NATIVE_TESTS_OK")
+  }
+
+  @MainActor
+  fileprivate static func runStartupOrderingTest(_ scratch: Scratch) async {
+    let defaults = isolatedDefaults("startup-ordering")
+    let app = AppState(updater: FakeUpdateChecker([.release(nil)]), defaults: defaults)
+
+    app.start(refreshBundledRuntime: true)
+    let statusFirst = await waitUntil(3.0) {
+      app.initialStatusResolved && app.status != nil &&
+        scratch.commands().contains("app refresh-services --no-agents")
+    }
+    check(statusFirst, "status must render before bundled runtime migration can finish")
+    check(app.daemonRunning, "the healthy console should be visible while migration is still waiting")
+
+    scratch.releaseRuntimeMigration()
+    let agentsSeparated = await waitUntil(3.0) {
+      scratch.commands().contains("app refresh-agents --lock-timeout-ms 5000")
+    }
+    check(agentsSeparated, "managed agent rewrites must use their own bounded migration step")
+    app.stop()
   }
 
   // Test 1: a double-fire while a decision is in flight reaches the CLI exactly once.
