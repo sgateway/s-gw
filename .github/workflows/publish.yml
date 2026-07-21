@@ -46,13 +46,13 @@ jobs:
       SGW_REQUIRE_RUST_CORE: "1"
       SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           ref: ${{ inputs.release_tag }}
 
       - name: Check out private Rust core
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: barryqy/s-gw-rust-core
           token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
@@ -260,13 +260,13 @@ jobs:
       SGW_REQUIRE_RUST_CORE: "1"
       SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           ref: ${{ inputs.release_tag }}
 
       - name: Check out private Rust core
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: barryqy/s-gw-rust-core
           token: ${{ secrets.SGW_CORE_REPO_TOKEN }}
@@ -385,7 +385,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           ref: ${{ inputs.release_tag }}
