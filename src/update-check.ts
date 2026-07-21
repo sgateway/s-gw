@@ -279,11 +279,11 @@ async function atomReleaseAssets(
 
 function decodeXml(value: string): string {
   return value
-    .replaceAll("&amp;", "&")
     .replaceAll("&quot;", '"')
     .replaceAll("&apos;", "'")
     .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">");
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
 }
 
 function emptyResult(currentVersion: string): UpdateCheckResult {

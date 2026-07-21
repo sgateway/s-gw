@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants,
   copyFileSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -531,17 +533,13 @@ function inspectAgentIntegrationLock(lockPath: string): AgentIntegrationLockStat
 
   const markerName = entries[0];
   const markerPath = path.join(lockPath, markerName);
-  const markerInfo = lstatSync(markerPath);
-  if (markerInfo.isSymbolicLink() || !markerInfo.isFile()) {
-    throw new Error(`${markerPath} is not a regular file. s-gw refuses to remove it.`);
-  }
-
-  const parsed = readAgentLockOwner(readFileSync(markerPath, "utf8"));
+  const marker = readRegularFileSnapshot(markerPath);
+  const parsed = readAgentLockOwner(marker.content.toString("utf8"));
   const owner = parsed && markerName === agentLockMarkerName(parsed.token) ? parsed : undefined;
   return {
     markerPath,
     owner,
-    modifiedAt: Math.max(lockInfo.mtimeMs, markerInfo.mtimeMs)
+    modifiedAt: Math.max(lockInfo.mtimeMs, marker.modifiedAt)
   };
 }
 
@@ -1484,13 +1482,10 @@ function writeManifest(manifestPath: string, manifest: AgentManifest): void {
 }
 
 function readTextIfPresent(filePath: string): { value?: string; error?: string } {
-  if (!existsSync(filePath)) return {};
   try {
-    const info = lstatSync(filePath);
-    if (info.isSymbolicLink()) return { error: `${filePath} is a symbolic link. s-gw refuses to modify it automatically.` };
-    if (!info.isFile()) return { error: `${filePath} is not a regular file. s-gw refuses to modify it automatically.` };
-    return { value: readFileSync(filePath, "utf8") };
+    return { value: readRegularFileSnapshot(filePath).content.toString("utf8") };
   } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return {};
     return { error: `Cannot read ${filePath}: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
@@ -1527,21 +1522,52 @@ function atomicWrite(filePath: string, content: string | Buffer, mode: number): 
 }
 
 function currentMode(filePath: string, fallback: number): number {
-  if (!existsSync(filePath)) return fallback;
-  return lstatSync(filePath).mode & 0o777;
+  try {
+    return readRegularFileSnapshot(filePath).mode;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return fallback;
+    throw error;
+  }
 }
 
 function rememberFile(
   filePath: string,
   rollbacks: Array<{ path: string; existed: boolean; content?: Buffer; mode?: number }>
 ): void {
-  if (!existsSync(filePath)) {
+  try {
+    const snapshot = readRegularFileSnapshot(filePath);
+    rollbacks.push({ path: filePath, existed: true, content: snapshot.content, mode: snapshot.mode });
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") throw error;
     rollbacks.push({ path: filePath, existed: false });
-    return;
   }
-  const info = lstatSync(filePath);
-  if (info.isSymbolicLink() || !info.isFile()) throw new Error(`${filePath} is not a regular file. s-gw left it unchanged.`);
-  rollbacks.push({ path: filePath, existed: true, content: readFileSync(filePath), mode: info.mode & 0o777 });
+}
+
+function readRegularFileSnapshot(filePath: string): { content: Buffer; mode: number; modifiedAt: number } {
+  let fd: number | undefined;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const before = fstatSync(fd);
+    const current = lstatSync(filePath);
+    if (!before.isFile() || current.isSymbolicLink() || !current.isFile() ||
+        before.dev !== current.dev || before.ino !== current.ino) {
+      throw new Error(`${filePath} is not a stable regular file. s-gw left it unchanged.`);
+    }
+
+    const content = readFileSync(fd);
+    const after = fstatSync(fd);
+    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new Error(`${filePath} changed while s-gw was reading it. s-gw left it unchanged.`);
+    }
+    return { content, mode: before.mode & 0o777, modifiedAt: before.mtimeMs };
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ELOOP") {
+      throw new Error(`${filePath} is a symbolic link. s-gw left it unchanged.`);
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function rollbackFiles(rollbacks: Array<{ path: string; existed: boolean; content?: Buffer; mode?: number }>): void {
