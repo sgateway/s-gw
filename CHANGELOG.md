@@ -4,10 +4,19 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.19 - 2026-07-21
+
 ### Changed
 
 - `npm install -g @s-gw/s-gw` is now the primary documented installation path on macOS, Windows, and Linux. The self-contained Apple Silicon DMG remains a desktop alternative.
 - Release automation publishes and verifies the npm package before it makes the GitHub release public, regardless of whether the macOS DMG is notarized. A recovery-only npm publish mode can repair a previously released version without changing its GitHub release.
+- Runtime dependencies and pinned GitHub Actions were refreshed, while Dependabot ignores unsupported TypeScript and Node type-definition major updates.
+
+### Fixed
+
+- The macOS app loads runtime status before first-launch migration and refreshes services separately from bounded agent configuration rewrites, preventing healthy installations from appearing incomplete or blocking the UI.
+- Agent integration and store-lock reads stay pinned to verified regular-file descriptors, EC2 update hosts require an exact AWS domain suffix, and XML update metadata is decoded only once.
+- Installed-app discovery is isolated in tests, and high-contention integration updates no longer fail because an open file's metadata changed during a concurrent operation.
 
 ## 0.1.18 - 2026-07-17
 
