@@ -1183,6 +1183,16 @@ function macApplicationsDirectory(): string {
 }
 
 function findInstalledSelfContainedMacApp(): string | undefined {
+  const override = process.env.SGW_APPLICATIONS_DIR?.trim();
+  if (process.env.SGW_TEST_MODE === "1" && !override) {
+    // Tests must not inherit a developer's real /Applications state.
+    return undefined;
+  }
+  if (override) {
+    const candidate = path.resolve(override, "s-gw.app");
+    return isSelfContainedMacApp(candidate) ? candidate : undefined;
+  }
+
   const candidates = [
     path.join(macApplicationsDirectory(), "s-gw.app"),
     "/Applications/s-gw.app",

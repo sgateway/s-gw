@@ -261,6 +261,10 @@ describe("platform installers", () => {
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("Record local npm package integrity");
     expect(npmJob).toContain("SGW_NPM_PACKAGE_INTEGRITY");
+    expect(npmJob).toContain("SGW_NPM_ALREADY_PUBLISHED=1");
+    expect(npmJob).toContain('if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" != 1 ]');
+    expect(npmJob).toContain("Verify an existing immutable release");
+    expect(npmJob).toContain("npm audit --audit-level=high");
     expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");
@@ -270,14 +274,14 @@ describe("platform installers", () => {
     expect(npmJob).toContain('test ! -e "$package_root/dist/native/s-gw-core"');
     expect(registryJob).toContain("needs: publish-npm");
     expect(registryJob).toContain("inputs.publish_release");
-    expect(registryJob).toContain("!inputs.publish_npm_only");
+    expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
     expect(registryJob).not.toContain("inputs.macos_distribution");
     expect(registryJob).toContain("runs-on: ubuntu-latest");
     expect(registryJob).toContain("mcp-publisher_linux_amd64.tar.gz");
     expect(registryJob).not.toContain("npm publish --access public");
   });
 
-  it("supports an npm-only recovery without rebuilding or changing a GitHub release", async () => {
+  it("repairs npm and Registry publication without rebuilding or changing a GitHub release", async () => {
     const workflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
     const assetJob = workflow.slice(
       workflow.indexOf("  release-assets:"),
@@ -300,8 +304,10 @@ describe("platform installers", () => {
     expect(assetJob).toContain("!inputs.publish_npm_only");
     expect(npmJob).toContain("always()");
     expect(npmJob).toContain("inputs.publish_npm_only ||");
+    expect(npmJob).toContain("if: ${{ inputs.publish_npm_only }}");
+    expect(npmJob).toContain("npm audit --audit-level=high");
     expect(releaseJob).toContain("!inputs.publish_npm_only");
-    expect(registryJob).toContain("!inputs.publish_npm_only");
+    expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
   });
 
   it("makes the registry package the primary public installation", async () => {

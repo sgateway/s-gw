@@ -60,7 +60,7 @@ jobs:
           path: .private/sgw-core
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -274,7 +274,7 @@ jobs:
           path: .private/sgw-core
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -282,7 +282,18 @@ jobs:
 
       - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
       - run: npm ci --ignore-scripts
-      - run: npm run verify
+      - name: Verify release source
+        if: ${{ !inputs.publish_npm_only }}
+        run: npm run verify
+
+      - name: Verify an existing immutable release
+        if: ${{ inputs.publish_npm_only }}
+        run: |
+          npm run build
+          npm run check:rust
+          npm test
+          npm audit --audit-level=high
+          npm run package:dry-run
 
       - name: Verify release version
         run: |
@@ -317,8 +328,8 @@ jobs:
           package_version="$(node -p "require('./package.json').version")"
           published_integrity="$(npm view "@s-gw/s-gw@${package_version}" dist.integrity 2>/dev/null || true)"
           if [ -n "$published_integrity" ]; then
-            test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
-            echo "@s-gw/s-gw@${package_version} is already published with the verified package integrity."
+            echo "SGW_NPM_ALREADY_PUBLISHED=1" >> "$GITHUB_ENV"
+            echo "@s-gw/s-gw@${package_version} is already published; the next step will verify the registry artifact."
             exit 0
           fi
           npm publish --access public --ignore-scripts
@@ -332,14 +343,23 @@ jobs:
           for _ in 1 2 3 4 5 6; do
             rm -rf "$prefix"
             published_integrity="$(npm view "@s-gw/s-gw@${package_version}" dist.integrity 2>/dev/null || true)"
-            if [ "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY" ] && npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
+            integrity_ok=0
+            if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" = 1 ] && [ -n "$published_integrity" ]; then
+              # Rebuilt native bundles are not byte-reproducible, so recovery validates the published artifact itself.
+              integrity_ok=1
+            elif [ "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY" ]; then
+              integrity_ok=1
+            fi
+            if [ "$integrity_ok" = 1 ] && npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
               installed=1
               break
             fi
             sleep 10
           done
           test "$installed" = 1
-          test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
+          if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" != 1 ]; then
+            test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
+          fi
 
           package_root="$prefix/lib/node_modules/@s-gw/s-gw"
           test -x "$prefix/bin/s-gw"
@@ -357,7 +377,7 @@ jobs:
 
   publish-registry:
     needs: publish-npm
-    if: always() && github.repository == 'sgateway/s-gw' && !inputs.publish_npm_only && inputs.publish_release && needs.publish-npm.result == 'success'
+    if: always() && github.repository == 'sgateway/s-gw' && needs.publish-npm.result == 'success' && (inputs.publish_npm_only || inputs.publish_release)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -370,7 +390,7 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.release_tag }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org

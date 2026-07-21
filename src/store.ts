@@ -4382,24 +4382,33 @@ async function inspectStoreLock(lockPath: string): Promise<StoreLockInspection |
   }
 
   const markerPath = path.join(lockPath, entries[0]);
-  let markerInfo: Awaited<ReturnType<typeof lstat>>;
+  let marker;
   try {
-    markerInfo = await lstat(markerPath);
+    marker = await open(markerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return {};
     }
+    if (isNodeError(error) && error.code === "ELOOP") return {};
     throw error;
   }
-  if (markerInfo.isSymbolicLink() || !markerInfo.isFile()) {
-    return {};
-  }
+  try {
+    const markerInfo = await marker.stat();
+    const current = await lstat(markerPath).catch(() => undefined);
+    if (!markerInfo.isFile() || !current || current.isSymbolicLink() || !current.isFile() ||
+        markerInfo.dev !== current.dev || markerInfo.ino !== current.ino) {
+      return {};
+    }
 
-  const state = parseStoreLockState(await readFile(markerPath, "utf8").catch(() => ""));
-  if (!state || entries[0] !== storeLockMarkerName(state.token)) {
-    return {};
+    const raw = await marker.readFile({ encoding: "utf8" }).catch(() => "");
+    const state = parseStoreLockState(raw);
+    if (!state || entries[0] !== storeLockMarkerName(state.token)) {
+      return {};
+    }
+    return { state, markerPath };
+  } finally {
+    await marker.close().catch(() => undefined);
   }
-  return { state, markerPath };
 }
 
 function parseStoreLockState(raw: string): StoreLockState | undefined {

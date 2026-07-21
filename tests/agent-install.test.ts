@@ -72,10 +72,14 @@ function vscodeConfigPath(homeDir: string): string {
 
 function runAgentCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number; stderr: string; stdout: string }> {
   const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+  const isolatedEnv = {
+    ...env,
+    SGW_APPLICATIONS_DIR: env.SGW_APPLICATIONS_DIR || path.join(env.HOME || os.tmpdir(), "Applications")
+  };
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [tsxCli, "src/cli.ts", ...args], {
       cwd: process.cwd(),
-      env,
+      env: isolatedEnv,
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -841,6 +845,7 @@ describe("agent integration installation", () => {
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       SGW_HOME: path.join(homeDir, ".s-gw"),
       SGW_RECOVERY_HOME: path.join(homeDir, ".s-gw-recovery"),
+      SGW_APPLICATIONS_DIR: path.join(homeDir, "Applications"),
       SGW_DISABLE_UPDATE_CHECK: "1"
     };
 
@@ -970,6 +975,21 @@ describe("agent integration installation", () => {
       expect(existsSync(staleCandidate)).toBe(true);
     }
   }, 45_000);
+
+  it("honors a short lock timeout for background agent refresh", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    const lockPath = path.join(homeDir, ".s-gw-agent-integrations.lock");
+    mkdirSync(lockPath, { mode: 0o700 });
+    writeFileSync(path.join(lockPath, "owner-active.json"), "active owner metadata", { mode: 0o600 });
+
+    const started = Date.now();
+    expect(() => refreshManagedAgentIntegrations({
+      ...opts(homeDir, binDir, ["codex"]),
+      lockTimeoutMs: 50
+    })).toThrow(/Timed out waiting for the agent integration lock/);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
 
   it("setup connects detected agents unless --no-agents is set", () => {
     const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");

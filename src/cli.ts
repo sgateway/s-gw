@@ -2046,9 +2046,21 @@ async function handleAppCommand(
       throw new Error("app refresh-services is only available on macOS.");
     }
     const services = await refreshMacRuntimeServices();
-    const agents = refreshManagedAgentIntegrations();
+    const agents = hasFlag(flags, "no-agents") ? [] : refreshManagedAgentIntegrations();
     const ok = agents.every((agent) => agent.state !== "conflict");
     printJson({ ok, services, agents });
+    if (!ok) process.exitCode = 1;
+    return;
+  }
+
+  if (action === "refresh-agents") {
+    if (process.platform !== "darwin") {
+      throw new Error("app refresh-agents is only available on macOS.");
+    }
+    const lockTimeoutMs = numericFlag(flags, "lock-timeout-ms", 35_000);
+    const agents = refreshManagedAgentIntegrations({ lockTimeoutMs });
+    const ok = agents.every((agent) => agent.state !== "conflict");
+    printJson({ ok, agents });
     if (!ok) process.exitCode = 1;
     return;
   }
@@ -2073,7 +2085,7 @@ async function handleAppCommand(
     return;
   }
 
-  throw new Error("app requires app-path, install, open, or refresh-services.");
+  throw new Error("app requires app-path, install, open, refresh-services, or refresh-agents.");
 }
 
 async function handleGuardCommand(
@@ -2197,7 +2209,8 @@ Commands:
   s-gw app app-path
   s-gw app install
   s-gw app open [--port 8718] [--console-url URL]
-  s-gw app refresh-services
+  s-gw app refresh-services [--no-agents]
+  s-gw app refresh-agents [--lock-timeout-ms 35000]
   s-gw guard status
   s-gw guard run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]

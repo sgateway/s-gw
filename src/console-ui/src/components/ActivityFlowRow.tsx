@@ -323,7 +323,8 @@ function targetNode(
     const context = activityText(event, request, handle);
     const isEC2 = context.includes("ec2")
       || context.includes("aws")
-      || host.includes("amazonaws.com");
+      || host === "amazonaws.com"
+      || host.endsWith(".amazonaws.com");
     return {
       label: host,
       detail: isEC2 ? "Amazon EC2" : "Remote host",

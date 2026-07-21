@@ -119,6 +119,29 @@ describe("release update checks", () => {
     ]);
   });
 
+  it("decodes Atom entities once", async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-atom-entities-"));
+    const checker = new ReleaseChecker({
+      cachePath: path.join(tmpDir, "update.json"),
+      currentVersion: "0.1.0",
+      endpoint: "https://api.github.test/releases",
+      feedEndpoint: "https://github.test/releases.atom",
+      enabled: true,
+      fetcher: async (input) => {
+        const url = String(input);
+        if (url.endsWith(".atom")) {
+          return new Response(`<feed><entry><id>tag:github.com,2008:Repository/1/v0.1.2</id><updated>2026-07-11T12:00:00Z</updated><link rel="alternate" href="https://github.com/sgateway/s-gw/releases/tag/v0.1.2?label=&amp;lt;safe&amp;gt;"/></entry></feed>`);
+        }
+        if (url.includes("/releases/download/")) return new Response(null, { status: 200 });
+        return new Response("rate limited", { status: 403 });
+      }
+    });
+
+    const result = await checker.check({ force: true });
+    expect(result.releaseUrl).toContain("label=&lt;safe&gt;");
+    expect(result.releaseUrl).not.toContain("label=<safe>");
+  });
+
   it("compares tagged release versions numerically", () => {
     expect(isNewerVersion("v0.10.0", "0.9.9")).toBe(true);
     expect(isNewerVersion("v0.1.1-preview.1", "0.1.0")).toBe(true);

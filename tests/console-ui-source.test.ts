@@ -368,6 +368,8 @@ describe("React console source contracts", () => {
     expect(activity).toContain("new Map(state.requests.map");
     expect(activity).toContain('request?.action.kind === "ssh_session"');
     expect(activity).toContain('request.action.ssh.target.split("@")');
+    expect(activity).toContain('host.endsWith(".amazonaws.com")');
+    expect(activity).not.toContain('host.includes("amazonaws.com")');
     expect(activity).toContain("function FlowConnector");
     expect(activity).toContain("export function describeEventFlow");
     expect(activity).toContain("export function EventFlowDiagram");
