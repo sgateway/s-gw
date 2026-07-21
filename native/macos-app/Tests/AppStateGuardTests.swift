@@ -113,6 +113,7 @@ fileprivate struct Scratch {
   let fakeCli: URL
   let invocationLog: URL
   let gate: URL  // FIFO the fake CLI reads from to stay "in flight"
+  let policyResponse: URL
 
   init() {
     let base = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -122,6 +123,7 @@ fileprivate struct Scratch {
     fakeCli = base.appendingPathComponent("fake-s-gw.sh")
     invocationLog = base.appendingPathComponent("invocations.log")
     gate = base.appendingPathComponent("gate.fifo")
+    policyResponse = base.appendingPathComponent("policy-response.json")
 
     // Named pipe: the fake CLI blocks reading from it for approve/deny, so the
     // decision stays in flight until the test writes a release token.
@@ -133,6 +135,24 @@ fileprivate struct Scratch {
     #!/bin/zsh
     verb="$1"
     print -- "$verb" >> "\(invocationLog.path)"
+    case "$*" in
+      status)
+        print -- '{"version":"0.1.18","packageRoot":"/tmp/sgw","ready":true,"readiness":{"ok":true,"summary":"ready","blockers":[]},"cliPath":{"path":"/tmp/cli.js","exists":true},"mcpPath":{"path":"/tmp/mcp.js","exists":true},"keychainHelperPath":{"path":"/tmp/helper","exists":true},"menuBarAppPath":{"path":"/tmp/mb.app","exists":true},"menuBarBinaryPath":{"path":"/tmp/mb","exists":true},"storePath":"/tmp/store.json","consoleUrl":"http://127.0.0.1:8718/","unlock":{"activeSource":"env"},"launchAgents":{"console":{"label":"c","plistPath":"/tmp/c.plist","installed":true,"loaded":true},"menuBar":{"label":"m","plistPath":"/tmp/m.plist","installed":false,"loaded":false}}}'
+        exit 0
+        ;;
+      "secret list"|requests|"agent list"|"approval grants")
+        print -- '[]'
+        exit 0
+        ;;
+      "approval settings")
+        print -- '{"mode":"per-transaction","durationMs":900000}'
+        exit 0
+        ;;
+      "approval policy list")
+        cat "\(policyResponse.path)"
+        exit 0
+        ;;
+    esac
     case "$verb" in
       approve|deny)
         # Block until the test releases us, so the decision is genuinely in flight.
@@ -154,7 +174,12 @@ fileprivate struct Scratch {
     esac
     """
     try? script.write(to: fakeCli, atomically: true, encoding: .utf8)
+    try? "[]\n".write(to: policyResponse, atomically: true, encoding: .utf8)
     chmod(fakeCli.path, 0o755)
+  }
+
+  func setPolicyResponse(_ json: String) {
+    try? (json + "\n").write(to: policyResponse, atomically: true, encoding: .utf8)
   }
 
   func invocationCount() -> Int {
@@ -235,6 +260,7 @@ struct AppStateGuardTests {
     runUpdateStateClearAfterInstallTest()
     runSharedUpdateStateConsistencyTest()
     await runBundledRuntimeRefreshTest()
+    await runPolicyRefreshRetentionTest(scratch)
     runSemVerComparisonTest()
     runAtomFallbackParsingTest()
     runChecksumManifestTest()
@@ -348,6 +374,32 @@ struct AppStateGuardTests {
     let activityOutput = app.activity.records.first?.output ?? ""
     check(activityOutput.contains("Command completed successfully"),
           "silent success should get a useful activity message, got: \(activityOutput)")
+  }
+
+  @MainActor
+  fileprivate static func runPolicyRefreshRetentionTest(_ scratch: Scratch) async {
+    let app = AppState()
+    scratch.setPolicyResponse("""
+    [{"id":"policy-one","name":"Codex","enabled":true,"priority":100,"decision":"allow","conditions":{"agents":["codex"]},"createdAt":"2026-07-20T00:00:00.000Z","updatedAt":"2026-07-20T00:00:00.000Z"}]
+    """)
+
+    await app.refresh(showSpinner: false)
+    check(app.approvalPolicyRules.map(\.id) == ["policy-one"],
+          "successful policy refresh should populate the policy list")
+    check(app.lastError == nil, "successful policy refresh should not report an error")
+
+    scratch.setPolicyResponse("not-json")
+    await app.refresh(showSpinner: false)
+    check(app.approvalPolicyRules.map(\.id) == ["policy-one"],
+          "failed policy refresh must retain the last successful policy list")
+    check(app.lastError?.contains("policies") == true,
+          "failed policy refresh should report a policy-specific error")
+
+    scratch.setPolicyResponse("[]")
+    await app.refresh(showSpinner: false)
+    check(app.approvalPolicyRules.isEmpty,
+          "a later successful empty response should clear the retained policy list")
+    check(app.lastError == nil, "a recovered policy refresh should clear the error")
   }
 
   @MainActor
@@ -649,6 +701,8 @@ struct AppStateGuardTests {
   }
 
   static func runSemVerComparisonTest() {
+    check(!UpdateChecker.isNewer("unsigned-macos-preview-v0.1.18-unsigned.3", than: "0.1.18"),
+          "legacy channel tags must never outrank a stable release")
     check(!UpdateChecker.isNewer("0.2.0-preview.1", than: "0.2.0"),
           "a preview must not outrank its stable release")
     check(UpdateChecker.isNewer("0.2.0", than: "0.2.0-preview.1"),

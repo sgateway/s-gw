@@ -181,6 +181,7 @@ final class AppState {
     }
 
     do {
+      var refreshWarnings: [String] = []
       let newStatus = try await cli.runJSON(StatusPayload.self, arguments: ["status"])
       async let handleList = cli.runJSON([HandleSummary].self, arguments: ["secret", "list"])
       async let requestList = cli.runJSON([RequestRecord].self, arguments: ["requests"])
@@ -197,10 +198,14 @@ final class AppState {
       agents = (try? await agentList.sorted { $0.name < $1.name }) ?? []
       approvalSettings = (try? await approval) ?? approvalSettings
       approvalGrants = (try? await grants.sorted { $0.updatedAt > $1.updatedAt }) ?? []
-      approvalPolicyRules = (try? await policies.sorted { $0.priority < $1.priority }) ?? []
+      do {
+        approvalPolicyRules = try await policies.sorted { $0.priority < $1.priority }
+      } catch {
+        refreshWarnings.append("Unable to refresh policies: \(error.localizedDescription)")
+      }
       audit = await auditList.sorted { $0.ts > $1.ts }
       routeToApprovalsIfNeeded()
-      lastError = nil
+      lastError = refreshWarnings.first
     } catch {
       lastError = error.localizedDescription
     }

@@ -238,7 +238,7 @@ describe("release update checks", () => {
             { name: `${previewAsset}.sha256`, state: "uploaded" }
           ]
         }),
-        release("unsigned-macos-preview-v0.2.0-unsigned.1", { prerelease: true }),
+        release("unsigned-macos-preview-v0.2.0-unsigned.1"),
         release("v0.1.1")
       ]), { status: 200 })
     });
