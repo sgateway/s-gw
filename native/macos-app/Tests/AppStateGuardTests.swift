@@ -151,7 +151,7 @@ fileprivate struct Scratch {
         exit 0
         ;;
       status)
-        print -- '{"version":"0.1.18","packageRoot":"/tmp/sgw","ready":true,"readiness":{"ok":true,"summary":"ready","blockers":[]},"cliPath":{"path":"/tmp/cli.js","exists":true},"mcpPath":{"path":"/tmp/mcp.js","exists":true},"keychainHelperPath":{"path":"/tmp/helper","exists":true},"menuBarAppPath":{"path":"/tmp/mb.app","exists":true},"menuBarBinaryPath":{"path":"/tmp/mb","exists":true},"storePath":"/tmp/store.json","consoleUrl":"http://127.0.0.1:8718/","unlock":{"activeSource":"env"},"launchAgents":{"console":{"label":"c","plistPath":"/tmp/c.plist","installed":true,"loaded":true},"menuBar":{"label":"m","plistPath":"/tmp/m.plist","installed":true,"loaded":true}}}'
+        print -- '{"version":"0.1.19","packageRoot":"/tmp/sgw","ready":true,"readiness":{"ok":true,"summary":"ready","blockers":[]},"cliPath":{"path":"/tmp/cli.js","exists":true},"mcpPath":{"path":"/tmp/mcp.js","exists":true},"keychainHelperPath":{"path":"/tmp/helper","exists":true},"menuBarAppPath":{"path":"/tmp/mb.app","exists":true},"menuBarBinaryPath":{"path":"/tmp/mb","exists":true},"storePath":"/tmp/store.json","consoleUrl":"http://127.0.0.1:8718/","unlock":{"activeSource":"env"},"launchAgents":{"console":{"label":"c","plistPath":"/tmp/c.plist","installed":true,"loaded":true},"menuBar":{"label":"m","plistPath":"/tmp/m.plist","installed":true,"loaded":true}}}'
         exit 0
         ;;
       app)
