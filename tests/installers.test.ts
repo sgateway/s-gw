@@ -261,6 +261,8 @@ describe("platform installers", () => {
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("Record local npm package integrity");
     expect(npmJob).toContain("SGW_NPM_PACKAGE_INTEGRITY");
+    expect(npmJob).toContain("Verify an existing immutable release");
+    expect(npmJob).toContain("npm audit --audit-level=high");
     expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");
@@ -300,6 +302,8 @@ describe("platform installers", () => {
     expect(assetJob).toContain("!inputs.publish_npm_only");
     expect(npmJob).toContain("always()");
     expect(npmJob).toContain("inputs.publish_npm_only ||");
+    expect(npmJob).toContain("if: ${{ inputs.publish_npm_only }}");
+    expect(npmJob).toContain("npm audit --audit-level=high");
     expect(releaseJob).toContain("!inputs.publish_npm_only");
     expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
   });

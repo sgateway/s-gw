@@ -282,7 +282,18 @@ jobs:
 
       - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
       - run: npm ci --ignore-scripts
-      - run: npm run verify
+      - name: Verify release source
+        if: ${{ !inputs.publish_npm_only }}
+        run: npm run verify
+
+      - name: Verify an existing immutable release
+        if: ${{ inputs.publish_npm_only }}
+        run: |
+          npm run build
+          npm run check:rust
+          npm test
+          npm audit --audit-level=high
+          npm run package:dry-run
 
       - name: Verify release version
         run: |
