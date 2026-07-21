@@ -7,6 +7,7 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 ### Fixed
 
 - The macOS app now restarts installed-but-unloaded local services when it opens, and LaunchAgent setup no longer issues a redundant blocking `kickstart` after loading a `RunAtLoad` job.
+- Windows agent integration updates now retry transient filesystem contention while another process releases the integration lock.
 
 ## 0.1.19 - 2026-07-21
 
