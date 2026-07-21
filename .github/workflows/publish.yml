@@ -328,8 +328,8 @@ jobs:
           package_version="$(node -p "require('./package.json').version")"
           published_integrity="$(npm view "@s-gw/s-gw@${package_version}" dist.integrity 2>/dev/null || true)"
           if [ -n "$published_integrity" ]; then
-            test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
-            echo "@s-gw/s-gw@${package_version} is already published with the verified package integrity."
+            echo "SGW_NPM_ALREADY_PUBLISHED=1" >> "$GITHUB_ENV"
+            echo "@s-gw/s-gw@${package_version} is already published; the next step will verify the registry artifact."
             exit 0
           fi
           npm publish --access public --ignore-scripts
@@ -343,14 +343,23 @@ jobs:
           for _ in 1 2 3 4 5 6; do
             rm -rf "$prefix"
             published_integrity="$(npm view "@s-gw/s-gw@${package_version}" dist.integrity 2>/dev/null || true)"
-            if [ "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY" ] && npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
+            integrity_ok=0
+            if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" = 1 ] && [ -n "$published_integrity" ]; then
+              # Rebuilt native bundles are not byte-reproducible, so recovery validates the published artifact itself.
+              integrity_ok=1
+            elif [ "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY" ]; then
+              integrity_ok=1
+            fi
+            if [ "$integrity_ok" = 1 ] && npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund --prefer-online "@s-gw/s-gw@${package_version}"; then
               installed=1
               break
             fi
             sleep 10
           done
           test "$installed" = 1
-          test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
+          if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" != 1 ]; then
+            test "$published_integrity" = "$SGW_NPM_PACKAGE_INTEGRITY"
+          fi
 
           package_root="$prefix/lib/node_modules/@s-gw/s-gw"
           test -x "$prefix/bin/s-gw"

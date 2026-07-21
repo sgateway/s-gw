@@ -261,6 +261,8 @@ describe("platform installers", () => {
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("Record local npm package integrity");
     expect(npmJob).toContain("SGW_NPM_PACKAGE_INTEGRITY");
+    expect(npmJob).toContain("SGW_NPM_ALREADY_PUBLISHED=1");
+    expect(npmJob).toContain('if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" != 1 ]');
     expect(npmJob).toContain("Verify an existing immutable release");
     expect(npmJob).toContain("npm audit --audit-level=high");
     expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
