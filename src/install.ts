@@ -1008,7 +1008,6 @@ ${aqua}  <key>StandardOutPath</key>
 function startLaunchAgent(label: string, plistPath: string): void {
   stopLaunchAgent(label);
   runLaunchctl(["bootstrap", launchdDomain(), plistPath]);
-  runLaunchctl(["kickstart", "-k", `${launchdDomain()}/${label}`]);
 }
 
 function stopLaunchAgent(label: string): void {

@@ -48,6 +48,7 @@ final class AppState {
   @ObservationIgnored private let now: () -> Date
   @ObservationIgnored private let updateCheckInterval: TimeInterval
   @ObservationIgnored private var seenPendingRequestIds = Set<String>()
+  @ObservationIgnored private var didAttemptServiceRecovery = false
 
   init(
     updater: any UpdateChecking = UpdateChecker(),
@@ -151,6 +152,7 @@ final class AppState {
     Task {
       await refreshInitialStatus()
       await refreshBundledRuntimeAfterReplacement(enabled: refreshBundledRuntime)
+      await recoverInstalledServices()
       await refresh()
     }
     Task {
@@ -182,6 +184,25 @@ final class AppState {
     } catch {
       lastError = error.localizedDescription
     }
+  }
+
+  func recoverInstalledServices() async {
+    guard !didAttemptServiceRecovery else { return }
+    guard
+      status?.ready == true,
+      status?.launchAgents.console.installed == true,
+      status?.launchAgents.console.loaded == false
+    else {
+      return
+    }
+
+    didAttemptServiceRecovery = true
+    let result = await cli.run(arguments: ["start", "--no-open-app"])
+    if !result.succeeded {
+      lastError = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+      return
+    }
+    await refreshInitialStatus()
   }
 
   func refresh(showSpinner: Bool = true) async {
