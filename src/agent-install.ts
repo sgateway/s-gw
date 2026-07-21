@@ -1555,10 +1555,6 @@ function readRegularFileSnapshot(filePath: string): { content: Buffer; mode: num
     }
 
     const content = readFileSync(fd);
-    const after = fstatSync(fd);
-    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-      throw new Error(`${filePath} changed while s-gw was reading it. s-gw left it unchanged.`);
-    }
     return { content, mode: before.mode & 0o777, modifiedAt: before.mtimeMs };
   } catch (error) {
     if (isNodeError(error) && error.code === "ELOOP") {

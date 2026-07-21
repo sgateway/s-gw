@@ -4401,10 +4401,6 @@ async function inspectStoreLock(lockPath: string): Promise<StoreLockInspection |
     }
 
     const raw = await marker.readFile({ encoding: "utf8" }).catch(() => "");
-    const after = await marker.stat();
-    if (markerInfo.size !== after.size || markerInfo.mtimeMs !== after.mtimeMs || markerInfo.ctimeMs !== after.ctimeMs) {
-      return {};
-    }
     const state = parseStoreLockState(raw);
     if (!state || entries[0] !== storeLockMarkerName(state.token)) {
       return {};
