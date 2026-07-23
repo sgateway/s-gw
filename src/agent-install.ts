@@ -549,6 +549,9 @@ function removeAbandonedAgentLock(lockPath: string): boolean {
     state = inspectAgentIntegrationLock(lockPath);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return true;
+    if (process.platform === "win32" && isNodeError(error) && (error.code === "EPERM" || error.code === "EACCES")) {
+      return false;
+    }
     throw error;
   }
 

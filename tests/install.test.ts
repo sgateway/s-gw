@@ -219,6 +219,17 @@ describe("launch-agent packaging", () => {
     expect(plist).not.toContain("<string>--notify-on-launch</string>");
   });
 
+  it("does not restart a newly bootstrapped LaunchAgent", async () => {
+    const source = await readFile(path.join(repoRoot, "src/install.ts"), "utf8");
+    const start = source.slice(
+      source.indexOf("function startLaunchAgent"),
+      source.indexOf("function stopLaunchAgent")
+    );
+
+    expect(start).toContain('runLaunchctl(["bootstrap"');
+    expect(start).not.toContain("kickstart");
+  });
+
   it("preserves the existing ledger namespace while rebinding a migrated runtime", () => {
     const oldHelper = process.env.SGW_KEYCHAIN_HELPER;
     delete process.env.SGW_KEYCHAIN_HELPER;
