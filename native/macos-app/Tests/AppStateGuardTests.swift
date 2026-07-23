@@ -263,6 +263,7 @@ struct AppStateGuardTests {
     UserDefaults.standard.set(scratch.fakeCli.path, forKey: CLIRunner.binaryOverrideKey)
 
     await runStartupOrderingTest(scratch)
+    await runStoppedServiceRecoveryTest(scratch)
     await runInFlightGuardTest(scratch)
     await runGuardReleaseTest(scratch)
     await runReadinessDerivationTest()
@@ -280,6 +281,27 @@ struct AppStateGuardTests {
     runChecksumManifestTest()
 
     print("ALL_NATIVE_TESTS_OK")
+  }
+
+  @MainActor
+  fileprivate static func runStoppedServiceRecoveryTest(_ scratch: Scratch) async {
+    let app = AppState()
+    app.status = statusPayload(ready: true,
+                               summary: "ready",
+                               blockers: [],
+                               activeSource: "env",
+                               consoleLoaded: false,
+                               consoleInstalled: true)
+    let before = scratch.commands().filter { $0 == "start --no-open-app" }.count
+
+    await app.recoverInstalledServices()
+    let after = scratch.commands().filter { $0 == "start --no-open-app" }.count
+    check(after == before + 1, "opening the app should recover an installed stopped console")
+    check(app.daemonRunning, "service recovery should refresh the running status")
+
+    await app.recoverInstalledServices()
+    let repeated = scratch.commands().filter { $0 == "start --no-open-app" }.count
+    check(repeated == after, "service recovery should run at most once per app launch")
   }
 
   @MainActor
@@ -763,6 +785,7 @@ struct AppStateGuardTests {
 
   static func statusPayload(ready: Bool, summary: String, blockers: [String],
                             activeSource: String, consoleLoaded: Bool,
+                            consoleInstalled: Bool? = nil,
                             version: String? = nil) -> StatusPayload {
     let blockerJson = blockers.map { "\"\($0)\"" }.joined(separator: ",")
     let versionJson = version.map { "\"version\":\"\($0)\"," } ?? ""
@@ -781,7 +804,7 @@ struct AppStateGuardTests {
       "consoleUrl": "http://127.0.0.1:8718/",
       "unlock": {"activeSource":"\(activeSource)"},
       "launchAgents": {
-        "console": {"label":"c","plistPath":"/tmp/c.plist","installed":\(consoleLoaded),"loaded":\(consoleLoaded)},
+        "console": {"label":"c","plistPath":"/tmp/c.plist","installed":\(consoleInstalled ?? consoleLoaded),"loaded":\(consoleLoaded)},
         "menuBar": {"label":"m","plistPath":"/tmp/m.plist","installed":false,"loaded":false}
       }
     }
