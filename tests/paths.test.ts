@@ -1,8 +1,8 @@
 import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ensureSgwHome, getSgwHome, getSgwRecoveryHome, getStorePath } from "../src/paths.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ensureSgwHome, getSgwHome, getSgwInstanceKey, getSgwRecoveryHome, getStorePath } from "../src/paths.js";
 
 let testRoot = "";
 let outsideRoot = "";
@@ -19,6 +19,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   process.env = previousEnv;
   await rm(testRoot, { recursive: true, force: true });
   await rm(outsideRoot, { recursive: true, force: true });
@@ -34,6 +35,52 @@ describe("test-mode s-gw paths", () => {
     expect(getStorePath()).toBe(path.join(home, "store.json"));
 
     await ensureSgwHome();
+  });
+
+  it("fingerprints non-secret credential authority settings", () => {
+    const first = getSgwInstanceKey();
+    process.env.SGW_MASTER_PASSPHRASE = "short";
+    expect(getSgwInstanceKey()).toBe(first);
+
+    process.env.SGW_MASTER_PASSPHRASE = "first secret value";
+    const withPassphrase = getSgwInstanceKey();
+    expect(withPassphrase).not.toBe(first);
+
+    process.env.SGW_MASTER_PASSPHRASE = "different secret value";
+    expect(getSgwInstanceKey()).toBe(withPassphrase);
+
+    const beforeBackendChange = getSgwInstanceKey();
+    process.env.SGW_SECRET_BACKEND = "keychain";
+    expect(getSgwInstanceKey()).not.toBe(beforeBackendChange);
+  });
+
+  it("preserves raw credential namespace semantics", () => {
+    process.env.SGW_KEYCHAIN_SERVICE = "service-name";
+    const plain = getSgwInstanceKey();
+
+    process.env.SGW_KEYCHAIN_SERVICE = " service-name ";
+    expect(getSgwInstanceKey()).not.toBe(plain);
+  });
+
+  it("separates users even when they share configured ledger paths", () => {
+    const userInfo = vi.spyOn(os, "userInfo");
+    userInfo.mockReturnValue({
+      uid: 1001,
+      gid: 1001,
+      username: "first-user",
+      homedir: path.join(testRoot, "first-user"),
+      shell: "/bin/sh"
+    });
+    const first = getSgwInstanceKey();
+
+    userInfo.mockReturnValue({
+      uid: 1002,
+      gid: 1002,
+      username: "second-user",
+      homedir: path.join(testRoot, "second-user"),
+      shell: "/bin/sh"
+    });
+    expect(getSgwInstanceKey()).not.toBe(first);
   });
 
   it("requires both test homes to be explicit", () => {

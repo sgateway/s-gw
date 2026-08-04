@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   accessSync,
@@ -14,7 +14,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getSgwHome, getSgwRecoveryHome, getStorePath } from "./paths.js";
+import { getSgwHome, getSgwInstanceKey, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
   isInstalledMacAppLocation,
   isSelfContainedMacApp,
@@ -133,6 +133,24 @@ export interface WindowsOpenResult {
   launcherPath: string;
   consoleUrl: string;
   pid?: number;
+  reusedExisting?: boolean;
+}
+
+export interface WindowsHelperProcess {
+  pid: number;
+  ownerSid: string;
+  sessionId: number;
+  instanceKey: string;
+  exactPath: boolean;
+}
+
+interface WindowsConsoleListenerProcess {
+  pid: number;
+  ownerSid: string;
+  sessionId: number;
+  exactNode: boolean;
+  exactCli: boolean;
+  exactArguments: boolean;
 }
 
 export interface WindowsStoppedSurfaces {
@@ -627,15 +645,40 @@ export function stopWindowsSurfaces(): WindowsStoppedSurfaces {
   requireWindows("Windows surface stop");
   const script = [
     "$stopped = @()",
+    "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$currentSessionId = [int](Get-Process -Id $PID).SessionId",
     "Get-CimInstance Win32_Process | ForEach-Object {",
     "  $line = [string]$_.CommandLine",
     "  $helper = $line -match '(?i)s-gw-helper\\.ps1'",
     "  $client = $line -match '(?i)s-gw-client\\.ps1'",
     "  $console = $line -match '(?i)[\\\\/]dist[\\\\/]cli\\.js' -and $line -match '(?i)\\sconsole(?:\\s|$)' -and $line -match '(?i)s-gw'",
     "  if ($_.ProcessId -ne $PID -and ($helper -or $client -or $console)) {",
+    "    if ([int]$_.SessionId -ne $currentSessionId) { return }",
+    "    $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "    if ($null -eq $owner -or $owner.ReturnValue -ne 0 -or [string]$owner.Sid -ne $currentSid) { return }",
     "    $kind = if ($helper) { 'helper' } elseif ($client) { 'client' } else { 'console' }",
-    "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
-    "    $stopped += [PSCustomObject]@{ pid = [int]$_.ProcessId; kind = $kind }",
+    "    $pidToStop = [int]$_.ProcessId",
+    "    $creationDate = [string]$_.CreationDate",
+    "    $expectedLine = $line",
+    "    $fresh = Get-CimInstance Win32_Process -Filter \"ProcessId = $pidToStop\" -ErrorAction SilentlyContinue",
+    "    if ($null -ne $fresh) {",
+    "      $freshOwner = Invoke-CimMethod -InputObject $fresh -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "      if ([string]$fresh.CreationDate -ne $creationDate -or [int]$fresh.SessionId -ne $currentSessionId -or [string]$fresh.CommandLine -ne $expectedLine -or $null -eq $freshOwner -or $freshOwner.ReturnValue -ne 0 -or [string]$freshOwner.Sid -ne $currentSid) {",
+    "        throw \"s-gw process $pidToStop changed before it could be stopped.\"",
+    "      }",
+    "      try {",
+    "        $termination = Invoke-CimMethod -InputObject $fresh -MethodName Terminate -ErrorAction Stop",
+    "        if ($termination.ReturnValue -ne 0) { throw \"s-gw process $pidToStop returned termination code $($termination.ReturnValue).\" }",
+    "      } catch {",
+    "        if ($null -ne (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { throw }",
+    "      }",
+    "    }",
+    "    for ($attempt = 0; $attempt -lt 50; $attempt += 1) {",
+    "      if ($null -eq (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { break }",
+    "      Start-Sleep -Milliseconds 50",
+    "    }",
+    "    if ($null -ne (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { throw \"s-gw process $pidToStop did not stop.\" }",
+    "    $stopped += [PSCustomObject]@{ pid = $pidToStop; kind = $kind }",
     "  }",
     "}",
     "$stopped | ConvertTo-Json -Compress"
@@ -663,10 +706,13 @@ export function stopWindowsSurfaces(): WindowsStoppedSurfaces {
 }
 
 export function startWindowsConsole(options: MenuBarOptions = {}): WindowsOpenResult {
+  return spawnWindowsConsole(options).result;
+}
+
+function spawnWindowsConsole(options: MenuBarOptions): { child: ChildProcess; result: WindowsOpenResult } {
   requireWindows("Windows console start");
   const layout = getPackageLayout();
-  const port = options.port || 8718;
-  const url = options.consoleUrl || consoleUrl(port);
+  const { port, url } = windowsConsoleEndpoint(options);
   const child = spawn(process.execPath, [
     layout.cliPath,
     "console",
@@ -683,19 +729,33 @@ export function startWindowsConsole(options: MenuBarOptions = {}): WindowsOpenRe
   });
   child.unref();
   return {
-    scriptPath: layout.cliPath,
-    launcherPath: process.execPath,
-    consoleUrl: url,
-    pid: child.pid
+    child,
+    result: {
+      scriptPath: layout.cliPath,
+      launcherPath: process.execPath,
+      consoleUrl: url,
+      pid: child.pid
+    }
   };
 }
 
 export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promise<WindowsOpenResult> {
   requireWindows("Windows console start");
   const layout = getPackageLayout();
-  const port = options.port || 8718;
-  const url = options.consoleUrl || consoleUrl(port);
-  if (await windowsConsoleReady(url)) {
+  const { port, url } = windowsConsoleEndpoint(options);
+  const instanceKey = getSgwInstanceKey();
+  findRunningWindowsHelpers(
+    layout.windowsHelperScriptPath,
+    port,
+    url,
+    windowsHelperInstanceKey(url)
+  );
+  const health = await windowsConsoleHealth(url);
+  if (health.ready) {
+    if (health.instanceKey !== instanceKey) {
+      throw new Error(`Port ${port} already has an s-gw console for another credential home. Stop it or choose another port.`);
+    }
+    assertWindowsConsoleListener(port, layout.cliPath);
     return {
       scriptPath: layout.cliPath,
       launcherPath: process.execPath,
@@ -703,9 +763,26 @@ export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promis
     };
   }
 
-  const started = startWindowsConsole({ ...options, port, consoleUrl: url });
-  await waitForWindowsConsole(url);
-  return started;
+  const started = spawnWindowsConsole({ ...options, port, consoleUrl: url });
+  try {
+    const listenerPid = await waitForWindowsConsole(url, instanceKey, port, layout.cliPath);
+    return {
+      ...started.result,
+      pid: listenerPid,
+      reusedExisting: listenerPid !== started.child.pid
+    };
+  } catch (error) {
+    try {
+      await stopSpawnedWindowsProcess(started.child, "console");
+    } catch (cleanupError) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+    const latest = await windowsConsoleHealth(url);
+    if (latest.ready && latest.instanceKey !== instanceKey) {
+      throw new Error(`Port ${port} became active for another s-gw credential home. Stop it or choose another port.`);
+    }
+    throw error;
+  }
 }
 
 export async function restartWindowsSurfaces(
@@ -717,16 +794,16 @@ export async function restartWindowsSurfaces(
   const failures: string[] = [];
   try {
     if (stopped.client) {
-      result.client = openWindowsClient(options);
+      result.client = await openWindowsClient(options);
     } else if (stopped.console) {
-      result.console = startWindowsConsole(options);
+      result.console = await ensureWindowsConsole(options);
     }
   } catch (error) {
     failures.push(`console/client: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (stopped.helper) {
     try {
-      result.helper = openWindowsHelper(options);
+      result.helper = await openWindowsHelper(options);
     } catch (error) {
       failures.push(`helper: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -734,7 +811,12 @@ export async function restartWindowsSurfaces(
 
   if ((stopped.console || stopped.client) && (result.console || result.client)) {
     try {
-      await waitForWindowsConsole(options.consoleUrl || consoleUrl(options.port || 8718));
+      await waitForWindowsConsole(
+        windowsConsoleEndpoint(options).url,
+        getSgwInstanceKey(),
+        windowsConsoleEndpoint(options).port,
+        getPackageLayout().cliPath
+      );
     } catch (error) {
       failures.push(`console health: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -751,22 +833,124 @@ export async function restartWindowsSurfaces(
   return result;
 }
 
-async function waitForWindowsConsole(url: string): Promise<void> {
+async function waitForWindowsConsole(url: string, instanceKey: string, port: number, cliPath: string): Promise<number> {
   const healthUrl = new URL("/api/health", url).toString();
+  let listenerError: unknown;
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    if (await windowsConsoleReady(url)) return;
+    const health = await windowsConsoleHealth(url);
+    if (health.ready && health.instanceKey === instanceKey) {
+      try {
+        return assertWindowsConsoleListener(port, cliPath);
+      } catch (error) {
+        listenerError = error;
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`s-gw console did not become healthy at ${healthUrl}`);
+  if (listenerError) throw listenerError;
+  throw new Error(`s-gw console did not become healthy for this credential home at ${healthUrl}`);
 }
 
-async function windowsConsoleReady(url: string): Promise<boolean> {
+function assertWindowsConsoleListener(port: number, cliPath: string): number {
+  const pid = trustedWindowsConsoleListener(port, cliPath);
+  if (!pid) {
+    throw new Error(`Port ${port} is not owned by this user's s-gw console process. Stop the listener or choose another port.`);
+  }
+  return pid;
+}
+
+function trustedWindowsConsoleListener(port: number, cliPath: string): number | undefined {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$currentSessionId = [int](Get-Process -Id $PID).SessionId",
+    "$connections = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$env:SGW_CONSOLE_PORT) | Where-Object { [string]$_.LocalAddress -eq '127.0.0.1' })",
+    "$listenerPids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique)",
+    "$cliPattern = '(?i)(?:^|\\s)\"?' + [regex]::Escape($env:SGW_CONSOLE_CLI_PATH) + '\"?(?:\\s|$)'",
+    "$portPattern = '(?i)(?:^|\\s)--port(?:\\s+|:|=)\"?' + [regex]::Escape($env:SGW_CONSOLE_PORT) + '\"?(?:\\s|$)'",
+    "$anyPortPattern = '(?i)(?:^|\\s)--port(?:\\s+|:|=)'",
+    "$hostPattern = '(?i)(?:^|\\s)--host(?:\\s+|:|=)\"?127\\.0\\.0\\.1\"?(?:\\s|$)'",
+    "$anyHostPattern = '(?i)(?:^|\\s)--host(?:\\s+|:|=)'",
+    "$consolePattern = '(?i)(?:^|\\s)console(?:\\s|$)'",
+    "$processes = @()",
+    "foreach ($listenerPid in $listenerPids) {",
+    "  $item = Get-CimInstance Win32_Process -Filter \"ProcessId = $listenerPid\" -ErrorAction SilentlyContinue",
+    "  if ($null -eq $item) { continue }",
+    "  $owner = Invoke-CimMethod -InputObject $item -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "  $ownerSid = if ($null -ne $owner -and $owner.ReturnValue -eq 0) { [string]$owner.Sid } else { '' }",
+    "  $exactNode = $false",
+    "  try { $exactNode = [string]::Equals([IO.Path]::GetFullPath([string]$item.ExecutablePath), [IO.Path]::GetFullPath($env:SGW_CONSOLE_NODE_PATH), [StringComparison]::OrdinalIgnoreCase) } catch {}",
+    "  $line = [string]$item.CommandLine",
+    "  $hostMatches = $line -match $hostPattern -or $line -notmatch $anyHostPattern",
+    "  $portMatches = $line -match $portPattern -or ($env:SGW_CONSOLE_PORT -eq '8718' -and $line -notmatch $anyPortPattern)",
+    "  $processes += [PSCustomObject]@{ pid = [int]$item.ProcessId; ownerSid = $ownerSid; sessionId = [int]$item.SessionId; exactNode = $exactNode; exactCli = [bool]($line -match $cliPattern); exactArguments = [bool]($line -match $consolePattern -and $hostMatches -and $portMatches) }",
+    "}",
+    "[PSCustomObject]@{ currentSid = $currentSid; currentSessionId = $currentSessionId; processes = $processes } | ConvertTo-Json -Depth 3 -Compress"
+  ].join("\n");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      SGW_CONSOLE_PORT: String(port),
+      SGW_CONSOLE_CLI_PATH: cliPath,
+      SGW_CONSOLE_NODE_PATH: process.execPath
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Could not inspect the Windows listener on port ${port}.`);
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(result.stdout) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Could not parse the Windows listener on port ${port}.`);
+  }
+  const currentSid = typeof payload.currentSid === "string" ? payload.currentSid.toLowerCase() : "";
+  const currentSessionId = Number(payload.currentSessionId);
+  const rawProcesses = Array.isArray(payload.processes)
+    ? payload.processes
+    : payload.processes ? [payload.processes] : [];
+  const processes = rawProcesses.flatMap((value): WindowsConsoleListenerProcess[] => {
+    if (!value || typeof value !== "object") return [];
+    const item = value as Record<string, unknown>;
+    const pid = Number(item.pid);
+    const sessionId = Number(item.sessionId);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(sessionId)) return [];
+    return [{
+      pid,
+      ownerSid: typeof item.ownerSid === "string" ? item.ownerSid : "",
+      sessionId,
+      exactNode: item.exactNode === true,
+      exactCli: item.exactCli === true,
+      exactArguments: item.exactArguments === true
+    }];
+  });
+  if (processes.length !== 1 || !currentSid || !Number.isInteger(currentSessionId)) return undefined;
+  const listener = processes[0];
+  if (
+    listener.ownerSid.toLowerCase() !== currentSid
+    || listener.sessionId !== currentSessionId
+    || !listener.exactNode
+    || !listener.exactCli
+    || !listener.exactArguments
+  ) return undefined;
+  return listener.pid;
+}
+
+async function windowsConsoleHealth(url: string): Promise<{ ready: boolean; instanceKey?: string }> {
   const healthUrl = new URL("/api/health", url).toString();
   try {
     const response = await fetch(healthUrl, { signal: AbortSignal.timeout(500) });
-    return response.ok;
+    if (!response.ok) return { ready: false };
+    const payload = await response.json() as Record<string, unknown>;
+    return {
+      ready: payload.ok === true && payload.name === "s-gw",
+      instanceKey: typeof payload.instanceKey === "string" ? payload.instanceKey : undefined
+    };
   } catch {
-    return false;
+    return { ready: false };
   }
 }
 
@@ -915,23 +1099,29 @@ export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppI
   return { appPath, sourcePath, changed: true };
 }
 
-export function openWindowsClient(options: MenuBarOptions = {}): WindowsOpenResult {
+export async function openWindowsClient(options: MenuBarOptions = {}): Promise<WindowsOpenResult> {
   requireWindows("Windows client open");
   assertWindowsClientExists();
   const layout = getPackageLayout();
-  const url = options.consoleUrl || consoleUrl(options.port || 8718);
+  const { port, url } = windowsConsoleEndpoint(options);
+  const instanceKey = getSgwInstanceKey();
+  await ensureWindowsConsole({ ...options, port, consoleUrl: url });
   const result = spawnSync(
     "powershell.exe",
     [
       "-NoProfile",
+      "-Sta",
       "-ExecutionPolicy",
       "Bypass",
       "-File",
       layout.windowsClientScriptPath,
       "-Port",
-      String(options.port || 8718),
+      String(port),
       "-ConsoleUrl",
-      url
+      url,
+      "-InstanceKey",
+      instanceKey,
+      "-NoStart"
     ],
     {
       encoding: "utf8",
@@ -951,23 +1141,41 @@ export function openWindowsClient(options: MenuBarOptions = {}): WindowsOpenResu
   };
 }
 
-export function openWindowsHelper(options: MenuBarOptions = {}): WindowsOpenResult {
+export async function openWindowsHelper(options: MenuBarOptions = {}): Promise<WindowsOpenResult> {
   requireWindows("Windows helper open");
   assertWindowsHelperExists();
   const layout = getPackageLayout();
-  const url = options.consoleUrl || consoleUrl(options.port || 8718);
+  const endpoint = windowsConsoleEndpoint(options);
+  const port = endpoint.port;
+  const url = endpoint.baseUrl;
+  await ensureWindowsConsole({ ...options, port, consoleUrl: url });
+  const instanceKey = windowsHelperInstanceKey(url);
+  const existingPid = findRunningWindowsHelpers(layout.windowsHelperScriptPath, port, url, instanceKey)[0];
+  if (existingPid) {
+    return {
+      scriptPath: layout.windowsHelperScriptPath,
+      launcherPath: layout.windowsHelperLauncherPath,
+      consoleUrl: url,
+      pid: existingPid,
+      reusedExisting: true
+    };
+  }
+
   const child = spawn(
     "powershell.exe",
     [
       "-NoProfile",
+      "-Sta",
       "-ExecutionPolicy",
       "Bypass",
       "-File",
       layout.windowsHelperScriptPath,
       "-Port",
-      String(options.port || 8718),
+      String(port),
       "-ConsoleUrl",
-      url
+      url,
+      "-InstanceKey",
+      instanceKey
     ],
     {
       detached: true,
@@ -976,13 +1184,183 @@ export function openWindowsHelper(options: MenuBarOptions = {}): WindowsOpenResu
     }
   );
   child.unref();
+  let pid: number;
+  try {
+    pid = waitForWindowsHelper(layout.windowsHelperScriptPath, port, url, instanceKey);
+  } catch (error) {
+    try {
+      await stopSpawnedWindowsProcess(child, "helper");
+    } catch (cleanupError) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+    throw error;
+  }
 
   return {
     scriptPath: layout.windowsHelperScriptPath,
     launcherPath: layout.windowsHelperLauncherPath,
     consoleUrl: url,
-    pid: child.pid
+    pid,
+    reusedExisting: pid !== child.pid
   };
+}
+
+async function stopSpawnedWindowsProcess(child: ChildProcess, label: string): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  let onExit: (() => void) | undefined;
+  const exited = new Promise<boolean>((resolve) => {
+    onExit = () => resolve(true);
+    child.once("exit", onExit);
+    setTimeout(() => resolve(false), 2500).unref();
+  });
+  try {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill();
+    if (!await exited && child.exitCode === null && child.signalCode === null) {
+      throw new Error(`spawned s-gw Windows ${label} did not exit`);
+    }
+  } finally {
+    if (onExit) child.removeListener("exit", onExit);
+  }
+}
+
+function findRunningWindowsHelpers(scriptPath: string, port: number, url: string, instanceKey: string): number[] {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$currentSessionId = [int](Get-Process -Id $PID).SessionId",
+    "$portPattern = '(?i)(?:^|\\s)-Port(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_HELPER_PORT) + '\"?(?:\\s|$)'",
+    "$anyPortPattern = '(?i)(?:^|\\s)-Port(?:\\s+|:)'",
+    "$helperPattern = '(?i)(?:^|\\s)-File(?:\\s+|:)(?:\"[^\"]*[\\\\/]|[^\\s\"]*[\\\\/])?s-gw-helper\\.ps1\"?(?:\\s|$)'",
+    "$exactPathPattern = '(?i)(?:^|\\s)-File(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_HELPER_SCRIPT_PATH) + '\"?(?:\\s|$)'",
+    "$instancePattern = '(?i)(?:^|\\s)-InstanceKey(?:\\s+|:)\"?([a-f0-9]{64})\"?(?:\\s|$)'",
+    "$helperProcesses = @()",
+    "Get-CimInstance Win32_Process | ForEach-Object {",
+    "  if ([string]$_.Name -notmatch '^(?i:powershell|pwsh)\\.exe$') { return }",
+    "  $line = [string]$_.CommandLine",
+    "  if (-not $line -or $line -notmatch $helperPattern) { return }",
+    "  $processInstanceKey = if ($line -match $instancePattern) { [string]$Matches[1] } else { '' }",
+    "  $usesDefaultPort = $env:SGW_HELPER_PORT -eq '8718' -and $line -notmatch $anyPortPattern",
+    "  if ($line -notmatch $portPattern -and -not $usesDefaultPort) { return }",
+    "  $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "  if ($null -eq $owner -or $owner.ReturnValue -ne 0) { return }",
+    "  $helperProcesses += [PSCustomObject]@{ pid = [int]$_.ProcessId; ownerSid = [string]$owner.Sid; sessionId = [int]$_.SessionId; instanceKey = $processInstanceKey; exactPath = [bool]($line -match $exactPathPattern) }",
+    "}",
+    "[PSCustomObject]@{ currentSid = $currentSid; currentSessionId = $currentSessionId; processes = $helperProcesses } | ConvertTo-Json -Depth 3 -Compress"
+  ].join("\n");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+    encoding: "utf8",
+    env: {
+      ...windowsEnvironment(url),
+      SGW_HELPER_PORT: String(port),
+      SGW_HELPER_SCRIPT_PATH: scriptPath
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || "Could not inspect the running s-gw Windows helper.");
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(result.stdout) as Record<string, unknown>;
+  } catch {
+    throw new Error("Could not parse the running s-gw Windows helper process list.");
+  }
+  const currentSid = typeof payload.currentSid === "string" ? payload.currentSid : "";
+  const currentSessionId = Number(payload.currentSessionId);
+  const rawProcesses = Array.isArray(payload.processes)
+    ? payload.processes
+    : payload.processes ? [payload.processes] : [];
+  const processes = rawProcesses.flatMap((item) => windowsHelperProcess(item));
+  const sessionProcesses = selectWindowsHelperProcesses(processes, currentSid, currentSessionId);
+  const conflicts = sessionProcesses.filter((item) => !item.exactPath || item.instanceKey.toLowerCase() !== instanceKey);
+  if (conflicts.length > 0) {
+    throw new Error(`Another s-gw Windows helper is already running in this session for port ${port}. Run s-gw stop before changing installation or credential authority.`);
+  }
+  return sessionProcesses.map((item) => item.pid).sort((a, b) => a - b);
+}
+
+function waitForWindowsHelper(scriptPath: string, port: number, url: string, instanceKey: string): number {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  let lastPids: number[] = [];
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    Atomics.wait(signal, 0, 0, 100);
+    lastPids = findRunningWindowsHelpers(scriptPath, port, url, instanceKey);
+    if (lastPids.length !== 1) continue;
+
+    Atomics.wait(signal, 0, 0, 100);
+    const confirmed = findRunningWindowsHelpers(scriptPath, port, url, instanceKey);
+    if (confirmed.length === 1 && confirmed[0] === lastPids[0]) return confirmed[0];
+    lastPids = confirmed;
+  }
+  throw new Error(`s-gw Windows helper did not settle to one process; found ${lastPids.length}.`);
+}
+
+function windowsHelperInstanceKey(url: string): string {
+  const normalizedUrl = new URL("/", url).toString();
+  return createHash("sha256")
+    .update(`${getSgwInstanceKey()}\n${normalizedUrl}`)
+    .digest("hex");
+}
+
+function windowsConsoleEndpoint(options: MenuBarOptions): { port: number; url: string; baseUrl: string } {
+  const port = options.port || 8718;
+  const rawUrl = options.consoleUrl || consoleUrl(port);
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`Invalid Windows console URL: ${rawUrl}`);
+  }
+  if (parsed.protocol !== "http:") {
+    throw new Error("The Windows console URL must use http on the local machine.");
+  }
+  if (!["127.0.0.1", "localhost"].includes(parsed.hostname.toLowerCase()) || parsed.username || parsed.password) {
+    throw new Error("The Windows console URL must use 127.0.0.1 or localhost without credentials.");
+  }
+  const urlPort = Number(parsed.port || 80);
+  if (urlPort !== port) {
+    throw new Error(`The Windows console URL port ${urlPort} must match --port ${port}.`);
+  }
+  return {
+    port,
+    url: parsed.toString(),
+    baseUrl: new URL("/", parsed).toString()
+  };
+}
+
+export function selectWindowsHelperPid(
+  processes: WindowsHelperProcess[],
+  currentSid: string,
+  currentSessionId: number
+): number | undefined {
+  return selectWindowsHelperProcesses(processes, currentSid, currentSessionId)[0]?.pid;
+}
+
+function selectWindowsHelperProcesses(
+  processes: WindowsHelperProcess[],
+  currentSid: string,
+  currentSessionId: number
+): WindowsHelperProcess[] {
+  if (!currentSid || !Number.isInteger(currentSessionId)) return [];
+  const sid = currentSid.toLowerCase();
+  return processes
+    .filter((item) => item.ownerSid.toLowerCase() === sid && item.sessionId === currentSessionId)
+    .sort((a, b) => a.pid - b.pid);
+}
+
+function windowsHelperProcess(value: unknown): WindowsHelperProcess[] {
+  if (!value || typeof value !== "object") return [];
+  const item = value as Record<string, unknown>;
+  const pid = Number(item.pid);
+  const ownerSid = typeof item.ownerSid === "string" ? item.ownerSid : "";
+  const sessionId = Number(item.sessionId);
+  const instanceKey = typeof item.instanceKey === "string" ? item.instanceKey : "";
+  const exactPath = item.exactPath === true;
+  if (!Number.isInteger(pid) || pid <= 0 || !ownerSid || !Number.isInteger(sessionId)) return [];
+  return [{ pid, ownerSid, sessionId, instanceKey, exactPath }];
 }
 
 export function macAppProcessRecordPath(): string {

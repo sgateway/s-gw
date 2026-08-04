@@ -265,7 +265,9 @@ s-gw helper open
 
 On Windows, `s-gw app open` launches `dist\windows\s-gw-client.ps1`. It starts the local console on `127.0.0.1` if needed, then opens the UI in Edge or Chrome app mode. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
 
-`s-gw setup` and `s-gw start` also start the loopback console directly, so `--no-open-app` leaves a usable headless runtime instead of depending on a browser window. Use `--no-service` to suppress the console process, `--no-menubar` to suppress the tray helper, and `s-gw stop` to stop the Windows console, client, and helper processes owned by s-gw.
+`s-gw setup` and `s-gw start` also start the loopback console directly, so `--no-open-app` leaves a usable headless runtime instead of depending on a browser window. The tray helper and client verify that the console belongs to the same Windows user, login session, credential home, and credential-store namespace before opening it. Repeated setup, start, and helper-open commands reuse one tray process per user session and port.
+
+Use `--no-menubar` to suppress the tray helper. `--no-service` requires `--no-menubar` because the helper cannot run without its matching console. Custom Windows console URLs must use loopback HTTP and the same port supplied through `--port`. Use `s-gw stop` to stop only the current user's console, client, and helper processes in the current login session.
 
 The Windows Credential Manager helper is staged at `dist\windows\s-gw-credential.ps1`. It uses the Windows credential APIs and receives new values on stdin, so unlock passphrases and secret values are not passed as process arguments. Signed `.exe` wrappers, login-start registration, and MSIX/installer packaging are still separate hardening work.
 

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
+import { getSgwInstanceKey } from "../src/paths.js";
 import { ReleaseChecker } from "../src/update-check.js";
 
 let tmpHome = "";
@@ -37,6 +38,17 @@ afterEach(async () => {
 });
 
 describe("local console server", () => {
+  it("identifies the credential home on the unauthenticated health endpoint", async () => {
+    running = await startConsoleServer({ port: 0 });
+
+    const health = await fetchJson("api/health");
+    expect(health).toMatchObject({
+      ok: true,
+      name: "s-gw",
+      instanceKey: getSgwInstanceKey(tmpHome)
+    });
+  });
+
   it("serves the console with a session token and protects local API writes", async () => {
     running = await startConsoleServer({ port: 0 });
 

@@ -43,9 +43,25 @@ writeFileSync(resolve(distRoot, "VERSION.txt"), `${packageInfo.name} ${packageIn
 console.log(`Staged Windows client helpers: ${distRoot}`);
 
 function launcherFor(scriptName) {
+  if (scriptName === "s-gw-client.ps1") {
+    return cliLauncher("app open");
+  }
+  if (scriptName === "s-gw-helper.ps1") {
+    return cliLauncher("helper open");
+  }
   return `@echo off\r
 setlocal\r
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0${scriptName}" %*\r
+exit /b %ERRORLEVEL%\r
+`;
+}
+
+function cliLauncher(command) {
+  return `@echo off\r
+setlocal\r
+set "_sgw_node=%SGW_NODE_PATH%"\r
+if not defined _sgw_node set "_sgw_node=node"\r
+"%_sgw_node%" "%~dp0..\\cli.js" ${command} %*\r
 exit /b %ERRORLEVEL%\r
 `;
 }

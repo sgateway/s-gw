@@ -1,7 +1,11 @@
-import os from "node:os";
-import path from "node:path";
+import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+export const MASTER_KEYCHAIN_SERVICE = "com.s-gw.sgw.master-passphrase";
+export const SECRET_KEYCHAIN_SERVICE = "com.s-gw.sgw.secret";
 
 export function expandHome(inputPath: string): string {
   if (inputPath === "~") {
@@ -24,6 +28,59 @@ export function getSgwHome(): string {
   const home = path.resolve(expandHome(configuredHome || "~/.s-gw"));
   assertIsolatedTestHome(home);
   return home;
+}
+
+export function getSgwInstanceKey(home = getSgwHome()): string {
+  const user = os.userInfo();
+  const identity = {
+    platform: process.platform,
+    user: {
+      username: user.username,
+      home: instancePath(user.homedir),
+      uid: user.uid,
+      gid: user.gid,
+      windowsDomain: process.platform === "win32" ? environmentValue("USERDOMAIN") : "",
+      windowsSession: process.platform === "win32" ? environmentValue("SESSIONNAME") : ""
+    },
+    home: instancePath(home),
+    recoveryHome: instancePath(getSgwRecoveryHome(home)),
+    disableKeychain: process.env.SGW_DISABLE_KEYCHAIN === "1",
+    masterPassphraseConfigured: typeof process.env.SGW_MASTER_PASSPHRASE === "string"
+      && process.env.SGW_MASTER_PASSPHRASE.trim().length >= 8,
+    keychainService: process.env.SGW_KEYCHAIN_SERVICE || MASTER_KEYCHAIN_SERVICE,
+    keychainAccount: process.env.SGW_KEYCHAIN_ACCOUNT || user.username || "local-user",
+    keychainHelper: process.env.SGW_KEYCHAIN_HELPER || "",
+    secretBackend: environmentValue("SGW_SECRET_BACKEND").toLowerCase(),
+    secretKeychainService: process.env.SGW_SECRET_KEYCHAIN_SERVICE || SECRET_KEYCHAIN_SERVICE,
+    secretTool: process.env.SGW_SECRET_TOOL || "",
+    windowsCredentialHelper: process.env.SGW_WINDOWS_CREDENTIAL_HELPER || "",
+    loginSessionId: getSgwLoginSessionId()
+  };
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
+
+export function getSgwLoginSessionId(): string {
+  const override = process.env.SGW_LOGIN_SESSION_ID?.trim();
+  if (override) return override.slice(0, 160);
+
+  const user = os.userInfo();
+  const parts = [
+    process.platform,
+    String(user.uid),
+    user.username,
+    process.env.TMPDIR || "",
+    process.env.XDG_RUNTIME_DIR || "",
+    process.env.SSH_AUTH_SOCK || ""
+  ];
+  return createHash("sha256").update(parts.join("\0")).digest("base64url").slice(0, 32);
+}
+
+function instancePath(inputPath: string): string {
+  return path.resolve(expandHome(inputPath));
+}
+
+function environmentValue(name: string): string {
+  return process.env[name]?.trim() || "";
 }
 
 export function getSgwRecoveryHome(home = getSgwHome()): string {

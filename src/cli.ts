@@ -1050,6 +1050,10 @@ async function handleSetupCommand(
   store: SecretStore,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  if (process.platform === "win32" && hasFlag(flags, "no-service") && !hasFlag(flags, "no-menubar")) {
+    throw new Error("--no-service requires --no-menubar on Windows because the tray helper requires its matching console.");
+  }
+
   if (process.platform === "darwin") {
     const layout = getPackageLayout();
     assertMacRuntimeForManagedSurfaces(layout);
@@ -1111,10 +1115,10 @@ async function handleSetupCommand(
       countMode: normalizeMenuBarCountMode(getFlag(flags, "menubar-count"))
     });
   } else if (process.platform === "win32" && !hasFlag(flags, "no-menubar")) {
-    windowsHelper = openWindowsHelper({ port, consoleUrl });
+    windowsHelper = await openWindowsHelper({ port, consoleUrl });
   }
 
-  const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+  const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
   const agents = hasFlag(flags, "no-agents")
     ? { skipped: true, results: [] }
     : { skipped: false, results: installAgentIntegrations() };
@@ -1149,20 +1153,23 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
   const port = numericFlag(flags, "port", 8718);
   const consoleUrl = `http://127.0.0.1:${port}/`;
   if (process.platform === "win32") {
+    if (hasFlag(flags, "no-service") && !hasFlag(flags, "no-menubar")) {
+      throw new Error("--no-service requires --no-menubar on Windows because the tray helper requires its matching console.");
+    }
     const console = hasFlag(flags, "no-service")
       ? undefined
       : await ensureWindowsConsole({ port, consoleUrl });
     const helper = hasFlag(flags, "no-menubar")
       ? undefined
-      : openWindowsHelper({ port, consoleUrl });
-    const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+      : await openWindowsHelper({ port, consoleUrl });
+    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
     printJson({ ok: true, consoleUrl, opened, console, helper });
     return;
   }
 
   if (process.platform === "linux") {
     const service = await installSystemdUserService({ port, start: true });
-    const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
     printJson({ ok: true, consoleUrl, opened, service });
     return;
   }
@@ -1174,7 +1181,7 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
     ? startInstalledLaunchAgent("menubar")
     : await installMenuBarLaunchAgent({ port, start: true });
 
-  const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+  const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
 
   printJson({ ok: true, consoleUrl, opened, service, menuBar });
 }
@@ -1366,7 +1373,7 @@ async function handleMenuBarCommand(
   if (action === "open") {
     if (process.platform === "win32") {
       printJson(
-        openWindowsHelper({
+        await openWindowsHelper({
           consoleUrl: getFlag(flags, "console-url"),
           port: numericFlag(flags, "port", 8718)
         })
@@ -2148,7 +2155,7 @@ async function handleAppCommand(
   if (action === "open") {
     if (process.platform === "win32") {
       printJson(
-        openWindowsClient({
+        await openWindowsClient({
           consoleUrl: getFlag(flags, "console-url"),
           port: numericFlag(flags, "port", 8718)
         })
@@ -2219,13 +2226,13 @@ async function handleGuardRun(
   process.exitCode = code;
 }
 
-function openPreferredUi(port: number, consoleUrl: string) {
-  try {
-    if (process.platform === "win32") {
-      const opened = openWindowsClient({ port, consoleUrl });
-      return { kind: "windows-client", ...opened };
-    }
+async function openPreferredUi(port: number, consoleUrl: string) {
+  if (process.platform === "win32") {
+    const opened = await openWindowsClient({ port, consoleUrl });
+    return { kind: "windows-client", ...opened };
+  }
 
+  try {
     const opened = openMacApp({ port, consoleUrl });
     return { kind: "mac-app", ...opened };
   } catch {

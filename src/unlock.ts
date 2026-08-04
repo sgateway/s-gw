@@ -18,11 +18,9 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getSgwHome } from "./paths.js";
+import { getSgwHome, MASTER_KEYCHAIN_SERVICE, SECRET_KEYCHAIN_SERVICE } from "./paths.js";
 import { resolveSelfContainedMacRuntime } from "./self-contained-runtime.js";
 
-const defaultService = "com.s-gw.sgw.master-passphrase";
-const defaultSecretService = "com.s-gw.sgw.secret";
 const nativeHelperName = "s-gw-keychain-helper";
 const nativeInspectorName = "s-gw-keychain-inspector";
 const keychainRepairService = "com.s-gw.sgw.keychain-repair";
@@ -181,14 +179,14 @@ function inspectKeychainPassphrase(
 export function keychainInfo(): KeychainInfo {
   return {
     supported: supportsLocalCredentialStore(),
-    service: process.env.SGW_KEYCHAIN_SERVICE || defaultService,
+    service: process.env.SGW_KEYCHAIN_SERVICE || MASTER_KEYCHAIN_SERVICE,
     account: process.env.SGW_KEYCHAIN_ACCOUNT || os.userInfo().username || "local-user",
     ...keychainProvider()
   };
 }
 
 export function defaultSecretKeychainService(): string {
-  return process.env.SGW_SECRET_KEYCHAIN_SERVICE || defaultSecretService;
+  return process.env.SGW_SECRET_KEYCHAIN_SERVICE || SECRET_KEYCHAIN_SERVICE;
 }
 
 export function setMacKeychainItem(ref: MacKeychainItemRef, value: string): void {

@@ -23,6 +23,7 @@ import {
 } from "./gateway.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { assertMacRuntimeForManagedSurfaces, getPackageLayout, readinessForUnlock } from "./install.js";
+import { getSgwInstanceKey } from "./paths.js";
 import { SecretStore, type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput } from "./store.js";
 import { unlockStatus } from "./unlock.js";
 import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
@@ -150,12 +151,13 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   };
 
   await store.init();
+  const instanceKey = getSgwInstanceKey(path.dirname(store.storePath));
   void updateChecker.check();
   const updateTimer = setInterval(() => void updateChecker.check(true), UPDATE_CHECK_INTERVAL_MS);
   updateTimer.unref();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions).catch((error) => {
+    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey).catch((error) => {
       sendError(res, error);
     });
   });
@@ -200,7 +202,8 @@ async function handleRequest(
   token: string,
   uiDir: string,
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
-  agentOptions: AgentIntegrationOptions
+  agentOptions: AgentIntegrationOptions,
+  instanceKey: string
 ): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (url.pathname.startsWith("/api/")) {
@@ -208,7 +211,7 @@ async function handleRequest(
       throw new HttpError(403, "Missing or invalid local console token.");
     }
 
-    await handleApi(req, res, url, store, updateChecker, agentOptions);
+    await handleApi(req, res, url, store, updateChecker, agentOptions, instanceKey);
     return;
   }
 
@@ -227,10 +230,16 @@ async function handleApi(
   url: URL,
   store: SecretStore,
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
-  agentOptions: AgentIntegrationOptions
+  agentOptions: AgentIntegrationOptions,
+  instanceKey: string
 ): Promise<void> {
   if (req.method === "GET" && url.pathname === "/api/health") {
-    sendJson(res, 200, { ok: true, name: "s-gw", version });
+    sendJson(res, 200, {
+      ok: true,
+      name: "s-gw",
+      version,
+      instanceKey
+    });
     return;
   }
 

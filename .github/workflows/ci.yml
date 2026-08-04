@@ -74,4 +74,4 @@ jobs:
       - run: npm run check
       - run: npm run build:windows-client
       - run: npx tsc -p tsconfig.json
-      - run: npx vitest run tests/windows-client.test.ts tests/windows-credential-e2e.test.ts tests/mcp-e2e.test.ts tests/installers.test.ts tests/agents.test.ts tests/agent-install.test.ts tests/agent-install-windows.test.ts
+      - run: npx vitest run --no-file-parallelism tests/windows-client.test.ts tests/windows-credential-e2e.test.ts tests/mcp-e2e.test.ts tests/installers.test.ts tests/agents.test.ts tests/agent-install.test.ts tests/agent-install-windows.test.ts
