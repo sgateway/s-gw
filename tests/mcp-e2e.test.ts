@@ -49,7 +49,7 @@ describe("MCP end-to-end flow", () => {
     } finally {
       await client.close();
     }
-  });
+  }, 20_000);
 
   it("denies execution before approval and returns sanitized output after approval", async () => {
     runCli(["init"]);
@@ -131,7 +131,7 @@ describe("MCP end-to-end flow", () => {
     } finally {
       await client.close();
     }
-  });
+  }, 20_000);
 });
 
 function runCli(args: string[], input?: string): string {

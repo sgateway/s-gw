@@ -93,7 +93,11 @@ describe("Windows credential protection", () => {
         expect(executed.stdout).not.toContain(secretValue);
 
         const deleted = JSON.parse(runCli(["secret", "delete", handle], testEnv));
-        expect(deleted.deleted).toBe(true);
+        expect(deleted.handle).toBe(handle);
+        expect(deleted.name).toBe("windows-e2e-token");
+        expect(JSON.parse(runCli(["secret", "list"], testEnv))).not.toEqual(
+          expect.arrayContaining([expect.objectContaining({ handle })])
+        );
         handle = "";
         expect(JSON.parse(runCli(["unlock", "keychain", "delete"], testEnv)).deleted).toBe(true);
         expect(JSON.parse(runCli(["unlock", "status"], testEnv)).activeSource).toBe("none");
