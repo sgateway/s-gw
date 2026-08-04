@@ -24,6 +24,7 @@ import {
 import { guardStatus, prepareGuardedRun, runGuardedAgent } from "./guard.js";
 import {
   assertMacRuntimeForManagedSurfaces,
+  ensureWindowsConsole,
   getPackageLayout,
   installMacAppBundle,
   installConsoleLaunchAgent,
@@ -311,7 +312,7 @@ async function main(): Promise<void> {
       type: secretType(getFlag(parsed.flags, "type") || "unknown"),
       value,
       service: getFlag(parsed.flags, "service"),
-      source: getFlag(parsed.flags, "source") || "macos-keychain",
+      source: getFlag(parsed.flags, "source"),
       policy: {
         injectEnv: getFlag(parsed.flags, "inject-env"),
         allowedCommands: getFlagList(parsed.flags, "allow-command"),
@@ -1072,11 +1073,14 @@ async function handleSetupCommand(
   const consoleUrl = `http://127.0.0.1:${port}/`;
   let service = launchAgentStatus("console");
   let menuBar = launchAgentStatus("menubar");
+  let windowsConsole: unknown;
   let windowsHelper: unknown;
   const appInstall = process.platform === "darwin" ? installMacAppBundle() : undefined;
 
   if (process.platform === "darwin" && !hasFlag(flags, "no-service")) {
     service = await installConsoleLaunchAgent({ port, start: true });
+  } else if (process.platform === "win32" && !hasFlag(flags, "no-service")) {
+    windowsConsole = await ensureWindowsConsole({ port, consoleUrl });
   }
 
   if (process.platform === "darwin" && !hasFlag(flags, "no-menubar")) {
@@ -1103,6 +1107,7 @@ async function handleSetupCommand(
     opened,
     service,
     menuBar,
+    windowsConsole,
     windowsHelper,
     keychainHelper,
     keychainCompatibility,
@@ -1124,9 +1129,14 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
   const port = numericFlag(flags, "port", 8718);
   const consoleUrl = `http://127.0.0.1:${port}/`;
   if (process.platform === "win32") {
-    const helper = openWindowsHelper({ port, consoleUrl });
+    const console = hasFlag(flags, "no-service")
+      ? undefined
+      : await ensureWindowsConsole({ port, consoleUrl });
+    const helper = hasFlag(flags, "no-menubar")
+      ? undefined
+      : openWindowsHelper({ port, consoleUrl });
     const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
-    printJson({ ok: true, consoleUrl, opened, helper });
+    printJson({ ok: true, consoleUrl, opened, console, helper });
     return;
   }
 
@@ -1143,6 +1153,10 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
 }
 
 async function handleStopCommand(): Promise<void> {
+  if (process.platform === "win32") {
+    printJson({ ok: true, windows: stopWindowsSurfaces() });
+    return;
+  }
   const { service, menuBar } = stopBackgroundSurfaces();
   printJson({ ok: true, service, menuBar });
 }
@@ -2198,7 +2212,7 @@ Commands:
   s-gw init
   s-gw setup [--port 8718] [--passphrase-stdin] [--menubar-count pending|credentials|none] [--no-open-app] [--no-service] [--no-menubar] [--no-agents]
   s-gw status
-  s-gw start [--port 8718] [--no-open-app]
+  s-gw start [--port 8718] [--no-open-app] [--no-service] [--no-menubar]
   s-gw stop
   s-gw doctor
   s-gw update check [--force]

@@ -6,6 +6,26 @@ import { describe, expect, it } from "vitest";
 import { getPackageLayout, installMacAppBundle } from "../src/install.js";
 
 describe("macOS app installation", () => {
+  it("documents an uninstall order that keeps the CLI available for cleanup", async () => {
+    const deployment = await readFile(path.join(process.cwd(), "docs/deployment.md"), "utf8");
+    const uninstall = deployment.slice(
+      deployment.indexOf("## Uninstall"),
+      deployment.indexOf("## Packaging Checklist")
+    );
+
+    const agentsAt = uninstall.indexOf("s-gw agent uninstall");
+    const servicesAt = uninstall.indexOf("s-gw service uninstall");
+    const unlockAt = uninstall.indexOf("s-gw unlock keychain delete");
+    const npmAt = uninstall.indexOf("npm uninstall -g @s-gw/s-gw");
+
+    expect(agentsAt).toBeGreaterThan(0);
+    expect(servicesAt).toBeGreaterThan(agentsAt);
+    expect(unlockAt).toBeGreaterThan(servicesAt);
+    expect(npmAt).toBeGreaterThan(unlockAt);
+    expect(uninstall).toContain("Move `s-gw.app` from Applications to Trash");
+    expect(uninstall).toContain("~/.s-gw-recovery");
+  });
+
   it.skipIf(process.platform !== "darwin")("installs the app bundle once and replaces a changed copy", async () => {
     const applicationsDir = await mkdtemp(path.join(os.tmpdir(), "sgw-app-install-"));
 

@@ -253,6 +253,8 @@ s-gw helper open
 
 On Windows, `s-gw app open` launches `dist\windows\s-gw-client.ps1`. It starts the local console on `127.0.0.1` if needed, then opens the UI in Edge or Chrome app mode. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
 
+`s-gw setup` and `s-gw start` also start the loopback console directly, so `--no-open-app` leaves a usable headless runtime instead of depending on a browser window. Use `--no-service` to suppress the console process, `--no-menubar` to suppress the tray helper, and `s-gw stop` to stop the Windows console, client, and helper processes owned by s-gw.
+
 The Windows Credential Manager helper is staged at `dist\windows\s-gw-credential.ps1`. It uses the Windows credential APIs and receives new values on stdin, so unlock passphrases and secret values are not passed as process arguments. Signed `.exe` wrappers, login-start registration, and MSIX/installer packaging are still separate hardening work.
 
 ### Local Installer Artifacts
@@ -421,27 +423,33 @@ For an offline npm upgrade, verify the downloaded `s-gw-VERSION.tgz` with either
 
 ## Uninstall
 
-Remove the tool:
+Disconnect integrations and stop the local surfaces while the CLI is still
+available:
 
 ```bash
+s-gw agent uninstall
 s-gw menubar uninstall
 s-gw service uninstall
-npm uninstall -g @s-gw/s-gw
 ```
 
-Remove local unlock material:
+Remove local unlock material before uninstalling the package:
 
 ```bash
 s-gw unlock keychain delete
 ```
 
-Remove local ledger if desired:
+Move `s-gw.app` from Applications to Trash, then remove the npm package:
 
 ```bash
-rm -rf ~/.s-gw
+npm uninstall -g @s-gw/s-gw
 ```
 
-Also remove the MCP server entry from each configured coding tool.
+The encrypted ledger and recovery checkpoints are preserved by default. Remove
+both only when you deliberately want to discard local s-gw state:
+
+```bash
+rm -rf ~/.s-gw ~/.s-gw-recovery
+```
 
 ## Packaging Checklist
 
@@ -475,7 +483,9 @@ For Windows preview packages, also verify:
 - Windows scripts exist under `dist/windows`;
 - `s-gw unlock keychain set --value-stdin` stores unlock material through Credential Manager;
 - `s-gw app open` starts the local console and opens the client shell;
+- `s-gw start --no-open-app --no-menubar` starts a healthy headless console, and `s-gw stop` stops it;
 - `s-gw helper open` creates a tray icon and sees pending requests;
+- a synthetic Credential Manager secret stays local, cannot execute before approval, and is tokenized in returned output after approval;
 - helper approve/deny actions use the CLI and do not require the console API token;
 - installer/startup registration does not log raw secrets or command stdin.
 

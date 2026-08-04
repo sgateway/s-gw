@@ -495,6 +495,24 @@ export function startWindowsConsole(options: MenuBarOptions = {}): WindowsOpenRe
   };
 }
 
+export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promise<WindowsOpenResult> {
+  requireWindows("Windows console start");
+  const layout = getPackageLayout();
+  const port = options.port || 8718;
+  const url = options.consoleUrl || consoleUrl(port);
+  if (await windowsConsoleReady(url)) {
+    return {
+      scriptPath: layout.cliPath,
+      launcherPath: process.execPath,
+      consoleUrl: url
+    };
+  }
+
+  const started = startWindowsConsole({ ...options, port, consoleUrl: url });
+  await waitForWindowsConsole(url);
+  return started;
+}
+
 export async function restartWindowsSurfaces(
   stopped: WindowsStoppedSurfaces,
   options: MenuBarOptions = {}
@@ -541,15 +559,20 @@ export async function restartWindowsSurfaces(
 async function waitForWindowsConsole(url: string): Promise<void> {
   const healthUrl = new URL("/api/health", url).toString();
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(500) });
-      if (response.ok) return;
-    } catch {
-      // The restored process can take a moment to bind after npm finishes.
-    }
+    if (await windowsConsoleReady(url)) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`s-gw console did not become healthy at ${healthUrl}`);
+}
+
+async function windowsConsoleReady(url: string): Promise<boolean> {
+  const healthUrl = new URL("/api/health", url).toString();
+  try {
+    const response = await fetch(healthUrl, { signal: AbortSignal.timeout(500) });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 export function launchAgentStatus(kind: "console" | "menubar"): LaunchAgentStatus {

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  ensureWindowsConsole,
   getPackageLayout,
   restartWindowsSurfaces,
   startWindowsConsole,
@@ -83,6 +84,46 @@ describe("Windows client packaging", () => {
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("starts headless and stops every Windows surface through the CLI", async () => {
+    if (process.platform !== "win32") return;
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-lifecycle-"));
+    const port = await freePort();
+    const testEnv = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
+      SGW_MASTER_PASSPHRASE: "windows lifecycle test passphrase",
+      SGW_DISABLE_KEYCHAIN: "1",
+      SGW_DISABLE_UPDATE_CHECK: "1"
+    };
+
+    try {
+      const started = JSON.parse(runBuiltCli([
+        "start",
+        "--port",
+        String(port),
+        "--no-open-app",
+        "--no-menubar"
+      ], testEnv));
+      expect(started.ok).toBe(true);
+      expect(started.console.consoleUrl).toBe(`http://127.0.0.1:${port}/`);
+      expect(started.helper).toBeUndefined();
+      await waitForHealth(port);
+
+      const existing = await ensureWindowsConsole({ port });
+      expect(existing.pid).toBeUndefined();
+
+      const stopped = JSON.parse(runBuiltCli(["stop"], testEnv));
+      expect(stopped.ok).toBe(true);
+      expect(stopped.windows.console).toBe(true);
+      await waitForHealthToStop(port);
+    } finally {
+      stopWindowsSurfaces();
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 async function freePort(): Promise<number> {
@@ -108,6 +149,28 @@ async function waitForHealth(port: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`s-gw console did not become healthy on port ${port}.`);
+}
+
+async function waitForHealthToStop(port: number): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/api/health`);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`s-gw console remained healthy on port ${port}.`);
+}
+
+function runBuiltCli(args: string[], env: NodeJS.ProcessEnv): string {
+  const layout = getPackageLayout();
+  return execFileSync(process.execPath, [layout.cliPath, ...args], {
+    cwd: repoRoot,
+    env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
 }
 
 function restoreEnv(name: string, value: string | undefined): void {
