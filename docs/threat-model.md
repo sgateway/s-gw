@@ -82,6 +82,8 @@ s-gw does not protect against:
 - broad prompt, file, terminal, or operating system interception solely through MCP registration;
 - denial of service, destructive approved commands, or incorrect user approval decisions.
 
+The Linux desktop service makes the user's home read-only rather than hiding it because npm, Node.js, and approved command targets may live there. This prevents service writes outside the s-gw ledger and recovery paths, but a compromise of the broker process could still read files already readable by that operating-system account. Install s-gw and Node.js under system paths when a stricter home-filesystem boundary is required, and review `systemd-analyze security --user s-gw.service` on the deployed host.
+
 Output sanitization is a last line of defense, not a data-loss-prevention guarantee. Keep allowed commands narrow, review destinations and arguments, and use low-privilege credentials with independent provider-side controls.
 
 ## Secure Use

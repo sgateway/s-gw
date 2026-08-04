@@ -1063,6 +1063,12 @@ async function handleSetupCommand(
     if (process.platform !== "darwin" && process.platform !== "linux" && process.platform !== "win32") {
       throw new Error("s-gw setup needs a supported local OS credential store or SGW_MASTER_PASSPHRASE.");
     }
+    if (beforeUnlock.keychain.state === "unavailable") {
+      throw new Error(
+        "s-gw setup cannot verify existing OS credential-store unlock material and will not generate or replace it. " +
+        (beforeUnlock.keychain.error || "Make the local credential store available, then retry.")
+      );
+    }
 
     const passphrase = hasFlag(flags, "passphrase-stdin")
       ? await readStdinValue(flags, "passphrase-stdin", "unlock passphrase")
@@ -1150,10 +1156,7 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
   }
 
   if (process.platform === "linux") {
-    const current = systemdUserServiceStatus();
-    const service = current.installed
-      ? startInstalledSystemdUserService()
-      : await installSystemdUserService({ port, start: true });
+    const service = await installSystemdUserService({ port, start: true });
     const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
     printJson({ ok: true, consoleUrl, opened, service });
     return;
@@ -2227,7 +2230,9 @@ function openPreferredUi(port: number, consoleUrl: string) {
 }
 
 function shouldOpenUi(flags: Record<string, string | boolean | string[]>): boolean {
-  return !hasFlag(flags, "no-open-console") && !hasFlag(flags, "no-open-app");
+  if (hasFlag(flags, "no-open-console") || hasFlag(flags, "no-open-app")) return false;
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return false;
+  return true;
 }
 
 function openBrowser(url: string): void {
@@ -2237,6 +2242,7 @@ function openBrowser(url: string): void {
     detached: true,
     stdio: "ignore"
   });
+  child.on("error", () => undefined);
   child.unref();
 }
 

@@ -29,6 +29,8 @@ const keychainRepairService = "com.s-gw.sgw.keychain-repair";
 const windowsCredentialHelperName = "s-gw-credential.ps1";
 const keychainRepairTimeoutMs = 10_000;
 const staleKeychainRepairMs = 30_000;
+const defaultSecretToolTimeoutMs = 10_000;
+const maxSecretToolInputBytes = 8_191;
 
 export interface KeychainInfo {
   supported: boolean;
@@ -43,6 +45,8 @@ export interface UnlockStatus {
   activeSource: "env" | "linux-secret-service" | "macos-keychain" | "windows-credential-manager" | "none";
   keychain: KeychainInfo & {
     configured: boolean;
+    state: "configured" | "missing" | "unavailable";
+    error?: string;
   };
 }
 
@@ -99,7 +103,8 @@ export function requireUnlockPassphrase(): string {
 export function unlockStatus(): UnlockStatus {
   const envConfigured = validPassphrase(process.env.SGW_MASTER_PASSPHRASE);
   const keychain = keychainInfo();
-  const configured = hasKeychainPassphrase();
+  const passphrase = inspectKeychainPassphrase(keychain);
+  const configured = passphrase.state === "configured";
 
   let activeSource: UnlockStatus["activeSource"] = "none";
   if (envConfigured) {
@@ -115,7 +120,8 @@ export function unlockStatus(): UnlockStatus {
     activeSource,
     keychain: {
       ...keychain,
-      configured
+      configured,
+      ...passphrase
     }
   };
 }
@@ -150,14 +156,25 @@ export function deleteKeychainPassphrase(): boolean {
 
 export function hasKeychainPassphrase(): boolean {
   const info = keychainInfo();
-  if (!info.supported || info.provider === "none" || process.env.SGW_DISABLE_KEYCHAIN === "1") {
-    return false;
-  }
+  return inspectKeychainPassphrase(info).state === "configured";
+}
 
+function inspectKeychainPassphrase(
+  info: KeychainInfo
+): { state: "configured" | "missing" | "unavailable"; error?: string } {
+  if (!info.supported || info.provider === "none") {
+    return { state: "unavailable", error: missingCredentialStoreError().message };
+  }
+  if (process.env.SGW_DISABLE_KEYCHAIN === "1") {
+    return { state: "unavailable", error: "OS credential-store access is disabled by SGW_DISABLE_KEYCHAIN." };
+  }
   try {
-    return keychainItemExists(info);
-  } catch {
-    return false;
+    return { state: keychainItemExists(info) ? "configured" : "missing" };
+  } catch (error) {
+    return {
+      state: "unavailable",
+      error: error instanceof Error ? error.message : String(error)
+    };
   }
 }
 
@@ -200,18 +217,22 @@ export function getMacKeychainItem(ref: MacKeychainItemRef): string {
 }
 
 export function deleteMacKeychainItem(ref: MacKeychainItemRef): boolean {
-  try {
-    preparePersistentMacHelper();
-    if (managedMacKeychainAccessEnabled()) {
-      return deleteManagedMacKeychainItem(ref);
-    }
-    const info = keychainInfoForItem(ref);
-    ensureNativeCredentialStore(info);
-    runKeychainDelete(info);
-    return true;
-  } catch {
-    return false;
+  preparePersistentMacHelper();
+  if (managedMacKeychainAccessEnabled()) {
+    return deleteManagedMacKeychainItem(ref);
   }
+  const info = keychainInfoForItem(ref);
+  ensureNativeCredentialStore(info);
+  if (info.provider === "secret-service-cli") {
+    if (!keychainItemExists(info)) return false;
+    runKeychainDelete(info);
+    if (keychainItemExists(info)) {
+      throw new Error(`Linux Secret Service did not delete the item for account ${ref.account}.`);
+    }
+    return true;
+  }
+  runKeychainDelete(info);
+  return true;
 }
 
 export function repairKeychainPassphraseAccess(): MacKeychainAccessRepair {
@@ -1009,9 +1030,11 @@ function keychainItemExists(info: KeychainInfo): boolean {
   if (info.provider === "secret-service-cli" && info.helperPath) {
     const result = spawnSync(info.helperPath, ["lookup", ...secretServiceAttributes(info)], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: secretToolTimeoutMs(),
+      killSignal: "SIGKILL"
     });
-    if (result.error) throw result.error;
+    assertSecretToolCompleted(result);
     if (result.status === 0) return result.stdout.replace(/\r?\n$/, "").length > 0;
     if (result.status === 1 && !result.stderr.trim()) return false;
     throw new Error(result.stderr.trim() || `Secret Service status check failed with status ${result.status}`);
@@ -1052,6 +1075,12 @@ function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw lo
   }
 
   if (info.provider === "secret-service-cli" && info.helperPath) {
+    const byteLength = Buffer.byteLength(passphrase, "utf8");
+    if (byteLength > maxSecretToolInputBytes) {
+      throw new Error(
+        `Linux Secret Service values are limited to ${maxSecretToolInputBytes} UTF-8 bytes by secret-tool; received ${byteLength}.`
+      );
+    }
     runSecretTool(
       info.helperPath,
       [`store`, `--label=${label}`, ...secretServiceAttributes(info)],
@@ -1111,13 +1140,31 @@ function runSecretTool(helperPath: string, args: string[], input?: string): stri
   const result = spawnSync(helperPath, args, {
     input,
     encoding: "utf8",
-    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"]
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    timeout: secretToolTimeoutMs(),
+    killSignal: "SIGKILL"
   });
-  if (result.error) throw result.error;
+  assertSecretToolCompleted(result);
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `Linux Secret Service helper failed with status ${result.status}`);
   }
   return result.stdout;
+}
+
+function secretToolTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultSecretToolTimeoutMs;
+  const configured = Number(process.env.SGW_SECRET_TOOL_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= defaultSecretToolTimeoutMs
+    ? configured
+    : defaultSecretToolTimeoutMs;
+}
+
+function assertSecretToolCompleted(result: ReturnType<typeof spawnSync>): void {
+  if (!result.error) return;
+  if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+    throw new Error(`Linux Secret Service helper timed out after ${secretToolTimeoutMs()} ms.`);
+  }
+  throw result.error;
 }
 
 function runNativeHelper(helperPath: string, args: string[], input?: string): string {

@@ -106,7 +106,7 @@ s-gw status
 
 On Windows, run the same commands in PowerShell. Windows support is preview software: it uses the TypeScript execution path and includes the PowerShell client, tray helper, and local web console.
 
-On Linux, install `secret-tool` first (`sudo apt install libsecret-tools` on Ubuntu/Debian). An unlocked desktop Secret Service is the normal persistent unlock provider; `s-gw setup` also installs and starts an owner-level `systemd --user` console service. A headless host without Secret Service can use an explicitly supplied `SGW_MASTER_PASSPHRASE` with `s-gw setup --no-service`, but s-gw never copies that value into a unit file.
+On Linux, install `secret-tool` first (`sudo apt install libsecret-tools` on Ubuntu/Debian). An unlocked desktop Secret Service is the normal persistent unlock provider; `s-gw setup` also installs and starts an owner-level `systemd --user` console service for the graphical session. A headless host without Secret Service can use an explicitly supplied `SGW_MASTER_PASSPHRASE` with `s-gw setup --no-service --no-open-app`, but s-gw never copies that value into a unit file or background-service environment.
 
 For an Apple Silicon Mac desktop bundle, [GitHub Releases](https://github.com/sgateway/s-gw/releases) also provides a self-contained `s-gw.dmg`. Drag `s-gw.app` to **Applications**, then open it and complete setup. The app includes its own Node runtime, CLI, MCP server, native helpers, and menu-bar helper; it does not require Node.js or npm on the host. Setup is intentionally blocked until the app is in `/Applications` or `~/Applications`.
 

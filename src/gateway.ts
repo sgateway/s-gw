@@ -75,6 +75,14 @@ export function preferredLocalSecretBackend(): LocalSecretBackend {
   }
 
   if (
+    process.platform === "linux"
+    && typeof process.env.SGW_MASTER_PASSPHRASE === "string"
+    && process.env.SGW_MASTER_PASSPHRASE.trim().length >= 8
+  ) {
+    return "local";
+  }
+
+  if (
     (process.platform === "darwin" || process.platform === "linux" || process.platform === "win32")
     && process.env.SGW_DISABLE_KEYCHAIN !== "1"
     && keychainInfo().provider !== "none"

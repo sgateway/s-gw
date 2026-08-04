@@ -43,6 +43,7 @@ afterEach(async () => {
     "SGW_FAKE_SYSTEMD_STATE",
     "SGW_FAKE_SYSTEMD_CAPTURE",
     "SGW_FAKE_SECRET_DB",
+    "SGW_FAKE_SECRET_LOOKUP_ERROR",
     "XDG_CONFIG_HOME"
   ]) {
     delete process.env[key];
@@ -68,8 +69,49 @@ describe.sequential("Linux systemd user service", () => {
     });
     expect(runLinuxCli(["service", "status"])).toMatchObject({ installed: true, active: true });
     expect(runLinuxCli(["stop"]).service).toMatchObject({ installed: true, active: false });
-    expect(runLinuxCli(["start", "--no-open-app"]).service).toMatchObject({ installed: true, active: true });
+    expect(runLinuxCli(["start", "--port", "9665", "--no-open-app"]).service)
+      .toMatchObject({ installed: true, active: true });
+    expect(await readFile(systemdUserServicePath(), "utf8")).toContain('"9665"');
     expect(runLinuxCli(["service", "uninstall"])).toMatchObject({ installed: false, active: false });
+  });
+
+  it("does not replace an existing unlock secret when Secret Service lookup fails", async () => {
+    const existing_passphrase = "synthetic-existing-linux-unlock";
+    await writeFile(process.env.SGW_FAKE_SECRET_DB!, existing_passphrase, { mode: 0o600 });
+    process.env.SGW_MASTER_PASSPHRASE = existing_passphrase;
+    runLinuxCli(["setup", "--no-open-app", "--no-service", "--no-menubar", "--no-agents"]);
+    delete process.env.SGW_MASTER_PASSPHRASE;
+
+    const storePath = path.join(process.env.SGW_HOME!, "store.json");
+    const ledger_before = await readFile(storePath, "utf8");
+    process.env.SGW_FAKE_SECRET_LOOKUP_ERROR = "1";
+
+    expect(() => runLinuxCli([
+      "setup",
+      "--no-open-app",
+      "--no-service",
+      "--no-menubar",
+      "--no-agents"
+    ])).toThrow(/will not generate or replace it/);
+    expect(await readFile(process.env.SGW_FAKE_SECRET_DB!, "utf8")).toBe(existing_passphrase);
+    expect(await readFile(storePath, "utf8")).toBe(ledger_before);
+  });
+
+  it("does not try to launch a browser during headless environment-only setup", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "synthetic-headless-environment-unlock";
+    process.env.SGW_DISABLE_KEYCHAIN = "1";
+
+    const setup = runLinuxCli([
+      "setup",
+      "--no-service",
+      "--no-menubar",
+      "--no-agents"
+    ], { DISPLAY: "", WAYLAND_DISPLAY: "" });
+    expect(setup).toMatchObject({
+      ok: true,
+      unlock: "existing-env"
+    });
+    expect(setup.opened).toBeUndefined();
   });
 
   it("installs, starts, stops, and uninstalls a hardened owner-only unit", async () => {
@@ -81,11 +123,19 @@ describe.sequential("Linux systemd user service", () => {
     expect((await stat(unitPath)).mode & 0o777).toBe(0o600);
     expect(unit).toContain("ExecStart=");
     expect(unit).toContain('"9443"');
+    expect(unit).toContain("Type=exec");
+    expect(unit).toContain('ExecStartPre="/usr/bin/test" "-x"');
+    expect(unit).toContain('ExecStartPre="/usr/bin/test" "-r"');
+    expect(unit).toContain('"/usr/bin/env" "-i"');
+    expect(unit).toContain("UnsetEnvironment=SGW_MASTER_PASSPHRASE");
+    expect(unit).toContain("PartOf=graphical-session.target");
+    expect(unit).toContain("WantedBy=graphical-session.target");
     expect(unit).toContain("NoNewPrivileges=true");
     expect(unit).toContain("ProtectSystem=strict");
     expect(unit).toContain("ProtectHome=read-only");
+    expect(unit).not.toContain("ProtectKernelModules=true");
     expect(unit).toContain("UMask=0077");
-    expect(unit).not.toContain("SGW_MASTER_PASSPHRASE");
+    expect(unit).not.toMatch(/"SGW_MASTER_PASSPHRASE=/);
     expect(unit).not.toContain("synthetic-systemd-unlock");
     expect(unit).not.toContain("SGW_SECRET_TOOL");
 
@@ -116,13 +166,34 @@ describe.sequential("Linux systemd user service", () => {
     expect(await readFile(target, "utf8")).toBe("leave me alone\n");
   });
 
+  it("refuses a systemd unit directory writable by other users", async () => {
+    const configRoot = process.env.XDG_CONFIG_HOME!;
+    await mkdir(configRoot, { recursive: true });
+    await chmod(configRoot, 0o777);
+
+    await expect(installSystemdUserService()).rejects.toThrow(/unsafe directory/);
+    await expect(lstat(systemdUserServicePath())).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("disables a stale enabled unit even when its service file is missing", async () => {
+    await writeFile(process.env.SGW_FAKE_SYSTEMD_STATE!, JSON.stringify({ enabled: true, active: false }));
+
+    expect(await uninstallSystemdUserService()).toMatchObject({ installed: false, active: false });
+    expect(await readFile(process.env.SGW_FAKE_SYSTEMD_CAPTURE!, "utf8"))
+      .toContain("disable --now s-gw.service");
+  });
+
   it("escapes systemd specifiers and variable markers in paths", () => {
     process.env.SGW_HOME = path.join(tmpDir, "ledger%$home");
     process.env.SGW_RECOVERY_HOME = path.join(tmpDir, "recovery%$home");
 
     const unit = buildSystemdUserUnit();
-    expect(unit).toContain("ledger%%$$home");
-    expect(unit).toContain("recovery%%$$home");
+    const execStart = unit.split("\n").find((line) => line.startsWith("ExecStart="));
+    const writable = unit.split("\n").find((line) => line.startsWith("ReadWritePaths="));
+    expect(execStart).toContain("ledger%%$$home");
+    expect(execStart).toContain("recovery%%$$home");
+    expect(writable).toContain("ledger%%$home");
+    expect(writable).toContain("recovery%%$home");
   });
 });
 
@@ -138,6 +209,10 @@ if (command === "store") {
   process.exit(0);
 }
 if (command === "lookup") {
+  if (process.env.SGW_FAKE_SECRET_LOOKUP_ERROR === "1") {
+    process.stderr.write("synthetic Secret Service lookup failure\\n");
+    process.exit(2);
+  }
   if (!existsSync(db)) process.exit(1);
   process.stdout.write(readFileSync(db, "utf8") + "\\n");
   process.exit(0);
@@ -152,7 +227,7 @@ process.exit(2);
   return helper;
 }
 
-function runLinuxCli(args: string[]): any {
+function runLinuxCli(args: string[], extraEnv: NodeJS.ProcessEnv = {}): any {
   const cliPath = path.resolve("src", "cli.ts");
   const script = [
     'Object.defineProperty(process, "platform", { configurable: true, value: "linux" });',
@@ -167,7 +242,7 @@ function runLinuxCli(args: string[]): any {
     script
   ], {
     cwd: process.cwd(),
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   }));

@@ -37,7 +37,7 @@ npm install -g @s-gw/s-gw
 s-gw setup
 ```
 
-The user's desktop keyring must be unlocked. Setup stores a generated ledger unlock secret in Secret Service, initializes the ledger, and installs a `systemd --user` console service. The unit contains only runtime paths and non-secret configuration; it never contains `SGW_MASTER_PASSPHRASE`.
+The user's desktop keyring must be unlocked. Setup stores a generated ledger unlock secret in Secret Service, initializes the ledger, and installs a `systemd --user` console service tied to `graphical-session.target`. The unit starts the console through a clean environment, passing only required runtime paths and non-secret configuration. It neither contains nor inherits `SGW_MASTER_PASSPHRASE` or unrelated user-manager credentials.
 
 For an npm-based Apple Silicon Mac installation, `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs `s-gw.app` in `/Applications` (or `~/Applications` when required), installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI. Do not use npm setup to manage a machine that already has the self-contained app installed.
 
@@ -226,9 +226,9 @@ s-gw service install --start
 s-gw service status
 ```
 
-This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at login. macOS uses a LaunchAgent; Linux uses an enabled, owner-level systemd unit at `~/.config/systemd/user/s-gw.service`. The Linux unit is owner-readable, applies process hardening, and does not persist unlock material.
+This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at desktop login. macOS uses a LaunchAgent; Linux uses an enabled, owner-level systemd unit at `~/.config/systemd/user/s-gw.service`. The Linux unit is owner-readable, applies process hardening, uses a clean runtime environment, and does not persist unlock material. It is attached to the graphical-session lifecycle so a lingering headless user manager does not start it before desktop keyring unlock.
 
-For an intentional headless Linux session without Secret Service, provide `SGW_MASTER_PASSPHRASE` through the session's approved secret-injection mechanism and run `s-gw setup --no-service`. Continue with `s-gw console --no-open` in that same environment. `s-gw service install` fails closed in this mode because copying the passphrase into systemd configuration would make it persistent and discoverable.
+For an intentional headless Linux session without Secret Service, provide `SGW_MASTER_PASSPHRASE` through the session's approved secret-injection mechanism and run `s-gw setup --no-service --no-open-app`. Continue with `s-gw console --no-open` in that same environment. Automatic capture uses the encrypted local ledger while this environment unlock is active. `s-gw service install` fails closed in this mode because copying the passphrase into systemd configuration would make it persistent and discoverable.
 
 Launch the native menu-bar helper:
 
@@ -435,13 +435,29 @@ For an offline npm upgrade, verify the downloaded `s-gw-VERSION.tgz` with either
 
 ## Uninstall
 
-Disconnect integrations and stop the local surfaces while the CLI is still
-available:
+Disconnect integrations while the CLI is still available:
 
 ```bash
 s-gw agent uninstall
+```
+
+On macOS, remove both desktop services:
+
+```bash
 s-gw menubar uninstall
 s-gw service uninstall
+```
+
+On Linux, remove the systemd user service:
+
+```bash
+s-gw service uninstall
+```
+
+On Windows, stop the local client and helper:
+
+```powershell
+s-gw stop
 ```
 
 Remove local unlock material before uninstalling the package:

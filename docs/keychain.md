@@ -24,7 +24,7 @@ The raw credential is written through the bundled helper on stdin. The encrypted
 
 Use `--service SERVICE` or `SGW_SECRET_KEYCHAIN_SERVICE` when you want a separate credential-store namespace for testing, work, or isolated profiles.
 
-On Linux, install the distribution's `secret-tool` package and make sure the user's Secret Service keyring is unlocked before setup. Ubuntu and Debian provide it in `libsecret-tools`. s-gw calls the fixed system helper directly, sends new values on stdin, and scopes each item with application, service, and account attributes. If Secret Service is unavailable or locked, credential operations stop with an actionable error.
+On Linux, install the distribution's `secret-tool` package and make sure the user's Secret Service keyring is unlocked before setup. Ubuntu and Debian provide it in `libsecret-tools`. s-gw calls the fixed system helper directly, sends new values on stdin, bounds each helper call, and scopes each item with application, service, and account attributes. `secret-tool` cannot safely accept values larger than 8,191 UTF-8 bytes, so s-gw rejects those before storage instead of risking truncation. If Secret Service is unavailable, locked, or does not respond in time, credential operations stop with an actionable error.
 
 On macOS, setup copies the first working Keychain helper to `~/.s-gw/native/darwin-arm64/s-gw-keychain-helper` with owner-only permissions. A Keychain ACL records the creating helper's path and code-signing requirement; macOS grants access only when the executing helper satisfies that requirement. npm updates preserve the existing helper before replacing a package, and later releases do not overwrite it silently. The self-contained app also copies its helper to that persistent path, but never modifies the installed app bundle itself.
 
@@ -38,7 +38,7 @@ The command reports counts and per-handle errors, but never prints credential va
 
 Already-running MCP servers may keep an older s-gw module in memory across an npm application upgrade. Setup and the npm updater therefore pin the preserved helper at both the persistent path and the package compatibility path used by those sessions. New agent sessions use the persistent path directly. A self-contained app keeps its sealed runtime untouched and refreshes its background services after an app replacement.
 
-Automatic capture paths, including guard mode and the local console API, prefer the OS credential store on macOS, Linux, and Windows. Set `SGW_SECRET_BACKEND=local` only for compatibility testing or environments without an OS credential-store provider.
+Automatic capture paths, including guard mode and the local console API, prefer the OS credential store on macOS, Linux, and Windows. A Linux session unlocked explicitly with `SGW_MASTER_PASSPHRASE` defaults to the encrypted local ledger because a headless Secret Service may not be usable; set `SGW_SECRET_BACKEND=keychain` only to request Secret Service explicitly in that mode.
 
 ## Local Execution Flow
 

@@ -349,6 +349,7 @@ export async function installSystemdUserService(
   const sgwHome = getSgwHome();
   const recoveryHome = getSgwRecoveryHome(sgwHome);
   await mkdir(path.dirname(unitPath), { recursive: true, mode: 0o700 });
+  assertSafeSystemdUnitDirectory(unitPath);
   await mkdir(path.join(sgwHome, "logs"), { recursive: true, mode: 0o700 });
   await mkdir(recoveryHome, { recursive: true, mode: 0o700 });
   assertSafeSystemdUnitTarget(unitPath);
@@ -397,13 +398,13 @@ export function stopInstalledSystemdUserService(): SystemdUserServiceStatus {
 export async function uninstallSystemdUserService(): Promise<SystemdUserServiceStatus> {
   requireLinux("systemd user service uninstall");
   const unitPath = systemdUserServicePath();
+  runSystemctl(["disable", "--now", systemdUnitName], true);
   if (existsSync(unitPath)) {
-    runSystemctl(["disable", "--now", systemdUnitName]);
     assertSafeSystemdUnitTarget(unitPath);
     await rm(unitPath, { force: true });
-    runSystemctl(["daemon-reload"]);
-    runSystemctl(["reset-failed", systemdUnitName], true);
   }
+  runSystemctl(["daemon-reload"]);
+  runSystemctl(["reset-failed", systemdUnitName], true);
   return systemdUserServiceStatus();
 }
 
@@ -446,20 +447,23 @@ export function buildSystemdUserUnit(port = 8718): string {
   const layout = getPackageLayout();
   const sgwHome = getSgwHome();
   const recoveryHome = getSgwRecoveryHome(sgwHome);
-  const args = [
-    layout.nodePath,
-    layout.cliPath,
-    "console",
-    "--host",
-    "127.0.0.1",
-    "--port",
-    String(port),
-    "--no-open"
-  ];
+  const runtimeDir = process.env.XDG_RUNTIME_DIR?.trim()
+    || (typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : undefined);
+  const dbusAddress = process.env.DBUS_SESSION_BUS_ADDRESS?.trim()
+    || (runtimeDir ? `unix:path=${runtimeDir}/bus` : undefined);
+  const username = os.userInfo().username;
   const env: Record<string, string> = {
+    HOME: os.homedir(),
+    LANG: "C.UTF-8",
+    LOGNAME: username,
+    PATH: "/usr/local/bin:/usr/bin:/bin",
+    SGW_DISABLE_UPDATE_CHECK: "1",
     SGW_HOME: sgwHome,
-    SGW_RECOVERY_HOME: recoveryHome
+    SGW_RECOVERY_HOME: recoveryHome,
+    USER: username
   };
+  if (runtimeDir) env.XDG_RUNTIME_DIR = runtimeDir;
+  if (dbusAddress) env.DBUS_SESSION_BUS_ADDRESS = dbusAddress;
   for (const key of [
     "SGW_KEYCHAIN_SERVICE",
     "SGW_KEYCHAIN_ACCOUNT",
@@ -469,19 +473,33 @@ export function buildSystemdUserUnit(port = 8718): string {
     const value = process.env[key];
     if (value) env[key] = value;
   }
-  const environment = Object.entries(env)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => `Environment=${systemdQuote(`${key}=${value}`)}`)
-    .join("\n");
+  const args = [
+    "/usr/bin/env",
+    "-i",
+    ...Object.entries(env)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${value}`),
+    layout.nodePath,
+    layout.cliPath,
+    "console",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--no-open"
+  ];
 
   return `[Unit]
 Description=s-gw local credential console
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
-Type=simple
-ExecStart=${args.map(systemdQuote).join(" ")}
-${environment}
+Type=exec
+ExecStartPre=${["/usr/bin/test", "-x", layout.nodePath].map(systemdExecQuote).join(" ")}
+ExecStartPre=${["/usr/bin/test", "-r", layout.cliPath].map(systemdExecQuote).join(" ")}
+ExecStart=${args.map(systemdExecQuote).join(" ")}
+UnsetEnvironment=SGW_MASTER_PASSPHRASE
 Restart=on-failure
 RestartSec=2
 UMask=0077
@@ -489,16 +507,15 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=${systemdQuote(sgwHome)} ${systemdQuote(recoveryHome)}
+ReadWritePaths=${systemdDirectiveQuote(sgwHome)} ${systemdDirectiveQuote(recoveryHome)}
 ProtectKernelTunables=true
-ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 `;
 }
 
@@ -1261,9 +1278,12 @@ function launchAgentPath(label: string): string {
 }
 
 export function systemdUserServicePath(): string {
+  return path.join(systemdUserConfigRoot(), "systemd", "user", systemdUnitName);
+}
+
+function systemdUserConfigRoot(): string {
   const configHome = process.env.XDG_CONFIG_HOME?.trim();
-  const root = configHome ? path.resolve(configHome) : path.join(os.homedir(), ".config");
-  return path.join(root, "systemd", "user", systemdUnitName);
+  return configHome ? path.resolve(configHome) : path.join(os.homedir(), ".config");
 }
 
 function safeSystemdUserServiceStatus(): SystemdUserServiceStatus {
@@ -1317,15 +1337,35 @@ function assertSafeSystemdUnitTarget(unitPath: string): void {
   }
 }
 
-function systemdQuote(value: string): string {
+function assertSafeSystemdUnitDirectory(unitPath: string): void {
+  const root = systemdUserConfigRoot();
+  const directories = [root, path.join(root, "systemd"), path.dirname(unitPath)];
+  const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
+  for (const directory of directories) {
+    const info = lstatSync(directory);
+    if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o022) !== 0) {
+      throw new Error(`Refusing to install a systemd user unit through an unsafe directory: ${directory}`);
+    }
+  }
+}
+
+function systemdExecQuote(value: string): string {
+  return quoteSystemdValue(value, true);
+}
+
+function systemdDirectiveQuote(value: string): string {
+  return quoteSystemdValue(value, false);
+}
+
+function quoteSystemdValue(value: string, escapeDollar: boolean): string {
   if (/[\0\r\n]/.test(value)) {
     throw new Error("systemd service paths and environment values cannot contain line breaks.");
   }
-  const escaped = value
+  let escaped = value
     .replaceAll("\\", "\\\\")
     .replaceAll('"', '\\"')
-    .replaceAll("$", () => "$$")
     .replaceAll("%", "%%");
+  if (escapeDollar) escaped = escaped.replaceAll("$", () => "$$");
   return `"${escaped}"`;
 }
 

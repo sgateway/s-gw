@@ -622,17 +622,17 @@ export class SecretStore {
   }
 
   async deleteSecret(handle: string): Promise<DeleteSecretResult> {
-    let keychainRef: MacKeychainItemRef | undefined;
-    const result = await this.mutate((store) => {
+    return this.mutate((store) => {
       const index = store.secrets.findIndex((secret) => secret.handle === handle);
       if (index < 0) {
         throw new Error(`Unknown secret handle: ${handle}`);
       }
 
-      const [deleted] = store.secrets.splice(index, 1);
+      const deleted = store.secrets[index];
       if (deleted.backend === "keychain") {
-        keychainRef = keychainRefFromRecord(deleted);
+        deleteMacKeychainItem(keychainRefFromRecord(deleted));
       }
+      store.secrets.splice(index, 1);
 
       const beforeGrants = store.approvalGrants.length;
       const beforePolicies = (store.approvalPolicyRules || []).length;
@@ -676,12 +676,6 @@ export class SecretStore {
         failedRequests
       };
     });
-
-    if (keychainRef) {
-      deleteMacKeychainItem(keychainRef);
-    }
-
-    return result;
   }
 
   async getApprovalSettings(): Promise<ApprovalSettings> {

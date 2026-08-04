@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { requirePassphrase } from "../src/crypto.js";
+import { preferredLocalSecretBackend } from "../src/gateway.js";
 import {
   deleteKeychainPassphrase,
   keychainInfo,
@@ -34,7 +35,11 @@ afterEach(async () => {
     "SGW_KEYCHAIN_ACCOUNT",
     "SGW_FAKE_SECRET_DB",
     "SGW_FAKE_SECRET_CAPTURE",
+    "SGW_FAKE_SECRET_LOOKUP_ERROR",
+    "SGW_FAKE_SECRET_HANG_COMMAND",
     "SGW_SECRET_TOOL",
+    "SGW_SECRET_TOOL_TIMEOUT_MS",
+    "SGW_SECRET_BACKEND",
     "SGW_MASTER_PASSPHRASE",
     "SGW_DISABLE_KEYCHAIN"
   ]) {
@@ -72,6 +77,60 @@ describe.sequential("Linux Secret Service unlock", () => {
     expect(unlockStatus().activeSource).toBe("none");
   });
 
+  it("distinguishes an unavailable Secret Service from a missing item", () => {
+    process.env.SGW_FAKE_SECRET_LOOKUP_ERROR = "1";
+
+    expect(unlockStatus()).toMatchObject({
+      activeSource: "none",
+      keychain: {
+        configured: false,
+        state: "unavailable",
+        error: "synthetic Secret Service lookup failure"
+      }
+    });
+  });
+
+  it("bounds a Secret Service status check that never responds", () => {
+    process.env.SGW_FAKE_SECRET_HANG_COMMAND = "lookup";
+    process.env.SGW_SECRET_TOOL_TIMEOUT_MS = "50";
+
+    expect(unlockStatus()).toMatchObject({
+      activeSource: "none",
+      keychain: {
+        configured: false,
+        state: "unavailable",
+        error: "Linux Secret Service helper timed out after 50 ms."
+      }
+    });
+  });
+
+  it("bounds a Secret Service write that never responds", () => {
+    process.env.SGW_FAKE_SECRET_HANG_COMMAND = "store";
+    process.env.SGW_SECRET_TOOL_TIMEOUT_MS = "50";
+
+    expect(() => setKeychainPassphrase("synthetic-timeout-passphrase"))
+      .toThrow(/timed out after 50 ms/);
+  });
+
+  it("uses the encrypted local ledger by default for an environment unlock", () => {
+    process.env.SGW_MASTER_PASSPHRASE = "synthetic-environment-unlock";
+    process.env.SGW_FAKE_SECRET_LOOKUP_ERROR = "1";
+
+    expect(preferredLocalSecretBackend()).toBe("local");
+    process.env.SGW_SECRET_BACKEND = "keychain";
+    expect(preferredLocalSecretBackend()).toBe("keychain");
+    delete process.env.SGW_SECRET_BACKEND;
+  });
+
+  it("rejects values that secret-tool cannot store without truncation", () => {
+    const boundary = "x".repeat(8_191);
+    setKeychainPassphrase(boundary);
+    expect(requirePassphrase()).toBe(boundary);
+
+    expect(() => setKeychainPassphrase("x".repeat(8_192))).toThrow(/limited to 8191 UTF-8 bytes/);
+    expect(requirePassphrase()).toBe(boundary);
+  });
+
   it("rejects a writable test helper", async () => {
     await chmod(process.env.SGW_SECRET_TOOL!, 0o777);
 
@@ -88,6 +147,10 @@ const [command, ...args] = process.argv.slice(2);
 const db = process.env.SGW_FAKE_SECRET_DB;
 const capture = process.env.SGW_FAKE_SECRET_CAPTURE;
 if (!db || !capture) process.exit(2);
+if (process.env.SGW_FAKE_SECRET_HANG_COMMAND === command) {
+  setInterval(() => {}, 1000);
+  return;
+}
 if (command === "store") {
   const value = readFileSync(0, "utf8");
   writeFileSync(db, value, { mode: 0o600 });
@@ -95,6 +158,10 @@ if (command === "store") {
   process.exit(0);
 }
 if (command === "lookup") {
+  if (process.env.SGW_FAKE_SECRET_LOOKUP_ERROR === "1") {
+    process.stderr.write("synthetic Secret Service lookup failure\\n");
+    process.exit(2);
+  }
   if (!existsSync(db)) process.exit(1);
   process.stdout.write(readFileSync(db, "utf8") + "\\n");
   process.exit(0);
