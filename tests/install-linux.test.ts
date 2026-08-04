@@ -148,6 +148,23 @@ describe.sequential("Linux systemd user service", () => {
     await expect(lstat(unitPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("restarts an active service after updating its port", async () => {
+    await installSystemdUserService({ port: 8718, start: true });
+    await writeFile(process.env.SGW_FAKE_SYSTEMD_CAPTURE!, "", { mode: 0o600 });
+
+    const updated = await installSystemdUserService({ port: 8719, start: true });
+
+    expect(updated).toMatchObject({ installed: true, enabled: true, active: true });
+    expect(await readFile(systemdUserServicePath(), "utf8")).toContain('"8719"');
+    expect(await readFile(process.env.SGW_FAKE_SYSTEMD_CAPTURE!, "utf8")).toBe([
+      "daemon-reload",
+      "enable s-gw.service",
+      "restart s-gw.service",
+      "show s-gw.service --property=LoadState --property=UnitFileState --property=ActiveState " +
+        "--property=SubState --property=MainPID --no-pager"
+    ].join("\n") + "\n");
+  });
+
   it("refuses to persist an environment-only unlock in a service", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "synthetic-environment-only-unlock";
 
