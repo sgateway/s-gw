@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -64,6 +65,61 @@ describe("command suggestions", () => {
 });
 
 describe("CLI unknown-command behavior (end to end)", () => {
+  it.each(["--help", "-h"])("prints setup help for %s without running setup", async (helpFlag) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-setup-help-"));
+    const home = path.join(root, "home");
+    const sgwHome = path.join(root, "state", ".s-gw");
+    const recoveryHome = path.join(root, "state", ".s-gw-recovery");
+    const applicationsDir = path.join(root, "Applications");
+    const trapDir = path.join(root, "bin");
+    const sideEffectMarker = path.join(root, "service-or-ui-command-ran");
+
+    try {
+      await mkdir(home, { recursive: true });
+      await mkdir(trapDir, { recursive: true });
+      if (process.platform !== "win32") {
+        const trap = `#!/bin/sh\nprintf '%s\\n' "$0" >> '${sideEffectMarker}'\nexit 97\n`;
+        for (const command of ["launchctl", "open", "systemctl"]) {
+          const commandPath = path.join(trapDir, command);
+          await writeFile(commandPath, trap, { mode: 0o755 });
+          await chmod(commandPath, 0o755);
+        }
+      }
+
+      const output = execFileSync(tsxBin, ["src/cli.ts", "setup", helpFlag], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${trapDir}${path.delimiter}${process.env.PATH || ""}`,
+          SGW_APPLICATIONS_DIR: applicationsDir,
+          SGW_DISABLE_KEYCHAIN: "1",
+          SGW_DISABLE_ONEPASSWORD_BACKUP: "1",
+          SGW_DISABLE_PROCESS_AGENT_DETECTION: "1",
+          SGW_DISABLE_UPDATE_CHECK: "1",
+          SGW_HOME: sgwHome,
+          SGW_MASTER_PASSPHRASE: "synthetic-setup-help-passphrase",
+          SGW_RECOVERY_HOME: recoveryHome,
+          SGW_SKIP_MAC_APP_CLI_REGISTRATION: "1",
+          SGW_TEST_HOME_ROOT: root,
+          SGW_TEST_MODE: "1"
+        },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      expect(output).toContain("Usage: s-gw setup [options]");
+      expect(output).toContain("-h, --help");
+      expect(existsSync(sgwHome)).toBe(false);
+      expect(existsSync(recoveryHome)).toBe(false);
+      expect(existsSync(applicationsDir)).toBe(false);
+      expect(existsSync(path.join(home, "Library", "LaunchAgents"))).toBe(false);
+      expect(existsSync(sideEffectMarker)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reports update status without requiring local store setup", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-update-"));
     try {

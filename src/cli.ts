@@ -92,6 +92,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "setup" && (second === "-h" || hasFlag(parsed.flags, "help"))) {
+    printSetupHelp();
+    return;
+  }
+
   if (first === "mcp") {
     await import("./mcp-server.js");
     return;
@@ -2347,6 +2352,23 @@ Commands:
   s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent]
   s-gw deny REQUEST_ID
   s-gw execute REQUEST_ID
+`);
+}
+
+function printSetupHelp(): void {
+  process.stdout.write(`Usage: s-gw setup [options]
+
+Initialize the local credential store and install the requested desktop integrations.
+
+Options:
+  --port PORT                         Console port (default: 8718)
+  --passphrase-stdin                  Read the unlock passphrase from stdin
+  --menubar-count MODE               pending, credentials, or none
+  --no-open-app                      Do not open the native app
+  --no-service                       Do not install or start the console service
+  --no-menubar                       Do not install or start the menu-bar helper
+  --no-agents                        Do not configure detected coding agents
+  -h, --help                         Show this help and exit
 `);
 }
 
