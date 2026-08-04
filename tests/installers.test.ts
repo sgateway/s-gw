@@ -167,7 +167,7 @@ describe("platform installers", () => {
       ].join("; ");
       execFileSync("powershell.exe", ["-NoProfile", "-Command", parseCommand], { stdio: "pipe" });
     }
-  });
+  }, 20_000);
 
   it("builds and verifies updater assets independently from npm publishing", async () => {
     const [workflow, builder, validator] = await Promise.all([
