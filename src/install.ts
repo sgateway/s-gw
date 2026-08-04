@@ -4,6 +4,7 @@ import {
   accessSync,
   constants,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -13,7 +14,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getSgwHome, getStorePath } from "./paths.js";
+import { getSgwHome, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
   isInstalledMacAppLocation,
   isSelfContainedMacApp,
@@ -24,6 +25,7 @@ import { CURRENT_VERSION } from "./version.js";
 
 export const consoleLabel = "com.s-gw.sgw.console";
 export const menuBarLabel = "com.s-gw.sgw.menubar";
+export const systemdUnitName = "s-gw.service";
 
 export interface PackageLayout {
   packageRoot: string;
@@ -52,6 +54,19 @@ export interface LaunchAgentStatus {
   plistPath: string;
   installed: boolean;
   loaded: boolean;
+}
+
+export interface SystemdUserServiceStatus {
+  unit: string;
+  unitPath: string;
+  installed: boolean;
+  loaded: boolean;
+  enabled: boolean;
+  active: boolean;
+  state: string;
+  subState: string;
+  mainPid?: number;
+  error?: string;
 }
 
 interface LaunchAgentDefinition {
@@ -211,7 +226,8 @@ export function packageHealth(port = 8718) {
     launchAgents: {
       console: launchAgentStatus("console"),
       menuBar: launchAgentStatus("menubar")
-    }
+    },
+    systemdService: process.platform === "linux" ? safeSystemdUserServiceStatus() : undefined
   };
 }
 
@@ -322,6 +338,168 @@ export function stopInstalledLaunchAgent(kind: "console" | "menubar"): LaunchAge
   requireMac("launch-agent stop");
   stopLaunchAgent(kind === "console" ? consoleLabel : menuBarLabel);
   return launchAgentStatus(kind);
+}
+
+export async function installSystemdUserService(
+  options: ServiceInstallOptions = {}
+): Promise<SystemdUserServiceStatus> {
+  requireLinux("systemd user service install");
+  assertLinuxServiceUnlock();
+  const unitPath = systemdUserServicePath();
+  const sgwHome = getSgwHome();
+  const recoveryHome = getSgwRecoveryHome(sgwHome);
+  await mkdir(path.dirname(unitPath), { recursive: true, mode: 0o700 });
+  await mkdir(path.join(sgwHome, "logs"), { recursive: true, mode: 0o700 });
+  await mkdir(recoveryHome, { recursive: true, mode: 0o700 });
+  assertSafeSystemdUnitTarget(unitPath);
+
+  const staging = `${unitPath}.install-${process.pid}-${Date.now()}`;
+  try {
+    await writeFile(staging, buildSystemdUserUnit(options.port || 8718), { mode: 0o600 });
+    renameSync(staging, unitPath);
+  } finally {
+    await rm(staging, { force: true });
+  }
+
+  runSystemctl(["daemon-reload"]);
+  runSystemctl(["enable", systemdUnitName]);
+  if (options.start) runSystemctl(["restart", systemdUnitName]);
+  const status = systemdUserServiceStatus();
+  if (options.start && !status.active) {
+    throw new Error(`systemd started ${systemdUnitName}, but it is not active (${status.state}/${status.subState}).`);
+  }
+  return status;
+}
+
+export function startInstalledSystemdUserService(): SystemdUserServiceStatus {
+  requireLinux("systemd user service start");
+  assertLinuxServiceUnlock();
+  const unitPath = systemdUserServicePath();
+  if (!existsSync(unitPath)) {
+    throw new Error(`systemd user service is not installed: ${unitPath}`);
+  }
+  runSystemctl(["start", systemdUnitName]);
+  const status = systemdUserServiceStatus();
+  if (!status.active) {
+    throw new Error(`systemd did not keep ${systemdUnitName} active (${status.state}/${status.subState}).`);
+  }
+  return status;
+}
+
+export function stopInstalledSystemdUserService(): SystemdUserServiceStatus {
+  requireLinux("systemd user service stop");
+  if (existsSync(systemdUserServicePath())) {
+    runSystemctl(["stop", systemdUnitName]);
+  }
+  return systemdUserServiceStatus();
+}
+
+export async function uninstallSystemdUserService(): Promise<SystemdUserServiceStatus> {
+  requireLinux("systemd user service uninstall");
+  const unitPath = systemdUserServicePath();
+  if (existsSync(unitPath)) {
+    runSystemctl(["disable", "--now", systemdUnitName]);
+    assertSafeSystemdUnitTarget(unitPath);
+    await rm(unitPath, { force: true });
+    runSystemctl(["daemon-reload"]);
+    runSystemctl(["reset-failed", systemdUnitName], true);
+  }
+  return systemdUserServiceStatus();
+}
+
+export function systemdUserServiceStatus(): SystemdUserServiceStatus {
+  requireLinux("systemd user service status");
+  const unitPath = systemdUserServicePath();
+  if (!existsSync(unitPath)) return emptySystemdUserServiceStatus(unitPath);
+
+  const output = runSystemctl([
+    "show",
+    systemdUnitName,
+    "--property=LoadState",
+    "--property=UnitFileState",
+    "--property=ActiveState",
+    "--property=SubState",
+    "--property=MainPID",
+    "--no-pager"
+  ]);
+  const fields = new Map<string, string>();
+  for (const line of output.split(/\r?\n/)) {
+    const separator = line.indexOf("=");
+    if (separator > 0) fields.set(line.slice(0, separator), line.slice(separator + 1));
+  }
+  const mainPid = Number(fields.get("MainPID"));
+  const state = fields.get("ActiveState") || "unknown";
+  return {
+    unit: systemdUnitName,
+    unitPath,
+    installed: true,
+    loaded: fields.get("LoadState") === "loaded",
+    enabled: fields.get("UnitFileState") === "enabled",
+    active: state === "active",
+    state,
+    subState: fields.get("SubState") || "unknown",
+    ...(Number.isInteger(mainPid) && mainPid > 0 ? { mainPid } : {})
+  };
+}
+
+export function buildSystemdUserUnit(port = 8718): string {
+  const layout = getPackageLayout();
+  const sgwHome = getSgwHome();
+  const recoveryHome = getSgwRecoveryHome(sgwHome);
+  const args = [
+    layout.nodePath,
+    layout.cliPath,
+    "console",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--no-open"
+  ];
+  const env: Record<string, string> = {
+    SGW_HOME: sgwHome,
+    SGW_RECOVERY_HOME: recoveryHome
+  };
+  for (const key of [
+    "SGW_KEYCHAIN_SERVICE",
+    "SGW_KEYCHAIN_ACCOUNT",
+    "SGW_SECRET_KEYCHAIN_SERVICE",
+    "SGW_SECRET_BACKEND"
+  ]) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  const environment = Object.entries(env)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `Environment=${systemdQuote(`${key}=${value}`)}`)
+    .join("\n");
+
+  return `[Unit]
+Description=s-gw local credential console
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=${args.map(systemdQuote).join(" ")}
+${environment}
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${systemdQuote(sgwHome)} ${systemdQuote(recoveryHome)}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
+`;
 }
 
 async function refreshConsoleLaunchAgent(status: LaunchAgentStatus): Promise<LaunchAgentStatus> {
@@ -1082,6 +1260,100 @@ function launchAgentPath(label: string): string {
   return path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`);
 }
 
+export function systemdUserServicePath(): string {
+  const configHome = process.env.XDG_CONFIG_HOME?.trim();
+  const root = configHome ? path.resolve(configHome) : path.join(os.homedir(), ".config");
+  return path.join(root, "systemd", "user", systemdUnitName);
+}
+
+function safeSystemdUserServiceStatus(): SystemdUserServiceStatus {
+  try {
+    return systemdUserServiceStatus();
+  } catch (error) {
+    return {
+      ...emptySystemdUserServiceStatus(systemdUserServicePath()),
+      installed: existsSync(systemdUserServicePath()),
+      state: "unavailable",
+      subState: "unknown",
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function emptySystemdUserServiceStatus(unitPath: string): SystemdUserServiceStatus {
+  return {
+    unit: systemdUnitName,
+    unitPath,
+    installed: false,
+    loaded: false,
+    enabled: false,
+    active: false,
+    state: "inactive",
+    subState: "dead"
+  };
+}
+
+function assertLinuxServiceUnlock(): void {
+  const source = unlockStatus().activeSource;
+  if (source === "linux-secret-service") return;
+  if (source === "env") {
+    throw new Error(
+      "The Linux systemd service will not persist SGW_MASTER_PASSPHRASE. " +
+      "Unset it and run `s-gw setup` with an unlocked Secret Service, or run `s-gw console` in this foreground session."
+    );
+  }
+  throw new Error(
+    "The Linux systemd service needs an unlocked Secret Service. " +
+    "Install libsecret-tools and run `s-gw setup`, or use SGW_MASTER_PASSPHRASE with `s-gw console` for a foreground session."
+  );
+}
+
+function assertSafeSystemdUnitTarget(unitPath: string): void {
+  if (!existsSync(unitPath)) return;
+  const info = lstatSync(unitPath);
+  const uid = typeof process.getuid === "function" ? process.getuid() : info.uid;
+  if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o022) !== 0) {
+    throw new Error(`Refusing to replace an unsafe systemd user unit: ${unitPath}`);
+  }
+}
+
+function systemdQuote(value: string): string {
+  if (/[\0\r\n]/.test(value)) {
+    throw new Error("systemd service paths and environment values cannot contain line breaks.");
+  }
+  const escaped = value
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("$", () => "$$")
+    .replaceAll("%", "%%");
+  return `"${escaped}"`;
+}
+
+function runSystemctl(args: string[], allowFailure = false): string {
+  const command = systemctlPath();
+  const result = spawnSync(command, ["--user", ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0 && !allowFailure) {
+    const detail = result.stderr.trim() || result.stdout.trim();
+    throw new Error(
+      detail || `systemctl --user ${args.join(" ")} failed. Confirm that this user has an active systemd session.`
+    );
+  }
+  return result.stdout;
+}
+
+function systemctlPath(): string {
+  if (process.env.SGW_TEST_MODE === "1" && process.env.SGW_SYSTEMCTL) {
+    return path.resolve(process.env.SGW_SYSTEMCTL);
+  }
+  if (existsSync("/usr/bin/systemctl")) return "/usr/bin/systemctl";
+  if (existsSync("/bin/systemctl")) return "/bin/systemctl";
+  throw new Error("systemctl is unavailable; s-gw needs a systemd user session for its Linux background service.");
+}
+
 async function ensureLogDir(sgwHome?: string): Promise<string> {
   const logs = path.join(path.resolve(sgwHome || getSgwHome()), "logs");
   await mkdir(logs, { recursive: true, mode: 0o700 });
@@ -1332,6 +1604,12 @@ function assertWindowsHelperExists(): void {
 function requireMac(action: string): void {
   if (process.platform !== "darwin") {
     throw new Error(`${action} is only available on macOS.`);
+  }
+}
+
+function requireLinux(action: string): void {
+  if (process.platform !== "linux") {
+    throw new Error(`${action} is only available on Linux.`);
   }
 }
 

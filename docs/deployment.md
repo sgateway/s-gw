@@ -29,6 +29,16 @@ s-gw setup
 
 On Windows, run the same commands in PowerShell. Windows 10/11 support is preview software, but npm is the expected install path for the PowerShell client, tray helper, and local web console.
 
+On Ubuntu or Debian Linux, install the Secret Service command-line client before setup:
+
+```bash
+sudo apt install libsecret-tools
+npm install -g @s-gw/s-gw
+s-gw setup
+```
+
+The user's desktop keyring must be unlocked. Setup stores a generated ledger unlock secret in Secret Service, initializes the ledger, and installs a `systemd --user` console service. The unit contains only runtime paths and non-secret configuration; it never contains `SGW_MASTER_PASSPHRASE`.
+
 For an npm-based Apple Silicon Mac installation, `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs `s-gw.app` in `/Applications` (or `~/Applications` when required), installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI. Do not use npm setup to manage a machine that already has the self-contained app installed.
 
 ### macOS App (Apple Silicon)
@@ -209,14 +219,16 @@ s-gw console
 
 The console binds to `127.0.0.1`, serves the UI from the installed package, and injects a per-session token into the page. That token is required for local API writes such as approving or denying requests, so another browser origin cannot silently drive the credential API with a plain form post.
 
-For a background setup, install the per-user console LaunchAgent instead:
+For a background setup, install the per-user console service:
 
 ```bash
 s-gw service install --start
 s-gw service status
 ```
 
-This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at login and writes logs under `~/.s-gw/logs`.
+This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at login. macOS uses a LaunchAgent; Linux uses an enabled, owner-level systemd unit at `~/.config/systemd/user/s-gw.service`. The Linux unit is owner-readable, applies process hardening, and does not persist unlock material.
+
+For an intentional headless Linux session without Secret Service, provide `SGW_MASTER_PASSPHRASE` through the session's approved secret-injection mechanism and run `s-gw setup --no-service`. Continue with `s-gw console --no-open` in that same environment. `s-gw service install` fails closed in this mode because copying the passphrase into systemd configuration would make it persistent and discoverable.
 
 Launch the native menu-bar helper:
 
@@ -365,7 +377,7 @@ The native app and browser console expose the same action on a stuck request. Re
 | --- | --- | --- | --- |
 | macOS arm64 | Primary development platform | Native Swift helper using Security.framework | Native app, menu helper, and Keychain path are covered by local tests. |
 | macOS Intel | Build-from-source candidate | Native Swift helper using Security.framework | Expected to work when built on Intel macOS with Node >= 20 and Swift toolchain, but not yet QA-tested here. |
-| Linux | Experimental CLI | `SGW_MASTER_PASSPHRASE` fallback | Needs a Secret Service/libsecret helper before desktop support. |
+| Linux x64/arm64 | Preview | Secret Service through trusted `secret-tool`; explicit environment fallback | systemd user service and local console; the keyring must be unlocked in the user session. |
 | Windows | Preview client/helper | Windows Credential Manager helper | PowerShell client opens the local console in browser app mode; tray helper supports queue/status actions. Needs Windows QA, signing, and installer work before production support. |
 
 The current preview is developed primarily on macOS with the native Keychain helper. Windows has a packaged preview path through Credential Manager, but the client and helper still require broader QA, signing, and installer hardening.

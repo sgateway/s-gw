@@ -825,6 +825,7 @@ function flowProviderLabel(provider?: string): string {
   if (value === "ssh") return "SSH";
   if (value === "onepassword") return "1Password";
   if (value === "keychain" || value === "macos-keychain") return "macOS Keychain";
+  if (value === "linux-secret-service") return "Linux Secret Service";
   if (value === "windows-credential-manager") return "Windows Credential Manager";
   return titleCase(value);
 }
@@ -1435,6 +1436,7 @@ function providerLabel(provider: string): string {
     generic: "Generic",
     keychain: "macOS Keychain",
     "macos-keychain": "macOS Keychain",
+    "linux-secret-service": "Linux Secret Service",
     "windows-credential-manager": "Windows Credential Manager",
     "api-token": "API Tokens",
     credential: "Credentials"

@@ -2493,7 +2493,8 @@ function keychainSecretLabel(name: string): string {
 }
 
 function credentialStoreProvider(): string {
-  return process.platform === "win32" ? "windows-credential-manager" : "macos-keychain";
+  if (process.platform === "win32") return "windows-credential-manager";
+  return process.platform === "linux" ? "linux-secret-service" : "macos-keychain";
 }
 
 function normalizeApprovalSettings(input?: Partial<ApprovalSettings>): ApprovalSettings {

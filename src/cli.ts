@@ -29,6 +29,7 @@ import {
   installMacAppBundle,
   installConsoleLaunchAgent,
   installMenuBarLaunchAgent,
+  installSystemdUserService,
   launchAgentStatus,
   normalizeMenuBarCountMode,
   openMacApp,
@@ -39,12 +40,16 @@ import {
   refreshMacRuntimeServices,
   restartWindowsSurfaces,
   startInstalledLaunchAgent,
+  startInstalledSystemdUserService,
   stopInstalledLaunchAgent,
+  stopInstalledSystemdUserService,
   stopMacApp,
   stopWindowsSurfaces,
   type WindowsStoppedSurfaces,
   uninstallConsoleLaunchAgent,
-  uninstallMenuBarLaunchAgent
+  uninstallMenuBarLaunchAgent,
+  uninstallSystemdUserService,
+  systemdUserServiceStatus
 } from "./install.js";
 import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "./onepassword.js";
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
@@ -1055,8 +1060,8 @@ async function handleSetupCommand(
   let unlockAction = beforeUnlock.activeSource === "none" ? "not-configured" : `existing-${beforeUnlock.activeSource}`;
 
   if (beforeUnlock.activeSource === "none") {
-    if (process.platform !== "darwin" && process.platform !== "win32") {
-      throw new Error("s-gw setup currently needs a local OS credential store. On Linux, set SGW_MASTER_PASSPHRASE and run s-gw init.");
+    if (process.platform !== "darwin" && process.platform !== "linux" && process.platform !== "win32") {
+      throw new Error("s-gw setup needs a supported local OS credential store or SGW_MASTER_PASSPHRASE.");
     }
 
     const passphrase = hasFlag(flags, "passphrase-stdin")
@@ -1071,7 +1076,9 @@ async function handleSetupCommand(
     ? await store.repairKeychainAccess()
     : undefined;
   const consoleUrl = `http://127.0.0.1:${port}/`;
-  let service = launchAgentStatus("console");
+  let service: unknown = process.platform === "linux"
+    ? systemdUserServiceStatus()
+    : launchAgentStatus("console");
   let menuBar = launchAgentStatus("menubar");
   let windowsConsole: unknown;
   let windowsHelper: unknown;
@@ -1079,6 +1086,8 @@ async function handleSetupCommand(
 
   if (process.platform === "darwin" && !hasFlag(flags, "no-service")) {
     service = await installConsoleLaunchAgent({ port, start: true });
+  } else if (process.platform === "linux" && !hasFlag(flags, "no-service")) {
+    service = await installSystemdUserService({ port, start: true });
   } else if (process.platform === "win32" && !hasFlag(flags, "no-service")) {
     windowsConsole = await ensureWindowsConsole({ port, consoleUrl });
   }
@@ -1140,6 +1149,16 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
     return;
   }
 
+  if (process.platform === "linux") {
+    const current = systemdUserServiceStatus();
+    const service = current.installed
+      ? startInstalledSystemdUserService()
+      : await installSystemdUserService({ port, start: true });
+    const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+    printJson({ ok: true, consoleUrl, opened, service });
+    return;
+  }
+
   const service = launchAgentStatus("console").installed
     ? startInstalledLaunchAgent("console")
     : await installConsoleLaunchAgent({ port, start: true });
@@ -1167,8 +1186,10 @@ function updateServiceLifecycle(keepAppRunning: boolean): {
 } {
   const serviceBefore = launchAgentStatus("console");
   const menuBarBefore = launchAgentStatus("menubar");
+  const systemdBefore = process.platform === "linux" ? systemdUserServiceStatus() : undefined;
   const serviceWasLoaded = process.platform === "darwin" && serviceBefore.installed && serviceBefore.loaded;
   const menuBarWasLoaded = process.platform === "darwin" && menuBarBefore.installed && menuBarBefore.loaded;
+  const systemdWasActive = Boolean(systemdBefore?.installed && systemdBefore.active);
   let macAppWasRunning = false;
   let windowsStopped: WindowsStoppedSurfaces | undefined;
 
@@ -1199,6 +1220,12 @@ function updateServiceLifecycle(keepAppRunning: boolean): {
           await restartWindowsSurfaces(windowsStopped);
         } catch (error) {
           failures.push(`Windows surfaces: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } else if (process.platform === "linux" && systemdWasActive) {
+        try {
+          startInstalledSystemdUserService();
+        } catch (error) {
+          failures.push(`systemd service: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 
@@ -1241,9 +1268,13 @@ function restartLaunchAgent(
 function stopBackgroundSurfaces() {
   const serviceBefore = launchAgentStatus("console");
   const menuBarBefore = launchAgentStatus("menubar");
-  const service = process.platform === "darwin" && serviceBefore.installed
-    ? stopInstalledLaunchAgent("console")
-    : serviceBefore;
+  let service: unknown = serviceBefore;
+  if (process.platform === "darwin" && serviceBefore.installed) {
+    service = stopInstalledLaunchAgent("console");
+  } else if (process.platform === "linux") {
+    const systemdBefore = systemdUserServiceStatus();
+    service = systemdBefore.installed ? stopInstalledSystemdUserService() : systemdBefore;
+  }
   const menuBar = process.platform === "darwin" && menuBarBefore.installed
     ? stopInstalledLaunchAgent("menubar")
     : menuBarBefore;
@@ -1254,6 +1285,33 @@ async function handleServiceCommand(
   action: string | undefined,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  if (process.platform === "linux") {
+    if (action === "install") {
+      printJson(await installSystemdUserService({
+        port: numericFlag(flags, "port", 8718),
+        start: hasFlag(flags, "start")
+      }));
+      return;
+    }
+    if (action === "start") {
+      printJson(startInstalledSystemdUserService());
+      return;
+    }
+    if (action === "stop") {
+      printJson(stopInstalledSystemdUserService());
+      return;
+    }
+    if (action === "status") {
+      printJson(systemdUserServiceStatus());
+      return;
+    }
+    if (action === "uninstall") {
+      printJson(await uninstallSystemdUserService());
+      return;
+    }
+    throw new Error("service requires install, start, stop, status, or uninstall.");
+  }
+
   if (action === "install") {
     printJson(
       await installConsoleLaunchAgent({

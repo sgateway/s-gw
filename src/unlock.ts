@@ -34,13 +34,13 @@ export interface KeychainInfo {
   supported: boolean;
   service: string;
   account: string;
-  provider: "native-helper" | "security-cli" | "windows-helper" | "none";
+  provider: "native-helper" | "security-cli" | "secret-service-cli" | "windows-helper" | "none";
   helperPath?: string;
 }
 
 export interface UnlockStatus {
   envConfigured: boolean;
-  activeSource: "env" | "macos-keychain" | "windows-credential-manager" | "none";
+  activeSource: "env" | "linux-secret-service" | "macos-keychain" | "windows-credential-manager" | "none";
   keychain: KeychainInfo & {
     configured: boolean;
   };
@@ -105,7 +105,9 @@ export function unlockStatus(): UnlockStatus {
   if (envConfigured) {
     activeSource = "env";
   } else if (configured) {
-    activeSource = process.platform === "win32" ? "windows-credential-manager" : "macos-keychain";
+    activeSource = process.platform === "win32"
+      ? "windows-credential-manager"
+      : process.platform === "linux" ? "linux-secret-service" : "macos-keychain";
   }
 
   return {
@@ -255,7 +257,7 @@ function readKeychainPassphrase(): string | undefined {
 
 function ensureLocalCredentialStore(): void {
   if (!keychainInfo().supported) {
-    throw new Error("OS credential-store unlock is only available on macOS or Windows.");
+    throw new Error("OS credential-store unlock is only available on macOS, Windows, or Linux with Secret Service.");
   }
 }
 
@@ -264,7 +266,12 @@ function ensureNativeCredentialStore(info: KeychainInfo): void {
     throw new Error("OS credential-store secret storage is only available on macOS or Windows.");
   }
 
-  if ((info.provider !== "native-helper" && info.provider !== "windows-helper") || !info.helperPath) {
+  if (
+    (info.provider !== "native-helper"
+      && info.provider !== "windows-helper"
+      && info.provider !== "secret-service-cli")
+    || !info.helperPath
+  ) {
     throw missingCredentialStoreError();
   }
 }
@@ -294,6 +301,11 @@ function keychainProvider(): Pick<KeychainInfo, "provider" | "helperPath"> {
     return helperPath ? { provider: "windows-helper", helperPath } : { provider: "none" };
   }
 
+  if (process.platform === "linux") {
+    const helperPath = findLinuxSecretTool();
+    return helperPath ? { provider: "secret-service-cli", helperPath } : { provider: "none" };
+  }
+
   if (process.platform !== "darwin") {
     return { provider: "none" };
   }
@@ -311,7 +323,7 @@ function keychainProvider(): Pick<KeychainInfo, "provider" | "helperPath"> {
 }
 
 function supportsLocalCredentialStore(): boolean {
-  return process.platform === "darwin" || process.platform === "win32";
+  return process.platform === "darwin" || process.platform === "linux" || process.platform === "win32";
 }
 
 function findNativeHelper(): string | undefined {
@@ -912,6 +924,32 @@ function findWindowsCredentialHelper(): string | undefined {
   return candidates.find((candidate) => existsSync(candidate));
 }
 
+function findLinuxSecretTool(): string | undefined {
+  const candidates: string[] = [];
+  if (process.env.SGW_TEST_MODE === "1" && process.env.SGW_SECRET_TOOL) {
+    candidates.push(path.resolve(process.env.SGW_SECRET_TOOL));
+  }
+  candidates.push("/usr/bin/secret-tool", "/bin/secret-tool");
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const info = lstatSync(candidate);
+      const currentUid = typeof process.getuid === "function" ? process.getuid() : info.uid;
+      const trustedOwner = info.uid === 0 || (process.env.SGW_TEST_MODE === "1" && info.uid === currentUid);
+      if (!info.isFile() || info.isSymbolicLink() || !trustedOwner || (info.mode & 0o022) !== 0) {
+        continue;
+      }
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Try the next fixed system path.
+    }
+  }
+
+  return undefined;
+}
+
 function runKeychainGet(info: KeychainInfo): string {
   if (info.provider === "native-helper" && info.helperPath) {
     return runNativeHelper(info.helperPath, ["get", "--service", info.service, "--account", info.account]);
@@ -930,6 +968,10 @@ function runKeychainGet(info: KeychainInfo): string {
 
   if (info.provider === "windows-helper" && info.helperPath) {
     return runWindowsCredentialHelper(info.helperPath, ["get", "-Service", info.service, "-Account", info.account]);
+  }
+
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    return runSecretTool(info.helperPath, ["lookup", ...secretServiceAttributes(info)]);
   }
 
   throw missingCredentialStoreError();
@@ -962,6 +1004,17 @@ function keychainItemExists(info: KeychainInfo): boolean {
     );
     const status = JSON.parse(output) as { configured?: unknown };
     return status.configured === true;
+  }
+
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    const result = spawnSync(info.helperPath, ["lookup", ...secretServiceAttributes(info)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    if (result.error) throw result.error;
+    if (result.status === 0) return result.stdout.replace(/\r?\n$/, "").length > 0;
+    if (result.status === 1 && !result.stderr.trim()) return false;
+    throw new Error(result.stderr.trim() || `Secret Service status check failed with status ${result.status}`);
   }
 
   return false;
@@ -998,6 +1051,15 @@ function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw lo
     return;
   }
 
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    runSecretTool(
+      info.helperPath,
+      [`store`, `--label=${label}`, ...secretServiceAttributes(info)],
+      passphrase
+    );
+    return;
+  }
+
   throw missingCredentialStoreError();
 }
 
@@ -1017,6 +1079,11 @@ function runKeychainDelete(info: KeychainInfo): void {
     return;
   }
 
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    runSecretTool(info.helperPath, ["clear", ...secretServiceAttributes(info)]);
+    return;
+  }
+
   throw missingCredentialStoreError();
 }
 
@@ -1027,7 +1094,30 @@ function missingCredentialStoreError(): Error {
       "Public npm and DMG releases currently include Apple Silicon native surfaces; Intel Macs must build them from source."
     );
   }
+  if (process.platform === "linux") {
+    return new Error(
+      "Linux Secret Service is unavailable. Install libsecret-tools and start an unlocked user keyring, " +
+      "or use SGW_MASTER_PASSPHRASE for an explicit foreground/headless session."
+    );
+  }
   return new Error("No local OS credential-store provider is available. Run `npm run build:native`.");
+}
+
+function secretServiceAttributes(info: Pick<KeychainInfo, "service" | "account">): string[] {
+  return ["application", "s-gw", "service", info.service, "account", info.account];
+}
+
+function runSecretTool(helperPath: string, args: string[], input?: string): string {
+  const result = spawnSync(helperPath, args, {
+    input,
+    encoding: "utf8",
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"]
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Linux Secret Service helper failed with status ${result.status}`);
+  }
+  return result.stdout;
 }
 
 function runNativeHelper(helperPath: string, args: string[], input?: string): string {

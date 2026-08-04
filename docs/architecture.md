@@ -38,6 +38,7 @@ The recovery home is a local recovery vault, not a physical WORM guarantee: a pr
 ### Credential Backends
 
 - **macOS Keychain:** the preferred backend on macOS.
+- **Linux Secret Service:** the preferred backend on Linux desktop/user sessions, accessed through the fixed system `secret-tool` client.
 - **Windows Credential Manager:** the preview backend on Windows.
 - **Encrypted local value:** compatibility and test path.
 - **1Password reference:** optional source backed by the local `op` CLI, with an encrypted local cache for a bounded reusable approval.

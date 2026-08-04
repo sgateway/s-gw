@@ -87,7 +87,7 @@ Output sanitization is a last line of defense, not a data-loss-prevention guaran
 ## Secure Use
 
 - Enroll credentials from a local terminal or supported UI, never from agent chat.
-- Prefer macOS Keychain or Windows Credential Manager over environment-provided unlock material.
+- Prefer macOS Keychain, Linux Secret Service, or Windows Credential Manager over environment-provided unlock material.
 - Use absolute executable paths for command grants where practical.
 - Keep reusable approvals short and scoped to one agent when possible.
 - Treat unlimited approvals and high-severity credentials as exceptional.

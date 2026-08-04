@@ -38,6 +38,7 @@ export function credentialBackendLabel(value?: string, platform = runtimePlatfor
   const normalized = normalize(value);
   if (isOnePassword(normalized)) return "1Password";
   if (normalized === "keychain" || normalized === "macos-keychain") return "macOS Keychain";
+  if (normalized === "linux-secret-service") return "Linux Secret Service";
   if (normalized === "windows-credential-manager") return "Windows Credential Manager";
   if (normalized === "tpm" || normalized === "windows-tpm") return "Windows TPM";
 
