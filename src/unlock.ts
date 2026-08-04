@@ -945,10 +945,11 @@ function findWindowsCredentialHelper(): string | undefined {
 
 function findLinuxSecretTool(): string | undefined {
   const candidates: string[] = [];
-  if (process.env.SGW_TEST_MODE === "1" && process.env.SGW_SECRET_TOOL) {
+  if (process.env.SGW_TEST_MODE === "1" && process.env.SGW_SECRET_TOOL !== undefined) {
     candidates.push(path.resolve(process.env.SGW_SECRET_TOOL));
+  } else {
+    candidates.push("/usr/bin/secret-tool", "/bin/secret-tool");
   }
-  candidates.push("/usr/bin/secret-tool", "/bin/secret-tool");
 
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
