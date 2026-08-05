@@ -25,6 +25,13 @@ await mkdir(tempParent, { recursive: true });
 const runRoot = path.join(tempParent, `sgw-windows-ci-${randomUUID()}`);
 const stagedRoot = path.join(runRoot, "source");
 const privateNode = path.join(runRoot, "node.exe");
+const privateNpmRoot = path.join(runRoot, "node_modules", "npm");
+const sourceNpmRoot = path.join(path.dirname(process.execPath), "node_modules", "npm");
+try {
+  await access(path.join(sourceNpmRoot, "bin", "npm-cli.js"));
+} catch {
+  throw new Error("The Windows test runner requires Node.js with npm included.");
+}
 let testResult;
 let cleanupError;
 
@@ -37,12 +44,13 @@ try {
     await cp(path.join(sourceRoot, entry.name), path.join(stagedRoot, entry.name), { recursive: true });
   }
   await copyFile(process.execPath, privateNode);
+  await cp(sourceNpmRoot, privateNpmRoot, { recursive: true });
   await symlink(path.join(sourceRoot, "node_modules"), path.join(stagedRoot, "node_modules"), "junction");
 
   const vitest = path.join(stagedRoot, "node_modules", "vitest", "vitest.mjs");
   testResult = spawnSync(privateNode, [vitest, "run", "--no-file-parallelism"], {
     cwd: stagedRoot,
-    env: process.env,
+    env: { ...process.env, npm_execpath: path.join(privateNpmRoot, "bin", "npm-cli.js") },
     stdio: "inherit",
     windowsHide: true
   });

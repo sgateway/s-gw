@@ -114,7 +114,7 @@ describe("Windows credential protection", () => {
         await rm(`${home}-recovery`, { recursive: true, force: true });
       }
     },
-    45_000
+    300_000
   );
 });
 
