@@ -54,6 +54,7 @@ describe("customer package layout", () => {
     expect(layout.menuBarAppPath).toContain("s-gw Menu Bar.app");
     expect(layout.windowsClientScriptPath).toMatch(/dist\/windows\/s-gw-client\.ps1$/);
     expect(layout.windowsHelperScriptPath).toMatch(/dist\/windows\/s-gw-helper\.ps1$/);
+    expect(layout.windowsHelperBootstrapPath).toMatch(/dist\/windows\/s-gw-helper-bootstrap\.ps1$/);
     expect(layout.windowsCredentialHelperPath).toMatch(/dist\/windows\/s-gw-credential\.ps1$/);
   });
 
@@ -116,6 +117,7 @@ describe("customer package layout", () => {
       expect(health).toContain("s-gw Menu Bar.app");
       expect(health).toContain("s-gw-client.ps1");
       expect(health).toContain("s-gw-helper.ps1");
+      expect(health).toContain("s-gw-helper-bootstrap.ps1");
       expect(health).not.toContain("do not serialize this value");
       expect(packageHealth().version).toBe(CURRENT_VERSION);
     } finally {

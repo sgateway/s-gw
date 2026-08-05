@@ -2,7 +2,8 @@
 param(
   [int]$Port = 8718,
   [string]$ConsoleUrl = "",
-  [string]$InstanceKey = ""
+  [string]$InstanceKey = "",
+  [string]$LaunchNonce = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +20,10 @@ if ($providedInstanceKey -notmatch '^[a-fA-F0-9]{64}$') {
   throw 'Launch the helper through s-gw-helper.cmd or s-gw menubar open.'
 }
 $script:InstanceKey = $providedInstanceKey.ToLowerInvariant()
+$providedLaunchNonce = $LaunchNonce.Trim()
+if ($providedLaunchNonce -and $providedLaunchNonce -notmatch '^[a-fA-F0-9]{64}$') {
+  throw 'Launch the helper through s-gw-helper.cmd or s-gw menubar open.'
+}
 
 function Get-Sha256Hex([string]$Value) {
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)

@@ -79,6 +79,7 @@ describe("platform installers", () => {
       expect(files).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
     }
+    expect(files).toContain("dist/windows/s-gw-helper-bootstrap.ps1");
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);

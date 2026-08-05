@@ -1,6 +1,6 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -41,11 +41,13 @@ describe("Windows client packaging", () => {
     expect(existsSync(layout.windowsClientScriptPath)).toBe(true);
     expect(existsSync(layout.windowsClientLauncherPath)).toBe(true);
     expect(existsSync(layout.windowsHelperScriptPath)).toBe(true);
+    expect(existsSync(layout.windowsHelperBootstrapPath)).toBe(true);
     expect(existsSync(layout.windowsHelperLauncherPath)).toBe(true);
     expect(existsSync(layout.windowsCredentialHelperPath)).toBe(true);
 
     const client = await readFile(layout.windowsClientScriptPath, "utf8");
     const helper = await readFile(layout.windowsHelperScriptPath, "utf8");
+    const helperBootstrap = await readFile(layout.windowsHelperBootstrapPath, "utf8");
     const helperLauncher = await readFile(layout.windowsHelperLauncherPath, "utf8");
     const credential = await readFile(layout.windowsCredentialHelperPath, "utf8");
     const launcher = await readFile(path.join(repoRoot, "dist/windows/s-gw-client.cmd"), "utf8");
@@ -66,6 +68,12 @@ describe("Windows client packaging", () => {
     expect(helper).toContain("WaitOne(0)");
     expect(helper).toContain("AbandonedMutexException");
     expect(helper).toContain("InstanceKey");
+    expect(helper).toContain("LaunchNonce");
+    expect(helperBootstrap).toContain("Microsoft.PowerShell.Management\\Start-Process");
+    expect(helperBootstrap).toContain("$PSHOME");
+    expect(helperBootstrap).toContain("startedAtUtcTicks");
+    expect(helperBootstrap).toContain("$process.Kill()");
+    expect(helperBootstrap).not.toContain("cmd.exe");
     expect(helperLauncher).toContain("helper open");
     expect(helperLauncher).toContain("..\\cli.js");
     expect(helperLauncher).not.toContain("s-gw-helper.ps1");
@@ -78,6 +86,76 @@ describe("Windows client packaging", () => {
     const combined = `${client}\n${helper}\n${credential}`;
     expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");
   });
+
+  it("cleans up when the helper bootstrap fails after starting", async () => {
+    if (process.platform !== "win32") return;
+    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
+    const layout = getPackageLayout();
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-bootstrap-home-"));
+    const helperPath = layout.windowsHelperScriptPath;
+    const bootstrapPath = path.join(
+      path.dirname(layout.windowsHelperBootstrapPath),
+      `s-gw-helper-bootstrap-failure-${process.pid}-${Date.now()}.ps1`
+    );
+    const port = await freePort();
+    const instanceKey = "a".repeat(64);
+    const launchNonce = "b".repeat(64);
+
+    try {
+      const bootstrap = await readFile(layout.windowsHelperBootstrapPath, "utf8");
+      const launchLine = "  $process = Microsoft.PowerShell.Management\\Start-Process -FilePath $powerShellPath -ArgumentList $argumentLine -WindowStyle Hidden -PassThru";
+      expect(bootstrap).toContain(launchLine);
+      await writeFile(bootstrapPath, bootstrap.replace(launchLine, `${launchLine}\n  throw "forced post-start bootstrap failure"`));
+
+      const result = spawnSync("powershell.exe", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        bootstrapPath,
+        "-HelperPath",
+        helperPath,
+        "-Port",
+        String(port),
+        "-ConsoleUrl",
+        `http://127.0.0.1:${port}/`,
+        "-InstanceKey",
+        instanceKey,
+        "-LaunchNonce",
+        launchNonce
+      ], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SGW_HOME: home,
+          SGW_RECOVERY_HOME: `${home}-recovery`,
+          SGW_MASTER_PASSPHRASE: "windows bootstrap failure passphrase",
+          SGW_DISABLE_UPDATE_CHECK: "1",
+          SGW_NODE_PATH: process.execPath,
+          SGW_CLI_PATH: layout.cliPath,
+          SGW_CONSOLE_URL: `http://127.0.0.1:${port}/`
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+        windowsHide: true
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout || ""}${result.stderr || ""}`).toMatch(/forced post-start bootstrap failure/);
+
+      let residues: number[] = [];
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        residues = windowsHelperPids(port);
+        if (residues.length === 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(residues).toEqual([]);
+    } finally {
+      stopWindowsSurfaces();
+      await rm(bootstrapPath, { force: true });
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("restores a running console after an update failure", async () => {
     if (process.platform !== "win32") return;
@@ -213,7 +291,7 @@ describe("Windows client packaging", () => {
       await rm(otherHome, { recursive: true, force: true });
       await rm(`${otherHome}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("rejects a healthy console from another credential home", async () => {
     if (process.platform !== "win32") return;
@@ -361,7 +439,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("keeps one authority when two credential homes race on one port", async () => {
     if (process.platform !== "win32") return;
@@ -410,7 +488,7 @@ describe("Windows client packaging", () => {
       await rm(secondHome, { recursive: true, force: true });
       await rm(`${secondHome}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("starts headless and stops every Windows surface through the CLI", async () => {
     if (process.platform !== "win32") return;

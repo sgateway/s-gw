@@ -18,6 +18,10 @@ const staged = [
     launcher: "s-gw-helper.cmd"
   },
   {
+    source: "native/windows-helper/s-gw-helper-bootstrap.ps1",
+    target: "s-gw-helper-bootstrap.ps1"
+  },
+  {
     source: "native/windows-credential/SgwCredential.ps1",
     target: "s-gw-credential.ps1",
     launcher: "s-gw-credential.cmd"
@@ -36,7 +40,9 @@ for (const item of staged) {
   const target = resolve(distRoot, item.target);
   copyFileSync(source, target);
   chmodSync(target, 0o755);
-  writeFileSync(resolve(distRoot, item.launcher), launcherFor(item.target));
+  if (item.launcher) {
+    writeFileSync(resolve(distRoot, item.launcher), launcherFor(item.target));
+  }
 }
 
 writeFileSync(resolve(distRoot, "VERSION.txt"), `${packageInfo.name} ${packageInfo.version}\n`);

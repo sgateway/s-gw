@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   accessSync,
   constants,
@@ -45,6 +45,7 @@ export interface PackageLayout {
   windowsClientScriptPath: string;
   windowsClientLauncherPath: string;
   windowsHelperScriptPath: string;
+  windowsHelperBootstrapPath: string;
   windowsHelperLauncherPath: string;
   windowsCredentialHelperPath: string;
 }
@@ -144,6 +145,17 @@ export interface WindowsHelperProcess {
   exactPath: boolean;
 }
 
+interface WindowsHelperCleanupTarget {
+  launchNonce: string;
+  pid?: number;
+  startedAtUtcTicks?: string;
+}
+
+interface WindowsHelperLaunch extends WindowsHelperCleanupTarget {
+  pid: number;
+  startedAtUtcTicks: string;
+}
+
 interface WindowsConsoleListenerProcess {
   pid: number;
   ownerSid: string;
@@ -200,6 +212,7 @@ export function getPackageLayout(): PackageLayout {
     windowsClientScriptPath: path.join(packageRoot, "dist", "windows", "s-gw-client.ps1"),
     windowsClientLauncherPath: path.join(packageRoot, "dist", "windows", "s-gw-client.cmd"),
     windowsHelperScriptPath: path.join(packageRoot, "dist", "windows", "s-gw-helper.ps1"),
+    windowsHelperBootstrapPath: path.join(packageRoot, "dist", "windows", "s-gw-helper-bootstrap.ps1"),
     windowsHelperLauncherPath: path.join(packageRoot, "dist", "windows", "s-gw-helper.cmd"),
     windowsCredentialHelperPath: path.join(packageRoot, "dist", "windows", "s-gw-credential.ps1")
   };
@@ -236,6 +249,7 @@ export function packageHealth(port = 8718) {
     windowsClientScriptPath: pathStatus(layout.windowsClientScriptPath),
     windowsClientLauncherPath: pathStatus(layout.windowsClientLauncherPath),
     windowsHelperScriptPath: pathStatus(layout.windowsHelperScriptPath),
+    windowsHelperBootstrapPath: pathStatus(layout.windowsHelperBootstrapPath),
     windowsHelperLauncherPath: pathStatus(layout.windowsHelperLauncherPath),
     windowsCredentialHelperPath: pathStatus(layout.windowsCredentialHelperPath),
     storePath: getStorePath(),
@@ -779,7 +793,7 @@ export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promis
     }
     const latest = await windowsConsoleHealth(url);
     if (latest.ready && latest.instanceKey !== instanceKey) {
-      throw new Error(`Port ${port} became active for another s-gw credential home. Stop it or choose another port.`);
+      throw new Error(`Port ${port} became active for another credential home. Stop it or choose another port.`);
     }
     throw error;
   }
@@ -1161,35 +1175,19 @@ export async function openWindowsHelper(options: MenuBarOptions = {}): Promise<W
     };
   }
 
-  const child = spawn(
-    "powershell.exe",
-    [
-      "-NoProfile",
-      "-Sta",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      layout.windowsHelperScriptPath,
-      "-Port",
-      String(port),
-      "-ConsoleUrl",
-      url,
-      "-InstanceKey",
-      instanceKey
-    ],
-    {
-      detached: true,
-      env: windowsEnvironment(url),
-      stdio: "ignore"
-    }
+  const launched = launchWindowsHelper(
+    layout.windowsHelperBootstrapPath,
+    layout.windowsHelperScriptPath,
+    port,
+    url,
+    instanceKey
   );
-  child.unref();
   let pid: number;
   try {
     pid = waitForWindowsHelper(layout.windowsHelperScriptPath, port, url, instanceKey);
   } catch (error) {
     try {
-      await stopSpawnedWindowsProcess(child, "helper");
+      stopLaunchedWindowsHelper(launched, layout.windowsHelperScriptPath, port, url, instanceKey);
     } catch (cleanupError) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}; ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
     }
@@ -1201,8 +1199,163 @@ export async function openWindowsHelper(options: MenuBarOptions = {}): Promise<W
     launcherPath: layout.windowsHelperLauncherPath,
     consoleUrl: url,
     pid,
-    reusedExisting: pid !== child.pid
+    reusedExisting: pid !== launched.pid
   };
+}
+
+function launchWindowsHelper(
+  bootstrapPath: string,
+  scriptPath: string,
+  port: number,
+  url: string,
+  instanceKey: string
+): WindowsHelperLaunch {
+  const launchNonce = randomBytes(32).toString("hex");
+  const result = spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      bootstrapPath,
+      "-HelperPath",
+      scriptPath,
+      "-Port",
+      String(port),
+      "-ConsoleUrl",
+      url,
+      "-InstanceKey",
+      instanceKey,
+      "-LaunchNonce",
+      launchNonce
+    ],
+    {
+      encoding: "utf8",
+      env: windowsEnvironment(url),
+      maxBuffer: 64 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+      windowsHide: true
+    }
+  );
+  const stdout = result.stdout || "";
+  const stderr = result.stderr || "";
+  let failure: Error | undefined;
+  let payload: Record<string, unknown> | undefined;
+  if (result.error) {
+    failure = new Error(`Could not launch the s-gw Windows helper: ${result.error.message}`);
+  } else if (result.status !== 0) {
+    failure = new Error(stderr.trim() || stdout.trim() || "Could not launch the s-gw Windows helper.");
+  } else {
+    try {
+      payload = JSON.parse(stdout) as Record<string, unknown>;
+    } catch {
+      failure = new Error("Could not parse the s-gw Windows helper launch result.");
+    }
+  }
+
+  const pid = Number(payload?.pid);
+  const startedAtUtcTicks = typeof payload?.startedAtUtcTicks === "string" ? payload.startedAtUtcTicks : "";
+  const returnedNonce = typeof payload?.launchNonce === "string" ? payload.launchNonce : "";
+  if (!failure && (
+    !Number.isInteger(pid)
+    || pid <= 0
+    || !/^\d{17,19}$/.test(startedAtUtcTicks)
+    || returnedNonce !== launchNonce
+  )) {
+    failure = new Error("The s-gw Windows helper launch result was invalid.");
+  }
+  if (failure) {
+    try {
+      stopLaunchedWindowsHelper({ launchNonce }, scriptPath, port, url, instanceKey);
+    } catch (cleanupError) {
+      throw new Error(`${failure.message}; ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+    throw failure;
+  }
+  return { pid, startedAtUtcTicks, launchNonce };
+}
+
+function stopLaunchedWindowsHelper(
+  launched: WindowsHelperCleanupTarget,
+  scriptPath: string,
+  port: number,
+  url: string,
+  instanceKey: string
+): void {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$currentSessionId = [int](Get-Process -Id $PID).SessionId",
+    "$expectedPid = if ($env:SGW_HELPER_LAUNCHED_PID) { [int]$env:SGW_HELPER_LAUNCHED_PID } else { 0 }",
+    "$expectedTicks = [string]$env:SGW_HELPER_LAUNCHED_TICKS",
+    "$portPattern = '(?i)(?:^|\\s)-Port(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_HELPER_PORT) + '\"?(?:\\s|$)'",
+    "$exactPathPattern = '(?i)(?:^|\\s)-File(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_HELPER_SCRIPT_PATH) + '\"?(?:\\s|$)'",
+    "$instancePattern = '(?i)(?:^|\\s)-InstanceKey(?:\\s+|:)\"?([a-f0-9]{64})\"?(?:\\s|$)'",
+    "$noncePattern = '(?i)(?:^|\\s)-LaunchNonce(?:\\s+|:)\"?([a-f0-9]{64})\"?(?:\\s|$)'",
+    "$candidates = @()",
+    "for ($attempt = 0; $attempt -lt 5; $attempt += 1) {",
+    "  $candidates = @()",
+    "  Get-CimInstance Win32_Process | ForEach-Object {",
+    "    if ([string]$_.Name -notmatch '^(?i:powershell|pwsh)\\.exe$') { return }",
+    "    $line = [string]$_.CommandLine",
+    "    $instanceMatch = [regex]::Match($line, $instancePattern)",
+    "    $nonceMatch = [regex]::Match($line, $noncePattern)",
+    "    if ($line -notmatch $portPattern -or $line -notmatch $exactPathPattern -or -not $instanceMatch.Success -or -not $nonceMatch.Success) { return }",
+    "    if ([string]$instanceMatch.Groups[1].Value -ine $env:SGW_HELPER_INSTANCE_KEY -or [string]$nonceMatch.Groups[1].Value -ine $env:SGW_HELPER_LAUNCH_NONCE) { return }",
+    "    if ($expectedPid -gt 0 -and [int]$_.ProcessId -ne $expectedPid) { return }",
+    "    if ([int]$_.SessionId -ne $currentSessionId) { return }",
+    "    $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "    if ($null -eq $owner -or $owner.ReturnValue -ne 0 -or [string]$owner.Sid -ne $currentSid) { return }",
+    "    $process = Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue",
+    "    if ($null -eq $process) { return }",
+    "    $startTicks = [string]$process.StartTime.ToUniversalTime().Ticks",
+    "    if ($expectedTicks -and $startTicks -ne $expectedTicks) { throw 'The launched s-gw helper PID was reused.' }",
+    "    $candidates += [PSCustomObject]@{ pid = [int]$_.ProcessId; creationDate = [string]$_.CreationDate; commandLine = $line; startTicks = $startTicks }",
+    "  }",
+    "  if ((@($candidates) | Measure-Object).Count -gt 0) { break }",
+    "  Start-Sleep -Milliseconds 100",
+    "}",
+    "$candidateCount = (@($candidates) | Measure-Object).Count",
+    "if ($candidateCount -eq 0) { exit 0 }",
+    "if ($candidateCount -ne 1) { throw 'More than one s-gw helper matched the launch nonce.' }",
+    "$record = @($candidates)[0]",
+    "$targetPid = [int]$record.pid",
+    "$fresh = Get-CimInstance Win32_Process -Filter \"ProcessId = $targetPid\" -ErrorAction SilentlyContinue",
+    "if ($null -eq $fresh) { exit 0 }",
+    "$freshProcess = Get-Process -Id $targetPid -ErrorAction SilentlyContinue",
+    "$freshOwner = Invoke-CimMethod -InputObject $fresh -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "if ($null -eq $freshProcess -or [string]$freshProcess.StartTime.ToUniversalTime().Ticks -ne [string]$record.startTicks -or [string]$fresh.CreationDate -ne [string]$record.creationDate -or [string]$fresh.CommandLine -ne [string]$record.commandLine -or [int]$fresh.SessionId -ne $currentSessionId -or $null -eq $freshOwner -or $freshOwner.ReturnValue -ne 0 -or [string]$freshOwner.Sid -ne $currentSid) { throw 'The launched s-gw helper changed before cleanup.' }",
+    "$termination = Invoke-CimMethod -InputObject $fresh -MethodName Terminate -ErrorAction Stop",
+    "if ($termination.ReturnValue -ne 0) { throw \"The launched s-gw helper returned termination code $($termination.ReturnValue).\" }",
+    "for ($attempt = 0; $attempt -lt 50; $attempt += 1) {",
+    "  if ($null -eq (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { exit 0 }",
+    "  Start-Sleep -Milliseconds 50",
+    "}",
+    "throw 'The launched s-gw helper did not stop.'"
+  ].join("\n");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+    encoding: "utf8",
+    env: {
+      ...windowsEnvironment(url),
+      SGW_HELPER_INSTANCE_KEY: instanceKey,
+      SGW_HELPER_LAUNCH_NONCE: launched.launchNonce,
+      SGW_HELPER_LAUNCHED_PID: launched.pid ? String(launched.pid) : "",
+      SGW_HELPER_LAUNCHED_TICKS: launched.startedAtUtcTicks || "",
+      SGW_HELPER_PORT: String(port),
+      SGW_HELPER_SCRIPT_PATH: scriptPath
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 10_000,
+    windowsHide: true
+  });
+  if (result.error) {
+    throw new Error(`Could not clean up the launched s-gw Windows helper: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error((result.stderr || "").trim() || "Could not clean up the launched s-gw Windows helper.");
+  }
 }
 
 async function stopSpawnedWindowsProcess(child: ChildProcess, label: string): Promise<void> {
@@ -2016,6 +2169,9 @@ function assertWindowsHelperExists(): void {
   const layout = getPackageLayout();
   if (!existsSync(layout.windowsHelperScriptPath)) {
     throw new Error(`Windows helper is missing. Expected script at ${layout.windowsHelperScriptPath}`);
+  }
+  if (!existsSync(layout.windowsHelperBootstrapPath)) {
+    throw new Error(`Windows helper bootstrap is missing. Expected script at ${layout.windowsHelperBootstrapPath}`);
   }
 }
 
