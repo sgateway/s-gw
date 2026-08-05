@@ -32,8 +32,8 @@ try {
   createPrivateDirectory(runRoot);
   await cp(sourceRoot, stagedRoot, {
     recursive: true,
-    filter: (source) => {
-      const relative = path.relative(sourceRoot, source);
+    filter: (_source, destination) => {
+      const relative = path.relative(stagedRoot, destination);
       if (!relative) return true;
       const first = relative.split(path.sep)[0];
       return first !== ".git" && first !== "node_modules";
