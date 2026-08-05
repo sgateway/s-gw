@@ -7,13 +7,30 @@ const rmdirFault = vi.hoisted(() => ({
   code: "EPERM",
   enabled: false,
   lockPath: "",
-  attempts: 0
+  attempts: 0,
+  markerOpenAttempts: 0,
+  markerOpenFailures: 0
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const target = String(args[0]);
+      const ownerMarker = rmdirFault.lockPath && (
+        target.startsWith(`${rmdirFault.lockPath}/owner-`) ||
+        target.startsWith(`${rmdirFault.lockPath}\\owner-`)
+      );
+      if (ownerMarker) {
+        rmdirFault.markerOpenAttempts += 1;
+        if (rmdirFault.markerOpenFailures > 0) {
+          rmdirFault.markerOpenFailures -= 1;
+          throw Object.assign(new Error("simulated lock owner sharing violation"), { code: "EPERM" });
+        }
+      }
+      return actual.open(...args);
+    },
     rmdir: async (
       target: Parameters<typeof actual.rmdir>[0],
       options?: Parameters<typeof actual.rmdir>[1]
@@ -31,15 +48,18 @@ const originalPlatform = process.platform;
 let testHome = "";
 let originalTemp: string | undefined;
 let originalTmp: string | undefined;
+let originalTestHomeRoot: string | undefined;
 
 beforeEach(async () => {
   originalTemp = process.env.TEMP;
   originalTmp = process.env.TMP;
+  originalTestHomeRoot = process.env.SGW_TEST_HOME_ROOT;
   testHome = await mkdtemp(path.join(os.tmpdir(), "sgw-lock-windows-"));
   process.env.TEMP = testHome;
   process.env.TMP = testHome;
-  process.env.SGW_HOME = testHome;
-  process.env.SGW_RECOVERY_HOME = `${testHome}-recovery`;
+  process.env.SGW_TEST_HOME_ROOT = testHome;
+  process.env.SGW_HOME = path.join(testHome, "home");
+  process.env.SGW_RECOVERY_HOME = path.join(testHome, "recovery");
   process.env.SGW_MASTER_PASSPHRASE = "local test passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
   process.env.SGW_DISABLE_ONEPASSWORD_BACKUP = "1";
@@ -48,6 +68,8 @@ beforeEach(async () => {
   rmdirFault.enabled = false;
   rmdirFault.lockPath = "";
   rmdirFault.attempts = 0;
+  rmdirFault.markerOpenAttempts = 0;
+  rmdirFault.markerOpenFailures = 0;
 });
 
 afterEach(async () => {
@@ -67,9 +89,13 @@ afterEach(async () => {
   } else {
     process.env.TMP = originalTmp;
   }
+  if (originalTestHomeRoot === undefined) {
+    delete process.env.SGW_TEST_HOME_ROOT;
+  } else {
+    process.env.SGW_TEST_HOME_ROOT = originalTestHomeRoot;
+  }
   rmdirFault.enabled = false;
   await rm(testHome, { recursive: true, force: true });
-  await rm(`${testHome}-recovery`, { recursive: true, force: true });
 });
 
 describe("Windows store lock cleanup", () => {
@@ -125,5 +151,42 @@ describe("Windows store lock cleanup", () => {
     expect(rmdirFault.attempts).toBe(1);
     expect(await readdir(rmdirFault.lockPath)).toEqual([]);
     expect((await store.listApprovalPolicyRules()).map((item) => item.id)).toContain(rule.id);
+  });
+
+  it("retries transient sharing violations while reading the lock owner", async () => {
+    const { SecretStore } = await import("../src/store.js");
+    const store = new SecretStore();
+    await store.init();
+    rmdirFault.lockPath = `${store.storePath}.lock`;
+    rmdirFault.markerOpenFailures = 3;
+
+    const rule = await store.addApprovalPolicyRule({
+      name: "Retried owner inspection",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+
+    expect(rule.name).toBe("Retried owner inspection");
+    expect(rmdirFault.markerOpenFailures).toBe(0);
+    expect(rmdirFault.markerOpenAttempts).toBeGreaterThan(3);
+    await expect(stat(rmdirFault.lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed when lock ownership stays unreadable", async () => {
+    const { SecretStore } = await import("../src/store.js");
+    const store = new SecretStore();
+    await store.init();
+    rmdirFault.lockPath = `${store.storePath}.lock`;
+    rmdirFault.markerOpenFailures = 21;
+
+    await expect(store.addApprovalPolicyRule({
+      name: "Must not commit",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    })).rejects.toThrow(/lock ownership was lost/i);
+
+    expect(rmdirFault.markerOpenFailures).toBe(0);
+    expect((await store.listApprovalPolicyRules()).map((rule) => rule.name)).not.toContain("Must not commit");
+    await expect(stat(rmdirFault.lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

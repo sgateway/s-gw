@@ -277,8 +277,8 @@ describe("launch-agent packaging", () => {
 
       for (const value of [
         "/custom/bin:/usr/bin:/bin",
-        "/secure/s-gw-home",
-        "/secure/s-gw-recovery",
+        path.resolve("/secure/s-gw-home"),
+        path.resolve("/secure/s-gw-recovery"),
         "com.example.s-gw",
         "com.example.s-gw.secret",
         "primary",

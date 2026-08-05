@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -12,6 +13,7 @@ import {
 } from "../src/windows-startup.js";
 import {
   trustedWindowsPowerShellSync,
+  trustedWindowsSystemRootSync,
   windowsSystemEnvironment
 } from "../src/windows-system.js";
 
@@ -141,6 +143,39 @@ describe("Windows login startup contract", () => {
     expect(background.NODE_OPTIONS).toBeUndefined();
     expect(JSON.stringify(background)).not.toContain("sentinel-");
   });
+
+  it.skipIf(process.platform !== "win32")(
+    "uses the kernel GLOBALROOT path outside isolated tests",
+    async () => {
+      const testMode = process.env.SGW_TEST_MODE;
+      delete process.env.SGW_TEST_MODE;
+      try {
+        const trustedRoot = String.raw`\\?\GLOBALROOT\SystemRoot`;
+        const trustedShell = path.win32.join(
+          trustedRoot,
+          "System32",
+          "WindowsPowerShell",
+          "v1.0",
+          "powershell.exe"
+        );
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+        expect((await lstat(trustedShell)).isFile()).toBe(true);
+
+        const result = spawnSync(trustedShell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], {
+          env: windowsSystemEnvironment(),
+          shell: false,
+          stdio: "ignore",
+          windowsHide: true
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(0);
+      } finally {
+        if (testMode === undefined) delete process.env.SGW_TEST_MODE;
+        else process.env.SGW_TEST_MODE = testMode;
+      }
+    }
+  );
 });
 
 function encodeRaw(value: unknown): string {

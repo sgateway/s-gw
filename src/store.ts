@@ -4513,6 +4513,18 @@ async function publishPreparedStoreLock(tempPath: string, lockPath: string): Pro
 }
 
 async function inspectStoreLock(lockPath: string): Promise<StoreLockInspection | undefined> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await inspectStoreLockOnce(lockPath);
+    } catch (error) {
+      if (!shouldRetryWindowsLockOperation(error)) throw error;
+      if (attempt + 1 >= windowsLockRenameAttempts) return {};
+      await sleep(windowsLockRenameDelayMs);
+    }
+  }
+}
+
+async function inspectStoreLockOnce(lockPath: string): Promise<StoreLockInspection | undefined> {
   let lockInfo: Awaited<ReturnType<typeof lstat>>;
   try {
     lockInfo = await lstat(lockPath);

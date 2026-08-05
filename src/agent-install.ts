@@ -155,6 +155,7 @@ const managedEnd = "# <<< s-gw managed MCP server";
 const agentLockTimeoutMs = 35_000;
 const staleAgentLockMs = 30_000;
 const agentLockPollMs = 25;
+const agentLockFileRetryMs = 1_000;
 const managedAuthorityEnvKeys = [
   "SGW_HOME",
   "SGW_RECOVERY_HOME",
@@ -529,8 +530,12 @@ function publishAgentIntegrationLock(
     }
   } finally {
     if (markerFd !== undefined) closeSync(markerFd);
-    tryUnlink(markerPath);
-    tryRmdir(tmpPath);
+    if (!tryUnlink(markerPath) && existsSync(tmpPath)) {
+      throw new Error(`Could not remove the temporary agent integration lock marker at ${markerPath}.`);
+    }
+    if (!tryRmdir(tmpPath) && existsSync(tmpPath)) {
+      throw new Error(`Could not remove the temporary agent integration lock directory at ${tmpPath}.`);
+    }
   }
 }
 
@@ -580,7 +585,7 @@ function removeAbandonedAgentLock(lockPath: string): boolean {
   }
 
   // The marker name belongs to this generation, so an old cleaner cannot unlink a replacement.
-  if (state.markerPath) tryUnlink(state.markerPath);
+  if (state.markerPath && !tryUnlink(state.markerPath)) return false;
   return tryRmdir(lockPath);
 }
 
@@ -610,33 +615,64 @@ function processIsAlive(pid: number): boolean {
 }
 
 function releaseAgentIntegrationLock(lockPath: string, markerName: string): void {
-  tryUnlink(path.join(lockPath, markerName));
-  tryRmdir(lockPath);
+  const markerPath = path.join(lockPath, markerName);
+  if (!tryUnlink(markerPath)) {
+    throw new Error(`Could not release the agent integration lock marker at ${markerPath}.`);
+  }
+  if (tryRmdir(lockPath)) return;
+
+  try {
+    if (readdirSync(lockPath).length > 0) return;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`Could not release the agent integration lock directory at ${lockPath}.`);
 }
 
-function tryUnlink(filePath: string): void {
-  try {
-    unlinkSync(filePath);
-  } catch (error) {
-    if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+function tryUnlink(filePath: string): boolean {
+  const started = Date.now();
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+  while (true) {
+    try {
+      unlinkSync(filePath);
+      return true;
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return true;
+      if (!isWindowsLockAccessError(error)) throw error;
+      if (Date.now() - started >= agentLockFileRetryMs) return false;
+      Atomics.wait(waiter, 0, 0, agentLockPollMs);
+    }
   }
 }
 
 function tryRmdir(dirPath: string): boolean {
-  try {
-    rmdirSync(dirPath);
-    return true;
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") return true;
-    if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+  const started = Date.now();
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+  while (true) {
     try {
-      if (readdirSync(dirPath).length > 0) return false;
-    } catch (readError) {
-      if (isNodeError(readError) && readError.code === "ENOENT") return true;
-      throw readError;
+      rmdirSync(dirPath);
+      return true;
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return true;
+      if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+      if (!isWindowsLockAccessError(error)) throw error;
+
+      try {
+        if (readdirSync(dirPath).length > 0) return false;
+      } catch (readError) {
+        if (isNodeError(readError) && readError.code === "ENOENT") return true;
+        if (!isWindowsLockAccessError(readError)) throw readError;
+      }
+      if (Date.now() - started >= agentLockFileRetryMs) return false;
+      Atomics.wait(waiter, 0, 0, agentLockPollMs);
     }
-    throw error;
   }
+}
+
+function isWindowsLockAccessError(error: unknown): boolean {
+  return process.platform === "win32" && isNodeError(error) &&
+    (error.code === "EPERM" || error.code === "EACCES");
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

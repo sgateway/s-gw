@@ -1786,7 +1786,7 @@ describe("SecretStore", () => {
     expect(sameLogin.state).toBe("approved");
   });
 
-  it("approves only once when the native login session cannot be identified", async () => {
+  it("approves only once when a request has no native login-session identity", async () => {
     const store = new SecretStore();
     await store.setApprovalSettings({ mode: "login-session" });
     const record = await store.addSecret({
@@ -1803,17 +1803,19 @@ describe("SecretStore", () => {
       args: ["-e", "process.stdout.write('approved')"],
       injectEnv: "SGW_UNIDENTIFIED_LOGIN_TOKEN"
     });
-    delete process.env.SGW_LOGIN_SESSION_ID;
-    vi.spyOn(process, "platform", "get").mockReturnValue("aix");
-
     const first = await store.createRequest(record.handle, action, "unidentified login first");
-    expect(first.loginSessionId).toBeUndefined();
-    const approved = await store.approveRequest(first.id);
+    const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    delete raw.requests.find((request: { id: string }) => request.id === first.id).loginSessionId;
+    await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
+
+    const reloaded = new SecretStore();
+    expect((await reloaded.getRequest(first.id)).loginSessionId).toBeUndefined();
+    const approved = await reloaded.approveRequest(first.id);
     expect(approved.state).toBe("approved");
     expect(approved.approvalGrantId).toBeUndefined();
-    expect(await store.listApprovalGrants()).toEqual([]);
+    expect(await reloaded.listApprovalGrants()).toEqual([]);
 
-    const second = await store.createRequest(record.handle, action, "unidentified login second");
+    const second = await reloaded.createRequest(record.handle, action, "unidentified login second");
     expect(second.state).toBe("pending");
   });
 

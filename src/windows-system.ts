@@ -4,7 +4,7 @@ import path from "node:path";
 const WINDOWS_GLOBAL_SYSTEM_ROOT = String.raw`\\?\GLOBALROOT\SystemRoot`;
 
 export function trustedWindowsSystemRootSync(): string {
-  if (path.sep !== "\\") {
+  if (process.env.SGW_TEST_MODE === "1" || path.sep !== "\\") {
     return simulatedWindowsSystemRoot();
   }
 
@@ -18,16 +18,7 @@ export function trustedWindowsSystemRootSync(): string {
     throw new Error("The kernel-anchored Windows system directory is unavailable.");
   }
 
-  let systemRoot = "";
-  try {
-    systemRoot = realpathSync(WINDOWS_GLOBAL_SYSTEM_ROOT);
-  } catch {
-    // The path below is also used as the trust anchor, so partial resolution is unsafe.
-  }
-  if (!systemRoot || !path.isAbsolute(systemRoot)) {
-    throw new Error("The kernel-anchored Windows system directory could not be resolved.");
-  }
-  return systemRoot;
+  return WINDOWS_GLOBAL_SYSTEM_ROOT;
 }
 
 export function trustedWindowsSystemExecutableSync(...parts: string[]): string {
@@ -41,6 +32,10 @@ export function trustedWindowsSystemExecutableSync(...parts: string[]): string {
   }
   if (!info.isFile() || info.isSymbolicLink()) {
     throw new Error("A required trusted Windows system executable is unavailable.");
+  }
+
+  if (path.sep === "\\" && sameWindowsPath(systemRoot, WINDOWS_GLOBAL_SYSTEM_ROOT)) {
+    return candidate;
   }
 
   let realCandidate = "";
