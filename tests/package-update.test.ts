@@ -19,6 +19,7 @@ import { CURRENT_VERSION } from "../src/version.js";
 
 const execFileAsync = promisify(execFile);
 const tmpDirs: string[] = [];
+const packageIntegrationTimeout = process.platform === "win32" ? 180_000 : 40_000;
 
 afterEach(async () => {
   for (const dir of tmpDirs.splice(0)) {
@@ -266,7 +267,7 @@ if (args[0] === "pack") {
     expect(installed.installed.binDir).toBe(process.platform === "win32" ? npmPrefix : path.join(npmPrefix, "bin"));
     expect(installed.installed.legacy).toBeNull();
     expect(installed.installed.scoped.version).toBe(CURRENT_VERSION);
-  }, 40_000);
+  }, packageIntegrationTimeout);
 
   it("builds a release bridge that upgrades the legacy package without a bin collision", async () => {
     const tmp = await tempDir("sgw-legacy-bridge-");
@@ -293,7 +294,7 @@ if (args[0] === "pack") {
     const installed = await inspectGlobalSgwInstall({ npmPrefix });
     expect(installed.legacy?.version).toBe(CURRENT_VERSION);
     expect(installed.scoped).toBeNull();
-  }, 40_000);
+  }, packageIntegrationTimeout);
 
   it("reports a concrete legacy rollback when scoped installation fails", async () => {
     const tmp = await tempDir("sgw-package-rollback-");

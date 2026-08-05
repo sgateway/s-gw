@@ -42,12 +42,7 @@ beforeEach(async () => {
 afterEach(async () => {
   cdp?.dispose();
   cdp = undefined;
-  if (chrome) {
-    const exited = new Promise<void>((resolve) => chrome?.once("exit", () => resolve()));
-    chrome.kill("SIGKILL");
-    await Promise.race([exited, delay(3000)]);
-    chrome = undefined;
-  }
+  await stopChrome();
   if (running) {
     await running.close();
     running = undefined;
@@ -1193,6 +1188,24 @@ describeBrowser("React local console (real headless Chrome)", () => {
 });
 
 async function launchChrome(url: string): Promise<{ cdp: Cdp; approvePostCount: () => number }> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await launchChromeOnce(url);
+    } catch (error) {
+      lastError = error;
+      await stopChrome();
+      if (attempt === 0) {
+        await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+        profileDir = await mkdtemp(path.join(os.tmpdir(), "sgw-react-chrome-"));
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function launchChromeOnce(url: string): Promise<{ cdp: Cdp; approvePostCount: () => number }> {
   chrome = spawn(
     chromePath as string,
     [
@@ -1203,7 +1216,8 @@ async function launchChrome(url: string): Promise<{ cdp: Cdp; approvePostCount: 
       "--remote-debugging-port=0",
       "--window-size=1500,950",
       `--user-data-dir=${profileDir}`,
-      url
+      ...(process.platform === "darwin" ? ["--use-mock-keychain"] : []),
+      "about:blank"
     ],
     { stdio: ["ignore", "ignore", "pipe"] }
   );
@@ -1237,10 +1251,15 @@ async function launchChrome(url: string): Promise<{ cdp: Cdp; approvePostCount: 
   }, "chrome page target");
 
   const client = await Cdp.attach(target!.webSocketDebuggerUrl as string);
-  await client.send("Page.enable", {});
-  await client.send("Runtime.enable", {});
-  await client.send("Network.enable", {});
-  await client.send("Page.navigate", { url });
+  try {
+    await sendCdpSetup(client, "Page.enable");
+    await sendCdpSetup(client, "Runtime.enable");
+    await sendCdpSetup(client, "Network.enable");
+    await sendCdpSetup(client, "Page.navigate", { url });
+  } catch (error) {
+    client.dispose();
+    throw error;
+  }
 
   let approvePosts = 0;
   client.on((msg) => {
@@ -1253,6 +1272,34 @@ async function launchChrome(url: string): Promise<{ cdp: Cdp; approvePostCount: 
   });
 
   return { cdp: client, approvePostCount: () => approvePosts };
+}
+
+async function sendCdpSetup(
+  client: Cdp,
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      client.send(method, params),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 8_000);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function stopChrome(): Promise<void> {
+  const runningChrome = chrome;
+  chrome = undefined;
+  if (!runningChrome || runningChrome.exitCode !== null) return;
+
+  const exited = new Promise<void>((resolve) => runningChrome.once("exit", () => resolve()));
+  runningChrome.kill("SIGKILL");
+  await Promise.race([exited, delay(3000)]);
 }
 
 async function api<T = unknown>(pathName: string, body?: unknown): Promise<T> {

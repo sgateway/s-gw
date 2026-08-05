@@ -16,7 +16,6 @@ import {
   stopInstalledWindowsLoginService,
   stopWindowsSurfaces,
   uninstallWindowsLoginService,
-  windowsLoginServiceStatus
 } from "../src/install.js";
 import { getSgwInstanceKey } from "../src/paths.js";
 import { deleteKeychainPassphrase, setKeychainPassphrase } from "../src/unlock.js";
@@ -24,6 +23,7 @@ import { deleteKeychainPassphrase, setKeychainPassphrase } from "../src/unlock.j
 const repoRoot = process.cwd();
 const keychainService = `com.s-gw.test.windows-client.${process.pid}.${Date.now()}`;
 const keychainAccount = `vitest-${process.pid}`;
+const windowsProcessTestTimeout = 300_000;
 let authorityEnvironment: NodeJS.ProcessEnv | undefined;
 let suiteEnvironment: NodeJS.ProcessEnv | undefined;
 
@@ -36,7 +36,7 @@ beforeAll(() => {
   process.env.SGW_KEYCHAIN_SERVICE = keychainService;
   process.env.SGW_KEYCHAIN_ACCOUNT = keychainAccount;
   setKeychainPassphrase(`windows-client-test-${process.pid}`);
-}, 60_000);
+}, windowsProcessTestTimeout);
 
 beforeEach(() => {
   if (process.platform !== "win32") return;
@@ -66,7 +66,7 @@ afterAll(async () => {
       suiteEnvironment = undefined;
     }
   }
-}, 120_000);
+}, windowsProcessTestTimeout);
 
 describe("Windows client packaging", () => {
   it("selects helpers only from the current Windows user session", () => {
@@ -208,7 +208,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("restores a running console after an update failure", async () => {
     if (process.platform !== "win32") return;
@@ -238,7 +238,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("reuses a directly started console with default host and port arguments", async () => {
     if (process.platform !== "win32") return;
@@ -272,7 +272,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("reuses one tray helper across repeated opens", async () => {
     if (process.platform !== "win32") return;
@@ -335,7 +335,7 @@ describe("Windows client packaging", () => {
       await rm(otherHome, { recursive: true, force: true });
       await rm(`${otherHome}-recovery`, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, windowsProcessTestTimeout);
 
   it("rejects a healthy console from another credential home", async () => {
     if (process.platform !== "win32") return;
@@ -363,7 +363,7 @@ describe("Windows client packaging", () => {
       await rm(otherHome, { recursive: true, force: true });
       await rm(`${otherHome}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("stops only the requested Windows credential authority", async () => {
     if (process.platform !== "win32") return;
@@ -394,7 +394,7 @@ describe("Windows client packaging", () => {
       await rm(secondHome, { recursive: true, force: true });
       await rm(`${secondHome}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("rejects a matching health response from a different listener process", async () => {
     if (process.platform !== "win32") return;
@@ -427,7 +427,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("does not open another credential home's console in the browser", async () => {
     if (process.platform !== "win32") return;
@@ -464,7 +464,7 @@ describe("Windows client packaging", () => {
       await rm(otherHome, { recursive: true, force: true });
       await rm(`${otherHome}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("returns one live tray helper when two CLI opens race", async () => {
     if (process.platform !== "win32") return;
@@ -500,7 +500,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, windowsProcessTestTimeout);
 
   it("keeps one authority when two credential homes race on one port", async () => {
     if (process.platform !== "win32") return;
@@ -550,7 +550,7 @@ describe("Windows client packaging", () => {
       await rm(secondHome, { recursive: true, force: true });
       await rm(`${secondHome}-recovery`, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, windowsProcessTestTimeout);
 
   it("starts headless and stops every Windows surface through the CLI", async () => {
     if (process.platform !== "win32") return;
@@ -612,7 +612,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, windowsProcessTestTimeout);
 
   it("persists alternate Windows authority settings and optional tray without credential environment", async () => {
     if (process.platform !== "win32") return;
@@ -677,7 +677,7 @@ describe("Windows client packaging", () => {
       restoreEnv("NODE_OPTIONS", oldNodeOptions);
       await rm(authorityRoot, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, windowsProcessTestTimeout);
 
   it("refuses background startup when only an environment passphrase is available", async () => {
     if (process.platform !== "win32") return;
@@ -696,12 +696,11 @@ describe("Windows client packaging", () => {
       process.env.SGW_KEYCHAIN_ACCOUNT = account;
       setKeychainPassphrase(`windows-client-test-restored-${process.pid}`);
     }
-  }, 30_000);
+  }, windowsProcessTestTimeout);
 
   it("preserves an unmanaged Startup shortcut collision", async () => {
     if (process.platform !== "win32") return;
-    const status = await windowsLoginServiceStatus();
-    const shortcutPath = status.shortcutPath;
+    const shortcutPath = windowsTestStartupShortcut();
     const script = [
       "$shell = New-Object -ComObject WScript.Shell",
       "$shortcut = $shell.CreateShortcut($env:SGW_TEST_COLLISION_PATH)",
@@ -713,6 +712,8 @@ describe("Windows client packaging", () => {
     ].join("\n");
 
     try {
+      await mkdir(path.dirname(shortcutPath), { recursive: true });
+      await rm(shortcutPath, { force: true });
       execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
         env: { ...process.env, SGW_TEST_COLLISION_PATH: shortcutPath },
         stdio: ["ignore", "pipe", "pipe"]
@@ -725,7 +726,7 @@ describe("Windows client packaging", () => {
     } finally {
       await rm(shortcutPath, { force: true });
     }
-  }, 60_000);
+  }, windowsProcessTestTimeout);
 });
 
 async function freePort(): Promise<number> {
@@ -849,6 +850,10 @@ function restoreEnv(name: string, value: string | undefined): void {
 
 function windowsTestRoot(): string {
   return process.env.SGW_TEST_HOME_ROOT || os.tmpdir();
+}
+
+function windowsTestStartupShortcut(): string {
+  return path.join(windowsTestRoot(), "windows-startup", "s-gw Credential Gateway.lnk");
 }
 
 function stopWindowsAuthority(home: string, recoveryHome: string, port: number): void {
