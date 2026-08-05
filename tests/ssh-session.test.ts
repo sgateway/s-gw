@@ -358,10 +358,14 @@ describe.sequential("s-gw-owned SSH sessions", () => {
 
     if (windows.aclLog) {
       const aclCalls = await readJsonLines(windows.aclLog);
-      expect(aclCalls.map((entry) => entry.mode)).toEqual(["create-directory", "verify-file", "verify-directory"]);
+      expect(aclCalls.map((entry) => entry.mode)).toEqual([
+        "create-directory",
+        "verify-directory", "verify-file",
+        "verify-directory", "verify-file"
+      ]);
       expect(path.dirname(aclCalls[0].target)).toBe(windows.temp);
       expect(path.basename(aclCalls[0].target)).toMatch(/^s-gw-ssh-[0-9a-f]{32}$/);
-      expect(aclCalls[1].target).toBe(keyPath);
+      expect(aclCalls[2].target).toBe(keyPath);
     }
 
     const beforeCloseCalls = calls.length;
@@ -370,6 +374,36 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect((await readFakeSshLog(fake.log))).toHaveLength(beforeCloseCalls);
     expect(existsSync(process.env.SGW_SSH_CONTROL_DIR!)).toBe(false);
   }, 30_000);
+
+  it.skipIf(originalPlatform === "win32")(
+    "rejects a Windows private key replaced before spawn",
+    async () => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const windows = await writeFakeWindowsTools();
+      const fake = await writeFakeSsh();
+      process.env.SGW_SSH_CLI = fake.bin;
+      process.env.SGW_FAKE_SSH_LOG = fake.log;
+      await writeFile(windows.replaceMarker!, "replace on pre-spawn validation\n");
+
+      const { store, requestId } = await approvedWindowsKeyRequest(2_000);
+      await expect(executeApprovedRequest(store, requestId))
+        .rejects.toThrow(/changed while its access was secured/i);
+
+      expect(existsSync(fake.log)).toBe(false);
+      const aclCalls = await readJsonLines(windows.aclLog!);
+      expect(aclCalls.map((entry) => entry.mode)).toEqual([
+        "create-directory",
+        "verify-directory", "verify-file",
+        "verify-directory"
+      ]);
+      const keyPath = aclCalls.find((entry) => entry.mode === "verify-file")!.target;
+      expect(existsSync(keyPath)).toBe(false);
+      expect(existsSync(path.dirname(keyPath))).toBe(false);
+      expect(await windowsAuthDirs(windows.temp)).toEqual([]);
+      expect((await store.getRequest(requestId)).state).toBe("failed");
+    },
+    30_000
+  );
 
   it("rejects Windows password SSH before revealing or materializing the secret", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -607,7 +641,12 @@ async function readFakeSshLog(log: string): Promise<Array<{ args: string[]; env:
   });
 }
 
-async function writeFakeWindowsTools(): Promise<{ root: string; temp: string; aclLog?: string }> {
+async function writeFakeWindowsTools(): Promise<{
+  root: string;
+  temp: string;
+  aclLog?: string;
+  replaceMarker?: string;
+}> {
   const temp = await realpath(tmpHome);
   process.env.TEMP = temp;
   process.env.TMP = temp;
@@ -626,6 +665,7 @@ async function writeFakeWindowsTools(): Promise<{ root: string; temp: string; ac
   const root = path.join(await realpath(tmpHome), "Windows");
   const powershell = path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const aclLog = path.join(tmpHome, "fake-acl.log");
+  const replaceMarker = path.join(tmpHome, "replace-key-before-spawn");
   await mkdir(path.dirname(powershell), { recursive: true });
   await writeFile(powershell, `#!${process.execPath}
 const fs = require('node:fs');
@@ -635,26 +675,39 @@ if (process.env.SGW_WINDOWS_ACL_EXPECTED_SID && process.env.SGW_WINDOWS_ACL_EXPE
   process.stderr.write('identity mismatch');
   process.exit(1);
 }
+const mode = process.env.SGW_WINDOWS_ACL_MODE;
 let target = process.env.SGW_WINDOWS_ACL_PATH || '';
-if (process.env.SGW_WINDOWS_ACL_MODE === 'create-directory') {
+if (mode === 'create-directory') {
   const root = process.env.SGW_WINDOWS_ACL_TEST_ROOT || process.env.TEMP;
   target = path.join(root, 's-gw-ssh-' + require('node:crypto').randomBytes(16).toString('hex'));
   fs.mkdirSync(target);
 }
-fs.appendFileSync(${JSON.stringify(aclLog)}, JSON.stringify({
-  mode: process.env.SGW_WINDOWS_ACL_MODE,
+const logPath = ${JSON.stringify(aclLog)};
+let priorDirectoryCalls = 0;
+if (fs.existsSync(logPath)) {
+  priorDirectoryCalls = fs.readFileSync(logPath, 'utf8').trim().split(String.fromCharCode(10)).filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.mode === 'verify-directory').length;
+}
+fs.appendFileSync(logPath, JSON.stringify({
+  mode,
   target,
   expectedSid: process.env.SGW_WINDOWS_ACL_EXPECTED_SID || ''
 }) + '\\n');
+if (mode === 'verify-directory' && priorDirectoryCalls > 0 && fs.existsSync(${JSON.stringify(replaceMarker)})) {
+  const keyPath = path.join(target, 'identity');
+  fs.renameSync(keyPath, keyPath + '.original');
+  fs.writeFileSync(keyPath, 'replacement private key material');
+}
 const result = { verified: true, sid, rules: 2 };
-if (process.env.SGW_WINDOWS_ACL_MODE === 'create-directory') result.path = target;
+if (mode === 'create-directory') result.path = target;
 process.stdout.write(JSON.stringify(result) + '\\n');
 `);
   await chmod(powershell, 0o755);
   process.env.SystemRoot = root;
   process.env.WINDIR = root;
   process.env.USERPROFILE = path.join(tmpHome, "user-profile");
-  return { root, temp, aclLog };
+  return { root, temp, aclLog, replaceMarker };
 }
 
 async function writeWindowsFakeSsh(options: FakeSshOptions): Promise<{ bin: string; log: string }> {

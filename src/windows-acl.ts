@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { realpath } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import {
   trustedWindowsSystemExecutableSync,
@@ -155,6 +156,18 @@ function New-PrivateDirectorySecurity() {
   return $acl
 }
 
+function New-PrivateFileSecurity() {
+  $acl = [System.Security.AccessControl.FileSecurity]::new()
+  $acl.SetOwner($identity.User)
+  $acl.SetAccessRuleProtection($true, $false)
+  $none = [System.Security.AccessControl.InheritanceFlags]::None
+  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, $full, $none, $propagation, $allow))
+  if ($currentSid -ne $systemSid) {
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($systemSid), $full, $none, $propagation, $allow))
+  }
+  return $acl
+}
+
 if ($env:SGW_WINDOWS_ACL_EXPECTED_SID -and $env:SGW_WINDOWS_ACL_EXPECTED_SID -ne $currentSid) {
   throw 'The Windows identity changed while preparing the SSH key.'
 }
@@ -200,6 +213,13 @@ if ($mode -eq 'verify-file') {
   if (($fileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-SamePath $fileInfo.FullName $target)) {
     throw 'The SSH private-key path is not a stable local file.'
   }
+  $fileInfo.SetAccessControl((New-PrivateFileSecurity))
+  $fileInfo.Refresh()
+  if (-not $fileInfo.Exists -or
+      ($fileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+      -not (Test-SamePath $fileInfo.FullName $target)) {
+    throw 'The SSH private-key path changed while its access was secured.'
+  }
   $acl = $fileInfo.GetAccessControl($accessAndOwner)
 } elseif ($mode -eq 'create-directory' -or $mode -eq 'verify-directory') {
   $dirInfo = Get-StableDirectory $target
@@ -209,6 +229,10 @@ if ($mode -eq 'verify-file') {
   }
 } else {
   throw 'Unsupported Windows ACL operation.'
+}
+
+if (-not $acl.AreAccessRulesProtected) {
+  throw 'The SSH temporary path still inherits access rules.'
 }
 
 $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
@@ -236,7 +260,13 @@ foreach ($rule in $rules) {
   if ($sid -eq $systemSid) {
     $systemSeen = $true
   }
-  if ($mode -ne 'verify-file') {
+  if ($mode -eq 'verify-file') {
+    if ($rule.IsInherited -or
+        $rule.InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None -or
+        $rule.PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) {
+      throw ('The SSH private-key file has an inheritable access rule for ' + $sid)
+    }
+  } else {
     if ($rule.IsInherited -or $rule.InheritanceFlags -ne $inherit -or $rule.PropagationFlags -ne $propagation) {
       throw ('The SSH temporary directory has incomplete child protection for ' + $sid)
     }
@@ -273,9 +303,30 @@ export async function createPrivateWindowsSshDirectory(): Promise<{ dirPath: str
   return { dirPath: result.path, sid: result.sid };
 }
 
-export async function verifyPrivateWindowsKeyFile(filePath: string, expectedSid: string): Promise<void> {
-  await runAclOperation("verify-file", filePath, expectedSid);
+export async function verifyPrivateWindowsKeyFile(
+  filePath: string,
+  expectedSid: string
+): Promise<() => Promise<void>> {
+  const original = await stablePrivateKeyIdentity(filePath);
+  await securePrivateWindowsKeyFile(filePath, expectedSid, original);
+  return () => securePrivateWindowsKeyFile(filePath, expectedSid, original);
+}
+
+interface FileIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+async function securePrivateWindowsKeyFile(
+  filePath: string,
+  expectedSid: string,
+  original: FileIdentity
+): Promise<void> {
+  assertSameFileIdentity(original, await stablePrivateKeyIdentity(filePath));
   await runAclOperation("verify-directory", path.dirname(filePath), expectedSid);
+  assertSameFileIdentity(original, await stablePrivateKeyIdentity(filePath));
+  await runAclOperation("verify-file", filePath, expectedSid);
+  assertSameFileIdentity(original, await stablePrivateKeyIdentity(filePath));
 }
 
 interface AclResult {
@@ -404,6 +455,29 @@ function isAclResult(value: unknown, requirePath: boolean): value is AclResult {
 function sameWindowsPath(left: string, right: string): boolean {
   return path.normalize(left).replace(/[\\/]+$/, "").toLowerCase()
     === path.normalize(right).replace(/[\\/]+$/, "").toLowerCase();
+}
+
+async function stablePrivateKeyIdentity(filePath: string): Promise<FileIdentity> {
+  const before = await privateKeyInfo(filePath);
+  const after = await privateKeyInfo(filePath);
+  if (before.dev !== after.dev || before.ino !== after.ino) {
+    throw new Error("The Windows SSH private-key file changed while its identity was checked.");
+  }
+  return { dev: before.dev, ino: before.ino };
+}
+
+async function privateKeyInfo(filePath: string): Promise<BigIntStats> {
+  const info = await lstat(filePath, { bigint: true }).catch(() => undefined);
+  if (!info || !info.isFile() || info.isSymbolicLink() || info.dev === 0n || info.ino === 0n) {
+    throw new Error("The Windows SSH private-key file does not have a stable identity.");
+  }
+  return info;
+}
+
+function assertSameFileIdentity(before: FileIdentity, after: FileIdentity): void {
+  if (before.dev !== after.dev || before.ino !== after.ino) {
+    throw new Error("The Windows SSH private-key file changed while its access was secured.");
+  }
 }
 
 function appendSmall(current: string, chunk: string): string {

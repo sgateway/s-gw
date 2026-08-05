@@ -196,31 +196,36 @@ async function runWindowsSshCommand(
   captureCap: number
 ): Promise<ExecutionSummary> {
   const remoteArgs = request.action.args.length > 0 ? request.action.args : ["true"];
+  const sshArgs = [
+    "-T",
+    "-F", "none",
+    "-o", "ClearAllForwardings=yes",
+    "-o", "ForwardAgent=no",
+    "-o", "ForwardX11=no",
+    "-o", "PermitLocalCommand=no",
+    "-o", "IdentityAgent=none",
+    "-o", "PasswordAuthentication=no",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "GSSAPIAuthentication=no",
+    "-o", "HostbasedAuthentication=no",
+    "-o", "PubkeyAuthentication=yes",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "BatchMode=yes",
+    ...auth.args,
+    "-p", String(port),
+    target,
+    ...remoteArgs
+  ];
+  if (!auth.validateBeforeSpawn) {
+    throw new Error("The Windows SSH private key has no pre-spawn validation.");
+  }
+  await auth.validateBeforeSpawn();
   const result = await runProcess(
     sshPath,
-    [
-      "-T",
-      "-F", "none",
-      "-o", "ClearAllForwardings=yes",
-      "-o", "ForwardAgent=no",
-      "-o", "ForwardX11=no",
-      "-o", "PermitLocalCommand=no",
-      "-o", "IdentityAgent=none",
-      "-o", "PasswordAuthentication=no",
-      "-o", "KbdInteractiveAuthentication=no",
-      "-o", "GSSAPIAuthentication=no",
-      "-o", "HostbasedAuthentication=no",
-      "-o", "PubkeyAuthentication=yes",
-      "-o", "StrictHostKeyChecking=accept-new",
-      "-o", "BatchMode=yes",
-      ...auth.args,
-      "-p", String(port),
-      target,
-      ...remoteArgs
-    ],
+    sshArgs,
     {
       timeoutMs: request.action.timeoutMs,
-      env: await baseSshEnv(),
+      env: auth.env,
       maxOutputBytes: captureCap,
       rejectOnNonZero: false
     }
@@ -342,6 +347,7 @@ interface PreparedSshAuth {
   args: string[];
   env: NodeJS.ProcessEnv;
   cleanup: () => Promise<void>;
+  validateBeforeSpawn?: () => Promise<void>;
 }
 
 async function prepareSshAuth(secret: SecretRecord, value: string): Promise<PreparedSshAuth> {
@@ -363,9 +369,10 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
   try {
     if (secret.type === "ssh-key" || secret.type === "private-key" || looksLikePrivateKey(value)) {
       const keyPath = path.join(tmpDir, "identity");
+      let validateBeforeSpawn: (() => Promise<void>) | undefined;
       if (process.platform === "win32") {
         await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { flag: "wx" });
-        await verifyPrivateWindowsKeyFile(keyPath, windowsDir!.sid);
+        validateBeforeSpawn = await verifyPrivateWindowsKeyFile(keyPath, windowsDir!.sid);
       } else {
         await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
         await chmod(keyPath, 0o600);
@@ -373,7 +380,8 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
       return {
         args: ["-i", keyPath, "-o", "IdentitiesOnly=yes"],
         env,
-        cleanup
+        cleanup,
+        validateBeforeSpawn
       };
     }
 

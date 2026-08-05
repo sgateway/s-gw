@@ -1,53 +1,65 @@
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, type BigIntStats } from "node:fs";
 import path from "node:path";
 
 const WINDOWS_GLOBAL_SYSTEM_ROOT = String.raw`\\?\GLOBALROOT\SystemRoot`;
+const WINDOWS_DEVICE_PREFIX = "\\\\?\\";
 
 export function trustedWindowsSystemRootSync(): string {
-  if (process.env.SGW_TEST_MODE === "1" || path.sep !== "\\") {
-    return simulatedWindowsSystemRoot();
-  }
+  if (path.sep !== "\\") return simulatedWindowsSystemRoot();
 
-  let info;
+  let normalRoot = "";
   try {
-    info = lstatSync(WINDOWS_GLOBAL_SYSTEM_ROOT);
+    normalRoot = realpathSync.native(WINDOWS_GLOBAL_SYSTEM_ROOT);
   } catch {
-    throw new Error("The kernel-anchored Windows system directory is unavailable.");
+    // Fail below without consulting ambient environment variables.
   }
-  if (!info.isDirectory() || info.isSymbolicLink()) {
-    throw new Error("The kernel-anchored Windows system directory is unavailable.");
+  if (!normalLocalWindowsPath(normalRoot)) {
+    throw new Error("The kernel-anchored Windows system directory did not resolve to a normal local drive path.");
   }
+  normalRoot = path.normalize(normalRoot);
 
-  return WINDOWS_GLOBAL_SYSTEM_ROOT;
+  assertSameWindowsIdentity(normalRoot, WINDOWS_GLOBAL_SYSTEM_ROOT, "directory");
+  assertSameWindowsIdentity(
+    path.join(normalRoot, "System32"),
+    path.join(WINDOWS_GLOBAL_SYSTEM_ROOT, "System32"),
+    "directory"
+  );
+  assertSameWindowsIdentity(
+    path.join(normalRoot, "System32", "kernel32.dll"),
+    path.join(WINDOWS_GLOBAL_SYSTEM_ROOT, "System32", "kernel32.dll"),
+    "file"
+  );
+  return normalRoot;
 }
 
 export function trustedWindowsSystemExecutableSync(...parts: string[]): string {
   const systemRoot = trustedWindowsSystemRootSync();
-  const candidate = path.join(systemRoot, "System32", ...parts);
-  let info;
+  const system32 = path.join(systemRoot, "System32");
+  const requested = path.join(system32, ...parts);
+  let candidate = "";
   try {
-    info = lstatSync(candidate);
-  } catch {
-    throw new Error("A required trusted Windows system executable is unavailable.");
-  }
-  if (!info.isFile() || info.isSymbolicLink()) {
-    throw new Error("A required trusted Windows system executable is unavailable.");
-  }
-
-  if (path.sep === "\\" && sameWindowsPath(systemRoot, WINDOWS_GLOBAL_SYSTEM_ROOT)) {
-    return candidate;
-  }
-
-  let realCandidate = "";
-  try {
-    realCandidate = realpathSync(candidate);
+    candidate = path.sep === "\\" ? realpathSync.native(requested) : realpathSync(requested);
   } catch {
     // Fail below without attempting PATH fallback.
   }
-  if (!realCandidate || !sameWindowsPath(realCandidate, candidate)) {
+  const relative = path.relative(system32, candidate);
+  if (!candidate || !parts.length || !relative || relative.startsWith(`..${path.sep}`) ||
+      relative === ".." || path.isAbsolute(relative) ||
+      (path.sep === "\\" && !normalLocalWindowsPath(candidate))) {
     throw new Error("Trusted Windows system executable path validation failed.");
   }
-  return realCandidate;
+  trustedWindowsPathInfo(candidate, "file");
+
+  if (path.sep === "\\") {
+    const kernelCandidate = path.join(WINDOWS_GLOBAL_SYSTEM_ROOT, "System32", ...parts);
+    assertSameWindowsIdentity(candidate, kernelCandidate, "file");
+    return candidate;
+  }
+
+  if (!sameWindowsPath(candidate, requested)) {
+    throw new Error("Trusted Windows system executable path validation failed.");
+  }
+  return candidate;
 }
 
 export function trustedWindowsPowerShellSync(): string {
@@ -70,7 +82,7 @@ export function windowsSystemEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.
     "USERNAME",
     "USERPROFILE"
   ]) {
-    const value = process.env[key];
+    const value = optionalWindowsEnvironmentValue(key);
     if (value) env[key] = value;
   }
   for (const [key, value] of Object.entries(extra)) {
@@ -92,16 +104,13 @@ function simulatedWindowsSystemRoot(): string {
   if (process.env.SGW_TEST_MODE !== "1") {
     throw new Error("A simulated Windows system directory is allowed only in isolated test mode.");
   }
-  const systemRoot = process.env.SystemRoot?.trim();
-  const winDir = process.env.WINDIR?.trim();
-  if (!systemRoot || !winDir) {
-    throw new Error("Windows SystemRoot and WINDIR are required for Windows system-path tests.");
-  }
-  const resolvedRoot = path.resolve(systemRoot);
-  if (!sameWindowsPath(resolvedRoot, path.resolve(winDir))) {
-    throw new Error("Windows SystemRoot and WINDIR do not identify the same test directory.");
+  const systemRoot = requiredWindowsEnvironmentPath("SystemRoot");
+  const winDir = requiredWindowsEnvironmentPath("WINDIR");
+  if (!sameWindowsPath(systemRoot, winDir)) {
+    throw new Error("Windows SystemRoot and WINDIR identify conflicting system directories.");
   }
 
+  const resolvedRoot = path.resolve(systemRoot);
   let realRoot = "";
   try {
     realRoot = realpathSync(resolvedRoot);
@@ -112,6 +121,60 @@ function simulatedWindowsSystemRoot(): string {
     throw new Error("The simulated Windows system directory could not be validated.");
   }
   return realRoot;
+}
+
+function requiredWindowsEnvironmentPath(name: "SystemRoot" | "WINDIR"): string {
+  const value = optionalWindowsEnvironmentValue(name);
+  if (!value) throw new Error(`Windows ${name} is required for trusted system paths.`);
+  return value;
+}
+
+function optionalWindowsEnvironmentValue(name: string): string | undefined {
+  const values: string[] = [];
+  for (const [key, raw] of Object.entries(process.env)) {
+    if (key.toLowerCase() !== name.toLowerCase() || raw === undefined) continue;
+    const value = raw.trim();
+    if (!value) throw new Error(`Windows ${name} contains an empty environment value.`);
+    values.push(value);
+  }
+  if (values.length === 0) return undefined;
+  if (values.some((value) => !sameWindowsPath(value, values[0]))) {
+    throw new Error(`Windows ${name} contains conflicting case-insensitive environment values.`);
+  }
+  return values[0];
+}
+
+function assertSameWindowsIdentity(normalPath: string, kernelPath: string, kind: "directory" | "file"): void {
+  const normalBefore = trustedWindowsPathInfo(normalPath, kind);
+  const kernelBefore = trustedWindowsPathInfo(kernelPath, kind);
+  const normalAfter = trustedWindowsPathInfo(normalPath, kind);
+  const kernelAfter = trustedWindowsPathInfo(kernelPath, kind);
+  if (!sameFileIdentity(normalBefore, normalAfter) || !sameFileIdentity(kernelBefore, kernelAfter) ||
+      !sameFileIdentity(normalBefore, kernelBefore)) {
+    throw new Error("Windows system path does not match the kernel-anchored system directory.");
+  }
+}
+
+function trustedWindowsPathInfo(input: string, kind: "directory" | "file"): BigIntStats {
+  let info: BigIntStats;
+  try {
+    info = lstatSync(input, { bigint: true });
+  } catch {
+    throw new Error("A required trusted Windows system path is unavailable.");
+  }
+  if (info.isSymbolicLink() || (kind === "directory" ? !info.isDirectory() : !info.isFile())) {
+    throw new Error("A required trusted Windows system path has an invalid file type.");
+  }
+  return info;
+}
+
+function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev !== 0n && left.ino !== 0n && right.dev !== 0n && right.ino !== 0n &&
+    left.dev === right.dev && left.ino === right.ino;
+}
+
+function normalLocalWindowsPath(input: string): boolean {
+  return /^[A-Za-z]:\\/u.test(input) && !input.startsWith(WINDOWS_DEVICE_PREFIX);
 }
 
 function sameWindowsPath(left: string, right: string): boolean {

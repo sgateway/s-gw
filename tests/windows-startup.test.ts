@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -13,6 +14,7 @@ import {
 } from "../src/windows-startup.js";
 import {
   trustedWindowsPowerShellSync,
+  trustedWindowsSystemExecutableSync,
   trustedWindowsSystemRootSync,
   windowsSystemEnvironment
 } from "../src/windows-system.js";
@@ -36,6 +38,13 @@ beforeEach(async () => {
 
 afterEach(async () => {
   process.env = previousEnv;
+  if (root) {
+    const junctionPath = path.join(root, "system-root junction");
+    const junctionInfo = await lstat(junctionPath).catch(() => undefined);
+    if (junctionInfo) {
+      await unlink(junctionPath);
+    }
+  }
   await rm(root, { recursive: true, force: true });
 });
 
@@ -113,44 +122,62 @@ describe("Windows login startup contract", () => {
     expect(process.env.SGW_WINDOWS_CREDENTIAL_HELPER).toBe("hostile-helper");
   });
 
-  it("uses the trusted System32 PowerShell and strips hostile inherited environment", async () => {
-    const systemRoot = path.join(root, "trusted Windows");
-    const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const hostileDir = path.join(root, "hostile path");
-    await mkdir(path.dirname(powershell), { recursive: true });
-    await mkdir(hostileDir, { recursive: true });
-    await writeFile(powershell, "trusted", "utf8");
-    await writeFile(path.join(hostileDir, "powershell.exe"), "hostile", "utf8");
-    process.env.SystemRoot = await realpath(systemRoot);
-    process.env.WINDIR = process.env.SystemRoot;
-    process.env.PATH = hostileDir;
-    process.env.SGW_MASTER_PASSPHRASE = "sentinel-master-passphrase";
-    process.env.AWS_SECRET_ACCESS_KEY = "sentinel-cloud-secret";
-    process.env.NODE_OPTIONS = "--require hostile-preload.js";
+  it.skipIf(process.platform === "win32")(
+    "uses the trusted System32 PowerShell and strips hostile inherited environment",
+    async () => {
+      const systemRoot = path.join(root, "trusted Windows");
+      const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const hostileDir = path.join(root, "hostile path");
+      await mkdir(path.dirname(powershell), { recursive: true });
+      await mkdir(hostileDir, { recursive: true });
+      await writeFile(powershell, "trusted", "utf8");
+      await writeFile(path.join(hostileDir, "powershell.exe"), "hostile", "utf8");
+      const directoryExecutable = path.join(path.dirname(powershell), "directory.exe");
+      await mkdir(directoryExecutable);
+      delete process.env.SystemRoot;
+      delete process.env.WINDIR;
+      process.env.systemroot = await realpath(systemRoot);
+      process.env.windir = process.env.systemroot;
+      process.env.PATH = hostileDir;
+      process.env.SGW_MASTER_PASSPHRASE = "sentinel-master-passphrase";
+      process.env.AWS_SECRET_ACCESS_KEY = "sentinel-cloud-secret";
+      process.env.NODE_OPTIONS = "--require hostile-preload.js";
 
-    expect(trustedWindowsPowerShellSync()).toBe(await realpath(powershell));
-    const systemEnv = windowsSystemEnvironment();
-    expect(systemEnv.PATH).toContain(path.join(process.env.SystemRoot, "System32"));
-    expect(systemEnv.PATH).not.toContain(hostileDir);
-    expect(() => windowsSystemEnvironment({ PATH: hostileDir })).toThrow(/cannot override trusted PATH/i);
+      expect(trustedWindowsPowerShellSync()).toBe(await realpath(powershell));
+      expect(() => trustedWindowsSystemExecutableSync(
+        "WindowsPowerShell",
+        "v1.0",
+        "directory.exe"
+      )).toThrow(/invalid file type/i);
+      const systemEnv = windowsSystemEnvironment();
+      expect(systemEnv.PATH).toContain(path.join(process.env.systemroot, "System32"));
+      expect(systemEnv.PATH).not.toContain(hostileDir);
+      expect(() => windowsSystemEnvironment({ PATH: hostileDir })).toThrow(/cannot override trusted PATH/i);
 
-    const background = windowsBackgroundEnvironment("http://127.0.0.1:8718/");
-    expect(background.SGW_HOME).toBe(process.env.SGW_HOME);
-    expect(background.SGW_RECOVERY_HOME).toBe(process.env.SGW_RECOVERY_HOME);
-    expect(background.SGW_EXECUTION_ENGINE).toBe("rust");
-    expect(background.SGW_MASTER_PASSPHRASE).toBeUndefined();
-    expect(background.AWS_SECRET_ACCESS_KEY).toBeUndefined();
-    expect(background.NODE_OPTIONS).toBeUndefined();
-    expect(JSON.stringify(background)).not.toContain("sentinel-");
-  });
+      const background = windowsBackgroundEnvironment("http://127.0.0.1:8718/");
+      expect(background.SGW_HOME).toBe(process.env.SGW_HOME);
+      expect(background.SGW_RECOVERY_HOME).toBe(process.env.SGW_RECOVERY_HOME);
+      expect(background.SGW_EXECUTION_ENGINE).toBe("rust");
+      expect(background.SGW_MASTER_PASSPHRASE).toBeUndefined();
+      expect(background.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(background.NODE_OPTIONS).toBeUndefined();
+      expect(JSON.stringify(background)).not.toContain("sentinel-");
+    }
+  );
 
   it.skipIf(process.platform !== "win32")(
-    "uses the kernel GLOBALROOT path outside isolated tests",
+    "validates kernel identity and returns a spawnable normal system path",
     async () => {
       const testMode = process.env.SGW_TEST_MODE;
+      let substDrive = "";
+      let substExecutable = "";
+      let substMapped = false;
+      const junctionPath = path.join(root, "system-root junction");
+      let junctionExists = false;
       delete process.env.SGW_TEST_MODE;
       try {
-        const trustedRoot = String.raw`\\?\GLOBALROOT\SystemRoot`;
+        const globalRoot = String.raw`\\?\GLOBALROOT\SystemRoot`;
+        const trustedRoot = trustedWindowsSystemRootSync();
         const trustedShell = path.win32.join(
           trustedRoot,
           "System32",
@@ -158,9 +185,22 @@ describe("Windows login startup contract", () => {
           "v1.0",
           "powershell.exe"
         );
-        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        const globalShell = path.win32.join(
+          globalRoot,
+          "System32",
+          "WindowsPowerShell",
+          "v1.0",
+          "powershell.exe"
+        );
+        expect(trustedRoot).toMatch(/^[A-Za-z]:\\/u);
+        expect(trustedRoot).not.toBe(globalRoot);
         expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
-        expect((await lstat(trustedShell)).isFile()).toBe(true);
+        const normalRootInfo = await lstat(trustedRoot, { bigint: true });
+        const globalRootInfo = await lstat(globalRoot, { bigint: true });
+        const normalShellInfo = await lstat(trustedShell, { bigint: true });
+        const globalShellInfo = await lstat(globalShell, { bigint: true });
+        expect([normalRootInfo.dev, normalRootInfo.ino]).toEqual([globalRootInfo.dev, globalRootInfo.ino]);
+        expect([normalShellInfo.dev, normalShellInfo.ino]).toEqual([globalShellInfo.dev, globalShellInfo.ino]);
 
         const result = spawnSync(trustedShell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], {
           env: windowsSystemEnvironment(),
@@ -170,7 +210,96 @@ describe("Windows login startup contract", () => {
         });
         expect(result.error).toBeUndefined();
         expect(result.status).toBe(0);
+
+        const hostileRoot = path.join(root, "hostile Windows");
+        await mkdir(hostileRoot, { recursive: true });
+        for (const key of Object.keys(process.env)) {
+          if (["systemroot", "windir"].includes(key.toLowerCase())) delete process.env[key];
+        }
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+
+        process.env.systemroot = hostileRoot;
+        process.env.windir = hostileRoot;
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+
+        process.env.SystemRoot = hostileRoot;
+        process.env.WINDIR = trustedRoot;
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+        expect(windowsSystemEnvironment()).toMatchObject({
+          SystemRoot: trustedRoot,
+          WINDIR: trustedRoot
+        });
+
+        await symlink(trustedRoot, junctionPath, "junction");
+        junctionExists = true;
+        expect(windowsPathKey(realpathSync.native(junctionPath))).toBe(windowsPathKey(trustedRoot));
+        process.env.SystemRoot = junctionPath;
+        process.env.WINDIR = junctionPath;
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+
+        await unlink(junctionPath);
+        junctionExists = false;
+        await symlink(hostileRoot, junctionPath, "junction");
+        junctionExists = true;
+        expect(windowsPathKey(realpathSync.native(junctionPath))).toBe(windowsPathKey(hostileRoot));
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+        await unlink(junctionPath);
+        junctionExists = false;
+
+        for (let code = "Z".charCodeAt(0); code >= "P".charCodeAt(0); code -= 1) {
+          const candidate = `${String.fromCharCode(code)}:`;
+          const exists = await lstat(`${candidate}\\`).then(() => true, () => false);
+          if (!exists) {
+            substDrive = candidate;
+            break;
+          }
+        }
+        expect(substDrive).not.toBe("");
+        substExecutable = trustedWindowsSystemExecutableSync("subst.exe");
+        const mapResult = spawnSync(substExecutable, [substDrive, trustedRoot], {
+          env: windowsSystemEnvironment(),
+          shell: false,
+          stdio: "ignore",
+          windowsHide: true
+        });
+        expect(mapResult.error).toBeUndefined();
+        expect(mapResult.status).toBe(0);
+        substMapped = true;
+
+        const substRoot = `${substDrive}\\`;
+        expect(windowsPathKey(realpathSync.native(substRoot))).toBe(windowsPathKey(trustedRoot));
+        process.env.SystemRoot = substRoot;
+        process.env.WINDIR = substRoot;
+        expect(trustedWindowsSystemRootSync()).toBe(trustedRoot);
+        expect(trustedWindowsPowerShellSync()).toBe(trustedShell);
+
+        const finalSpawn = spawnSync(trustedWindowsPowerShellSync(), [
+          "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"
+        ], {
+          env: windowsSystemEnvironment(),
+          shell: false,
+          stdio: "ignore",
+          windowsHide: true
+        });
+        expect(finalSpawn.error).toBeUndefined();
+        expect(finalSpawn.status).toBe(0);
       } finally {
+        if (junctionExists) {
+          await unlink(junctionPath).catch(() => undefined);
+        }
+        if (substMapped) {
+          spawnSync(substExecutable, [substDrive, "/D"], {
+            env: previousEnv,
+            shell: false,
+            stdio: "ignore",
+            windowsHide: true
+          });
+        }
         if (testMode === undefined) delete process.env.SGW_TEST_MODE;
         else process.env.SGW_TEST_MODE = testMode;
       }
@@ -180,4 +309,8 @@ describe("Windows login startup contract", () => {
 
 function encodeRaw(value: unknown): string {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function windowsPathKey(value: string): string {
+  return path.win32.normalize(value).replace(/[\\/]+$/, "").toLowerCase();
 }
