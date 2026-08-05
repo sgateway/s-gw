@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,7 @@ import type { StoreFile } from "../src/types.js";
 import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-installed-upgrade.js";
 
 let tmpHome = "";
+let originalNodeOptions: string | undefined;
 
 function fakeAwsAccessKey(): string {
   return ["A", "KIA", "IOSFODNN7EXAMPLE"].join("");
@@ -80,6 +81,7 @@ function canonicalFixtureValue(value: unknown): unknown {
 }
 
 beforeEach(async () => {
+  originalNodeOptions = process.env.NODE_OPTIONS;
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-test-"));
   process.env.SGW_HOME = tmpHome;
   process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
@@ -100,6 +102,11 @@ afterEach(async () => {
   delete process.env.SGW_LOGIN_SESSION_ID;
   delete process.env.SGW_RECOVERY_HOME;
   delete process.env.AWS_SECRET_ACCESS_KEY;
+  if (originalNodeOptions === undefined) {
+    delete process.env.NODE_OPTIONS;
+  } else {
+    process.env.NODE_OPTIONS = originalNodeOptions;
+  }
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
     await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
@@ -1859,15 +1866,24 @@ describe("SecretStore", () => {
     expect(admission.kind).toBe("reusable");
     if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
 
-    const execution = executeReusablePermit(store, admission.permit, { engine: "typescript" });
+    const executionFailure = executeReusablePermit(store, admission.permit, { engine: "typescript" }).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    let setupFailure: unknown;
     try {
       await waitForFile(enteredPath);
       await store.setApprovalPolicyRuleEnabled(rule.id, false);
+    } catch (error) {
+      setupFailure = error;
     } finally {
       await writeFile(releasePath, "release\n");
     }
 
-    await expect(execution).rejects.toThrow(/authorization changed|approval policy changed/i);
+    const failure = await executionFailure;
+    if (setupFailure) throw setupFailure;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/authorization changed|approval policy changed/i);
   });
 
   it("caches policy-authorized 1Password one-shot execution after the first run", async () => {
@@ -3169,66 +3185,75 @@ function legacyApprovalActionKey(handle: string, action: ReturnType<typeof build
 }
 
 async function writeFakeOp(secret: string): Promise<string> {
-  const fakeOp = path.join(tmpHome, "op");
   const reference = onePasswordFixtureRef();
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.34.0\\n'
-  exit 0
-fi
-if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
-  printf '%s' '${secret}'
-  exit 0
-fi
-printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
-exit 2
+  return writeNodeBackedFakeOp("op", `
+if (args[0] === "read" && args[1] === ${JSON.stringify(reference)}) {
+  process.stdout.write(${JSON.stringify(secret)});
+  process.exit(0);
+}
+process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+process.exit(2);
 `);
-  await chmod(fakeOp, 0o755);
-  return fakeOp;
 }
 
 async function writeCountingFakeOp(secret: string, counterPath: string): Promise<string> {
-  const fakeOp = path.join(tmpHome, `op-counting-${path.basename(counterPath)}`);
   const reference = onePasswordFixtureRef();
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.34.0\\n'
-  exit 0
-fi
-if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
-  count="$(cat '${counterPath}' 2>/dev/null || printf 0)"
-  count="$((count + 1))"
-  printf '%s' "$count" > '${counterPath}'
-  printf '%s' '${secret}'
-  exit 0
-fi
-printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
-exit 2
+  return writeNodeBackedFakeOp(`op-counting-${path.basename(counterPath)}`, `
+if (args[0] === "read" && args[1] === ${JSON.stringify(reference)}) {
+  let count = 0;
+  try { count = Number.parseInt(fs.readFileSync(${JSON.stringify(counterPath)}, "utf8"), 10) || 0; } catch {}
+  fs.writeFileSync(${JSON.stringify(counterPath)}, String(count + 1));
+  process.stdout.write(${JSON.stringify(secret)});
+  process.exit(0);
+}
+process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+process.exit(2);
 `);
-  await chmod(fakeOp, 0o755);
-  return fakeOp;
 }
 
 async function writeGatedFakeOp(secret: string, enteredPath: string, releasePath: string): Promise<string> {
-  const fakeOp = path.join(tmpHome, "op-gated");
   const reference = onePasswordFixtureRef();
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.34.0\\n'
-  exit 0
-fi
-if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
-  : > '${enteredPath}'
-  while [ ! -f '${releasePath}' ]; do
-    sleep 0.01
-  done
-  printf '%s' '${secret}'
-  exit 0
-fi
-printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
-exit 2
+  return writeNodeBackedFakeOp("op-gated", `
+if (args[0] === "read" && args[1] === ${JSON.stringify(reference)}) {
+  fs.writeFileSync(${JSON.stringify(enteredPath)}, "entered\\n");
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  while (!fs.existsSync(${JSON.stringify(releasePath)})) {
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+  process.stdout.write(${JSON.stringify(secret)});
+  process.exit(0);
+}
+process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+process.exit(2);
 `);
+}
+
+async function writeNodeBackedFakeOp(name: string, behavior: string): Promise<string> {
+  const executableName = process.platform === "win32" ? `${name}.exe` : name;
+  const fakeOp = path.join(tmpHome, executableName);
+  const preload = path.join(tmpHome, `${name} preload.cjs`);
+  try {
+    await link(process.execPath, fakeOp);
+  } catch {
+    await copyFile(process.execPath, fakeOp);
+  }
   await chmod(fakeOp, 0o755);
+  await writeFile(preload, `
+const fs = require("node:fs");
+const path = require("node:path");
+const fakeExecutable = ${JSON.stringify(fakeOp)};
+const actualExecutable = fs.realpathSync.native(process.execPath);
+const expectedExecutable = fs.realpathSync.native(fakeExecutable);
+const sameExecutable = process.platform === "win32"
+  ? actualExecutable.toLowerCase() === expectedExecutable.toLowerCase()
+  : actualExecutable === expectedExecutable;
+if (sameExecutable) {
+  const args = [path.basename(process.argv[1] || ""), ...process.argv.slice(2)];
+  ${behavior}
+}
+`);
+  const preloadOption = `--require="${preload.replaceAll('"', '\\"')}"`;
+  process.env.NODE_OPTIONS = [originalNodeOptions, preloadOption].filter(Boolean).join(" ");
   return fakeOp;
 }
 

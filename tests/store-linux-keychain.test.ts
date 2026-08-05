@@ -4,11 +4,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SecretStore } from "../src/store.js";
 
-const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+const describeLinux = process.platform === "linux" ? describe.sequential : describe.skip;
 let tmpDir = "";
 
 beforeEach(async () => {
-  Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-linux-store-"));
   process.env.SGW_HOME = path.join(tmpDir, "home");
   process.env.SGW_RECOVERY_HOME = path.join(tmpDir, "recovery");
@@ -20,7 +19,6 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
   for (const key of [
     "SGW_HOME",
     "SGW_RECOVERY_HOME",
@@ -36,7 +34,7 @@ afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true });
 });
 
-describe.sequential("Linux Secret Service store", () => {
+describeLinux("Linux Secret Service store", () => {
   it("retains a retryable handle when credential deletion fails", async () => {
     const store = new SecretStore();
     const record = await store.addKeychainSecret({

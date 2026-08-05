@@ -41,21 +41,32 @@ describe("customer package layout", () => {
   it("finds package artifacts from the runtime module location", () => {
     const layout = getPackageLayout();
 
-    expect(layout.cliPath).toMatch(/dist\/cli\.js$/);
-    expect(layout.mcpPath).toMatch(/dist\/mcp-server\.js$/);
+    expect(layout.cliPath).toBe(path.join(layout.packageRoot, "dist", "cli.js"));
+    expect(layout.mcpPath).toBe(path.join(layout.packageRoot, "dist", "mcp-server.js"));
     expect(layout.keychainHelperPath).toBe(
       path.join(layout.packageRoot, "dist", "native", `${process.platform}-${process.arch}`, "s-gw-keychain-helper")
     );
     expect(layout.packagedMacAppPath).toBe(path.join(layout.packageRoot, "dist", "s-gw.app"));
-    expect(layout.packagedMacAppBinaryPath).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
-    expect(layout.installedMacAppPath).toMatch(/Applications\/s-gw\.app$/);
-    expect(layout.macAppPath).toContain("s-gw.app");
-    expect(layout.macAppBinaryPath).toContain("s-gw.app/Contents/MacOS/s-gw");
-    expect(layout.menuBarAppPath).toContain("s-gw Menu Bar.app");
-    expect(layout.windowsClientScriptPath).toMatch(/dist\/windows\/s-gw-client\.ps1$/);
-    expect(layout.windowsHelperScriptPath).toMatch(/dist\/windows\/s-gw-helper\.ps1$/);
-    expect(layout.windowsHelperBootstrapPath).toMatch(/dist\/windows\/s-gw-helper-bootstrap\.ps1$/);
-    expect(layout.windowsCredentialHelperPath).toMatch(/dist\/windows\/s-gw-credential\.ps1$/);
+    expect(layout.packagedMacAppBinaryPath).toBe(
+      path.join(layout.packagedMacAppPath, "Contents", "MacOS", "s-gw")
+    );
+    expect(path.basename(layout.installedMacAppPath)).toBe("s-gw.app");
+    expect(path.basename(path.dirname(layout.installedMacAppPath))).toBe("Applications");
+    expect(path.basename(layout.macAppPath)).toBe("s-gw.app");
+    expect(layout.macAppBinaryPath).toBe(path.join(layout.macAppPath, "Contents", "MacOS", "s-gw"));
+    expect(path.basename(layout.menuBarAppPath)).toBe("s-gw Menu Bar.app");
+    expect(layout.windowsClientScriptPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-client.ps1")
+    );
+    expect(layout.windowsHelperScriptPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-helper.ps1")
+    );
+    expect(layout.windowsHelperBootstrapPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-helper-bootstrap.ps1")
+    );
+    expect(layout.windowsCredentialHelperPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-credential.ps1")
+    );
   });
 
   it("routes app installation through the native app command", async () => {
@@ -78,7 +89,7 @@ describe("customer package layout", () => {
     expect(cliSource).toContain("assertMacRuntimeForManagedSurfaces(layout)");
   });
 
-  it("tracks a running native app so open focuses instead of relaunching", async () => {
+  it.skipIf(process.platform !== "darwin")("tracks a running native app so open focuses instead of relaunching", async () => {
     const [installSource, appSource] = await Promise.all([
       readFile(path.join(repoRoot, "src/install.ts"), "utf8"),
       readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/App/SgwApp.swift"), "utf8")

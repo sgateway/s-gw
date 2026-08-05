@@ -11,11 +11,10 @@ import {
   unlockStatus
 } from "../src/unlock.js";
 
-const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+const describeLinux = process.platform === "linux" ? describe.sequential : describe.skip;
 let tmpDir = "";
 
 beforeEach(async () => {
-  Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-linux-unlock-"));
   process.env.SGW_HOME = path.join(tmpDir, "home");
   process.env.SGW_RECOVERY_HOME = path.join(tmpDir, "recovery");
@@ -29,7 +28,6 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
   for (const key of [
     "SGW_KEYCHAIN_SERVICE",
     "SGW_KEYCHAIN_ACCOUNT",
@@ -48,7 +46,7 @@ afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true });
 });
 
-describe.sequential("Linux Secret Service unlock", () => {
+describeLinux("Linux Secret Service unlock", () => {
   it("stores generated unlock material on stdin and reads it back", async () => {
     const passphrase = "synthetic-linux-secret-service-passphrase";
     setKeychainPassphrase(passphrase);

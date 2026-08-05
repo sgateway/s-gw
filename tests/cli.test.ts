@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -10,7 +10,11 @@ import { KNOWN_COMMANDS, suggestCommands, unknownCommandMessage } from "../src/c
 import { CURRENT_VERSION } from "../src/version.js";
 
 const repoRoot = process.cwd();
-const tsxBin = path.join(repoRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+
+function runCliSync(args: string[], options: ExecFileSyncOptionsWithStringEncoding): string {
+  return execFileSync(process.execPath, [tsxCli, ...args], options);
+}
 
 function fakeAwsAccessKey(): string {
   return ["A", "KIA", "IOSFODNN7EXAMPLE"].join("");
@@ -86,7 +90,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         }
       }
 
-      const output = execFileSync(tsxBin, ["src/cli.ts", "setup", helpFlag], {
+      const output = runCliSync(["src/cli.ts", "setup", helpFlag], {
         cwd: repoRoot,
         env: {
           ...process.env,
@@ -123,7 +127,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
   it("reports update status without requiring local store setup", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-update-"));
     try {
-      const result = JSON.parse(execFileSync(tsxBin, ["src/cli.ts", "update", "check"], {
+      const result = JSON.parse(runCliSync(["src/cli.ts", "update", "check"], {
         cwd: repoRoot,
         env: {
           ...process.env,
@@ -159,7 +163,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       SGW_DISABLE_KEYCHAIN: "1",
       SGW_DISABLE_ONEPASSWORD_BACKUP: "1"
     };
-    const run = (args: string[]) => execFileSync(tsxBin, ["src/cli.ts", ...args], {
+    const run = (args: string[]) => runCliSync(["src/cli.ts", ...args], {
       cwd: repoRoot,
       env,
       encoding: "utf8",
@@ -254,7 +258,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     let stderr = "";
     let code = 0;
     try {
-      execFileSync(tsxBin, ["src/cli.ts", "statu"], {
+      runCliSync(["src/cli.ts", "statu"], {
         cwd: repoRoot,
         env: {
           ...process.env,
@@ -292,7 +296,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     let stderr = "";
     let code = 0;
     try {
-      execFileSync(tsxBin, ["src/cli.ts", "console", "--port", String(port), "--no-open"], {
+      runCliSync(["src/cli.ts", "console", "--port", String(port), "--no-open"], {
         cwd: repoRoot,
         env: {
           ...process.env,
@@ -333,7 +337,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     };
 
     try {
-      const secret = JSON.parse(execFileSync(tsxBin, [
+      const secret = JSON.parse(runCliSync([
         "src/cli.ts",
         "secret",
         "add",
@@ -354,7 +358,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const access = JSON.parse(execFileSync(tsxBin, [
+      const access = JSON.parse(runCliSync([
         "src/cli.ts",
         "secret",
         "add",
@@ -375,7 +379,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const request = JSON.parse(execFileSync(tsxBin, [
+      const request = JSON.parse(runCliSync([
         "src/cli.ts",
         "request",
         "env-command",
@@ -434,7 +438,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
 
     try {
       const secretValue = "execute-next-secret-value-123456789";
-      const secret = JSON.parse(execFileSync(tsxBin, [
+      const secret = JSON.parse(runCliSync([
         "src/cli.ts",
         "secret",
         "add",
@@ -455,7 +459,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const request = JSON.parse(execFileSync(tsxBin, [
+      const request = JSON.parse(runCliSync([
         "src/cli.ts",
         "request",
         "env-command",
@@ -475,14 +479,14 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["ignore", "pipe", "pipe"]
       }));
 
-      execFileSync(tsxBin, ["src/cli.ts", "approve", request.id], {
+      runCliSync(["src/cli.ts", "approve", request.id], {
         cwd: repoRoot,
         env,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       });
 
-      const executed = JSON.parse(execFileSync(tsxBin, [
+      const executed = JSON.parse(runCliSync([
         "src/cli.ts",
         "execute-next",
         "--handle",
@@ -523,7 +527,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     await chmod(wrapper, 0o700);
 
     try {
-      const secret = JSON.parse(execFileSync(tsxBin, [
+      const secret = JSON.parse(runCliSync([
         "src/cli.ts",
         "secret",
         "add",
@@ -544,7 +548,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const access = JSON.parse(execFileSync(tsxBin, [
+      const access = JSON.parse(runCliSync([
         "src/cli.ts",
         "secret",
         "add",
@@ -565,7 +569,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const plan = JSON.parse(execFileSync(tsxBin, [
+      const plan = JSON.parse(runCliSync([
         "src/cli.ts",
         "aws",
         "plan",
@@ -584,14 +588,14 @@ describe("CLI unknown-command behavior (end to end)", () => {
         `s-gw aws run --secret-handle ${secret.handle} --access-handle ${access.handle} --wrapper ${wrapper} -- sts get-caller-identity`
       );
 
-      expect(() => execFileSync(tsxBin, ["src/cli.ts", "aws", "--version"], {
+      expect(() => runCliSync(["src/cli.ts", "aws", "--version"], {
         cwd: repoRoot,
         env,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
       })).toThrow(/does not run the AWS CLI/);
 
-      const request = JSON.parse(execFileSync(tsxBin, [
+      const request = JSON.parse(runCliSync([
         "src/cli.ts",
         "aws",
         "request",
@@ -618,7 +622,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(request.request.action.command).toBe(wrapper);
       expect(request.request.action.args).toEqual(["sts", "get-caller-identity"]);
 
-      execFileSync(tsxBin, [
+      runCliSync([
         "src/cli.ts",
         "approve",
         request.request.id,
@@ -636,7 +640,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       });
 
       const beforeRun = await readFile(path.join(home, "store.json"), "utf8");
-      const run = JSON.parse(execFileSync(tsxBin, [
+      const run = JSON.parse(runCliSync([
         "src/cli.ts",
         "aws",
         "run",
@@ -663,7 +667,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(run.summary.stdout).toContain("args=ec2 describe-instances --region us-west-2");
       expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(beforeRun);
 
-      const raw = execFileSync(tsxBin, [
+      const raw = runCliSync([
         "src/cli.ts",
         "aws",
         "run",
@@ -711,7 +715,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         await chmod(wrapperPath, 0o700);
       }
 
-      const secret = JSON.parse(execFileSync(tsxBin, [
+      const secret = JSON.parse(runCliSync([
         "src/cli.ts", "secret", "add",
         "--name", "AWS secret",
         "--type", "credential",
@@ -727,7 +731,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const access = JSON.parse(execFileSync(tsxBin, [
+      const access = JSON.parse(runCliSync([
         "src/cli.ts", "secret", "add",
         "--name", "AWS access key id",
         "--type", "credential",
@@ -745,7 +749,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
 
       const beforeAmbiguousRuns = await readFile(path.join(home, "store.json"), "utf8");
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        expect(() => execFileSync(tsxBin, [
+        expect(() => runCliSync([
           "src/cli.ts", "aws", "run",
           "--secret-handle", secret.handle,
           "--access-handle", access.handle,
@@ -760,7 +764,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(beforeAmbiguousRuns);
       expect(await readFile(wrapperRuns, "utf8").catch(() => "")).toBe("");
 
-      expect(() => execFileSync(tsxBin, [
+      expect(() => runCliSync([
         "src/cli.ts", "aws", "plan",
         "--secret-handle", secret.handle,
         "--access-handle", access.handle
@@ -771,7 +775,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["ignore", "pipe", "pipe"]
       })).toThrow(/Multiple AWS wrappers/);
 
-      expect(() => execFileSync(tsxBin, [
+      expect(() => runCliSync([
         "src/cli.ts", "aws", "plan",
         "--secret-handle", secret.handle,
         "--access-handle", access.handle,
@@ -783,7 +787,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["ignore", "pipe", "pipe"]
       })).toThrow(/not allowed by both credential handles/);
 
-      const plan = JSON.parse(execFileSync(tsxBin, [
+      const plan = JSON.parse(runCliSync([
         "src/cli.ts", "aws", "plan",
         "--secret-handle", secret.handle,
         "--access-handle", access.handle,
@@ -823,7 +827,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       await writeFile(wrapper, "#!/bin/sh\nexit 0\n");
       await chmod(wrapper, 0o700);
 
-      const secret = JSON.parse(execFileSync(tsxBin, [
+      const secret = JSON.parse(runCliSync([
         "src/cli.ts", "secret", "add",
         "--name", "AWS secret with normalized wrapper",
         "--type", "credential",
@@ -838,7 +842,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const access = JSON.parse(execFileSync(tsxBin, [
+      const access = JSON.parse(runCliSync([
         "src/cli.ts", "secret", "add",
         "--name", "AWS access key with normalized wrapper",
         "--type", "credential",
@@ -853,7 +857,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const plan = JSON.parse(execFileSync(tsxBin, [
+      const plan = JSON.parse(runCliSync([
         "src/cli.ts", "aws", "plan",
         "--secret-handle", secret.handle,
         "--access-handle", access.handle,
@@ -890,7 +894,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         await chmod(wrapperPath, 0o700);
       }
 
-      const secret = JSON.parse(execFileSync(tsxBin, [
+      const secret = JSON.parse(runCliSync([
         "src/cli.ts", "secret", "add",
         "--name", "AWS secret without shared wrapper",
         "--type", "credential",
@@ -905,7 +909,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         stdio: ["pipe", "pipe", "pipe"]
       }));
 
-      const access = JSON.parse(execFileSync(tsxBin, [
+      const access = JSON.parse(runCliSync([
         "src/cli.ts", "secret", "add",
         "--name", "AWS access key without shared wrapper",
         "--type", "credential",
@@ -921,7 +925,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       }));
 
       const before = await readFile(path.join(home, "store.json"), "utf8");
-      expect(() => execFileSync(tsxBin, [
+      expect(() => runCliSync([
         "src/cli.ts", "aws", "run",
         "--secret-handle", secret.handle,
         "--access-handle", access.handle,

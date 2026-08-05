@@ -141,15 +141,33 @@ export function setKeychainPassphrase(passphrase: string): void {
 export function deleteKeychainPassphrase(): boolean {
   ensureLocalCredentialStore();
   preparePersistentMacHelper();
-  try {
-    if (managedMacKeychainAccessEnabled()) {
-      return deleteManagedMacKeychainItem(masterPassphraseRef());
-    }
-    runKeychainDelete(keychainInfo());
-    return true;
-  } catch {
+  if (managedMacKeychainAccessEnabled()) {
+    return deleteManagedMacKeychainItem(masterPassphraseRef());
+  }
+
+  const info = keychainInfo();
+  if (!keychainItemExists(info)) {
     return false;
   }
+  if (info.provider === "windows-helper" && info.helperPath) {
+    const output = runWindowsCredentialHelper(
+      info.helperPath,
+      ["delete", "-Service", info.service, "-Account", info.account]
+    );
+    const result = JSON.parse(output) as { deleted?: unknown };
+    if (typeof result.deleted !== "boolean") {
+      throw new Error("Windows Credential Manager delete returned an invalid response.");
+    }
+    if (keychainItemExists(info)) {
+      throw new Error(`The OS credential store did not delete the unlock value for account ${info.account}.`);
+    }
+    return result.deleted;
+  }
+  runKeychainDelete(info);
+  if (keychainItemExists(info)) {
+    throw new Error(`The OS credential store did not delete the unlock value for account ${info.account}.`);
+  }
+  return true;
 }
 
 export function hasKeychainPassphrase(): boolean {
@@ -1023,7 +1041,10 @@ function keychainItemExists(info: KeychainInfo): boolean {
       ["status", "-Service", info.service, "-Account", info.account]
     );
     const status = JSON.parse(output) as { configured?: unknown };
-    return status.configured === true;
+    if (typeof status.configured !== "boolean") {
+      throw new Error("Windows Credential Manager status returned an invalid response.");
+    }
+    return status.configured;
   }
 
   if (info.provider === "secret-service-cli" && info.helperPath) {

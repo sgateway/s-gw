@@ -78,7 +78,11 @@ describe("Windows client packaging", () => {
     expect(helperLauncher).toContain("..\\cli.js");
     expect(helperLauncher).not.toContain("s-gw-helper.ps1");
     expect(credential).toContain("CredReadW");
+    expect(credential).toContain("CredReadWithError");
     expect(credential).toContain("CredWriteW");
+    expect(credential).toContain("CredWriteWithError");
+    expect(credential).toContain("CredDeleteWithError");
+    expect(credential).toContain("ERROR_NOT_FOUND");
     expect(credential).toContain("[Console]::In.ReadToEnd()");
     expect(launcher).toContain("app open");
     expect(launcher).not.toContain("s-gw-client.ps1");

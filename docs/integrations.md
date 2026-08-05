@@ -189,7 +189,11 @@ Only after approval may the agent call `sgw_execute_request`. The executor injec
 }
 ```
 
-For SSH, use `sgw_request_ssh_session` rather than asking the agent to run raw `ssh`. s-gw opens the approved connection through its own persistent ControlMaster socket, then runs later commands over that socket with `BatchMode=yes` while the approval grant is still valid. The matching CLI flow is:
+For SSH, use `sgw_request_ssh_session` rather than asking the agent to run raw `ssh`. On macOS and Linux, s-gw opens the approved connection through its own persistent ControlMaster socket, then runs later commands over that socket with `BatchMode=yes` while the approval grant is still valid. On Windows, OpenSSH multiplexing is unavailable, so each approved action runs as a separate `ssh.exe` process. Windows SSH accepts only `ssh-key` and `private-key` handles; password and keyboard-interactive handles fail before s-gw resolves their values. The private key is written inside a fresh directory whose Windows ACL is applied and verified for the current user and SYSTEM, then removed after success, failure, or timeout. The Windows command ignores SSH config files and disables forwarding, agents, local commands, and non-key authentication.
+
+Both paths currently use `StrictHostKeyChecking=accept-new`. This is trust on first use: verify a new host fingerprint through a separate trusted channel before relying on the saved host key.
+
+The matching CLI flow is:
 
 ```bash
 s-gw secret allow-command "$HANDLE" --command s-gw:ssh-session

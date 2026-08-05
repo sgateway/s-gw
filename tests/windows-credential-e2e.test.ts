@@ -100,6 +100,7 @@ describe("Windows credential protection", () => {
         );
         handle = "";
         expect(JSON.parse(runCli(["unlock", "keychain", "delete"], testEnv)).deleted).toBe(true);
+        expect(runCredentialDelete(masterService, masterAccount)).toEqual({ deleted: false });
         expect(JSON.parse(runCli(["unlock", "status"], testEnv)).activeSource).toBe("none");
       } finally {
         try {
@@ -129,21 +130,26 @@ function runCli(args: string[], env: NodeJS.ProcessEnv, input?: string): string 
 }
 
 function deleteCredential(service: string, account: string): void {
-  const helper = getPackageLayout().windowsCredentialHelperPath;
   try {
-    execFileSync("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      helper,
-      "delete",
-      "-Service",
-      service,
-      "-Account",
-      account
-    ], { stdio: "ignore" });
+    runCredentialDelete(service, account);
   } catch {
     // The primary assertions preserve the failure; cleanup remains best effort.
   }
+}
+
+function runCredentialDelete(service: string, account: string): { deleted: boolean } {
+  const helper = getPackageLayout().windowsCredentialHelperPath;
+  const output = execFileSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    helper,
+    "delete",
+    "-Service",
+    service,
+    "-Account",
+    account
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  return JSON.parse(output) as { deleted: boolean };
 }

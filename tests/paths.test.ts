@@ -7,6 +7,7 @@ import { ensureSgwHome, getSgwHome, getSgwInstanceKey, getSgwRecoveryHome, getSt
 let testRoot = "";
 let outsideRoot = "";
 let previousEnv: NodeJS.ProcessEnv;
+const directoryLinkType = process.platform === "win32" ? "junction" : "dir";
 
 beforeEach(async () => {
   previousEnv = { ...process.env };
@@ -112,8 +113,8 @@ describe("test-mode s-gw paths", () => {
     const recoveryLink = path.join(testRoot, "recovery-link");
     await mkdir(path.join(outsideRoot, "home"));
     await mkdir(path.join(outsideRoot, "recovery"));
-    await symlink(path.join(outsideRoot, "home"), homeLink);
-    await symlink(path.join(outsideRoot, "recovery"), recoveryLink);
+    await symlink(path.join(outsideRoot, "home"), homeLink, directoryLinkType);
+    await symlink(path.join(outsideRoot, "recovery"), recoveryLink, directoryLinkType);
 
     process.env.SGW_HOME = homeLink;
     expect(() => getSgwHome()).toThrow(/outside SGW_TEST_HOME_ROOT/i);
@@ -127,7 +128,7 @@ describe("test-mode s-gw paths", () => {
     const home = path.join(testRoot, "home");
     const recoveryLink = path.join(testRoot, "recovery-link");
     await mkdir(home);
-    await symlink(home, recoveryLink);
+    await symlink(home, recoveryLink, directoryLinkType);
 
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = recoveryLink;
@@ -147,7 +148,7 @@ describe("test-mode s-gw paths", () => {
 
   it("rejects a dangling home symlink before it can become a write target", async () => {
     const link = path.join(testRoot, "dangling-home-link");
-    await symlink(path.join(outsideRoot, "missing-home"), link);
+    await symlink(path.join(outsideRoot, "missing-home"), link, directoryLinkType);
 
     process.env.SGW_HOME = link;
     expect(() => getSgwHome()).toThrow(/symlinked s-gw test path/i);

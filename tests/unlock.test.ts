@@ -292,7 +292,7 @@ describe("unlock passphrase provider", () => {
     expect(() => requirePassphrase()).toThrow(/stopped before requesting your login password/i);
   });
 
-  it("parses only the requested Keychain item's trusted application paths", () => {
+  it.skipIf(process.platform !== "darwin")("parses only the requested Keychain item's trusted application paths", () => {
     const dump = `keychain: "/Users/test/login.keychain-db"
 attributes:
     "acct"<blob>="s-gw:first"

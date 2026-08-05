@@ -8,7 +8,7 @@ import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 const repoRoot = process.cwd();
-const tsxBin = path.join(repoRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
 
 function fakeGithubToken(): string {
   return ["gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789ABCD"].join("");
@@ -110,8 +110,9 @@ describe("guard mode", () => {
   it("CLI dry-run keeps raw secrets out of stdout", () => {
     const raw = fakeOpenAiToken("_cli");
     const out = execFileSync(
-      tsxBin,
+      process.execPath,
       [
+        tsxCli,
         "src/cli.ts",
         "guard",
         "run",

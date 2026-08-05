@@ -9,7 +9,7 @@ import {
   type SecretStore
 } from "./store.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
-import { runOwnedSshSession } from "./ssh.js";
+import { assertSshCredentialSupported, runOwnedSshSession } from "./ssh.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 
 export interface ExecutionOptions {
@@ -71,13 +71,17 @@ async function executeRequest(
 ): Promise<ExecutionSummary> {
   const secretRecord = await store.getSecretRecord(request.handle);
   assertActionAllowed(secretRecord, request.action);
+  if (request.action.kind === "ssh_session") {
+    assertSshCredentialSupported(secretRecord);
+  }
   const secretValue = await store.revealSecretForLocalUse(request.handle, request, {
     cache: executionOptions.cacheOnePassword !== false
   });
+  if (request.action.kind === "ssh_session") {
+    return runOwnedSshSession(request, secretRecord, secretValue, store.home);
+  }
   const extraSecrets = await resolveExtraSecrets(store, request, executionOptions);
-  return request.action.kind === "ssh_session"
-    ? runOwnedSshSession(request, secretRecord, secretValue, store.home)
-    : runEnvCommand(request, secretRecord, secretValue, extraSecrets, options);
+  return runEnvCommand(request, secretRecord, secretValue, extraSecrets, options);
 }
 
 interface PreparedEnvExecution {

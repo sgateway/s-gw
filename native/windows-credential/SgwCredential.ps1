@@ -26,6 +26,7 @@ using System.Runtime.InteropServices;
 public static class SgwCredMan {
   public const UInt32 CRED_TYPE_GENERIC = 1;
   public const UInt32 CRED_PERSIST_LOCAL_MACHINE = 2;
+  public const Int32 ERROR_NOT_FOUND = 1168;
 
   [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
   public struct CREDENTIAL {
@@ -46,11 +47,29 @@ public static class SgwCredMan {
   [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern bool CredRead(string target, UInt32 type, UInt32 flags, out IntPtr credentialPtr);
 
+  public static bool CredReadWithError(string target, UInt32 type, UInt32 flags, out IntPtr credentialPtr, out Int32 errorCode) {
+    bool read = CredRead(target, type, flags, out credentialPtr);
+    errorCode = read ? 0 : Marshal.GetLastWin32Error();
+    return read;
+  }
+
   [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern bool CredWrite(ref CREDENTIAL credential, UInt32 flags);
 
+  public static bool CredWriteWithError(ref CREDENTIAL credential, UInt32 flags, out Int32 errorCode) {
+    bool written = CredWrite(ref credential, flags);
+    errorCode = written ? 0 : Marshal.GetLastWin32Error();
+    return written;
+  }
+
   [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern bool CredDelete(string target, UInt32 type, UInt32 flags);
+
+  public static bool CredDeleteWithError(string target, UInt32 type, UInt32 flags, out Int32 errorCode) {
+    bool deleted = CredDelete(target, type, flags);
+    errorCode = deleted ? 0 : Marshal.GetLastWin32Error();
+    return deleted;
+  }
 
   [DllImport("advapi32.dll", EntryPoint = "CredFree", SetLastError = true)]
   public static extern void CredFree(IntPtr buffer);
@@ -61,24 +80,19 @@ function Get-TargetName {
   return "s-gw/$Service/$Account"
 }
 
-function Get-LastErrorCode {
-  return [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-}
-
-function Throw-Win32([string]$Action) {
-  $code = Get-LastErrorCode
-  $message = (New-Object ComponentModel.Win32Exception($code)).Message
-  throw "$Action failed ($code): $message"
+function Throw-Win32([string]$Action, [int]$Code) {
+  $message = (New-Object ComponentModel.Win32Exception($Code)).Message
+  throw "$Action failed ($Code): $message"
 }
 
 function Read-CredentialValue([string]$Target) {
   $ptr = [IntPtr]::Zero
-  if (-not [SgwCredMan]::CredRead($Target, [SgwCredMan]::CRED_TYPE_GENERIC, 0, [ref]$ptr)) {
-    $code = Get-LastErrorCode
-    if ($code -eq 1168) {
+  [int]$code = 0
+  if (-not [SgwCredMan]::CredReadWithError($Target, [SgwCredMan]::CRED_TYPE_GENERIC, 0, [ref]$ptr, [ref]$code)) {
+    if ($code -eq [SgwCredMan]::ERROR_NOT_FOUND) {
       exit 44
     }
-    Throw-Win32 "CredRead"
+    Throw-Win32 "CredRead" $code
   }
 
   try {
@@ -93,8 +107,12 @@ function Read-CredentialValue([string]$Target) {
 
 function Test-CredentialValue([string]$Target) {
   $ptr = [IntPtr]::Zero
-  if (-not [SgwCredMan]::CredRead($Target, [SgwCredMan]::CRED_TYPE_GENERIC, 0, [ref]$ptr)) {
-    return $false
+  [int]$code = 0
+  if (-not [SgwCredMan]::CredReadWithError($Target, [SgwCredMan]::CRED_TYPE_GENERIC, 0, [ref]$ptr, [ref]$code)) {
+    if ($code -eq [SgwCredMan]::ERROR_NOT_FOUND) {
+      return $false
+    }
+    Throw-Win32 "CredRead" $code
   }
 
   [SgwCredMan]::CredFree($ptr)
@@ -119,8 +137,9 @@ function Write-CredentialValue([string]$Target, [string]$Value) {
     $cred.Persist = [SgwCredMan]::CRED_PERSIST_LOCAL_MACHINE
     $cred.UserName = "$env:USERDOMAIN\$env:USERNAME"
 
-    if (-not [SgwCredMan]::CredWrite([ref]$cred, 0)) {
-      Throw-Win32 "CredWrite"
+    [int]$code = 0
+    if (-not [SgwCredMan]::CredWriteWithError([ref]$cred, 0, [ref]$code)) {
+      Throw-Win32 "CredWrite" $code
     }
   } finally {
     $pinned.Free()
@@ -128,15 +147,17 @@ function Write-CredentialValue([string]$Target, [string]$Value) {
 }
 
 function Remove-CredentialValue([string]$Target) {
-  if ([SgwCredMan]::CredDelete($Target, [SgwCredMan]::CRED_TYPE_GENERIC, 0)) {
+  [int]$code = 0
+  if ([SgwCredMan]::CredDeleteWithError($Target, [SgwCredMan]::CRED_TYPE_GENERIC, 0, [ref]$code)) {
     return $true
   }
 
-  $code = Get-LastErrorCode
-  if ($code -eq 1168) {
+  if ($code -eq [SgwCredMan]::ERROR_NOT_FOUND) {
     return $false
   }
-  Throw-Win32 "CredDelete"
+
+  $message = (New-Object ComponentModel.Win32Exception($code)).Message
+  throw "CredDelete failed ($code): $message"
 }
 
 $target = Get-TargetName

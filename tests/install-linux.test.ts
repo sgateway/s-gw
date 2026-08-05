@@ -14,11 +14,10 @@ import {
   uninstallSystemdUserService
 } from "../src/install.js";
 
-const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+const describeLinux = process.platform === "linux" ? describe.sequential : describe.skip;
 let tmpDir = "";
 
 beforeEach(async () => {
-  Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
   tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-linux-install-"));
   process.env.SGW_HOME = path.join(tmpDir, "ledger home");
   process.env.SGW_RECOVERY_HOME = path.join(tmpDir, "recovery");
@@ -34,7 +33,6 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
   for (const key of [
     "SGW_MASTER_PASSPHRASE",
     "SGW_DISABLE_KEYCHAIN",
@@ -51,7 +49,7 @@ afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true });
 });
 
-describe.sequential("Linux systemd user service", () => {
+describeLinux("Linux systemd user service", () => {
   it("routes setup and service commands through systemd", async () => {
     await rm(process.env.SGW_FAKE_SECRET_DB!, { force: true });
     const setup = runLinuxCli([
@@ -247,7 +245,6 @@ process.exit(2);
 function runLinuxCli(args: string[], extraEnv: NodeJS.ProcessEnv = {}): any {
   const cliPath = path.resolve("src", "cli.ts");
   const script = [
-    'Object.defineProperty(process, "platform", { configurable: true, value: "linux" });',
     `process.argv = ${JSON.stringify([process.execPath, cliPath, ...args])};`,
     `await import(${JSON.stringify(pathToFileURL(cliPath).href)});`
   ].join("\n");
