@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, cp, copyFile, mkdir, realpath, rm, symlink } from "node:fs/promises";
+import { access, cp, copyFile, mkdir, readdir, realpath, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -30,15 +30,12 @@ let cleanupError;
 
 try {
   createPrivateDirectory(runRoot);
-  await cp(sourceRoot, stagedRoot, {
-    recursive: true,
-    filter: (_source, destination) => {
-      const relative = path.relative(stagedRoot, destination);
-      if (!relative) return true;
-      const first = relative.split(path.sep)[0];
-      return first !== ".git" && first !== "node_modules";
-    }
-  });
+  await mkdir(stagedRoot);
+  const entries = await readdir(sourceRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === ".git" || entry.name === "node_modules") continue;
+    await cp(path.join(sourceRoot, entry.name), path.join(stagedRoot, entry.name), { recursive: true });
+  }
   await copyFile(process.execPath, privateNode);
   await symlink(path.join(sourceRoot, "node_modules"), path.join(stagedRoot, "node_modules"), "junction");
 
