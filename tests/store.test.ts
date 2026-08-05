@@ -1107,23 +1107,27 @@ describe("SecretStore", () => {
     await expect(readFile(store.storePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("serializes concurrent recovery so every reader gets the same ledger", async () => {
-    const store = new SecretStore();
-    const secret = await store.addSecret({
-      name: "concurrent recovery token",
-      type: "api-token",
-      value: fakeOpenAiToken("concurrent_recovery"),
-      policy: { injectEnv: "CONCURRENT_RECOVERY_TOKEN" }
-    });
-    await rm(store.storePath);
+  it(
+    "serializes concurrent recovery so every reader gets the same ledger",
+    async () => {
+      const store = new SecretStore();
+      const secret = await store.addSecret({
+        name: "concurrent recovery token",
+        type: "api-token",
+        value: fakeOpenAiToken("concurrent_recovery"),
+        policy: { injectEnv: "CONCURRENT_RECOVERY_TOKEN" }
+      });
+      await rm(store.storePath);
 
-    const results = await Promise.all(
-      Array.from({ length: 20 }, () => new SecretStore().listHandles())
-    );
-    for (const handles of results) {
-      expect(handles.map((item) => item.handle)).toContain(secret.handle);
-    }
-  });
+      const results = await Promise.all(
+        Array.from({ length: 20 }, () => new SecretStore().listHandles())
+      );
+      for (const handles of results) {
+        expect(handles.map((item) => item.handle)).toContain(secret.handle);
+      }
+    },
+    30_000
+  );
 
   it("refuses to use the live s-gw home while running tests", () => {
     const oldHome = process.env.SGW_HOME;

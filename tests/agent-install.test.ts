@@ -1114,10 +1114,18 @@ describe("agent integration installation", () => {
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
       expect(Object.keys(manifest.agents).sort()).toEqual([...agentIds].sort());
       const statusOptions = opts(homeDir, binDir, agentIds);
-      expect(agentIntegrationStatus({
+      const statusEnv = {
+        ...statusOptions.env,
+        ...mcpAuthorityEnvironment({ homeDir, sgwHome: statusOptions.sgwHome, env })
+      };
+      const currentStatus = agentIntegrationStatus({
         ...statusOptions,
-        env: { ...statusOptions.env, SGW_RECOVERY_HOME: env.SGW_RECOVERY_HOME }
-      }).every((item) => item.state === "installed")).toBe(true);
+        env: statusEnv
+      });
+      expect(
+        currentStatus.every((item) => item.state === "installed"),
+        JSON.stringify(currentStatus)
+      ).toBe(true);
 
       const removed = await Promise.all(
         agentIds.map((agentId) => runAgentCli(["agent", "uninstall", agentId], env))
@@ -1126,7 +1134,7 @@ describe("agent integration installation", () => {
       expect(JSON.parse(readFileSync(manifestPath, "utf8")).agents).toEqual({});
       const afterRemoval = agentIntegrationStatus({
         ...statusOptions,
-        env: { ...statusOptions.env, SGW_RECOVERY_HOME: env.SGW_RECOVERY_HOME }
+        env: statusEnv
       });
       expect(
         afterRemoval.every((item) => item.mcp.state === "missing" && item.skill.state === "missing"),

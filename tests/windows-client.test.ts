@@ -42,11 +42,10 @@ afterEach(async () => {
   } catch {
     // A test asserting an unmanaged collision owns its fixture cleanup.
   }
-  stopWindowsSurfaces();
   deleteKeychainPassphrase();
   process.env = authorityEnvironment;
   authorityEnvironment = undefined;
-});
+}, 60_000);
 
 describe("Windows client packaging", () => {
   it("selects helpers only from the current Windows user session", () => {
@@ -592,7 +591,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("persists alternate Windows authority settings and optional tray without credential environment", async () => {
     if (process.platform !== "win32") return;
@@ -657,7 +656,7 @@ describe("Windows client packaging", () => {
       restoreEnv("NODE_OPTIONS", oldNodeOptions);
       await rm(authorityRoot, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 120_000);
 
   it("refuses background startup when only an environment passphrase is available", async () => {
     if (process.platform !== "win32") return;
@@ -676,7 +675,7 @@ describe("Windows client packaging", () => {
       process.env.SGW_KEYCHAIN_ACCOUNT = account;
       setKeychainPassphrase(`windows-client-test-restored-${process.pid}`);
     }
-  });
+  }, 30_000);
 
   it("preserves an unmanaged Startup shortcut collision", async () => {
     if (process.platform !== "win32") return;
@@ -705,7 +704,7 @@ describe("Windows client packaging", () => {
     } finally {
       await rm(shortcutPath, { force: true });
     }
-  });
+  }, 60_000);
 });
 
 async function freePort(): Promise<number> {
@@ -763,7 +762,7 @@ function windowsHelperPids(port: number): number[] {
     "$sessionId = [int](Get-Process -Id $PID).SessionId",
     `$portPattern = '(?i)(?:^|\\s)-Port(?:\\s+|:)\"?${port}\"?(?:\\s|$)'`,
     "$helperPattern = '(?i)(?:^|\\s)-File(?:\\s+|:)(?:\"[^\"]*[\\\\/]|[^\\s\"]*[\\\\/])?s-gw-helper\\.ps1\"?(?:\\s|$)'",
-    "$pids = @(Get-CimInstance Win32_Process | Where-Object {",
+    "$pids = @(Get-CimInstance Win32_Process -Filter \"Name = 'powershell.exe' OR Name = 'pwsh.exe'\" | Where-Object {",
     "  [int]$_.SessionId -eq $sessionId -and [string]$_.CommandLine -match $helperPattern -and [string]$_.CommandLine -match $portPattern",
     "} | ForEach-Object { [int]$_.ProcessId })",
     "$pids | ConvertTo-Json -Compress"

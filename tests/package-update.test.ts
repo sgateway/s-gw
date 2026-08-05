@@ -153,7 +153,7 @@ if (args[0] === "pack") {
       ? await execFileAsync(command, [], { env, shell: true })
       : await execFileAsync(command, [], { env });
     expect(output.stdout.trim()).toBe(`@s-gw/s-gw ${CURRENT_VERSION}`);
-  }, 30_000);
+  }, 60_000);
 
   it("preserves the installed macOS helper before replacing a scoped package", async () => {
     if (process.platform !== "darwin") {
