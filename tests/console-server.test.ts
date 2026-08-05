@@ -22,6 +22,7 @@ beforeEach(async () => {
   process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "console e2e passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
+  process.env.SGW_SECRET_BACKEND = "local";
 });
 
 afterEach(async () => {

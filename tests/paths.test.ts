@@ -46,6 +46,7 @@ describe("test-mode s-gw paths", () => {
   });
 
   it("fingerprints stable credential authority settings without ephemeral unlock state", () => {
+    delete process.env.SGW_SECRET_BACKEND;
     const first = getSgwInstanceKey();
     process.env.USERDOMAIN = "first-domain";
     process.env.SESSIONNAME = "RDP-Tcp#4";

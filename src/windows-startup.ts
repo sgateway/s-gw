@@ -285,11 +285,11 @@ if ($mode -eq 'uninstall') {
     [Console]::Out.WriteLine(($existing | ConvertTo-Json -Compress))
     exit 0
   }
-  if (-not (Test-ManagedShortcut $existing)
-    -or -not (Test-SamePath $existing.targetPath $env:SGW_WINDOWS_STARTUP_TARGET)
-    -or $existing.arguments -cne $env:SGW_WINDOWS_STARTUP_ARGUMENTS
-    -or $existing.description -cne $marker
-    -or -not (Test-SamePath $existing.workingDirectory $env:SGW_WINDOWS_STARTUP_WORKING)) {
+  if (-not (Test-ManagedShortcut $existing) -or
+      -not (Test-SamePath $existing.targetPath $env:SGW_WINDOWS_STARTUP_TARGET) -or
+      $existing.arguments -cne $env:SGW_WINDOWS_STARTUP_ARGUMENTS -or
+      $existing.description -cne $marker -or
+      -not (Test-SamePath $existing.workingDirectory $env:SGW_WINDOWS_STARTUP_WORKING)) {
     throw 'The s-gw Startup shortcut changed before uninstall; it was not removed.'
   }
   [System.IO.File]::Delete($shortcutPath)

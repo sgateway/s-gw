@@ -669,7 +669,7 @@ describe("Windows client packaging", () => {
 
     try {
       expect(() => startWindowsConsole({ port }))
-        .toThrow(/requires configured Windows Credential Manager/i);
+        .toThrow(/will not persist or inherit SGW_MASTER_PASSPHRASE/i);
     } finally {
       delete process.env.SGW_MASTER_PASSPHRASE;
       process.env.SGW_KEYCHAIN_SERVICE = service;

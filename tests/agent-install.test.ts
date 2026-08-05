@@ -1124,8 +1124,14 @@ describe("agent integration installation", () => {
       );
       expect(removed.every((result) => result.status === 0), removed.map((item) => item.stderr).join("\n")).toBe(true);
       expect(JSON.parse(readFileSync(manifestPath, "utf8")).agents).toEqual({});
-      const afterRemoval = agentIntegrationStatus(opts(homeDir, binDir, agentIds));
-      expect(afterRemoval.every((item) => item.mcp.state === "missing" && item.skill.state === "missing")).toBe(true);
+      const afterRemoval = agentIntegrationStatus({
+        ...statusOptions,
+        env: { ...statusOptions.env, SGW_RECOVERY_HOME: env.SGW_RECOVERY_HOME }
+      });
+      expect(
+        afterRemoval.every((item) => item.mcp.state === "missing" && item.skill.state === "missing"),
+        JSON.stringify(afterRemoval)
+      ).toBe(true);
       expect(existsSync(lockPath)).toBe(false);
       expect(existsSync(staleCandidate)).toBe(true);
     }
