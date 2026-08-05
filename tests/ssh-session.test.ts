@@ -16,6 +16,7 @@ import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 const originalPlatform = process.platform;
+const windowsSshTestTimeout = originalPlatform === "win32" ? 120_000 : 30_000;
 const savedEnvKeys = ["SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "NODE_OPTIONS", "PATH", "SGW_TEST_HOME_ROOT"] as const;
 let savedEnv: Partial<Record<(typeof savedEnvKeys)[number], string>> = {};
 const unixIt = originalPlatform === "win32" ? it.skip : it;
@@ -373,7 +374,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect(closed).toMatchObject({ exitCode: 0, timedOut: false, stdout: `${WINDOWS_SSH_CLOSE_MESSAGE}\n` });
     expect((await readFakeSshLog(fake.log))).toHaveLength(beforeCloseCalls);
     expect(existsSync(process.env.SGW_SSH_CONTROL_DIR!)).toBe(false);
-  }, 30_000);
+  }, windowsSshTestTimeout);
 
   it.skipIf(originalPlatform === "win32")(
     "rejects a Windows private key replaced before spawn",
@@ -402,7 +403,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
       expect(await windowsAuthDirs(windows.temp)).toEqual([]);
       expect((await store.getRequest(requestId)).state).toBe("failed");
     },
-    30_000
+    windowsSshTestTimeout
   );
 
   it("rejects Windows password SSH before revealing or materializing the secret", async () => {
@@ -440,7 +441,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect(failed.error).toBe(WINDOWS_SSH_KEY_ONLY_ERROR);
     expect(JSON.stringify(failed)).not.toContain(rawSecret);
     expect(JSON.stringify(await store.auditLog())).not.toContain(rawSecret);
-  }, 30_000);
+  }, windowsSshTestTimeout);
 
   it("sanitizes a Windows SSH nonzero result before persisting it and still cleans up the key", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -479,7 +480,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect(existsSync(keyPath)).toBe(false);
     expect(JSON.stringify(await store.getRequest(request.id))).not.toContain(secret);
     expect(JSON.stringify(await store.auditLog())).not.toContain(secret);
-  }, 30_000);
+  }, windowsSshTestTimeout);
 
   it("removes the Windows private key after an SSH timeout", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -496,7 +497,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     const keyPath = call.args[call.args.indexOf("-i") + 1];
     expect(existsSync(keyPath)).toBe(false);
     expect(existsSync(path.dirname(keyPath))).toBe(false);
-  }, 30_000);
+  }, windowsSshTestTimeout);
 
   it("removes the Windows private key when the configured client cannot start", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -516,7 +517,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
       expect(existsSync(path.dirname(keyCall!.target))).toBe(false);
     }
     expect((await store.getRequest(requestId)).state).toBe("failed");
-  }, 30_000);
+  }, windowsSshTestTimeout);
 });
 
 function fakePrivateKey(): string {

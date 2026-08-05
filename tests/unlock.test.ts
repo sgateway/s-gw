@@ -68,7 +68,7 @@ describe("unlock passphrase provider", () => {
 
     expect(requirePassphrase()).toBe("env passphrase");
     expect(unlockStatus().activeSource).toBe("env");
-  });
+  }, process.platform === "win32" ? 60_000 : 5_000);
 
   it("can fall back to a local macOS Keychain passphrase", async () => {
     if (process.platform !== "darwin") {
@@ -339,7 +339,7 @@ access: 1 entries
     }
 
     expect(() => requirePassphrase()).toThrow(/unlock passphrase/i);
-  });
+  }, process.platform === "win32" ? 60_000 : 5_000);
 });
 
 async function installFakeHelper(passphrase: string): Promise<void> {

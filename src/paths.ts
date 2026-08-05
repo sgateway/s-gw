@@ -9,6 +9,9 @@ import { trustedWindowsSystemExecutableSync, windowsSystemEnvironment } from "./
 export const MASTER_KEYCHAIN_SERVICE = "com.s-gw.sgw.master-passphrase";
 export const SECRET_KEYCHAIN_SERVICE = "com.s-gw.sgw.secret";
 
+let windowsLoginSessionCached = false;
+let cachedWindowsLoginSession: string | undefined;
+
 export function expandHome(inputPath: string): string {
   if (inputPath === "~") {
     return os.homedir();
@@ -188,12 +191,15 @@ function macBootSessionId(): string | undefined {
 }
 
 function windowsLoginSessionId(): string | undefined {
+  if (windowsLoginSessionCached) return cachedWindowsLoginSession;
+
   let command: string;
   let env: NodeJS.ProcessEnv;
   try {
     command = trustedWindowsSystemExecutableSync("whoami.exe");
     env = windowsSystemEnvironment();
   } catch {
+    windowsLoginSessionCached = true;
     return undefined;
   }
   const result = spawnSync(command, ["/logonid"], {
@@ -204,8 +210,11 @@ function windowsLoginSessionId(): string | undefined {
     timeout: 2_000,
     windowsHide: true
   });
-  if (result.status !== 0 || result.error) return undefined;
-  return /S-1-5-5-\d+-\d+/iu.exec(result.stdout)?.[0].toLowerCase();
+  cachedWindowsLoginSession = result.status === 0 && !result.error
+    ? /S-1-5-5-\d+-\d+/iu.exec(result.stdout)?.[0].toLowerCase()
+    : undefined;
+  windowsLoginSessionCached = true;
+  return cachedWindowsLoginSession;
 }
 
 function instancePath(inputPath: string): string {

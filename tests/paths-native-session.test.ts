@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const native = vi.hoisted(() => ({
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
-  spawnSync: vi.fn()
+  spawnSync: vi.fn(),
+  trustedWindowsSystemExecutableSync: vi.fn(),
+  windowsSystemEnvironment: vi.fn()
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -18,6 +20,15 @@ vi.mock("node:fs", async (importOriginal) => {
     ...actual,
     existsSync: native.existsSync,
     readFileSync: native.readFileSync
+  };
+});
+
+vi.mock("../src/windows-system.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/windows-system.js")>();
+  return {
+    ...actual,
+    trustedWindowsSystemExecutableSync: native.trustedWindowsSystemExecutableSync,
+    windowsSystemEnvironment: native.windowsSystemEnvironment
   };
 });
 
@@ -42,6 +53,8 @@ afterEach(() => {
   native.existsSync.mockReset();
   native.readFileSync.mockReset();
   native.spawnSync.mockReset();
+  native.trustedWindowsSystemExecutableSync.mockReset();
+  native.windowsSystemEnvironment.mockReset();
 });
 
 describe("native login-session identity", () => {
@@ -106,5 +119,19 @@ describe("native login-session identity", () => {
 
     expect(getSgwLoginSessionId()).toBeUndefined();
     expect(getSgwLoginSessionId()).toBeUndefined();
+  });
+
+  it("reads the immutable Windows logon identity once per process", () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    native.trustedWindowsSystemExecutableSync.mockReturnValue(String.raw`C:\Windows\System32\whoami.exe`);
+    native.windowsSystemEnvironment.mockReturnValue({});
+    native.spawnSync.mockReturnValue({ status: 0, stdout: "Logon ID: S-1-5-5-123-456\n" });
+
+    const first = getSgwLoginSessionId();
+    const second = getSgwLoginSessionId();
+
+    expect(first).toBeTruthy();
+    expect(second).toBe(first);
+    expect(native.spawnSync).toHaveBeenCalledTimes(1);
   });
 });

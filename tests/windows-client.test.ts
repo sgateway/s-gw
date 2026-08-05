@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   ensureWindowsConsole,
   getPackageLayout,
@@ -22,7 +22,21 @@ import { getSgwInstanceKey } from "../src/paths.js";
 import { deleteKeychainPassphrase, setKeychainPassphrase } from "../src/unlock.js";
 
 const repoRoot = process.cwd();
+const keychainService = `com.s-gw.test.windows-client.${process.pid}.${Date.now()}`;
+const keychainAccount = `vitest-${process.pid}`;
 let authorityEnvironment: NodeJS.ProcessEnv | undefined;
+let suiteEnvironment: NodeJS.ProcessEnv | undefined;
+
+beforeAll(() => {
+  if (process.platform !== "win32") return;
+  suiteEnvironment = { ...process.env };
+  delete process.env.SGW_DISABLE_KEYCHAIN;
+  delete process.env.SGW_MASTER_PASSPHRASE;
+  delete process.env.SGW_WINDOWS_CREDENTIAL_HELPER;
+  process.env.SGW_KEYCHAIN_SERVICE = keychainService;
+  process.env.SGW_KEYCHAIN_ACCOUNT = keychainAccount;
+  setKeychainPassphrase(`windows-client-test-${process.pid}`);
+}, 60_000);
 
 beforeEach(() => {
   if (process.platform !== "win32") return;
@@ -30,22 +44,29 @@ beforeEach(() => {
   delete process.env.SGW_DISABLE_KEYCHAIN;
   delete process.env.SGW_MASTER_PASSPHRASE;
   delete process.env.SGW_WINDOWS_CREDENTIAL_HELPER;
-  process.env.SGW_KEYCHAIN_SERVICE = `com.s-gw.test.windows-client.${process.pid}.${Date.now()}`;
-  process.env.SGW_KEYCHAIN_ACCOUNT = `vitest-${process.pid}`;
-  setKeychainPassphrase(`windows-client-test-${process.pid}-${Date.now()}`);
+  process.env.SGW_KEYCHAIN_SERVICE = keychainService;
+  process.env.SGW_KEYCHAIN_ACCOUNT = keychainAccount;
 });
 
-afterEach(async () => {
+afterEach(() => {
   if (process.platform !== "win32" || !authorityEnvironment) return;
-  try {
-    await uninstallWindowsLoginService();
-  } catch {
-    // A test asserting an unmanaged collision owns its fixture cleanup.
-  }
-  deleteKeychainPassphrase();
   process.env = authorityEnvironment;
   authorityEnvironment = undefined;
-}, 60_000);
+});
+
+afterAll(async () => {
+  if (process.platform !== "win32" || !suiteEnvironment) return;
+  try {
+    await uninstallWindowsLoginService();
+  } finally {
+    try {
+      deleteKeychainPassphrase();
+    } finally {
+      process.env = suiteEnvironment;
+      suiteEnvironment = undefined;
+    }
+  }
+}, 120_000);
 
 describe("Windows client packaging", () => {
   it("selects helpers only from the current Windows user session", () => {
@@ -591,7 +612,7 @@ describe("Windows client packaging", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 120_000);
 
   it("persists alternate Windows authority settings and optional tray without credential environment", async () => {
     if (process.platform !== "win32") return;

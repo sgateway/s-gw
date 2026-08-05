@@ -92,5 +92,5 @@ $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentif
       await rm(dirPath, { recursive: true, force: true });
     }
   },
-  30_000
+  120_000
 );

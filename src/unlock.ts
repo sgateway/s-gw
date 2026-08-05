@@ -29,6 +29,7 @@ const windowsCredentialHelperName = "s-gw-credential.ps1";
 const keychainRepairTimeoutMs = 10_000;
 const staleKeychainRepairMs = 30_000;
 const defaultSecretToolTimeoutMs = 10_000;
+const windowsCredentialHelperTimeoutMs = 30_000;
 const maxSecretToolInputBytes = 8_191;
 
 export interface KeychainInfo {
@@ -1251,9 +1252,17 @@ function runWindowsCredentialHelper(helperPath: string, args: string[], input?: 
     input,
     encoding: "utf8",
     env: windowsSystemEnvironment(),
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: windowsCredentialHelperTimeoutMs,
+    killSignal: "SIGKILL"
   });
 
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+      throw new Error(`Windows Credential Manager helper timed out after ${windowsCredentialHelperTimeoutMs} ms.`);
+    }
+    throw result.error;
+  }
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `Windows Credential Manager helper failed with status ${result.status}`);
   }

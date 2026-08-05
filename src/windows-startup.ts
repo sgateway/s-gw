@@ -9,6 +9,7 @@ import { trustedWindowsPowerShellSync, windowsSystemEnvironment } from "./window
 const STARTUP_DESCRIPTION = "s-gw per-user login startup (managed)";
 const STARTUP_FILE_NAME = "s-gw Credential Gateway.lnk";
 const PAYLOAD_VERSION = 1;
+const STARTUP_OPERATION_TIMEOUT_MS = 30_000;
 const AUTHORITY_ENV_KEYS = [
   "SGW_EXECUTION_ENGINE",
   "SGW_HOME",
@@ -443,8 +444,12 @@ export async function windowsStartupShortcutStatus(
   }
 }
 
-export async function uninstallWindowsStartupShortcut(nodePath: string, cliPath: string): Promise<WindowsStartupShortcutStatus> {
-  const status = await windowsStartupShortcutStatus(nodePath, cliPath);
+export async function uninstallWindowsStartupShortcut(
+  nodePath: string,
+  cliPath: string,
+  verifiedStatus?: WindowsStartupShortcutStatus
+): Promise<WindowsStartupShortcutStatus> {
+  const status = verifiedStatus || await windowsStartupShortcutStatus(nodePath, cliPath);
   if (!status.installed) return status;
   if (!status.managed || !status.targetPath || !status.cliPath || !status.config) {
     throw new Error(status.error || "The existing Windows Startup item is not managed by s-gw.");
@@ -462,9 +467,10 @@ export async function uninstallWindowsStartupShortcut(nodePath: string, cliPath:
 export async function installedWindowsStartupConfig(
   nodePath: string,
   cliPath: string,
-  expectedPayload?: string
+  expectedPayload?: string,
+  verifiedStatus?: WindowsStartupShortcutStatus
 ): Promise<WindowsStartupConfig> {
-  const status = await windowsStartupShortcutStatus(nodePath, cliPath);
+  const status = verifiedStatus || await windowsStartupShortcutStatus(nodePath, cliPath);
   if (!status.installed || !status.managed || !status.current || !status.config) {
     throw new Error(status.error || "The s-gw Windows login startup is not installed.");
   }
@@ -569,7 +575,7 @@ function runShortcutOperation(
     env: windowsSystemEnvironment(extra),
     maxBuffer: 64 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 15_000,
+    timeout: STARTUP_OPERATION_TIMEOUT_MS,
     windowsHide: true
   });
   if (result.error) {

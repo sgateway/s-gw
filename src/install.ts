@@ -901,16 +901,17 @@ export async function installWindowsLoginService(options: {
   assertWindowsBackgroundUnlock();
   const layout = getPackageLayout();
   const port = options.port || 8718;
-  await installWindowsStartupShortcut({
+  const shortcut = await installWindowsStartupShortcut({
     nodePath: layout.nodePath,
     cliPath: layout.cliPath,
     port,
     tray: options.tray === true
   });
   if (options.start) {
-    await startInstalledWindowsLoginService();
+    return startWindowsLoginServiceForShortcut(shortcut);
   }
-  return windowsLoginServiceStatus();
+  const config = await installedWindowsStartupConfig(layout.nodePath, layout.cliPath, undefined, shortcut);
+  return windowsLoginServiceStatusForConfig(config, shortcut);
 }
 
 export async function startInstalledWindowsLoginService(
@@ -918,7 +919,21 @@ export async function startInstalledWindowsLoginService(
 ): Promise<WindowsLoginServiceStatus> {
   requireWindows("Windows login startup start");
   const layout = getPackageLayout();
-  const config = await installedWindowsStartupConfig(layout.nodePath, layout.cliPath, expectedPayload);
+  const shortcut = await windowsStartupShortcutStatus(layout.nodePath, layout.cliPath);
+  return startWindowsLoginServiceForShortcut(shortcut, expectedPayload);
+}
+
+async function startWindowsLoginServiceForShortcut(
+  shortcut: WindowsStartupShortcutStatus,
+  expectedPayload?: string
+): Promise<WindowsLoginServiceStatus> {
+  const layout = getPackageLayout();
+  const config = await installedWindowsStartupConfig(
+    layout.nodePath,
+    layout.cliPath,
+    expectedPayload,
+    shortcut
+  );
   const restore = applyWindowsStartupConfig(config);
   try {
     assertWindowsBackgroundUnlock();
@@ -926,7 +941,7 @@ export async function startInstalledWindowsLoginService(
     if (config.tray) {
       await openWindowsHelper({ port: config.port, consoleUrl: consoleUrl(config.port) });
     }
-    return await windowsLoginServiceStatusForConfig(config);
+    return await windowsLoginServiceStatusForConfig(config, shortcut);
   } finally {
     restore();
   }
@@ -940,7 +955,10 @@ export async function stopInstalledWindowsLoginService(): Promise<WindowsLoginSe
     throw new Error(shortcut.error || "The existing Windows Startup item is not managed by s-gw.");
   }
   const stopped = stopWindowsSurfacesForShortcut(shortcut);
-  return { ...await windowsLoginServiceStatus(), stopped };
+  if (!shortcut.config) {
+    return { ...shortcut, active: false, helperActive: false, stopped };
+  }
+  return { ...await windowsLoginServiceStatusForConfig(shortcut.config, shortcut), stopped };
 }
 
 export async function uninstallWindowsLoginService(): Promise<WindowsLoginServiceStatus> {
@@ -951,8 +969,8 @@ export async function uninstallWindowsLoginService(): Promise<WindowsLoginServic
     throw new Error(shortcut.error || "The existing Windows Startup item is not managed by s-gw.");
   }
   stopWindowsSurfacesForShortcut(shortcut);
-  await uninstallWindowsStartupShortcut(layout.nodePath, layout.cliPath);
-  return windowsLoginServiceStatus();
+  const removed = await uninstallWindowsStartupShortcut(layout.nodePath, layout.cliPath, shortcut);
+  return { ...removed, active: false, helperActive: false };
 }
 
 function stopWindowsSurfacesForShortcut(shortcut: WindowsStartupShortcutStatus): WindowsStoppedSurfaces {

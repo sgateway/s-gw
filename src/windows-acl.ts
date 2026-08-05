@@ -8,7 +8,7 @@ import {
   windowsSystemEnvironment
 } from "./windows-system.js";
 
-const ACL_TIMEOUT_MS = 10_000;
+const ACL_TIMEOUT_MS = 30_000;
 
 const WINDOWS_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'

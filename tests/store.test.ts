@@ -2100,7 +2100,7 @@ describe("SecretStore", () => {
     if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
     await store.clearApprovalGrants();
     await expect(executeReusablePermit(store, admission.permit)).rejects.toThrow(/authorization changed|grant is no longer valid/i);
-  });
+  }, 30_000);
 
   it("coalesces repeated unapproved one-shot commands into one pending request", async () => {
     const store = new SecretStore();
