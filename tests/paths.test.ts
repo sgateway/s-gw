@@ -2,7 +2,14 @@ import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ensureSgwHome, getSgwHome, getSgwInstanceKey, getSgwRecoveryHome, getStorePath } from "../src/paths.js";
+import {
+  ensureSgwHome,
+  getSgwHome,
+  getSgwInstanceKey,
+  getSgwLoginSessionId,
+  getSgwRecoveryHome,
+  getStorePath
+} from "../src/paths.js";
 
 let testRoot = "";
 let outsideRoot = "";
@@ -38,21 +45,44 @@ describe("test-mode s-gw paths", () => {
     await ensureSgwHome();
   });
 
-  it("fingerprints non-secret credential authority settings", () => {
+  it("fingerprints stable credential authority settings without ephemeral unlock state", () => {
     const first = getSgwInstanceKey();
-    process.env.SGW_MASTER_PASSPHRASE = "short";
-    expect(getSgwInstanceKey()).toBe(first);
-
+    process.env.USERDOMAIN = "first-domain";
+    process.env.SESSIONNAME = "RDP-Tcp#4";
     process.env.SGW_MASTER_PASSPHRASE = "first secret value";
-    const withPassphrase = getSgwInstanceKey();
-    expect(withPassphrase).not.toBe(first);
-
+    process.env.SGW_DISABLE_KEYCHAIN = "1";
+    process.env.SGW_KEYCHAIN_HELPER = path.join(testRoot, "helper-one");
+    process.env.SGW_WINDOWS_CREDENTIAL_HELPER = path.join(testRoot, "windows-helper-one");
+    process.env.SGW_LOGIN_SESSION_ID = "first-session";
+    expect(getSgwInstanceKey()).toBe(first);
     process.env.SGW_MASTER_PASSPHRASE = "different secret value";
-    expect(getSgwInstanceKey()).toBe(withPassphrase);
+    process.env.SGW_KEYCHAIN_HELPER = path.join(testRoot, "helper-two");
+    process.env.SGW_WINDOWS_CREDENTIAL_HELPER = path.join(testRoot, "windows-helper-two");
+    process.env.SGW_LOGIN_SESSION_ID = "second-session";
+    process.env.USERDOMAIN = "second-domain";
+    process.env.SESSIONNAME = "Console";
+    expect(getSgwInstanceKey()).toBe(first);
 
     const beforeBackendChange = getSgwInstanceKey();
     process.env.SGW_SECRET_BACKEND = "keychain";
     expect(getSgwInstanceKey()).not.toBe(beforeBackendChange);
+  });
+
+  it("does not derive login-session grants from ambient temporary or SSH variables", () => {
+    delete process.env.SGW_LOGIN_SESSION_ID;
+    const first = getSgwLoginSessionId();
+    process.env.TMPDIR = path.join(testRoot, "different-tmp");
+    process.env.XDG_RUNTIME_DIR = path.join(testRoot, "different-runtime");
+    process.env.SSH_AUTH_SOCK = path.join(testRoot, "different-agent.sock");
+    expect(getSgwLoginSessionId()).toBe(first);
+  });
+
+  it("accepts a login-session override only in isolated test mode", () => {
+    process.env.SGW_LOGIN_SESSION_ID = "test-login-session";
+    expect(getSgwLoginSessionId()).toBe("test-login-session");
+
+    delete process.env.SGW_TEST_MODE;
+    expect(() => getSgwLoginSessionId()).toThrow(/restricted to isolated s-gw tests/i);
   });
 
   it("preserves raw credential namespace semantics", () => {

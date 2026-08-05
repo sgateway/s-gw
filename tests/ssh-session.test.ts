@@ -16,7 +16,7 @@ import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 const originalPlatform = process.platform;
-const savedEnvKeys = ["SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "NODE_OPTIONS", "PATH"] as const;
+const savedEnvKeys = ["SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "NODE_OPTIONS", "PATH", "SGW_TEST_HOME_ROOT"] as const;
 let savedEnv: Partial<Record<(typeof savedEnvKeys)[number], string>> = {};
 const unixIt = originalPlatform === "win32" ? it.skip : it;
 
@@ -358,7 +358,9 @@ describe.sequential("s-gw-owned SSH sessions", () => {
 
     if (windows.aclLog) {
       const aclCalls = await readJsonLines(windows.aclLog);
-      expect(aclCalls.map((entry) => entry.mode)).toEqual(["apply-directory", "verify-file", "verify-directory"]);
+      expect(aclCalls.map((entry) => entry.mode)).toEqual(["create-directory", "verify-file", "verify-directory"]);
+      expect(path.dirname(aclCalls[0].target)).toBe(windows.temp);
+      expect(path.basename(aclCalls[0].target)).toMatch(/^s-gw-ssh-[0-9a-f]{32}$/);
       expect(aclCalls[1].target).toBe(keyPath);
     }
 
@@ -367,7 +369,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect(closed).toMatchObject({ exitCode: 0, timedOut: false, stdout: `${WINDOWS_SSH_CLOSE_MESSAGE}\n` });
     expect((await readFakeSshLog(fake.log))).toHaveLength(beforeCloseCalls);
     expect(existsSync(process.env.SGW_SSH_CONTROL_DIR!)).toBe(false);
-  });
+  }, 30_000);
 
   it("rejects Windows password SSH before revealing or materializing the secret", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -397,14 +399,14 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect(existsSync(fake.log)).toBe(false);
     if (windows.aclLog) expect(existsSync(windows.aclLog)).toBe(false);
     expect(existsSync(process.env.SGW_SSH_CONTROL_DIR!)).toBe(false);
-    expect((await readdir(windows.temp)).filter((name) => name.startsWith("sgw-ssh-"))).toEqual([]);
+    expect((await readdir(windows.temp)).filter((name) => name.startsWith("s-gw-ssh-"))).toEqual([]);
 
     const failed = await store.getRequest(request.id);
     expect(failed.state).toBe("failed");
     expect(failed.error).toBe(WINDOWS_SSH_KEY_ONLY_ERROR);
     expect(JSON.stringify(failed)).not.toContain(rawSecret);
     expect(JSON.stringify(await store.auditLog())).not.toContain(rawSecret);
-  });
+  }, 30_000);
 
   it("sanitizes a Windows SSH nonzero result before persisting it and still cleans up the key", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -443,7 +445,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     expect(existsSync(keyPath)).toBe(false);
     expect(JSON.stringify(await store.getRequest(request.id))).not.toContain(secret);
     expect(JSON.stringify(await store.auditLog())).not.toContain(secret);
-  });
+  }, 30_000);
 
   it("removes the Windows private key after an SSH timeout", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -452,7 +454,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     process.env.SGW_SSH_CLI = fake.bin;
     process.env.SGW_FAKE_SSH_LOG = fake.log;
 
-    const { store, requestId } = await approvedWindowsKeyRequest(500);
+    const { store, requestId } = await approvedWindowsKeyRequest(1_000);
     const summary = await executeApprovedRequest(store, requestId);
     expect(summary).toMatchObject({ exitCode: 124, timedOut: true });
 
@@ -460,7 +462,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     const keyPath = call.args[call.args.indexOf("-i") + 1];
     expect(existsSync(keyPath)).toBe(false);
     expect(existsSync(path.dirname(keyPath))).toBe(false);
-  });
+  }, 30_000);
 
   it("removes the Windows private key when the configured client cannot start", async () => {
     Object.defineProperty(process, "platform", { value: "win32" });
@@ -480,7 +482,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
       expect(existsSync(path.dirname(keyCall!.target))).toBe(false);
     }
     expect((await store.getRequest(requestId)).state).toBe("failed");
-  });
+  }, 30_000);
 });
 
 function fakePrivateKey(): string {
@@ -514,7 +516,7 @@ async function approvedWindowsKeyRequest(timeoutMs: number): Promise<{ store: Se
 }
 
 async function windowsAuthDirs(temp: string): Promise<string[]> {
-  return (await readdir(temp)).filter((name) => name.startsWith("sgw-ssh-")).sort();
+  return (await readdir(temp)).filter((name) => name.startsWith("s-gw-ssh-")).sort();
 }
 
 interface FakeSshOptions {
@@ -606,10 +608,12 @@ async function readFakeSshLog(log: string): Promise<Array<{ args: string[]; env:
 }
 
 async function writeFakeWindowsTools(): Promise<{ root: string; temp: string; aclLog?: string }> {
-  const temp = path.join(tmpHome, "windows-temp");
-  await mkdir(temp, { recursive: true });
+  const temp = await realpath(tmpHome);
   process.env.TEMP = temp;
   process.env.TMP = temp;
+  process.env.SGW_TEST_HOME_ROOT = temp;
+  process.env.SGW_HOME = path.join(temp, "home");
+  process.env.SGW_RECOVERY_HOME = path.join(temp, "recovery");
 
   if (originalPlatform === "win32") {
     const root = savedEnv.SystemRoot || savedEnv.WINDIR;
@@ -625,17 +629,26 @@ async function writeFakeWindowsTools(): Promise<{ root: string; temp: string; ac
   await mkdir(path.dirname(powershell), { recursive: true });
   await writeFile(powershell, `#!${process.execPath}
 const fs = require('node:fs');
+const path = require('node:path');
 const sid = 'S-1-5-21-1000-1000-1000-1001';
 if (process.env.SGW_WINDOWS_ACL_EXPECTED_SID && process.env.SGW_WINDOWS_ACL_EXPECTED_SID !== sid) {
   process.stderr.write('identity mismatch');
   process.exit(1);
 }
+let target = process.env.SGW_WINDOWS_ACL_PATH || '';
+if (process.env.SGW_WINDOWS_ACL_MODE === 'create-directory') {
+  const root = process.env.SGW_WINDOWS_ACL_TEST_ROOT || process.env.TEMP;
+  target = path.join(root, 's-gw-ssh-' + require('node:crypto').randomBytes(16).toString('hex'));
+  fs.mkdirSync(target);
+}
 fs.appendFileSync(${JSON.stringify(aclLog)}, JSON.stringify({
   mode: process.env.SGW_WINDOWS_ACL_MODE,
-  target: process.env.SGW_WINDOWS_ACL_PATH,
+  target,
   expectedSid: process.env.SGW_WINDOWS_ACL_EXPECTED_SID || ''
 }) + '\\n');
-process.stdout.write(JSON.stringify({ verified: true, sid, rules: 2 }) + '\\n');
+const result = { verified: true, sid, rules: 2 };
+if (process.env.SGW_WINDOWS_ACL_MODE === 'create-directory') result.path = target;
+process.stdout.write(JSON.stringify(result) + '\\n');
 `);
   await chmod(powershell, 0o755);
   process.env.SystemRoot = root;
@@ -711,7 +724,7 @@ public static class FakeSsh {
 
 async function execFilePromise(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    execFile(command, args, { env, windowsHide: true }, (error, _stdout, stderr) => {
+    execFile(command, args, { env, windowsHide: true, timeout: 20_000 }, (error, _stdout, stderr) => {
       if (!error) {
         resolve();
         return;

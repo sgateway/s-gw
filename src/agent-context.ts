@@ -174,7 +174,7 @@ function readParentProcessTree(): string {
 
 function readProcessRow(pid: number): { parentPid: number; text: string } | undefined {
   try {
-    const output = execFileSync("ps", ["-p", String(pid), "-o", "ppid=", "-o", "command="], {
+    const output = execFileSync("/bin/ps", ["-p", String(pid), "-o", "ppid=", "-o", "command="], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 250

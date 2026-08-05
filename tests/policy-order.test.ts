@@ -59,6 +59,22 @@ describe("approval policy ordering", () => {
     expect(approvalPolicyRuleCovers(paired, samePair)).toBe(true);
   });
 
+  it("treats exact executable paths as part of policy containment", () => {
+    const broad = rule("broad", 10, { commands: ["aws"] });
+    const arm = rule("arm", 20, {
+      commands: ["aws"],
+      resolvedCommands: ["/opt/homebrew/bin/aws"]
+    });
+    const intel = rule("intel", 30, {
+      commands: ["aws"],
+      resolvedCommands: ["/usr/local/bin/aws"]
+    });
+
+    expect(approvalPolicyRuleCovers(broad, arm)).toBe(false);
+    expect(approvalPolicyRuleCovers(arm, broad)).toBe(false);
+    expect(approvalPolicyRuleCovers(arm, intel)).toBe(false);
+  });
+
   it("preserves the established last-updated-first order for equal priorities", () => {
     const older = { ...rule("older", 100, {}), updatedAt: "2026-07-16T00:00:00Z" };
     const newer = { ...rule("newer", 100, {}), updatedAt: "2026-07-16T00:01:00Z" };

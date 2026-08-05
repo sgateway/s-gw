@@ -8,7 +8,7 @@ import { getSgwHome } from "./paths.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
 import type { CommandAction, ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 import {
-  applyPrivateWindowsDirectoryAcl,
+  createPrivateWindowsSshDirectory,
   trustedWindowsSystemExecutable,
   trustedWindowsSystemRoot,
   verifyPrivateWindowsKeyFile
@@ -346,7 +346,8 @@ interface PreparedSshAuth {
 
 async function prepareSshAuth(secret: SecretRecord, value: string): Promise<PreparedSshAuth> {
   const env = await baseSshEnv();
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-ssh-"));
+  const windowsDir = process.platform === "win32" ? await createPrivateWindowsSshDirectory() : undefined;
+  const tmpDir = windowsDir?.dirPath || await mkdtemp(path.join(os.tmpdir(), "sgw-ssh-"));
   let cleaned = false;
   const cleanup = async () => {
     if (cleaned) {
@@ -363,9 +364,8 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
     if (secret.type === "ssh-key" || secret.type === "private-key" || looksLikePrivateKey(value)) {
       const keyPath = path.join(tmpDir, "identity");
       if (process.platform === "win32") {
-        const ownerSid = await applyPrivateWindowsDirectoryAcl(tmpDir);
         await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { flag: "wx" });
-        await verifyPrivateWindowsKeyFile(keyPath, ownerSid);
+        await verifyPrivateWindowsKeyFile(keyPath, windowsDir!.sid);
       } else {
         await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
         await chmod(keyPath, 0o600);

@@ -122,6 +122,7 @@ interface WorkContext {
   homeDir: string;
   pathEnv: string;
   sgwHome: string;
+  mcpEnv: Record<string, string>;
   env: NodeJS.ProcessEnv;
   platform: NodeJS.Platform;
   includeSystemApps: boolean;
@@ -154,6 +155,16 @@ const managedEnd = "# <<< s-gw managed MCP server";
 const agentLockTimeoutMs = 35_000;
 const staleAgentLockMs = 30_000;
 const agentLockPollMs = 25;
+const managedAuthorityEnvKeys = [
+  "SGW_HOME",
+  "SGW_RECOVERY_HOME",
+  "SGW_KEYCHAIN_SERVICE",
+  "SGW_KEYCHAIN_ACCOUNT",
+  "SGW_SECRET_KEYCHAIN_SERVICE",
+  "SGW_SECRET_BACKEND",
+  "SGW_EXECUTION_ENGINE"
+] as const;
+type ManagedAuthorityEnvKey = typeof managedAuthorityEnvKeys[number];
 
 function envPath(value: string | undefined, fallback: string): string {
   const configured = value?.trim();
@@ -311,8 +322,10 @@ function refreshManagedAgentIntegrationsUnlocked(options: AgentIntegrationOption
   const results: AgentIntegrationResult[] = [];
   for (const agentId of agentIds) {
     const current = loadContext(options);
-    const sgwHome = managedAgentSgwHome(current, agentId) || options.sgwHome;
-    results.push(...installAgentIntegrationsUnlocked({ ...options, agentIds: [agentId], sgwHome }));
+    const managedEnv = managedAgentAuthorityEnv(current, agentId);
+    const sgwHome = managedEnv.SGW_HOME || options.sgwHome;
+    const env = { ...(options.env || process.env), ...managedEnv };
+    results.push(...installAgentIntegrationsUnlocked({ ...options, agentIds: [agentId], env, sgwHome }));
   }
   return results;
 }
@@ -397,6 +410,7 @@ function loadContext(options: AgentIntegrationOptions): WorkContext {
   const env = options.env || process.env;
   const platform = options.platform || process.platform;
   const homeDir = integrationHome(options);
+  const mcpEnv = mcpAuthorityEnvironment(options);
   const pathEnv = options.pathEnv ?? env.PATH ?? "";
   const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
   const layout = getPackageLayout();
@@ -412,7 +426,8 @@ function loadContext(options: AgentIntegrationOptions): WorkContext {
   return {
     homeDir,
     pathEnv,
-    sgwHome: path.resolve(options.sgwHome || env.SGW_HOME || path.join(homeDir, ".s-gw")),
+    sgwHome: mcpEnv.SGW_HOME,
+    mcpEnv,
     env,
     platform,
     includeSystemApps: !options.homeDir,
@@ -437,7 +452,7 @@ export function resolvePackagedMcpCommand(
   const bundledMacMcp = options.platform === "darwin" && layout.isSelfContainedMacApp;
   if (options.platform === "win32" || bundledMacMcp) {
     return {
-      command: path.resolve(bundledMacMcp ? layout.nodePath : process.execPath),
+      command: bundledMacMcp ? layout.nodePath : path.resolve(process.execPath),
       args: [options.mcpServerPath]
     };
   }
@@ -709,41 +724,128 @@ function statusForProfile(profile: AgentProfile, ctx: WorkContext): AgentIntegra
   };
 }
 
-function managedAgentSgwHome(ctx: WorkContext, agentId: string): string | undefined {
-  const ownership = ctx.manifest.agents[agentId];
-  if (!ownership?.mcp) return undefined;
-  const adapter = adapters.find((candidate) => candidate.id === agentId);
-  if (!adapter) return undefined;
-  return readManagedSgwHome(adapter, ownership.mcp.path);
+export function mcpAuthorityEnvironment(
+  options: Pick<AgentIntegrationOptions, "homeDir" | "sgwHome" | "env"> = {}
+): Record<string, string> {
+  const env = options.env || process.env;
+  const homeDir = integrationHome(options);
+  const result: Record<string, string> = {
+    SGW_HOME: resolveManagedAuthorityPath(
+      "SGW_HOME",
+      options.sgwHome || env.SGW_HOME,
+      path.join(homeDir, ".s-gw"),
+      homeDir
+    )
+  };
+  const recoveryHome = optionalManagedAuthorityValue("SGW_RECOVERY_HOME", env.SGW_RECOVERY_HOME);
+  if (recoveryHome) {
+    result.SGW_RECOVERY_HOME = resolveManagedAuthorityPath(
+      "SGW_RECOVERY_HOME",
+      recoveryHome,
+      "",
+      homeDir
+    );
+  }
+
+  for (const key of ["SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT", "SGW_SECRET_KEYCHAIN_SERVICE"] as const) {
+    const value = optionalManagedAuthorityValue(key, env[key]);
+    if (value) result[key] = value;
+  }
+
+  const backend = optionalManagedAuthorityValue("SGW_SECRET_BACKEND", env.SGW_SECRET_BACKEND);
+  if (backend) {
+    const normalized = backend.trim().toLowerCase();
+    if (normalized !== "local" && normalized !== "keychain") {
+      throw new Error(`Unsupported SGW_SECRET_BACKEND value: ${backend}`);
+    }
+    result.SGW_SECRET_BACKEND = normalized;
+  }
+
+  const engine = optionalManagedAuthorityValue("SGW_EXECUTION_ENGINE", env.SGW_EXECUTION_ENGINE);
+  if (engine) {
+    const normalized = engine.trim().toLowerCase();
+    if (normalized !== "auto" && normalized !== "rust" && normalized !== "typescript") {
+      throw new Error(`Unsupported SGW_EXECUTION_ENGINE value: ${engine}`);
+    }
+    result.SGW_EXECUTION_ENGINE = normalized;
+  }
+  return result;
 }
 
-function readManagedSgwHome(adapter: AgentAdapter, configPath: string): string | undefined {
+function optionalManagedAuthorityValue(
+  key: ManagedAuthorityEnvKey,
+  value: string | undefined
+): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value.length > 4_096 || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    throw new Error(`Invalid ${key} value for a managed agent integration.`);
+  }
+  return value.trim() ? value : undefined;
+}
+
+function resolveManagedAuthorityPath(
+  key: "SGW_HOME" | "SGW_RECOVERY_HOME",
+  value: string | undefined,
+  fallback: string,
+  homeDir: string
+): string {
+  const checked = optionalManagedAuthorityValue(key, value);
+  if (!checked) return path.resolve(fallback);
+
+  const configured = checked.trim();
+  if (configured === "~") return path.resolve(homeDir);
+  if (configured.startsWith("~/") || configured.startsWith("~\\")) {
+    return path.resolve(homeDir, configured.slice(2));
+  }
+  return path.resolve(path.isAbsolute(configured) ? configured : path.join(homeDir, configured));
+}
+
+function managedAgentAuthorityEnv(ctx: WorkContext, agentId: string): Record<string, string> {
+  const ownership = ctx.manifest.agents[agentId];
+  if (!ownership?.mcp) return {};
+  const adapter = adapters.find((candidate) => candidate.id === agentId);
+  if (!adapter) return {};
+  return readManagedAuthorityEnv(adapter, ownership.mcp.path);
+}
+
+function readManagedAuthorityEnv(adapter: AgentAdapter, configPath: string): Record<string, string> {
   if (adapter.configKind !== "toml") {
     const info = inspectJsonConfig(configPath, adapter.jsonContainer || "mcpServers", adapter.configKind);
-    return sgwHomeFromEntry(info.entry);
+    return authorityEnvFromEntry(info.entry);
   }
 
   const current = readTextIfPresent(configPath);
-  if (!current.value) return undefined;
+  if (!current.value) return {};
   const section = findCodexSection(current.value);
-  if (!section) return undefined;
-  const match = /\bSGW_HOME\s*=\s*("(?:[^"\\]|\\.)*")/.exec(section.text);
-  if (!match) return undefined;
-  try {
-    return normalizeManagedSgwHome(JSON.parse(match[1]));
-  } catch {
-    return undefined;
+  if (!section) return {};
+
+  const result: Record<string, string> = {};
+  for (const key of managedAuthorityEnvKeys) {
+    const match = new RegExp(`\\b${key}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*")`).exec(section.text);
+    if (!match) continue;
+    try {
+      const value = JSON.parse(match[1]);
+      if (typeof value === "string") result[key] = value;
+    } catch {
+      // A malformed owned block will be reported as a fingerprint conflict.
+    }
   }
+  return result;
 }
 
-function sgwHomeFromEntry(entry: Record<string, unknown> | undefined): string | undefined {
-  if (!entry || !isPlainObject(entry.env)) return undefined;
-  return normalizeManagedSgwHome(entry.env.SGW_HOME);
-}
+function authorityEnvFromEntry(entry: Record<string, unknown> | undefined): Record<string, string> {
+  if (!entry) return {};
+  const rawEnv = isPlainObject(entry.env)
+    ? entry.env
+    : isPlainObject(entry.environment) ? entry.environment : undefined;
+  if (!rawEnv) return {};
 
-function normalizeManagedSgwHome(value: unknown): string | undefined {
-  if (typeof value !== "string" || !value.trim() || !path.isAbsolute(value)) return undefined;
-  return path.resolve(value);
+  const result: Record<string, string> = {};
+  for (const key of managedAuthorityEnvKeys) {
+    const value = rawEnv[key];
+    if (typeof value === "string") result[key] = value;
+  }
+  return result;
 }
 
 function detectProfile(profile: AgentProfile, adapter: AgentAdapter | undefined, ctx: WorkContext): boolean {
@@ -1272,7 +1374,7 @@ function expectedJsonEntry(profile: AgentProfile, ctx: WorkContext): Record<stri
   const snippet = JSON.parse(renderAgentMcpSnippet(profile.id, {
     command: ctx.mcpCommand,
     args: ctx.mcpArgs,
-    env: { SGW_HOME: ctx.sgwHome }
+    env: ctx.mcpEnv
   })) as Record<string, unknown>;
   const servers = snippet[container];
   if (!isPlainObject(servers) || !isPlainObject(servers["s-gw"])) {
@@ -1285,7 +1387,7 @@ function codexManagedBlock(profile: AgentProfile, ctx: WorkContext): string {
   return `${managedStart}\n${renderAgentMcpSnippet(profile.id, {
     command: ctx.mcpCommand,
     args: ctx.mcpArgs,
-    env: { SGW_HOME: ctx.sgwHome }
+    env: ctx.mcpEnv
   })}\n${managedEnd}`;
 }
 

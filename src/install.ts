@@ -14,7 +14,14 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getSgwHome, getSgwInstanceKey, getSgwRecoveryHome, getStorePath } from "./paths.js";
+import {
+  getSgwHome,
+  getSgwInstanceKey,
+  getSgwRecoveryHome,
+  getStorePath,
+  MASTER_KEYCHAIN_SERVICE,
+  SECRET_KEYCHAIN_SERVICE
+} from "./paths.js";
 import {
   isInstalledMacAppLocation,
   isSelfContainedMacApp,
@@ -22,6 +29,16 @@ import {
 } from "./self-contained-runtime.js";
 import { unlockStatus } from "./unlock.js";
 import { CURRENT_VERSION } from "./version.js";
+import {
+  applyWindowsStartupConfig,
+  installWindowsStartupShortcut,
+  installedWindowsStartupConfig,
+  uninstallWindowsStartupShortcut,
+  windowsStartupShortcutStatus,
+  type WindowsStartupConfig,
+  type WindowsStartupShortcutStatus
+} from "./windows-startup.js";
+import { trustedWindowsPowerShellSync, windowsSystemEnvironment } from "./windows-system.js";
 
 export const consoleLabel = "com.s-gw.sgw.console";
 export const menuBarLabel = "com.s-gw.sgw.menubar";
@@ -93,6 +110,11 @@ export interface MenuBarOptions {
   show?: boolean;
   notify?: boolean;
   countMode?: MenuBarCountMode;
+}
+
+export interface WindowsSurfaceScope extends MenuBarOptions {
+  cliPath?: string;
+  nodePath?: string;
 }
 
 export type MenuBarCountMode = "pending" | "credentials" | "none";
@@ -176,6 +198,14 @@ export interface WindowsRestartResult {
   console?: WindowsOpenResult;
   helper?: WindowsOpenResult;
   client?: WindowsOpenResult;
+}
+
+export interface WindowsLoginServiceStatus extends WindowsStartupShortcutStatus {
+  active: boolean;
+  helperActive: boolean;
+  consoleUrl?: string;
+  consolePid?: number;
+  stopped?: WindowsStoppedSurfaces;
 }
 
 export function getPackageLayout(): PackageLayout {
@@ -298,6 +328,7 @@ function buildReadiness(checks: { unlockConfigured: boolean; cli: boolean; mcp: 
 export async function installConsoleLaunchAgent(options: ServiceInstallOptions = {}): Promise<LaunchAgentStatus> {
   requireMac("launchd service install");
   assertMacRuntimeForManagedSurfaces();
+  assertMacBackgroundUnlock();
   const port = options.port || 8718;
   const plistPath = launchAgentPath(consoleLabel);
   const logs = await ensureLogDir();
@@ -320,6 +351,7 @@ export async function uninstallConsoleLaunchAgent(): Promise<LaunchAgentStatus> 
 export async function installMenuBarLaunchAgent(options: MenuBarOptions = {}): Promise<LaunchAgentStatus> {
   requireMac("menu-bar install");
   assertMacRuntimeForManagedSurfaces();
+  assertMacBackgroundUnlock();
   assertMenuBarExists();
   const plistPath = launchAgentPath(menuBarLabel);
   const logs = await ensureLogDir();
@@ -342,6 +374,7 @@ export async function uninstallMenuBarLaunchAgent(): Promise<LaunchAgentStatus> 
 export function startInstalledLaunchAgent(kind: "console" | "menubar"): LaunchAgentStatus {
   requireMac("launch-agent start");
   assertMacRuntimeForManagedSurfaces();
+  assertMacBackgroundUnlock();
   const label = kind === "console" ? consoleLabel : menuBarLabel;
   const plistPath = launchAgentPath(label);
   if (!existsSync(plistPath)) {
@@ -358,6 +391,7 @@ export async function refreshMacRuntimeServices(): Promise<{
 }> {
   requireMac("macOS runtime refresh");
   assertMacRuntimeForManagedSurfaces();
+  assertMacBackgroundUnlock();
   const console = launchAgentStatus("console");
   const menuBar = launchAgentStatus("menubar");
   return {
@@ -496,15 +530,16 @@ export function buildSystemdUserUnit(port = 8718): string {
   };
   if (runtimeDir) env.XDG_RUNTIME_DIR = runtimeDir;
   if (dbusAddress) env.DBUS_SESSION_BUS_ADDRESS = dbusAddress;
-  for (const key of [
-    "SGW_KEYCHAIN_SERVICE",
-    "SGW_KEYCHAIN_ACCOUNT",
-    "SGW_SECRET_KEYCHAIN_SERVICE",
-    "SGW_SECRET_BACKEND"
-  ]) {
-    const value = process.env[key];
+  for (const key of ["SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT", "SGW_SECRET_KEYCHAIN_SERVICE"] as const) {
+    const value = boundedAuthorityValue(key, process.env[key]);
     if (value) env[key] = value;
   }
+  copyNormalizedAuthorityEnum(env, "SGW_SECRET_BACKEND", process.env.SGW_SECRET_BACKEND, ["local", "keychain"]);
+  copyNormalizedAuthorityEnum(env, "SGW_EXECUTION_ENGINE", process.env.SGW_EXECUTION_ENGINE, [
+    "auto",
+    "rust",
+    "typescript"
+  ]);
   const args = [
     "/usr/bin/env",
     "-i",
@@ -629,7 +664,7 @@ export function stopMacApp(): MacAppProcessInfo | undefined {
     "}",
     "JSON.stringify(pids)"
   ].join("\n");
-  const result = spawnSync("osascript", ["-l", "JavaScript", "-e", script], {
+  const result = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -655,50 +690,100 @@ export function stopMacApp(): MacAppProcessInfo | undefined {
   };
 }
 
-export function stopWindowsSurfaces(): WindowsStoppedSurfaces {
+export function stopWindowsSurfaces(options: WindowsSurfaceScope = {}): WindowsStoppedSurfaces {
   requireWindows("Windows surface stop");
+  const layout = getPackageLayout();
+  const endpoint = windowsConsoleEndpoint(options);
+  const cliPath = path.resolve(options.cliPath || layout.cliPath);
+  const nodePath = path.resolve(options.nodePath || layout.nodePath);
+  const windowsScripts = path.join(path.dirname(cliPath), "windows");
+  const helperPath = path.join(windowsScripts, "s-gw-helper.ps1");
+  const clientPath = path.join(windowsScripts, "s-gw-client.ps1");
+  const instanceKey = getSgwInstanceKey();
+  const helperInstanceKey = windowsHelperInstanceKey(endpoint.baseUrl);
+  const powershell = trustedWindowsPowerShellSync();
   const script = [
+    "$ErrorActionPreference = 'Stop'",
     "$stopped = @()",
     "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$currentSessionId = [int](Get-Process -Id $PID).SessionId",
+    "$consoleAuthorityMatches = $false",
+    "try {",
+    "  $health = Invoke-RestMethod -Method Get -Uri $env:SGW_STOP_HEALTH_URL -TimeoutSec 1",
+    "  $consoleAuthorityMatches = $health.ok -eq $true -and [string]$health.name -eq 's-gw' -and [string]$health.instanceKey -ceq $env:SGW_STOP_INSTANCE_KEY",
+    "} catch {}",
+    "$cliPattern = '(?i)(?:^|\\s)\"?' + [regex]::Escape($env:SGW_STOP_CLI_PATH) + '\"?(?:\\s|$)'",
+    "$helperPattern = '(?i)(?:^|\\s)-File(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_STOP_HELPER_PATH) + '\"?(?:\\s|$)'",
+    "$clientPattern = '(?i)(?:^|\\s)-File(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_STOP_CLIENT_PATH) + '\"?(?:\\s|$)'",
+    "$portPattern = '(?i)(?:^|\\s)(?:--port|-Port)(?:\\s+|:|=)\"?' + [regex]::Escape($env:SGW_STOP_PORT) + '\"?(?:\\s|$)'",
+    "$anyPortPattern = '(?i)(?:^|\\s)(?:--port|-Port)(?:\\s+|:|=)'",
+    "$hostPattern = '(?i)(?:^|\\s)--host(?:\\s+|:|=)\"?127\\.0\\.0\\.1\"?(?:\\s|$)'",
+    "$anyHostPattern = '(?i)(?:^|\\s)--host(?:\\s+|:|=)'",
+    "$helperInstancePattern = '(?i)(?:^|\\s)-InstanceKey(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_STOP_HELPER_INSTANCE_KEY) + '\"?(?:\\s|$)'",
+    "$clientInstancePattern = '(?i)(?:^|\\s)-InstanceKey(?:\\s+|:)\"?' + [regex]::Escape($env:SGW_STOP_INSTANCE_KEY) + '\"?(?:\\s|$)'",
     "Get-CimInstance Win32_Process | ForEach-Object {",
     "  $line = [string]$_.CommandLine",
-    "  $helper = $line -match '(?i)s-gw-helper\\.ps1'",
-    "  $client = $line -match '(?i)s-gw-client\\.ps1'",
-    "  $console = $line -match '(?i)[\\\\/]dist[\\\\/]cli\\.js' -and $line -match '(?i)\\sconsole(?:\\s|$)' -and $line -match '(?i)s-gw'",
-    "  if ($_.ProcessId -ne $PID -and ($helper -or $client -or $console)) {",
-    "    if ([int]$_.SessionId -ne $currentSessionId) { return }",
-    "    $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
-    "    if ($null -eq $owner -or $owner.ReturnValue -ne 0 -or [string]$owner.Sid -ne $currentSid) { return }",
-    "    $kind = if ($helper) { 'helper' } elseif ($client) { 'client' } else { 'console' }",
-    "    $pidToStop = [int]$_.ProcessId",
-    "    $creationDate = [string]$_.CreationDate",
-    "    $expectedLine = $line",
-    "    $fresh = Get-CimInstance Win32_Process -Filter \"ProcessId = $pidToStop\" -ErrorAction SilentlyContinue",
-    "    if ($null -ne $fresh) {",
-    "      $freshOwner = Invoke-CimMethod -InputObject $fresh -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
-    "      if ([string]$fresh.CreationDate -ne $creationDate -or [int]$fresh.SessionId -ne $currentSessionId -or [string]$fresh.CommandLine -ne $expectedLine -or $null -eq $freshOwner -or $freshOwner.ReturnValue -ne 0 -or [string]$freshOwner.Sid -ne $currentSid) {",
-    "        throw \"s-gw process $pidToStop changed before it could be stopped.\"",
-    "      }",
-    "      try {",
-    "        $termination = Invoke-CimMethod -InputObject $fresh -MethodName Terminate -ErrorAction Stop",
-    "        if ($termination.ReturnValue -ne 0) { throw \"s-gw process $pidToStop returned termination code $($termination.ReturnValue).\" }",
-    "      } catch {",
-    "        if ($null -ne (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { throw }",
-    "      }",
-    "    }",
-    "    for ($attempt = 0; $attempt -lt 50; $attempt += 1) {",
-    "      if ($null -eq (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { break }",
-    "      Start-Sleep -Milliseconds 50",
-    "    }",
-    "    if ($null -ne (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { throw \"s-gw process $pidToStop did not stop.\" }",
-    "    $stopped += [PSCustomObject]@{ pid = $pidToStop; kind = $kind }",
+    "  if (-not $line -or [int]$_.ProcessId -eq $PID -or [int]$_.SessionId -ne $currentSessionId) { return }",
+    "  $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "  if ($null -eq $owner -or $owner.ReturnValue -ne 0 -or [string]$owner.Sid -ne $currentSid) { return }",
+    "  $exactNode = $false",
+    "  $exactPowerShell = $false",
+    "  try {",
+    "    $executable = [IO.Path]::GetFullPath([string]$_.ExecutablePath)",
+    "    $exactNode = [string]::Equals($executable, [IO.Path]::GetFullPath($env:SGW_STOP_NODE_PATH), [StringComparison]::OrdinalIgnoreCase)",
+    "    $exactPowerShell = [string]::Equals($executable, [IO.Path]::GetFullPath($env:SGW_STOP_POWERSHELL_PATH), [StringComparison]::OrdinalIgnoreCase)",
+    "  } catch {}",
+    "  $portMatches = $line -match $portPattern -or ($env:SGW_STOP_PORT -eq '8718' -and $line -notmatch $anyPortPattern)",
+    "  $hostMatches = $line -match $hostPattern -or $line -notmatch $anyHostPattern",
+    "  $kind = ''",
+    "  if ($exactPowerShell -and $line -match $helperPattern -and $line -match $helperInstancePattern -and $portMatches) {",
+    "    $kind = 'helper'",
+    "  } elseif ($exactPowerShell -and $line -match $clientPattern -and $line -match $clientInstancePattern -and $portMatches) {",
+    "    $kind = 'client'",
+    "  } elseif ($consoleAuthorityMatches -and $exactNode -and $line -match $cliPattern -and $line -match '(?i)(?:^|\\s)console(?:\\s|$)' -and $portMatches -and $hostMatches) {",
+    "    $kind = 'console'",
     "  }",
+    "  if (-not $kind) { return }",
+    "  $pidToStop = [int]$_.ProcessId",
+    "  $creationDate = [string]$_.CreationDate",
+    "  $expectedLine = $line",
+    "  $expectedExecutable = [string]$_.ExecutablePath",
+    "  $fresh = Get-CimInstance Win32_Process -Filter \"ProcessId = $pidToStop\" -ErrorAction SilentlyContinue",
+    "  if ($null -ne $fresh) {",
+    "    $freshOwner = Invoke-CimMethod -InputObject $fresh -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "    if ([string]$fresh.CreationDate -ne $creationDate -or [int]$fresh.SessionId -ne $currentSessionId -or [string]$fresh.CommandLine -ne $expectedLine -or [string]$fresh.ExecutablePath -ne $expectedExecutable -or $null -eq $freshOwner -or $freshOwner.ReturnValue -ne 0 -or [string]$freshOwner.Sid -ne $currentSid) {",
+    "      throw \"s-gw process $pidToStop changed before it could be stopped.\"",
+    "    }",
+    "    try {",
+    "      $termination = Invoke-CimMethod -InputObject $fresh -MethodName Terminate -ErrorAction Stop",
+    "      if ($termination.ReturnValue -ne 0) { throw \"s-gw process $pidToStop returned termination code $($termination.ReturnValue).\" }",
+    "    } catch {",
+    "      if ($null -ne (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { throw }",
+    "    }",
+    "  }",
+    "  for ($attempt = 0; $attempt -lt 50; $attempt += 1) {",
+    "    if ($null -eq (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { break }",
+    "    Start-Sleep -Milliseconds 50",
+    "  }",
+    "  if ($null -ne (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue)) { throw \"s-gw process $pidToStop did not stop.\" }",
+    "  $stopped += [PSCustomObject]@{ pid = $pidToStop; kind = $kind }",
     "}",
     "$stopped | ConvertTo-Json -Compress"
   ].join("\n");
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+  const result = spawnSync(powershell, ["-NoProfile", "-Command", script], {
+    cwd: path.dirname(powershell),
     encoding: "utf8",
+    env: windowsBackgroundEnvironment(endpoint.baseUrl, {
+      SGW_STOP_CLI_PATH: cliPath,
+      SGW_STOP_CLIENT_PATH: clientPath,
+      SGW_STOP_HEALTH_URL: new URL("api/health", endpoint.baseUrl).toString(),
+      SGW_STOP_HELPER_INSTANCE_KEY: helperInstanceKey,
+      SGW_STOP_HELPER_PATH: helperPath,
+      SGW_STOP_INSTANCE_KEY: instanceKey,
+      SGW_STOP_NODE_PATH: nodePath,
+      SGW_STOP_PORT: String(endpoint.port),
+      SGW_STOP_POWERSHELL_PATH: powershell
+    }),
     stdio: ["ignore", "pipe", "pipe"]
   });
   if (result.status !== 0) {
@@ -709,7 +794,10 @@ export function stopWindowsSurfaces(): WindowsStoppedSurfaces {
   const entries = (Array.isArray(parsed) ? parsed : [parsed]).filter((entry): entry is { pid: number; kind: string } => {
     if (!entry || typeof entry !== "object") return false;
     const item = entry as { pid?: unknown; kind?: unknown };
-    return typeof item.pid === "number" && Number.isInteger(item.pid) && item.pid > 0 && typeof item.kind === "string";
+    return typeof item.pid === "number"
+      && Number.isInteger(item.pid)
+      && item.pid > 0
+      && ["client", "console", "helper"].includes(String(item.kind));
   });
   return {
     pids: entries.map((entry) => entry.pid),
@@ -725,6 +813,7 @@ export function startWindowsConsole(options: MenuBarOptions = {}): WindowsOpenRe
 
 function spawnWindowsConsole(options: MenuBarOptions): { child: ChildProcess; result: WindowsOpenResult } {
   requireWindows("Windows console start");
+  assertWindowsBackgroundUnlock();
   const layout = getPackageLayout();
   const { port, url } = windowsConsoleEndpoint(options);
   const child = spawn(process.execPath, [
@@ -755,6 +844,7 @@ function spawnWindowsConsole(options: MenuBarOptions): { child: ChildProcess; re
 
 export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promise<WindowsOpenResult> {
   requireWindows("Windows console start");
+  assertWindowsBackgroundUnlock();
   const layout = getPackageLayout();
   const { port, url } = windowsConsoleEndpoint(options);
   const instanceKey = getSgwInstanceKey();
@@ -797,6 +887,139 @@ export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promis
     }
     throw error;
   }
+}
+
+export async function installWindowsLoginService(options: {
+  port?: number;
+  start?: boolean;
+  tray?: boolean;
+} = {}): Promise<WindowsLoginServiceStatus> {
+  requireWindows("Windows login startup install");
+  assertWindowsBackgroundUnlock();
+  const layout = getPackageLayout();
+  const port = options.port || 8718;
+  await installWindowsStartupShortcut({
+    nodePath: layout.nodePath,
+    cliPath: layout.cliPath,
+    port,
+    tray: options.tray === true
+  });
+  if (options.start) {
+    await startInstalledWindowsLoginService();
+  }
+  return windowsLoginServiceStatus();
+}
+
+export async function startInstalledWindowsLoginService(
+  expectedPayload?: string
+): Promise<WindowsLoginServiceStatus> {
+  requireWindows("Windows login startup start");
+  const layout = getPackageLayout();
+  const config = await installedWindowsStartupConfig(layout.nodePath, layout.cliPath, expectedPayload);
+  const restore = applyWindowsStartupConfig(config);
+  try {
+    assertWindowsBackgroundUnlock();
+    await ensureWindowsConsole({ port: config.port, consoleUrl: consoleUrl(config.port) });
+    if (config.tray) {
+      await openWindowsHelper({ port: config.port, consoleUrl: consoleUrl(config.port) });
+    }
+    return await windowsLoginServiceStatusForConfig(config);
+  } finally {
+    restore();
+  }
+}
+
+export async function stopInstalledWindowsLoginService(): Promise<WindowsLoginServiceStatus> {
+  requireWindows("Windows login startup stop");
+  const layout = getPackageLayout();
+  const shortcut = await windowsStartupShortcutStatus(layout.nodePath, layout.cliPath);
+  if (shortcut.installed && !shortcut.managed) {
+    throw new Error(shortcut.error || "The existing Windows Startup item is not managed by s-gw.");
+  }
+  const stopped = stopWindowsSurfacesForShortcut(shortcut);
+  return { ...await windowsLoginServiceStatus(), stopped };
+}
+
+export async function uninstallWindowsLoginService(): Promise<WindowsLoginServiceStatus> {
+  requireWindows("Windows login startup uninstall");
+  const layout = getPackageLayout();
+  const shortcut = await windowsStartupShortcutStatus(layout.nodePath, layout.cliPath);
+  if (shortcut.installed && !shortcut.managed) {
+    throw new Error(shortcut.error || "The existing Windows Startup item is not managed by s-gw.");
+  }
+  stopWindowsSurfacesForShortcut(shortcut);
+  await uninstallWindowsStartupShortcut(layout.nodePath, layout.cliPath);
+  return windowsLoginServiceStatus();
+}
+
+function stopWindowsSurfacesForShortcut(shortcut: WindowsStartupShortcutStatus): WindowsStoppedSurfaces {
+  if (!shortcut.config || !shortcut.targetPath || !shortcut.cliPath) {
+    return stopWindowsSurfaces();
+  }
+  const restore = applyWindowsStartupConfig(shortcut.config);
+  try {
+    return stopWindowsSurfaces({
+      cliPath: shortcut.cliPath,
+      consoleUrl: consoleUrl(shortcut.config.port),
+      nodePath: shortcut.targetPath,
+      port: shortcut.config.port
+    });
+  } finally {
+    restore();
+  }
+}
+
+export async function windowsLoginServiceStatus(): Promise<WindowsLoginServiceStatus> {
+  requireWindows("Windows login startup status");
+  const layout = getPackageLayout();
+  const shortcut = await windowsStartupShortcutStatus(layout.nodePath, layout.cliPath);
+  if (!shortcut.config) {
+    return { ...shortcut, active: false, helperActive: false };
+  }
+  const restore = applyWindowsStartupConfig(shortcut.config);
+  try {
+    return await windowsLoginServiceStatusForConfig(shortcut.config, shortcut);
+  } finally {
+    restore();
+  }
+}
+
+async function windowsLoginServiceStatusForConfig(
+  config: WindowsStartupConfig,
+  shortcut?: WindowsStartupShortcutStatus
+): Promise<WindowsLoginServiceStatus> {
+  const layout = getPackageLayout();
+  const registration = shortcut || await windowsStartupShortcutStatus(layout.nodePath, layout.cliPath);
+  const url = consoleUrl(config.port);
+  let active = false;
+  let helperActive = false;
+  let consolePid: number | undefined;
+  let runtimeError: string | undefined;
+  try {
+    const health = await windowsConsoleHealth(url);
+    if (health.ready && health.instanceKey === getSgwInstanceKey()) {
+      consolePid = trustedWindowsConsoleListener(config.port, layout.cliPath);
+      active = consolePid !== undefined;
+    }
+    if (config.tray) {
+      helperActive = findRunningWindowsHelpers(
+        layout.windowsHelperScriptPath,
+        config.port,
+        url,
+        windowsHelperInstanceKey(url)
+      ).length === 1;
+    }
+  } catch (error) {
+    runtimeError = error instanceof Error ? error.message : String(error);
+  }
+  return {
+    ...registration,
+    active,
+    helperActive,
+    consoleUrl: url,
+    ...(consolePid ? { consolePid } : {}),
+    ...((registration.error || runtimeError) ? { error: [registration.error, runtimeError].filter(Boolean).join("; ") } : {})
+  };
 }
 
 export async function restartWindowsSurfaces(
@@ -901,14 +1124,15 @@ function trustedWindowsConsoleListener(port: number, cliPath: string): number | 
     "}",
     "[PSCustomObject]@{ currentSid = $currentSid; currentSessionId = $currentSessionId; processes = $processes } | ConvertTo-Json -Depth 3 -Compress"
   ].join("\n");
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+  const powershell = trustedWindowsPowerShellSync();
+  const result = spawnSync(powershell, ["-NoProfile", "-Command", script], {
+    cwd: path.dirname(powershell),
     encoding: "utf8",
-    env: {
-      ...process.env,
+    env: windowsEnvironment(consoleUrl(port), {
       SGW_CONSOLE_PORT: String(port),
       SGW_CONSOLE_CLI_PATH: cliPath,
       SGW_CONSOLE_NODE_PATH: process.execPath
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"]
   });
   if (result.status !== 0) {
@@ -1002,7 +1226,7 @@ export function openMenuBarHelper(options: MenuBarOptions = {}): { appPath: stri
     args.push("--no-notify");
   }
 
-  const result = spawnSync("open", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = spawnSync("/usr/bin/open", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || "Failed to open s-gw menu-bar helper.");
   }
@@ -1035,7 +1259,7 @@ export function openMacApp(options: MenuBarOptions = {}): MacAppOpenResult {
   }
 
   args.push(layout.macAppPath);
-  const result = spawnSync("open", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = spawnSync("/usr/bin/open", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || "Failed to open s-gw macOS app.");
   }
@@ -1120,8 +1344,9 @@ export async function openWindowsClient(options: MenuBarOptions = {}): Promise<W
   const { port, url } = windowsConsoleEndpoint(options);
   const instanceKey = getSgwInstanceKey();
   await ensureWindowsConsole({ ...options, port, consoleUrl: url });
+  const powershell = trustedWindowsPowerShellSync();
   const result = spawnSync(
-    "powershell.exe",
+    powershell,
     [
       "-NoProfile",
       "-Sta",
@@ -1138,6 +1363,7 @@ export async function openWindowsClient(options: MenuBarOptions = {}): Promise<W
       "-NoStart"
     ],
     {
+      cwd: path.dirname(powershell),
       encoding: "utf8",
       env: windowsEnvironment(url),
       stdio: ["ignore", "pipe", "pipe"]
@@ -1211,8 +1437,9 @@ function launchWindowsHelper(
   instanceKey: string
 ): WindowsHelperLaunch {
   const launchNonce = randomBytes(32).toString("hex");
+  const powershell = trustedWindowsPowerShellSync();
   const result = spawnSync(
-    "powershell.exe",
+    powershell,
     [
       "-NoProfile",
       "-ExecutionPolicy",
@@ -1231,6 +1458,7 @@ function launchWindowsHelper(
       launchNonce
     ],
     {
+      cwd: path.dirname(powershell),
       encoding: "utf8",
       env: windowsEnvironment(url),
       maxBuffer: 64 * 1024,
@@ -1335,17 +1563,18 @@ function stopLaunchedWindowsHelper(
     "}",
     "throw 'The launched s-gw helper did not stop.'"
   ].join("\n");
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+  const powershell = trustedWindowsPowerShellSync();
+  const result = spawnSync(powershell, ["-NoProfile", "-Command", script], {
+    cwd: path.dirname(powershell),
     encoding: "utf8",
-    env: {
-      ...windowsEnvironment(url),
+    env: windowsEnvironment(url, {
       SGW_HELPER_INSTANCE_KEY: instanceKey,
       SGW_HELPER_LAUNCH_NONCE: launched.launchNonce,
       SGW_HELPER_LAUNCHED_PID: launched.pid ? String(launched.pid) : "",
       SGW_HELPER_LAUNCHED_TICKS: launched.startedAtUtcTicks || "",
       SGW_HELPER_PORT: String(port),
       SGW_HELPER_SCRIPT_PATH: scriptPath
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 10_000,
     windowsHide: true
@@ -1402,13 +1631,14 @@ function findRunningWindowsHelpers(scriptPath: string, port: number, url: string
     "}",
     "[PSCustomObject]@{ currentSid = $currentSid; currentSessionId = $currentSessionId; processes = $helperProcesses } | ConvertTo-Json -Depth 3 -Compress"
   ].join("\n");
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+  const powershell = trustedWindowsPowerShellSync();
+  const result = spawnSync(powershell, ["-NoProfile", "-Command", script], {
+    cwd: path.dirname(powershell),
     encoding: "utf8",
-    env: {
-      ...windowsEnvironment(url),
+    env: windowsEnvironment(url, {
       SGW_HELPER_PORT: String(port),
       SGW_HELPER_SCRIPT_PATH: scriptPath
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"]
   });
   if (result.status !== 0) {
@@ -1559,7 +1789,7 @@ function readMacAppProcessRecord(): MacAppProcessInfo | undefined {
 }
 
 function findRunningMacAppProcess(layout: PackageLayout): MacAppProcessInfo | undefined {
-  const result = spawnSync("pgrep", ["-x", "s-gw"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = spawnSync("/usr/bin/pgrep", ["-x", "s-gw"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (result.status !== 0) {
     return undefined;
   }
@@ -1598,7 +1828,7 @@ function focusMacAppProcess(app: MacAppProcessInfo, appPath: string): void {
   }
 
   if (app.bundleIdentifier) {
-    const byBundle = spawnSync("open", ["-b", app.bundleIdentifier], {
+    const byBundle = spawnSync("/usr/bin/open", ["-b", app.bundleIdentifier], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -1607,7 +1837,7 @@ function focusMacAppProcess(app: MacAppProcessInfo, appPath: string): void {
     }
   }
 
-  const byPath = spawnSync("open", [appPath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const byPath = spawnSync("/usr/bin/open", [appPath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (byPath.status !== 0) {
     throw new Error(byPath.stderr.trim() || "Failed to focus running s-gw macOS app.");
   }
@@ -1620,7 +1850,7 @@ function postOpenMainWindowNotification(): boolean {
     "  'com.s-gw.sgw.openMainWindow', null, null, true",
     ")"
   ].join("\n");
-  const result = spawnSync("osascript", ["-l", "JavaScript", "-e", script], {
+  const result = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1628,7 +1858,7 @@ function postOpenMainWindowNotification(): boolean {
 }
 
 function commandForPid(pid: number): string | undefined {
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+  const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "command="], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1762,13 +1992,13 @@ function startLaunchAgent(label: string, plistPath: string): void {
 function stopLaunchAgent(label: string): void {
   const plistPath = launchAgentPath(label);
   if (existsSync(plistPath)) {
-    spawnSync("launchctl", ["bootout", launchdDomain(), plistPath], {
+    spawnSync("/bin/launchctl", ["bootout", launchdDomain(), plistPath], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"]
     });
   }
 
-  spawnSync("launchctl", ["bootout", `${launchdDomain()}/${label}`], {
+  spawnSync("/bin/launchctl", ["bootout", `${launchdDomain()}/${label}`], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1776,14 +2006,14 @@ function stopLaunchAgent(label: string): void {
 }
 
 function runLaunchctl(args: string[]): void {
-  const result = spawnSync("launchctl", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = spawnSync("/bin/launchctl", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `launchctl ${args.join(" ")} failed.`);
   }
 }
 
 function isLaunchAgentLoaded(label: string): boolean {
-  const result = spawnSync("launchctl", ["print", `${launchdDomain()}/${label}`], {
+  const result = spawnSync("/bin/launchctl", ["print", `${launchdDomain()}/${label}`], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1934,17 +2164,46 @@ async function ensureLogDir(sgwHome?: string): Promise<string> {
 
 function launchdBaseEnvironment(inherited: Record<string, string> = {}): Record<string, string> {
   const layout = getPackageLayout();
+  const inheritedHome = boundedAuthorityValue("SGW_HOME", inherited.SGW_HOME);
+  const sgwHome = absoluteAuthorityPath("SGW_HOME", inheritedHome || getSgwHome());
+  const inheritedRecovery = boundedAuthorityValue("SGW_RECOVERY_HOME", inherited.SGW_RECOVERY_HOME);
+  const recoveryHome = absoluteAuthorityPath(
+    "SGW_RECOVERY_HOME",
+    inheritedRecovery || getSgwRecoveryHome(sgwHome)
+  );
+  if (authorityPathsOverlap(sgwHome, recoveryHome)) {
+    throw new Error("SGW_HOME and SGW_RECOVERY_HOME must not overlap in a managed service.");
+  }
   const env: Record<string, string> = {
     PATH: inherited.PATH || process.env.PATH || "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-    SGW_NODE_PATH: layout.nodePath
+    SGW_HOME: sgwHome,
+    SGW_KEYCHAIN_ACCOUNT: boundedAuthorityValue(
+      "SGW_KEYCHAIN_ACCOUNT",
+      inherited.SGW_KEYCHAIN_ACCOUNT || process.env.SGW_KEYCHAIN_ACCOUNT
+    ) || os.userInfo().username || "local-user",
+    SGW_KEYCHAIN_SERVICE: boundedAuthorityValue(
+      "SGW_KEYCHAIN_SERVICE",
+      inherited.SGW_KEYCHAIN_SERVICE || process.env.SGW_KEYCHAIN_SERVICE
+    ) || MASTER_KEYCHAIN_SERVICE,
+    SGW_NODE_PATH: layout.nodePath,
+    SGW_RECOVERY_HOME: recoveryHome,
+    SGW_SECRET_KEYCHAIN_SERVICE: boundedAuthorityValue(
+      "SGW_SECRET_KEYCHAIN_SERVICE",
+      inherited.SGW_SECRET_KEYCHAIN_SERVICE || process.env.SGW_SECRET_KEYCHAIN_SERVICE
+    ) || SECRET_KEYCHAIN_SERVICE
   };
-
-  for (const key of ["SGW_HOME", "SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT"]) {
-    copyEnvironmentValue(env, inherited, key);
-  }
-  if (process.env.SGW_KEYCHAIN_HELPER) {
-    env.SGW_KEYCHAIN_HELPER = process.env.SGW_KEYCHAIN_HELPER;
-  }
+  copyNormalizedAuthorityEnum(
+    env,
+    "SGW_SECRET_BACKEND",
+    inherited.SGW_SECRET_BACKEND || process.env.SGW_SECRET_BACKEND,
+    ["local", "keychain"]
+  );
+  copyNormalizedAuthorityEnum(
+    env,
+    "SGW_EXECUTION_ENGINE",
+    inherited.SGW_EXECUTION_ENGINE || process.env.SGW_EXECUTION_ENGINE,
+    ["auto", "rust", "typescript"]
+  );
   return env;
 }
 
@@ -1999,26 +2258,106 @@ function menuBarEnvironment(
   return env;
 }
 
-function windowsEnvironment(url: string): NodeJS.ProcessEnv {
+export function windowsBackgroundEnvironment(
+  url: string,
+  extra: NodeJS.ProcessEnv = {}
+): NodeJS.ProcessEnv {
   const layout = getPackageLayout();
-  return {
-    ...process.env,
+  const authority: NodeJS.ProcessEnv = {
+    SGW_DISABLE_UPDATE_CHECK: "1",
+    SGW_EXECUTION_ENGINE: process.env.SGW_EXECUTION_ENGINE || "",
+    SGW_HOME: getSgwHome(),
+    SGW_RECOVERY_HOME: getSgwRecoveryHome(),
+    SGW_KEYCHAIN_SERVICE: process.env.SGW_KEYCHAIN_SERVICE || "com.s-gw.sgw.master-passphrase",
+    SGW_KEYCHAIN_ACCOUNT: process.env.SGW_KEYCHAIN_ACCOUNT || os.userInfo().username || "local-user",
+    SGW_SECRET_KEYCHAIN_SERVICE: process.env.SGW_SECRET_KEYCHAIN_SERVICE || "com.s-gw.sgw.secret",
+    SGW_SECRET_BACKEND: process.env.SGW_SECRET_BACKEND || "",
     SGW_NODE_PATH: process.execPath,
     SGW_CLI_PATH: layout.cliPath,
     SGW_CONSOLE_URL: url,
     SGW_APP_PATH: layout.windowsClientLauncherPath
   };
+  for (const [key, value] of Object.entries(extra)) {
+    if (Object.prototype.hasOwnProperty.call(authority, key)) {
+      throw new Error(`Windows background environment cannot override ${key}.`);
+    }
+    authority[key] = value;
+  }
+  return windowsSystemEnvironment(authority);
 }
 
-function copyEnvironmentValue(
-  target: Record<string, string>,
-  inherited: Record<string, string>,
-  key: string
-): void {
-  const value = inherited[key] || process.env[key];
-  if (value) {
-    target[key] = value;
+function windowsEnvironment(url: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return windowsBackgroundEnvironment(url, extra);
+}
+
+export function assertMacBackgroundUnlock(): void {
+  const unlock = unlockStatus();
+  if (unlock.envConfigured) {
+    throw new Error(
+      "macOS background startup will not persist or inherit SGW_MASTER_PASSPHRASE. " +
+      "Unset it and run `s-gw setup` with macOS Keychain, or run `s-gw console` in this foreground session."
+    );
   }
+  if (unlock.activeSource !== "macos-keychain") {
+    throw new Error(
+      "macOS background startup requires configured Keychain unlock material. " +
+      "Run `s-gw setup`, or use `s-gw console` in the foreground."
+    );
+  }
+}
+
+function assertWindowsBackgroundUnlock(): void {
+  const unlock = unlockStatus();
+  if (unlock.envConfigured) {
+    throw new Error(
+      "Windows background startup will not persist or inherit SGW_MASTER_PASSPHRASE. " +
+      "Unset it and run `s-gw setup` with Windows Credential Manager, or run `s-gw console` in this foreground session."
+    );
+  }
+  if (!unlock.keychain.configured) {
+    throw new Error(
+      "Windows background startup requires configured Windows Credential Manager unlock material. " +
+      "SGW_MASTER_PASSPHRASE is never inherited by background children; run `s-gw setup`, or use `s-gw console` in the foreground."
+    );
+  }
+}
+
+function boundedAuthorityValue(name: string, value: string | undefined): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value.length > 4_096 || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    throw new Error(`Invalid ${name} value for a managed service.`);
+  }
+  return value;
+}
+
+function absoluteAuthorityPath(name: string, value: string): string {
+  if (!path.isAbsolute(value)) {
+    throw new Error(`${name} must be an absolute path for a managed service.`);
+  }
+  return path.resolve(value);
+}
+
+function authorityPathsOverlap(left: string, right: string): boolean {
+  const relative = path.relative(path.resolve(left), path.resolve(right));
+  if (!relative) return true;
+  if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return true;
+  const reverse = path.relative(path.resolve(right), path.resolve(left));
+  return reverse !== ".." && !reverse.startsWith(`..${path.sep}`) && !path.isAbsolute(reverse);
+}
+
+function copyNormalizedAuthorityEnum(
+  target: Record<string, string>,
+  name: string,
+  value: string | undefined,
+  allowed: readonly string[]
+): void {
+  const checked = boundedAuthorityValue(name, value);
+  if (!checked) return;
+  const normalized = checked.trim().toLowerCase();
+  if (!normalized || !allowed.includes(normalized)) {
+    throw new Error(`Unsupported ${name} value: ${checked}`);
+  }
+  target[name] = normalized;
 }
 
 function consoleUrl(port: number): string {

@@ -1,5 +1,6 @@
-import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +14,7 @@ import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-in
 
 let tmpHome = "";
 let originalNodeOptions: string | undefined;
+const resolvedNodeExecutable = realpathSync.native(process.execPath);
 
 function fakeAwsAccessKey(): string {
   return ["A", "KIA", "IOSFODNN7EXAMPLE"].join("");
@@ -196,15 +198,76 @@ describe("SecretStore", () => {
       approvalPolicyRules: [policy]
     }, null, 2)}\n`, { mode: 0o600 });
 
-    await store.addSecret({
+    const record = await store.addSecret({
       name: "unrelated legacy credential",
       type: "api-token",
       value: fakeOpenAiToken("legacy_policy"),
-      policy: { injectEnv: "LEGACY_POLICY_TOKEN" }
+      policy: { injectEnv: "LEGACY_POLICY_TOKEN", allowedCommands: [process.execPath] }
     });
 
     const persisted = JSON.parse(await readFile(store.storePath, "utf8"));
     expect(persisted.approvalPolicyRules).toEqual([policy]);
+
+    const request = await store.createRequest(record.handle, buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "LEGACY_POLICY_TOKEN"
+    }), "Codex legacy policy request");
+    expect(request.state).toBe("pending");
+  });
+
+  it("does not reuse a pinned allow policy after a bare command resolves elsewhere", async () => {
+    const firstBin = path.join(tmpHome, "first-bin");
+    const secondBin = path.join(tmpHome, "second-bin");
+    const executableName = process.platform === "win32" ? "policy-tool.exe" : "policy-tool";
+    const firstTool = path.join(firstBin, executableName);
+    const secondTool = path.join(secondBin, executableName);
+    await mkdir(firstBin);
+    await mkdir(secondBin);
+    if (process.platform === "win32") {
+      await copyFile(process.execPath, firstTool);
+      await copyFile(process.execPath, secondTool);
+    } else {
+      await writeFile(firstTool, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      await writeFile(secondTool, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    }
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = firstBin;
+      const store = new SecretStore();
+      const record = await store.addSecret({
+        name: "path-bound policy token",
+        type: "api-token",
+        value: fakeOpenAiToken("path_bound_policy"),
+        policy: { injectEnv: "PATH_BOUND_POLICY_TOKEN", allowedCommands: ["policy-tool"] }
+      });
+      await store.addApprovalPolicyRule({
+        name: "Allow one policy-tool executable",
+        decision: "allow",
+        conditions: {
+          handles: [record.handle],
+          commands: ["policy-tool"],
+          resolvedCommands: [realpathSync.native(firstTool)]
+        }
+      });
+      const action = buildEnvCommandAction({
+        command: "policy-tool",
+        injectEnv: "PATH_BOUND_POLICY_TOKEN"
+      });
+
+      const approved = await store.createRequest(record.handle, action, "Codex pinned policy request");
+      expect(approved.state).toBe("approved");
+      expect(approved.action.resolvedCommand).toBe(realpathSync.native(firstTool));
+
+      process.env.PATH = secondBin;
+      const pending = await store.createRequest(record.handle, action, "Codex changed PATH request");
+      expect(pending.state).toBe("pending");
+      expect(pending.action.resolvedCommand).toBe(realpathSync.native(secondTool));
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
   });
 
   it("updates the injection environment without reading the secret", async () => {
@@ -1011,6 +1074,23 @@ describe("SecretStore", () => {
     expect(rule.name).toBe("Recovered dead lock");
   });
 
+  it("recovers an empty lock directory left by an interrupted release", async () => {
+    const store = new SecretStore();
+    await store.init();
+    const lockPath = `${store.storePath}.lock`;
+    await mkdir(lockPath, { mode: 0o700 });
+    const stale = new Date(Date.now() - 5_000);
+    await utimes(lockPath, stale, stale);
+
+    const rule = await store.addApprovalPolicyRule({
+      name: "Recovered interrupted release",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    expect(rule.name).toBe("Recovered interrupted release");
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("fails closed when recovery evidence exists but no valid ledger remains", async () => {
     const store = new SecretStore();
     await store.addSecret({
@@ -1693,13 +1773,48 @@ describe("SecretStore", () => {
     });
 
     const first = await store.createRequest(record.handle, action, "login session first");
-    await store.approveRequest(first.id);
-    const sameLogin = await store.createRequest(record.handle, action, "same login");
-    expect(sameLogin.state).toBe("approved");
-
     process.env.SGW_LOGIN_SESSION_ID = "login-session-b";
+    const approved = await store.approveRequest(first.id);
+    const grant = (await store.listApprovalGrants()).find((item) => item.id === approved.approvalGrantId);
+    expect(grant?.loginSessionId).toBe("login-session-a");
+
     const differentLogin = await store.createRequest(record.handle, action, "different login");
     expect(differentLogin.state).toBe("pending");
+
+    process.env.SGW_LOGIN_SESSION_ID = "login-session-a";
+    const sameLogin = await store.createRequest(record.handle, action, "same login");
+    expect(sameLogin.state).toBe("approved");
+  });
+
+  it("approves only once when the native login session cannot be identified", async () => {
+    const store = new SecretStore();
+    await store.setApprovalSettings({ mode: "login-session" });
+    const record = await store.addSecret({
+      name: "unidentified login token",
+      type: "api-token",
+      value: "unidentified-login-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_UNIDENTIFIED_LOGIN_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('approved')"],
+      injectEnv: "SGW_UNIDENTIFIED_LOGIN_TOKEN"
+    });
+    delete process.env.SGW_LOGIN_SESSION_ID;
+    vi.spyOn(process, "platform", "get").mockReturnValue("aix");
+
+    const first = await store.createRequest(record.handle, action, "unidentified login first");
+    expect(first.loginSessionId).toBeUndefined();
+    const approved = await store.approveRequest(first.id);
+    expect(approved.state).toBe("approved");
+    expect(approved.approvalGrantId).toBeUndefined();
+    expect(await store.listApprovalGrants()).toEqual([]);
+
+    const second = await store.createRequest(record.handle, action, "unidentified login second");
+    expect(second.state).toBe("pending");
   });
 
   it("can reuse an approval for the same agent and duration from the approval choice", async () => {
@@ -1769,7 +1884,8 @@ describe("SecretStore", () => {
       conditions: {
         handles: [record.handle],
         agents: ["Codex"],
-        commands: [process.execPath]
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
       }
     });
     const action = buildEnvCommandAction({
@@ -1815,7 +1931,11 @@ describe("SecretStore", () => {
     await store.addApprovalPolicyRule({
       name: "Allow opaque permit execution",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -1855,7 +1975,11 @@ describe("SecretStore", () => {
     const rule = await store.addApprovalPolicyRule({
       name: "Allow gated one-shot permit execution",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -1903,7 +2027,11 @@ describe("SecretStore", () => {
     const rule = await store.addApprovalPolicyRule({
       name: "Allow policy-cached 1Password execution",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -2066,7 +2194,11 @@ describe("SecretStore", () => {
       name: "Allow only the primary secret",
       priority: 200,
       decision: "allow",
-      conditions: { handles: [primary.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [primary.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
 
     const incomplete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
@@ -2078,7 +2210,11 @@ describe("SecretStore", () => {
       name: "Allow both injected secrets",
       priority: 100,
       decision: "allow",
-      conditions: { handles: [primary.handle, extra.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [primary.handle, extra.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const complete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
     expect(complete.kind).toBe("reusable");
@@ -2187,6 +2323,7 @@ describe("SecretStore", () => {
         agents: ["Codex"],
         providers: ["github"],
         commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable],
         injectEnvs: ["SGW_POLICY_CODEX_TOKEN"]
       }
     });
@@ -2412,6 +2549,7 @@ describe("SecretStore", () => {
       agents: ["codex"],
       actionKinds: ["env_command"],
       commands: [process.execPath],
+      resolvedCommands: [resolvedNodeExecutable],
       injectEnvs: ["SGW_SCOPED_POLICY"],
       workingDirs: [tmpHome]
     });
@@ -2536,6 +2674,7 @@ describe("SecretStore", () => {
         agents: ["Codex"],
         actionKinds: ["env_command"],
         commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable],
         injectEnvs: ["SGW_EXISTING_POLICY"]
       }
     });
@@ -2643,7 +2782,11 @@ describe("SecretStore", () => {
     const rule = await store.addApprovalPolicyRule({
       name: "Allow revocable policy request",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -3232,10 +3375,14 @@ async function writeNodeBackedFakeOp(name: string, behavior: string): Promise<st
   const executableName = process.platform === "win32" ? `${name}.exe` : name;
   const fakeOp = path.join(tmpHome, executableName);
   const preload = path.join(tmpHome, `${name} preload.cjs`);
-  try {
-    await link(process.execPath, fakeOp);
-  } catch {
+  if (process.platform === "win32") {
     await copyFile(process.execPath, fakeOp);
+  } else {
+    try {
+      await link(process.execPath, fakeOp);
+    } catch {
+      await copyFile(process.execPath, fakeOp);
+    }
   }
   await chmod(fakeOp, 0o755);
   await writeFile(preload, `
@@ -3252,7 +3399,8 @@ if (sameExecutable) {
   ${behavior}
 }
 `);
-  const preloadOption = `--require="${preload.replaceAll('"', '\\"')}"`;
+  const preloadPath = process.platform === "win32" ? preload.replaceAll("\\", "/") : preload;
+  const preloadOption = `--require="${preloadPath.replaceAll('"', '\\"')}"`;
   process.env.NODE_OPTIONS = [originalNodeOptions, preloadOption].filter(Boolean).join(" ");
   return fakeOp;
 }

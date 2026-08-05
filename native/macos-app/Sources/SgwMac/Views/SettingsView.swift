@@ -442,6 +442,10 @@ struct PolicyRuleEditor: View {
           }
 
           TextField("Command", text: $draft.command)
+          TextField("Resolved executable", text: $draft.resolvedCommand)
+          Text("Allow command policies require an exact executable path.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
           TextField("Environment name", text: $draft.injectEnv)
 
           HStack {

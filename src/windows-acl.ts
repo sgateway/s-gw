@@ -1,9 +1,13 @@
 import { spawn } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
+import {
+  trustedWindowsSystemExecutableSync,
+  trustedWindowsSystemRootSync,
+  windowsSystemEnvironment
+} from "./windows-system.js";
 
 const ACL_TIMEOUT_MS = 10_000;
-const WINDOWS_GLOBAL_SYSTEM_ROOT = String.raw`\\?\GLOBALROOT\SystemRoot`;
 
 const WINDOWS_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -12,60 +16,194 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [Console]::OutputEncoding
 
 $mode = $env:SGW_WINDOWS_ACL_MODE
-$target = [System.IO.Path]::GetFullPath($env:SGW_WINDOWS_ACL_PATH)
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $currentSid = $identity.User.Value
 $systemSid = 'S-1-5-18'
+$administratorsSid = 'S-1-5-32-544'
+$creatorOwnerSid = 'S-1-3-0'
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+$full = [System.Security.AccessControl.FileSystemRights]::FullControl
+$inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagation = [System.Security.AccessControl.PropagationFlags]::None
+$accessAndOwner = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+$target = $null
 
-if ((New-Object System.Uri($target)).IsUnc) {
-  throw 'The SSH temporary path must not use a UNC location.'
+trap {
+  if ($mode -eq 'create-directory' -and $target -and [System.IO.Directory]::Exists($target)) {
+    try { [System.IO.Directory]::Delete($target, $false) } catch {}
+  }
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
 }
-$volumeRoot = [System.IO.Path]::GetPathRoot($target)
-$volume = New-Object System.IO.DriveInfo($volumeRoot)
-if ($volume.DriveType -ne [System.IO.DriveType]::Fixed) {
-  throw 'The SSH temporary path must use a fixed local volume.'
+
+function Test-SamePath([string]$left, [string]$right) {
+  return [string]::Equals(
+    $left.TrimEnd([System.IO.Path]::DirectorySeparatorChar),
+    $right.TrimEnd([System.IO.Path]::DirectorySeparatorChar),
+    [System.StringComparison]::OrdinalIgnoreCase
+  )
+}
+
+function Assert-LocalFixedPath([string]$inputPath) {
+  if (-not $inputPath) {
+    throw 'The SSH credential root is unavailable.'
+  }
+  $fullPath = [System.IO.Path]::GetFullPath($inputPath)
+  if ((New-Object System.Uri($fullPath)).IsUnc) {
+    throw 'The SSH temporary path must not use a UNC location.'
+  }
+  $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+  $volume = New-Object System.IO.DriveInfo($volumeRoot)
+  if ($volume.DriveType -ne [System.IO.DriveType]::Fixed) {
+    throw 'The SSH temporary path must use a fixed local volume.'
+  }
+  return $fullPath
+}
+
+function Get-StableDirectory([string]$dirPath) {
+  $dirInfo = [System.IO.DirectoryInfo]::new($dirPath)
+  $dirInfo.Refresh()
+  if (-not $dirInfo.Exists) {
+    throw 'The SSH credential directory does not exist.'
+  }
+  if (($dirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-SamePath $dirInfo.FullName $dirPath)) {
+    throw 'The SSH credential path is not a stable local directory.'
+  }
+  return $dirInfo
+}
+
+function Assert-TrustedAncestor([string]$dirPath, [bool]$isAuthRoot) {
+  $dirInfo = Get-StableDirectory $dirPath
+  $acl = $dirInfo.GetAccessControl($accessAndOwner)
+  $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+  if ($ownerSid -ne $currentSid -and $ownerSid -ne $systemSid -and $ownerSid -ne $administratorsSid) {
+    throw ('The SSH credential ancestor has an unexpected owner: ' + $ownerSid)
+  }
+
+  $unsafeRights = (
+    [System.Security.AccessControl.FileSystemRights]::Delete -bor
+    [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+  )
+  if ($isAuthRoot) {
+    $unsafeRights = $unsafeRights -bor [System.Security.AccessControl.FileSystemRights]::Write
+  }
+
+  $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  foreach ($rule in $rules) {
+    if ($rule.AccessControlType -ne $allow) {
+      continue
+    }
+    $sid = $rule.IdentityReference.Value
+    if ($sid -eq $currentSid -or $sid -eq $systemSid -or $sid -eq $administratorsSid -or $sid -eq $creatorOwnerSid) {
+      continue
+    }
+    if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+      continue
+    }
+    if (($rule.FileSystemRights -band $unsafeRights) -ne 0) {
+      throw ('The SSH credential ancestor grants unsafe access to ' + $sid)
+    }
+  }
+}
+
+function Get-AuthRoot() {
+  if ($env:SGW_WINDOWS_ACL_TEST_ROOT) {
+    return (Assert-LocalFixedPath $env:SGW_WINDOWS_ACL_TEST_ROOT)
+  }
+  return (Assert-LocalFixedPath ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::LocalApplicationData)))
+}
+
+function Assert-TrustedRootChain([string]$rootPath) {
+  $profilePath = Assert-LocalFixedPath ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile))
+  $profilePrefix = $profilePath.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+  if (-not (Test-SamePath $rootPath $profilePath) -and -not $rootPath.StartsWith($profilePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The SSH credential root must stay inside the current local user profile.'
+  }
+
+  $paths = New-Object 'System.Collections.Generic.List[string]'
+  $cursor = $rootPath
+  while ($true) {
+    $paths.Add($cursor)
+    if (Test-SamePath $cursor $profilePath) {
+      break
+    }
+    $parent = [System.IO.Directory]::GetParent($cursor)
+    if (-not $parent) {
+      throw 'The SSH credential root could not be anchored to the current profile.'
+    }
+    $cursor = $parent.FullName
+  }
+  $profileParent = [System.IO.Directory]::GetParent($profilePath)
+  if ($profileParent) {
+    $paths.Add($profileParent.FullName)
+  }
+  foreach ($pathEntry in $paths) {
+    Assert-TrustedAncestor $pathEntry (Test-SamePath $pathEntry $rootPath)
+  }
+}
+
+function New-PrivateDirectorySecurity() {
+  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+  $acl.SetOwner($identity.User)
+  $acl.SetAccessRuleProtection($true, $false)
+  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, $full, $inherit, $propagation, $allow))
+  if ($currentSid -ne $systemSid) {
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($systemSid), $full, $inherit, $propagation, $allow))
+  }
+  return $acl
 }
 
 if ($env:SGW_WINDOWS_ACL_EXPECTED_SID -and $env:SGW_WINDOWS_ACL_EXPECTED_SID -ne $currentSid) {
   throw 'The Windows identity changed while preparing the SSH key.'
 }
 
-if ($mode -eq 'apply-directory') {
-  if (-not [System.IO.Directory]::Exists($target)) {
-    throw 'The SSH temporary directory does not exist.'
+if ($mode -eq 'create-directory') {
+  $root = Get-AuthRoot
+  Assert-TrustedRootChain $root
+  for ($attempt = 0; $attempt -lt 8; $attempt += 1) {
+    $candidate = [System.IO.Path]::Combine($root, 's-gw-ssh-' + [System.Guid]::NewGuid().ToString('N'))
+    if (-not [System.IO.Directory]::Exists($candidate)) {
+      $target = $candidate
+      break
+    }
   }
-  $dirInfo = [System.IO.DirectoryInfo]::new($target)
-  if (($dirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $dirInfo.FullName -ne $target) {
-    throw 'The SSH temporary directory is not a stable local directory.'
+  if (-not $target) {
+    throw 'Could not reserve a private Windows SSH directory name.'
   }
-
-  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-  $acl.SetAccessRuleProtection($true, $false)
-  $acl.SetOwner($identity.User)
-  $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-  $propagation = [System.Security.AccessControl.PropagationFlags]::None
-  $allow = [System.Security.AccessControl.AccessControlType]::Allow
-  $full = [System.Security.AccessControl.FileSystemRights]::FullControl
-  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, $full, $inherit, $propagation, $allow))
-  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($systemSid), $full, $inherit, $propagation, $allow))
-  $dirInfo.SetAccessControl($acl)
+  $null = [System.IO.Directory]::CreateDirectory($target, (New-PrivateDirectorySecurity))
+} else {
+  $target = Assert-LocalFixedPath $env:SGW_WINDOWS_ACL_PATH
+  $root = Get-AuthRoot
+  $authDir = $target
+  if ($mode -eq 'verify-file') {
+    $authDir = [System.IO.Directory]::GetParent($target).FullName
+  } elseif ($mode -ne 'verify-directory') {
+    throw 'Unsupported Windows ACL operation.'
+  }
+  $authParent = [System.IO.Directory]::GetParent($authDir)
+  $authName = [System.IO.Path]::GetFileName($authDir)
+  if (-not $authParent -or -not (Test-SamePath $authParent.FullName $root) -or $authName -cnotmatch '^s-gw-ssh-[0-9a-f]{32}$') {
+    throw 'The SSH credential path escaped its trusted per-user root.'
+  }
 }
+
+Assert-TrustedRootChain $root
 
 if ($mode -eq 'verify-file') {
   if (-not [System.IO.File]::Exists($target)) {
     throw 'The SSH private-key file does not exist.'
   }
   $fileInfo = [System.IO.FileInfo]::new($target)
-  if (($fileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $fileInfo.FullName -ne $target) {
+  $fileInfo.Refresh()
+  if (($fileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-SamePath $fileInfo.FullName $target)) {
     throw 'The SSH private-key path is not a stable local file.'
   }
-  $acl = $fileInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
-} elseif ($mode -eq 'apply-directory' -or $mode -eq 'verify-directory') {
-  $dirInfo = [System.IO.DirectoryInfo]::new($target)
-  if (($dirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $dirInfo.FullName -ne $target) {
-    throw 'The SSH temporary directory is not a stable local directory.'
-  }
-  $acl = $dirInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner)
+  $acl = $fileInfo.GetAccessControl($accessAndOwner)
+} elseif ($mode -eq 'create-directory' -or $mode -eq 'verify-directory') {
+  $dirInfo = Get-StableDirectory $target
+  $acl = $dirInfo.GetAccessControl($accessAndOwner)
   if (-not $acl.AreAccessRulesProtected) {
     throw 'The SSH temporary directory still inherits access rules.'
   }
@@ -80,6 +218,7 @@ if ($ownerSid -ne $currentSid) {
 
 $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
 $currentSeen = $false
+$systemSeen = $false
 foreach ($rule in $rules) {
   $sid = $rule.IdentityReference.Value
   if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
@@ -94,18 +233,44 @@ foreach ($rule in $rules) {
   if ($sid -eq $currentSid) {
     $currentSeen = $true
   }
+  if ($sid -eq $systemSid) {
+    $systemSeen = $true
+  }
+  if ($mode -ne 'verify-file') {
+    if ($rule.IsInherited -or $rule.InheritanceFlags -ne $inherit -or $rule.PropagationFlags -ne $propagation) {
+      throw ('The SSH temporary directory has incomplete child protection for ' + $sid)
+    }
+  }
 }
 
 if (-not $currentSeen) {
   throw 'The current Windows identity does not control the SSH temporary path.'
 }
+if (-not $systemSeen) {
+  throw 'The Windows SYSTEM identity does not control the SSH temporary path.'
+}
+$expectedRuleCount = 2
+if ($currentSid -eq $systemSid) {
+  $expectedRuleCount = 1
+}
+if ($rules.Count -ne $expectedRuleCount) {
+  throw 'The SSH temporary path does not have the expected access-rule count.'
+}
 
-[Console]::Out.WriteLine('{"verified":true,"sid":"' + $currentSid + '","rules":' + $rules.Count + '}')
+Assert-TrustedRootChain $root
+$result = @{ verified = $true; sid = $currentSid; rules = $rules.Count }
+if ($mode -eq 'create-directory') {
+  $result.path = $target
+}
+[Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
 `;
 
-export async function applyPrivateWindowsDirectoryAcl(dirPath: string): Promise<string> {
-  const result = await runAclOperation("apply-directory", dirPath);
-  return result.sid;
+export async function createPrivateWindowsSshDirectory(): Promise<{ dirPath: string; sid: string }> {
+  const result = await runAclOperation("create-directory", "");
+  if (!result.path) {
+    throw new Error("Windows ACL verification did not return the private SSH directory.");
+  }
+  return { dirPath: result.path, sid: result.sid };
 }
 
 export async function verifyPrivateWindowsKeyFile(filePath: string, expectedSid: string): Promise<void> {
@@ -117,6 +282,7 @@ interface AclResult {
   verified: true;
   sid: string;
   rules: number;
+  path?: string;
 }
 
 async function runAclOperation(mode: string, target: string, expectedSid?: string): Promise<AclResult> {
@@ -131,6 +297,17 @@ async function runAclOperation(mode: string, target: string, expectedSid?: strin
   const env = windowsSystemEnv(systemRoot);
   env.SGW_WINDOWS_ACL_MODE = mode;
   env.SGW_WINDOWS_ACL_PATH = target;
+  if (process.env.SGW_TEST_MODE === "1") {
+    const configuredRoot = process.env.SGW_TEST_HOME_ROOT?.trim();
+    if (!configuredRoot) {
+      throw new Error("SGW_TEST_HOME_ROOT is required for Windows SSH ACL tests.");
+    }
+    const testRoot = await realpath(configuredRoot).catch(() => "");
+    if (!testRoot || !path.isAbsolute(testRoot)) {
+      throw new Error("The Windows SSH ACL test root could not be validated.");
+    }
+    env.SGW_WINDOWS_ACL_TEST_ROOT = testRoot;
+  }
   if (expectedSid) {
     env.SGW_WINDOWS_ACL_EXPECTED_SID = expectedSid;
   }
@@ -142,6 +319,7 @@ async function runAclOperation(mode: string, target: string, expectedSid?: strin
     "-ExecutionPolicy", "Bypass",
     "-EncodedCommand", encoded
   ], {
+    cwd: path.dirname(powershell),
     env,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
@@ -182,83 +360,35 @@ async function runAclOperation(mode: string, target: string, expectedSid?: strin
   } catch {
     throw new Error("Windows ACL verification returned an invalid response.");
   }
-  if (!isAclResult(parsed) || (expectedSid && parsed.sid !== expectedSid)) {
+  if (!isAclResult(parsed, mode === "create-directory") || (expectedSid && parsed.sid !== expectedSid)) {
     throw new Error("Windows ACL verification did not confirm the current user boundary.");
   }
   return parsed;
 }
 
 export async function trustedWindowsSystemExecutable(...parts: string[]): Promise<string> {
-  const systemRoot = await trustedWindowsSystemRoot();
-  return trustedWindowsSystemExecutableAtRoot(systemRoot, ...parts);
+  return trustedWindowsSystemExecutableSync(...parts);
 }
 
 export async function trustedWindowsSystemRoot(): Promise<string> {
-  if (path.sep !== "\\") {
-    return simulatedWindowsSystemRoot();
-  }
-
-  const info = await lstat(WINDOWS_GLOBAL_SYSTEM_ROOT).catch(() => undefined);
-  if (!info?.isDirectory()) {
-    throw new Error("The kernel-anchored Windows system directory is unavailable.");
-  }
-  const systemRoot = await realpath(WINDOWS_GLOBAL_SYSTEM_ROOT).catch(() => "");
-  if (!systemRoot || !path.isAbsolute(systemRoot)) {
-    throw new Error("The kernel-anchored Windows system directory could not be resolved.");
-  }
-  return systemRoot;
-}
-
-async function simulatedWindowsSystemRoot(): Promise<string> {
-  if (process.env.SGW_TEST_MODE !== "1") {
-    throw new Error("A simulated Windows system directory is allowed only in isolated test mode.");
-  }
-  const systemRoot = process.env.SystemRoot?.trim();
-  const winDir = process.env.WINDIR?.trim();
-  if (!systemRoot || !winDir) {
-    throw new Error("Windows SystemRoot and WINDIR are required to test SSH private-key protection.");
-  }
-  const resolvedRoot = path.resolve(systemRoot);
-  if (!sameWindowsPath(resolvedRoot, path.resolve(winDir))) {
-    throw new Error("Windows SystemRoot and WINDIR do not identify the same test directory.");
-  }
-  const realRoot = await realpath(resolvedRoot).catch(() => "");
-  if (!realRoot || !sameWindowsPath(realRoot, resolvedRoot)) {
-    throw new Error("The simulated Windows system directory could not be validated.");
-  }
-  return realRoot;
+  return trustedWindowsSystemRootSync();
 }
 
 async function trustedWindowsSystemExecutableAtRoot(systemRoot: string, ...parts: string[]): Promise<string> {
-  const candidate = path.join(systemRoot, "System32", ...parts);
-  const info = await lstat(candidate).catch(() => undefined);
-  if (!info?.isFile() || info.isSymbolicLink()) {
-    throw new Error("A required trusted Windows system executable is unavailable; refusing to materialize the SSH key.");
+  if (!sameWindowsPath(trustedWindowsSystemRootSync(), systemRoot)) {
+    throw new Error("Trusted Windows system executable path validation failed.");
   }
-
-  const realCandidate = await realpath(candidate).catch(() => "");
-  if (!realCandidate || !sameWindowsPath(realCandidate, candidate)) {
-    throw new Error("Trusted Windows system executable path validation failed; refusing to materialize the SSH key.");
-  }
-  return realCandidate;
+  return trustedWindowsSystemExecutableSync(...parts);
 }
 
 function windowsSystemEnv(systemRoot: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    SystemRoot: systemRoot,
-    WINDIR: systemRoot,
-    PATH: `${path.join(systemRoot, "System32")};${systemRoot}`
-  };
-  for (const key of ["USERPROFILE", "TEMP", "TMP"]) {
-    const value = process.env[key];
-    if (value) {
-      env[key] = value;
-    }
-  }
+  const env = windowsSystemEnvironment();
+  env.SystemRoot = systemRoot;
+  env.WINDIR = systemRoot;
   return env;
 }
 
-function isAclResult(value: unknown): value is AclResult {
+function isAclResult(value: unknown, requirePath: boolean): value is AclResult {
   if (!value || typeof value !== "object") {
     return false;
   }
@@ -267,8 +397,8 @@ function isAclResult(value: unknown): value is AclResult {
     && typeof result.sid === "string"
     && /^S-\d+(?:-\d+)+$/.test(result.sid)
     && Number.isInteger(result.rules)
-    && Number(result.rules) >= 1
-    && Number(result.rules) <= 2;
+    && Number(result.rules) === (result.sid === "S-1-5-18" ? 1 : 2)
+    && (!requirePath || (typeof result.path === "string" && path.isAbsolute(result.path)));
 }
 
 function sameWindowsPath(left: string, right: string): boolean {

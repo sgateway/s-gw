@@ -106,6 +106,7 @@ export interface PolicyInput {
   minSeverity?: SecretSeverity | null;
   actionKinds?: string[];
   commands?: string[];
+  resolvedCommands?: string[];
   injectEnvs?: string[];
   workingDirs?: string[];
   sshTargets?: string[];

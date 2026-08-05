@@ -1,22 +1,52 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ensureWindowsConsole,
   getPackageLayout,
+  installWindowsLoginService,
   openWindowsHelper,
   restartWindowsSurfaces,
   selectWindowsHelperPid,
   startWindowsConsole,
-  stopWindowsSurfaces
+  stopInstalledWindowsLoginService,
+  stopWindowsSurfaces,
+  uninstallWindowsLoginService,
+  windowsLoginServiceStatus
 } from "../src/install.js";
 import { getSgwInstanceKey } from "../src/paths.js";
+import { deleteKeychainPassphrase, setKeychainPassphrase } from "../src/unlock.js";
 
 const repoRoot = process.cwd();
+let authorityEnvironment: NodeJS.ProcessEnv | undefined;
+
+beforeEach(() => {
+  if (process.platform !== "win32") return;
+  authorityEnvironment = { ...process.env };
+  delete process.env.SGW_DISABLE_KEYCHAIN;
+  delete process.env.SGW_MASTER_PASSPHRASE;
+  delete process.env.SGW_WINDOWS_CREDENTIAL_HELPER;
+  process.env.SGW_KEYCHAIN_SERVICE = `com.s-gw.test.windows-client.${process.pid}.${Date.now()}`;
+  process.env.SGW_KEYCHAIN_ACCOUNT = `vitest-${process.pid}`;
+  setKeychainPassphrase(`windows-client-test-${process.pid}-${Date.now()}`);
+});
+
+afterEach(async () => {
+  if (process.platform !== "win32" || !authorityEnvironment) return;
+  try {
+    await uninstallWindowsLoginService();
+  } catch {
+    // A test asserting an unmanaged collision owns its fixture cleanup.
+  }
+  stopWindowsSurfaces();
+  deleteKeychainPassphrase();
+  process.env = authorityEnvironment;
+  authorityEnvironment = undefined;
+});
 
 describe("Windows client packaging", () => {
   it("selects helpers only from the current Windows user session", () => {
@@ -95,7 +125,7 @@ describe("Windows client packaging", () => {
     if (process.platform !== "win32") return;
     execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
     const layout = getPackageLayout();
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-bootstrap-home-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-bootstrap-home-"));
     const helperPath = layout.windowsHelperScriptPath;
     const bootstrapPath = path.join(
       path.dirname(layout.windowsHelperBootstrapPath),
@@ -133,7 +163,6 @@ describe("Windows client packaging", () => {
           ...process.env,
           SGW_HOME: home,
           SGW_RECOVERY_HOME: `${home}-recovery`,
-          SGW_MASTER_PASSPHRASE: "windows bootstrap failure passphrase",
           SGW_DISABLE_UPDATE_CHECK: "1",
           SGW_NODE_PATH: process.execPath,
           SGW_CLI_PATH: layout.cliPath,
@@ -154,7 +183,7 @@ describe("Windows client packaging", () => {
       }
       expect(residues).toEqual([]);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsSurfaces({ port });
       await rm(bootstrapPath, { force: true });
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
@@ -163,31 +192,28 @@ describe("Windows client packaging", () => {
 
   it("restores a running console after an update failure", async () => {
     if (process.platform !== "win32") return;
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-restart-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-restart-"));
     const port = await freePort();
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
     const oldUpdateCheck = process.env.SGW_DISABLE_UPDATE_CHECK;
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows restart test passphrase";
     process.env.SGW_DISABLE_UPDATE_CHECK = "1";
 
     try {
       startWindowsConsole({ port });
       await waitForHealth(port);
-      const stopped = stopWindowsSurfaces();
+      const stopped = stopWindowsSurfaces({ port });
       expect(stopped.console).toBe(true);
       expect(stopped.pids.length).toBeGreaterThan(0);
 
       await restartWindowsSurfaces(stopped, { port });
       await waitForHealth(port);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsSurfaces({ port });
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
       restoreEnv("SGW_DISABLE_UPDATE_CHECK", oldUpdateCheck);
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
@@ -196,20 +222,18 @@ describe("Windows client packaging", () => {
 
   it("reuses a directly started console with default host and port arguments", async () => {
     if (process.platform !== "win32") return;
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-default-console-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-default-console-"));
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
     const oldUpdateCheck = process.env.SGW_DISABLE_UPDATE_CHECK;
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows default console passphrase";
     process.env.SGW_DISABLE_UPDATE_CHECK = "1";
     const layout = getPackageLayout();
     let consoleProcess: ReturnType<typeof spawn> | undefined;
 
     try {
-      stopWindowsSurfaces();
+      stopWindowsSurfaces({ port: 8718 });
       consoleProcess = spawn(process.execPath, [layout.cliPath, "console", "--no-open"], {
         cwd: repoRoot,
         env: process.env,
@@ -220,11 +244,10 @@ describe("Windows client packaging", () => {
       const existing = await ensureWindowsConsole({ port: 8718 });
       expect(existing.pid).toBeUndefined();
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsSurfaces({ port: 8718 });
       consoleProcess?.kill();
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
       restoreEnv("SGW_DISABLE_UPDATE_CHECK", oldUpdateCheck);
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
@@ -233,16 +256,14 @@ describe("Windows client packaging", () => {
 
   it("reuses one tray helper across repeated opens", async () => {
     if (process.platform !== "win32") return;
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-helper-"));
-    const otherHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-helper-other-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-"));
+    const otherHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-other-"));
     const port = await freePort();
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
     const oldUpdateCheck = process.env.SGW_DISABLE_UPDATE_CHECK;
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows helper test passphrase";
     process.env.SGW_DISABLE_UPDATE_CHECK = "1";
 
     try {
@@ -285,10 +306,9 @@ describe("Windows client packaging", () => {
         consoleUrl: `http://127.0.0.1:${otherPort}/`
       })).rejects.toThrow(/must match --port/);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsSurfaces({ port });
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
       restoreEnv("SGW_DISABLE_UPDATE_CHECK", oldUpdateCheck);
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
@@ -299,15 +319,13 @@ describe("Windows client packaging", () => {
 
   it("rejects a healthy console from another credential home", async () => {
     if (process.platform !== "win32") return;
-    const firstHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-console-first-"));
-    const otherHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-console-other-"));
+    const firstHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-console-first-"));
+    const otherHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-console-other-"));
     const port = await freePort();
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
     process.env.SGW_HOME = firstHome;
     process.env.SGW_RECOVERY_HOME = `${firstHome}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows console identity passphrase";
 
     try {
       startWindowsConsole({ port });
@@ -317,10 +335,9 @@ describe("Windows client packaging", () => {
       process.env.SGW_RECOVERY_HOME = `${otherHome}-recovery`;
       await expect(ensureWindowsConsole({ port })).rejects.toThrow(/another credential home/);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsAuthority(firstHome, `${firstHome}-recovery`, port);
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
       await rm(firstHome, { recursive: true, force: true });
       await rm(`${firstHome}-recovery`, { recursive: true, force: true });
       await rm(otherHome, { recursive: true, force: true });
@@ -328,15 +345,44 @@ describe("Windows client packaging", () => {
     }
   }, 30_000);
 
+  it("stops only the requested Windows credential authority", async () => {
+    if (process.platform !== "win32") return;
+    const firstHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-stop-first-"));
+    const secondHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-stop-second-"));
+    const firstPort = await freePort();
+    const secondPort = await freePort();
+
+    try {
+      process.env.SGW_HOME = firstHome;
+      process.env.SGW_RECOVERY_HOME = `${firstHome}-recovery`;
+      startWindowsConsole({ port: firstPort });
+      await waitForHealth(firstPort);
+
+      process.env.SGW_HOME = secondHome;
+      process.env.SGW_RECOVERY_HOME = `${secondHome}-recovery`;
+      startWindowsConsole({ port: secondPort });
+      await waitForHealth(secondPort);
+
+      stopWindowsAuthority(firstHome, `${firstHome}-recovery`, firstPort);
+      await waitForHealthToStop(firstPort);
+      await waitForHealth(secondPort);
+    } finally {
+      stopWindowsAuthority(firstHome, `${firstHome}-recovery`, firstPort);
+      stopWindowsAuthority(secondHome, `${secondHome}-recovery`, secondPort);
+      await rm(firstHome, { recursive: true, force: true });
+      await rm(`${firstHome}-recovery`, { recursive: true, force: true });
+      await rm(secondHome, { recursive: true, force: true });
+      await rm(`${secondHome}-recovery`, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("rejects a matching health response from a different listener process", async () => {
     if (process.platform !== "win32") return;
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-listener-owner-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-listener-owner-"));
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows listener owner passphrase";
     const server = createServer((request, response) => {
       if (request.url !== "/api/health") {
         response.writeHead(404).end();
@@ -358,7 +404,6 @@ describe("Windows client packaging", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
@@ -366,17 +411,13 @@ describe("Windows client packaging", () => {
 
   it("does not open another credential home's console in the browser", async () => {
     if (process.platform !== "win32") return;
-    const firstHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-browser-first-"));
-    const otherHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-browser-other-"));
+    const firstHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-browser-first-"));
+    const otherHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-browser-other-"));
     const port = await freePort();
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
-    const oldDisableKeychain = process.env.SGW_DISABLE_KEYCHAIN;
     process.env.SGW_HOME = firstHome;
     process.env.SGW_RECOVERY_HOME = `${firstHome}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows browser authority passphrase";
-    process.env.SGW_DISABLE_KEYCHAIN = "1";
 
     try {
       startWindowsConsole({ port });
@@ -389,18 +430,15 @@ describe("Windows client packaging", () => {
       };
       await expect(runProcess(process.execPath, [
         layout.cliPath,
-        "start",
-        "--no-service",
-        "--no-menubar",
+        "app",
+        "open",
         "--port",
         String(port)
       ], env)).rejects.toThrow(/another credential home|credential authority/i);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsAuthority(firstHome, `${firstHome}-recovery`, port);
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
-      restoreEnv("SGW_DISABLE_KEYCHAIN", oldDisableKeychain);
       await rm(firstHome, { recursive: true, force: true });
       await rm(`${firstHome}-recovery`, { recursive: true, force: true });
       await rm(otherHome, { recursive: true, force: true });
@@ -411,21 +449,20 @@ describe("Windows client packaging", () => {
   it("returns one live tray helper when two CLI opens race", async () => {
     if (process.platform !== "win32") return;
     execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-helper-race-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-race-"));
     const port = await freePort();
     const layout = getPackageLayout();
     const testEnv = {
       ...process.env,
       SGW_HOME: home,
       SGW_RECOVERY_HOME: `${home}-recovery`,
-      SGW_MASTER_PASSPHRASE: "windows helper race passphrase",
       SGW_DISABLE_UPDATE_CHECK: "1",
       SGW_NODE_PATH: process.execPath,
       SGW_CLI_PATH: layout.cliPath,
       SGW_CONSOLE_URL: `http://127.0.0.1:${port}/`
     };
     try {
-      stopWindowsSurfaces();
+      stopWindowsAuthority(home, `${home}-recovery`, port);
       const args = [layout.cliPath, "menubar", "open", "--port", String(port)];
       const opened = await Promise.all([
         runProcess(process.execPath, args, testEnv),
@@ -439,7 +476,7 @@ describe("Windows client packaging", () => {
       expect(returnedPids[0]).toBe(pids[0]);
       expect(() => process.kill(returnedPids[0], 0)).not.toThrow();
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsAuthority(home, `${home}-recovery`, port);
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
@@ -448,13 +485,12 @@ describe("Windows client packaging", () => {
   it("keeps one authority when two credential homes race on one port", async () => {
     if (process.platform !== "win32") return;
     execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
-    const firstHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-helper-authority-a-"));
-    const secondHome = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-helper-authority-b-"));
+    const firstHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-authority-a-"));
+    const secondHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-authority-b-"));
     const port = await freePort();
     const layout = getPackageLayout();
     const baseEnv = {
       ...process.env,
-      SGW_MASTER_PASSPHRASE: "windows helper authority race passphrase",
       SGW_DISABLE_UPDATE_CHECK: "1",
       SGW_NODE_PATH: process.execPath,
       SGW_CLI_PATH: layout.cliPath,
@@ -463,7 +499,8 @@ describe("Windows client packaging", () => {
     const args = [layout.cliPath, "helper", "open", "--port", String(port)];
 
     try {
-      stopWindowsSurfaces();
+      stopWindowsAuthority(firstHome, `${firstHome}-recovery`, port);
+      stopWindowsAuthority(secondHome, `${secondHome}-recovery`, port);
       const results = await Promise.allSettled([
         runProcess(process.execPath, args, {
           ...baseEnv,
@@ -486,7 +523,8 @@ describe("Windows client packaging", () => {
       expect(pids).toHaveLength(1);
       expect(Number(JSON.parse(succeeded[0].value).pid)).toBe(pids[0]);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsAuthority(firstHome, `${firstHome}-recovery`, port);
+      stopWindowsAuthority(secondHome, `${secondHome}-recovery`, port);
       await rm(firstHome, { recursive: true, force: true });
       await rm(`${firstHome}-recovery`, { recursive: true, force: true });
       await rm(secondHome, { recursive: true, force: true });
@@ -496,17 +534,13 @@ describe("Windows client packaging", () => {
 
   it("starts headless and stops every Windows surface through the CLI", async () => {
     if (process.platform !== "win32") return;
-    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-windows-lifecycle-"));
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-lifecycle-"));
     const port = await freePort();
     const oldHome = process.env.SGW_HOME;
     const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
-    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
-    const oldDisableKeychain = process.env.SGW_DISABLE_KEYCHAIN;
     const oldUpdateCheck = process.env.SGW_DISABLE_UPDATE_CHECK;
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
-    process.env.SGW_MASTER_PASSPHRASE = "windows lifecycle test passphrase";
-    process.env.SGW_DISABLE_KEYCHAIN = "1";
     process.env.SGW_DISABLE_UPDATE_CHECK = "1";
     const testEnv = {
       ...process.env,
@@ -521,8 +555,15 @@ describe("Windows client packaging", () => {
         "--no-menubar"
       ], testEnv));
       expect(started.ok).toBe(true);
-      expect(started.console.consoleUrl).toBe(`http://127.0.0.1:${port}/`);
-      expect(started.helper).toBeUndefined();
+      expect(started.service).toMatchObject({
+        installed: true,
+        managed: true,
+        current: true,
+        enabled: true,
+        active: true,
+        helperActive: false,
+        config: { port, tray: false }
+      });
       await waitForHealth(port);
 
       const existing = await ensureWindowsConsole({ port });
@@ -532,17 +573,139 @@ describe("Windows client packaging", () => {
       expect(stopped.ok).toBe(true);
       expect(stopped.windows.console).toBe(true);
       await waitForHealthToStop(port);
+
+      const inactive = JSON.parse(runBuiltCli(["service", "status"], testEnv));
+      expect(inactive).toMatchObject({ installed: true, enabled: true, active: false });
+
+      const restarted = JSON.parse(runBuiltCli(["service", "start"], testEnv));
+      expect(restarted).toMatchObject({ installed: true, active: true, helperActive: false });
+      await waitForHealth(port);
+
+      const uninstalled = JSON.parse(runBuiltCli(["service", "uninstall"], testEnv));
+      expect(uninstalled).toMatchObject({ installed: false, enabled: false, active: false });
+      await waitForHealthToStop(port);
     } finally {
-      stopWindowsSurfaces();
+      stopWindowsSurfaces({ port });
       restoreEnv("SGW_HOME", oldHome);
       restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
-      restoreEnv("SGW_MASTER_PASSPHRASE", oldPassphrase);
-      restoreEnv("SGW_DISABLE_KEYCHAIN", oldDisableKeychain);
       restoreEnv("SGW_DISABLE_UPDATE_CHECK", oldUpdateCheck);
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("persists alternate Windows authority settings and optional tray without credential environment", async () => {
+    if (process.platform !== "win32") return;
+    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
+    const authorityRoot = path.join(windowsTestRoot(), `Windows authority 漢字 é ${Date.now()}`);
+    const home = path.join(authorityRoot, "ledger home");
+    const recovery = path.join(authorityRoot, "recovery home");
+    await mkdir(home, { recursive: true });
+    await mkdir(recovery, { recursive: true });
+    const oldHome = process.env.SGW_HOME;
+    const oldRecovery = process.env.SGW_RECOVERY_HOME;
+    const oldBackend = process.env.SGW_SECRET_BACKEND;
+    const oldEngine = process.env.SGW_EXECUTION_ENGINE;
+    const oldAwsSecret = process.env.AWS_SECRET_ACCESS_KEY;
+    const oldNodeOptions = process.env.NODE_OPTIONS;
+    const port = await freePort();
+    const sentinel = `windows-startup-secret-${process.pid}-${Date.now()}`;
+    process.env.SGW_HOME = home;
+    process.env.SGW_RECOVERY_HOME = recovery;
+    process.env.SGW_SECRET_BACKEND = "  KEYCHAIN ";
+    process.env.SGW_EXECUTION_ENGINE = "  TYPESCRIPT ";
+    process.env.AWS_SECRET_ACCESS_KEY = sentinel;
+    process.env.NODE_OPTIONS = `--require=C:\\missing\\${sentinel}.cjs`;
+
+    try {
+      const installed = await installWindowsLoginService({ port, start: true, tray: true });
+      expect(installed).toMatchObject({
+        installed: true,
+        managed: true,
+        current: true,
+        active: true,
+        helperActive: true,
+        config: {
+          port,
+          tray: true,
+          env: {
+            SGW_HOME: home,
+            SGW_RECOVERY_HOME: recovery,
+            SGW_SECRET_BACKEND: "keychain",
+            SGW_EXECUTION_ENGINE: "typescript"
+          }
+        }
+      });
+      expect(JSON.stringify(installed)).not.toContain(sentinel);
+      expect((await readFile(installed.shortcutPath)).includes(Buffer.from(sentinel))).toBe(false);
+
+      const stopped = await stopInstalledWindowsLoginService();
+      expect(stopped).toMatchObject({ installed: true, enabled: true, active: false, helperActive: false });
+      expect(existsSync(stopped.shortcutPath)).toBe(true);
+
+      const uninstalled = await uninstallWindowsLoginService();
+      expect(uninstalled).toMatchObject({ installed: false, enabled: false, active: false });
+      expect(existsSync(installed.shortcutPath)).toBe(false);
+    } finally {
+      stopWindowsSurfaces({ port });
+      try { await uninstallWindowsLoginService(); } catch {}
+      restoreEnv("SGW_HOME", oldHome);
+      restoreEnv("SGW_RECOVERY_HOME", oldRecovery);
+      restoreEnv("SGW_SECRET_BACKEND", oldBackend);
+      restoreEnv("SGW_EXECUTION_ENGINE", oldEngine);
+      restoreEnv("AWS_SECRET_ACCESS_KEY", oldAwsSecret);
+      restoreEnv("NODE_OPTIONS", oldNodeOptions);
+      await rm(authorityRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("refuses background startup when only an environment passphrase is available", async () => {
+    if (process.platform !== "win32") return;
+    const service = process.env.SGW_KEYCHAIN_SERVICE as string;
+    const account = process.env.SGW_KEYCHAIN_ACCOUNT as string;
+    deleteKeychainPassphrase();
+    process.env.SGW_MASTER_PASSPHRASE = "foreground-only-passphrase";
+    const port = await freePort();
+
+    try {
+      expect(() => startWindowsConsole({ port }))
+        .toThrow(/requires configured Windows Credential Manager/i);
+    } finally {
+      delete process.env.SGW_MASTER_PASSPHRASE;
+      process.env.SGW_KEYCHAIN_SERVICE = service;
+      process.env.SGW_KEYCHAIN_ACCOUNT = account;
+      setKeychainPassphrase(`windows-client-test-restored-${process.pid}`);
+    }
+  });
+
+  it("preserves an unmanaged Startup shortcut collision", async () => {
+    if (process.platform !== "win32") return;
+    const status = await windowsLoginServiceStatus();
+    const shortcutPath = status.shortcutPath;
+    const script = [
+      "$shell = New-Object -ComObject WScript.Shell",
+      "$shortcut = $shell.CreateShortcut($env:SGW_TEST_COLLISION_PATH)",
+      "$shortcut.TargetPath = $env:ComSpec",
+      "$shortcut.Arguments = '/c exit 0'",
+      "$shortcut.WorkingDirectory = $env:SystemRoot",
+      "$shortcut.Description = 'unmanaged test fixture'",
+      "$shortcut.Save()"
+    ].join("\n");
+
+    try {
+      execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+        env: { ...process.env, SGW_TEST_COLLISION_PATH: shortcutPath },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      const original = await readFile(shortcutPath);
+      await expect(installWindowsLoginService({ port: await freePort() }))
+        .rejects.toThrow(/unmanaged item/i);
+      await expect(uninstallWindowsLoginService()).rejects.toThrow(/not managed|unmanaged item/i);
+      expect(await readFile(shortcutPath)).toEqual(original);
+    } finally {
+      await rm(shortcutPath, { force: true });
+    }
+  });
 });
 
 async function freePort(): Promise<number> {
@@ -662,4 +825,21 @@ function restoreEnv(name: string, value: string | undefined): void {
     return;
   }
   process.env[name] = value;
+}
+
+function windowsTestRoot(): string {
+  return process.env.SGW_TEST_HOME_ROOT || os.tmpdir();
+}
+
+function stopWindowsAuthority(home: string, recoveryHome: string, port: number): void {
+  const oldHome = process.env.SGW_HOME;
+  const oldRecovery = process.env.SGW_RECOVERY_HOME;
+  process.env.SGW_HOME = home;
+  process.env.SGW_RECOVERY_HOME = recoveryHome;
+  try {
+    stopWindowsSurfaces({ port });
+  } finally {
+    restoreEnv("SGW_HOME", oldHome);
+    restoreEnv("SGW_RECOVERY_HOME", oldRecovery);
+  }
 }

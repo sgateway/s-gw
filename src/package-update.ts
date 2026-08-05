@@ -487,18 +487,19 @@ function npmContext(options: PackageUpdateOptions): {
   run: (args: string[]) => Promise<NpmCommandResult>;
   commandLabel: string;
 } {
-  const env = { ...process.env, ...options.env };
+  const inheritedEnv = { ...process.env, ...options.env };
   if (options.runNpm) {
     const runner = options.runNpm;
     return {
-      run: (args) => runner(args, env),
+      run: (args) => runner(args, inheritedEnv),
       commandLabel: options.npmCommand || "npm"
     };
   }
 
-  const runtime = npmRuntime(options.npmCommand, env);
+  const runtime = npmRuntime(options.npmCommand, inheritedEnv);
+  const env = npmEnvironment(inheritedEnv);
   return {
-    run: (args) => runCommand(runtime.command, [...runtime.leadingArgs, ...args], env, runtime.shell),
+    run: (args) => runCommand(runtime.command, [...runtime.leadingArgs, ...args], env),
     commandLabel: options.npmCommand || "npm"
   };
 }
@@ -544,7 +545,6 @@ function registryTarget(spec: string): boolean {
 function npmRuntime(command: string | undefined, env: NodeJS.ProcessEnv): {
   command: string;
   leadingArgs: string[];
-  shell: boolean;
 } {
   const requested = command?.trim();
   if (requested) return runtimeForPath(requested);
@@ -567,23 +567,28 @@ function npmRuntime(command: string | undefined, env: NodeJS.ProcessEnv): {
   return runtimeForPath(process.platform === "win32" ? "npm.cmd" : "npm");
 }
 
-function runtimeForPath(command: string): { command: string; leadingArgs: string[]; shell: boolean } {
+function runtimeForPath(command: string): { command: string; leadingArgs: string[] } {
   if (/\.(?:c?m?js)$/i.test(command)) {
-    return { command: process.execPath, leadingArgs: [command], shell: false };
+    return { command: process.execPath, leadingArgs: [command] };
   }
-  return { command, leadingArgs: [], shell: process.platform === "win32" && /\.cmd$/i.test(command) };
+  if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command)) {
+    throw new PackageUpdateError(
+      "Windows package updates require npm-cli.js and will not execute npm through a command shell. Reinstall Node.js with npm included, then retry.",
+      "preflight"
+    );
+  }
+  return { command, leadingArgs: [] };
 }
 
 async function runCommand(
   command: string,
   args: string[],
-  env: NodeJS.ProcessEnv,
-  shell: boolean
+  env: NodeJS.ProcessEnv
 ): Promise<NpmCommandResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       env,
-      shell,
+      shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -598,6 +603,41 @@ async function runCommand(
     });
     child.on("close", (code) => resolve({ status: code ?? 1, stdout, stderr }));
   });
+}
+
+function npmEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of [
+    "APPDATA",
+    "ComSpec",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LOCALAPPDATA",
+    "NO_COLOR",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy"
+  ]) {
+    const value = source[key];
+    if (typeof value === "string" && value) env[key] = value;
+  }
+  return env;
 }
 
 async function readNpmPath(

@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  assertMacBackgroundUnlock,
   assertMacRuntimeForManagedSurfaces,
   buildConsoleLaunchAgentPlist,
   buildMenuBarLaunchAgentPlist,
@@ -142,6 +143,17 @@ describe("customer package layout", () => {
 });
 
 describe("install readiness", () => {
+  it.skipIf(process.platform !== "darwin")("refuses to put an environment passphrase in launchd", () => {
+    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
+    process.env.SGW_MASTER_PASSPHRASE = "foreground-only-mac-passphrase";
+    try {
+      expect(() => assertMacBackgroundUnlock()).toThrow(/will not persist or inherit SGW_MASTER_PASSPHRASE/i);
+    } finally {
+      if (oldPassphrase === undefined) delete process.env.SGW_MASTER_PASSPHRASE;
+      else process.env.SGW_MASTER_PASSPHRASE = oldPassphrase;
+    }
+  });
+
   it("reports ready when an unlock source is configured", () => {
     const oldValue = process.env.SGW_MASTER_PASSPHRASE;
     process.env.SGW_MASTER_PASSPHRASE = "configured-passphrase";
@@ -251,22 +263,50 @@ describe("launch-agent packaging", () => {
       const inherited = {
         PATH: "/custom/bin:/usr/bin:/bin",
         SGW_HOME: "/secure/s-gw-home",
+        SGW_RECOVERY_HOME: "/secure/s-gw-recovery",
         SGW_KEYCHAIN_SERVICE: "com.example.s-gw",
         SGW_KEYCHAIN_ACCOUNT: "primary",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+        SGW_SECRET_BACKEND: " KEYCHAIN ",
+        SGW_EXECUTION_ENGINE: " TYPESCRIPT ",
+        SGW_MASTER_PASSPHRASE: "must-not-persist",
         SGW_KEYCHAIN_HELPER: "/old/npm/s-gw-keychain-helper"
       };
       const console = buildConsoleLaunchAgentPlist(9123, "/secure/s-gw-home/logs", inherited);
       const menu = buildMenuBarLaunchAgentPlist({ port: 9123 }, "/secure/s-gw-home/logs", inherited);
 
-      for (const value of ["/custom/bin:/usr/bin:/bin", "/secure/s-gw-home", "com.example.s-gw", "primary"]) {
+      for (const value of [
+        "/custom/bin:/usr/bin:/bin",
+        "/secure/s-gw-home",
+        "/secure/s-gw-recovery",
+        "com.example.s-gw",
+        "com.example.s-gw.secret",
+        "primary",
+        "keychain",
+        "typescript"
+      ]) {
         expect(console).toContain(value);
         expect(menu).toContain(value);
       }
       expect(console).not.toContain("/old/npm/s-gw-keychain-helper");
       expect(menu).not.toContain("/old/npm/s-gw-keychain-helper");
+      expect(console).not.toContain("must-not-persist");
+      expect(menu).not.toContain("must-not-persist");
     } finally {
       if (oldHelper === undefined) delete process.env.SGW_KEYCHAIN_HELPER;
       else process.env.SGW_KEYCHAIN_HELPER = oldHelper;
     }
+  });
+
+  it.each([
+    ["SGW_SECRET_BACKEND", "windows-credential-manager"],
+    ["SGW_EXECUTION_ENGINE", "native"],
+    ["SGW_SECRET_BACKEND", "keychain\nmalformed"]
+  ])("rejects an invalid launchd authority value for %s", (key, value) => {
+    expect(() => buildConsoleLaunchAgentPlist(8718, "/tmp/s-gw logs", {
+      SGW_HOME: "/secure/s-gw-home",
+      SGW_RECOVERY_HOME: "/secure/s-gw-recovery",
+      [key]: value
+    })).toThrow(new RegExp(key));
   });
 });

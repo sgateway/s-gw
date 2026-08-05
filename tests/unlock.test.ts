@@ -48,6 +48,21 @@ afterEach(async () => {
 });
 
 describe("unlock passphrase provider", () => {
+  it.skipIf(process.platform !== "darwin")("refuses raw helper overrides outside isolated test mode", async () => {
+    const helper = path.join(tmpDir, "s-gw-keychain-helper");
+    await writeFile(helper, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await chmod(helper, 0o700);
+    const oldTestMode = process.env.SGW_TEST_MODE;
+    process.env.SGW_KEYCHAIN_HELPER = helper;
+    delete process.env.SGW_TEST_MODE;
+    try {
+      expect(() => keychainInfo()).toThrow(/SGW_KEYCHAIN_HELPER.*restricted to isolated s-gw tests/i);
+    } finally {
+      if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+      else process.env.SGW_TEST_MODE = oldTestMode;
+    }
+  });
+
   it("prefers the explicit environment passphrase", () => {
     process.env.SGW_MASTER_PASSPHRASE = "env passphrase";
 

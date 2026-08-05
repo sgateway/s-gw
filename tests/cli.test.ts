@@ -1,5 +1,5 @@
 import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -222,6 +222,8 @@ describe("CLI unknown-command behavior (end to end)", () => {
         "deny",
         "--command",
         "aws",
+        "--resolved-command",
+        realpathSync.native(process.execPath),
         "--clear-expiry"
       ]));
       expect(updated).toMatchObject({
@@ -232,6 +234,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(updated.conditions).toMatchObject({
         agents: ["codex"],
         commands: ["aws"],
+        resolvedCommands: [realpathSync.native(process.execPath)],
         envBindings: [{ handle: "s-gw:api-token:cli", injectEnv: "SGW_CLI_POLICY" }]
       });
       expect(updated.expiresAt).toBeUndefined();
@@ -246,6 +249,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       const help = run(["help"]);
       expect(help).toContain("s-gw approval policy update --id POLICY_ID");
       expect(help).toContain("s-gw approval policy arrange");
+      expect(help).toContain("--resolved-command /path/to/tool");
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(recoveryHome, { recursive: true, force: true });
@@ -419,6 +423,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         "json"
       ]);
       expect(request.action.env).toEqual([{ handle: access.handle, injectEnv: "AWS_ACCESS_KEY_ID" }]);
+      expect(request.action.resolvedCommand).toBe(realpathSync.native(process.execPath));
       expect(request.action.timeoutMs).toBe(1_800_000);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -454,7 +459,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       ], {
         cwd: repoRoot,
         env,
-        input: secretValue,
+        input: `${secretValue}\r\n`,
         encoding: "utf8",
         stdio: ["pipe", "pipe", "pipe"]
       }));
@@ -471,7 +476,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
         "--arg",
         "-e",
         "--arg",
-        "console.log(process.env.SGW_NEXT_TOKEN)"
+        "console.log(process.env.SGW_NEXT_TOKEN); console.error('length=' + Buffer.byteLength(process.env.SGW_NEXT_TOKEN || ''))"
       ], {
         cwd: repoRoot,
         env,
@@ -501,15 +506,16 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(executed.requestId).toBe(request.id);
       expect(executed.summary.stdout).not.toContain(secretValue);
       expect(executed.summary.stdout).toContain(`<<SGW_SECRET:${secret.handle}>>`);
+      expect(executed.summary.stderr).toContain(`length=${Buffer.byteLength(secretValue)}`);
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("wraps the AWS-dev handle pair behind a first-class request/run shortcut", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-aws-"));
-    const wrapper = path.join(home, "aws-wrapper");
+    const wrapper = path.join(home, process.platform === "win32" ? "aws-wrapper.exe" : "aws-wrapper");
     const env = {
       ...process.env,
       SGW_HOME: home,
@@ -518,13 +524,45 @@ describe("CLI unknown-command behavior (end to end)", () => {
       SGW_DISABLE_KEYCHAIN: "1"
     };
 
-    await writeFile(wrapper, [
-      "#!/bin/sh",
-      "printf 'access=%s\\n' \"$SGW_AWS_DEV_ACCESS_KEY_ID\"",
-      "printf 'secret=%s\\n' \"$SGW_AWS_DEV_CREDENTIAL\"",
-      "printf 'args=%s\\n' \"$*\""
-    ].join("\n"));
-    await chmod(wrapper, 0o700);
+    if (process.platform === "win32") {
+      const source = path.join(home, "aws-wrapper.cs");
+      await writeFile(source, `
+using System;
+
+public static class FakeAwsWrapper {
+  public static int Main(string[] args) {
+    Console.WriteLine("access=" + (Environment.GetEnvironmentVariable("SGW_AWS_DEV_ACCESS_KEY_ID") ?? ""));
+    Console.WriteLine("secret=" + (Environment.GetEnvironmentVariable("SGW_AWS_DEV_CREDENTIAL") ?? ""));
+    Console.WriteLine("args=" + string.Join(" ", args));
+    return 0;
+  }
+}
+`);
+      const systemRoot = process.env.SystemRoot || process.env.WINDIR;
+      if (!systemRoot) throw new Error("Windows test requires SystemRoot or WINDIR.");
+      const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const compileScript = [
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -Path $env:SGW_FAKE_AWS_SOURCE -OutputAssembly $env:SGW_FAKE_AWS_OUTPUT -OutputType ConsoleApplication"
+      ].join("\n");
+      execFileSync(powershell, [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-EncodedCommand", Buffer.from(compileScript, "utf16le").toString("base64")
+      ], {
+        env: { ...process.env, SGW_FAKE_AWS_SOURCE: source, SGW_FAKE_AWS_OUTPUT: wrapper },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 20_000
+      });
+    } else {
+      await writeFile(wrapper, [
+        "#!/bin/sh",
+        "printf 'access=%s\\n' \"$SGW_AWS_DEV_ACCESS_KEY_ID\"",
+        "printf 'secret=%s\\n' \"$SGW_AWS_DEV_CREDENTIAL\"",
+        "printf 'args=%s\\n' \"$*\""
+      ].join("\n"));
+      await chmod(wrapper, 0o700);
+    }
 
     try {
       const secret = JSON.parse(runCliSync([
@@ -693,7 +731,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 60_000);
 
   it("requires an explicit AWS wrapper when credential policies share more than one", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-aws-wrapper-"));

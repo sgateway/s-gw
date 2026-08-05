@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { prepareGuardedRun } from "../src/guard.js";
+import { prepareGuardedRun, resolveGuardLauncher } from "../src/guard.js";
 import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
@@ -144,4 +144,111 @@ describe("guard mode", () => {
     expect(plan.args).toEqual(["-v"]);
     expect(plan.dryRun).toBe(true);
   });
+
+  it("launches canonical npm cmd shims without a command shell", async () => {
+    const binDir = path.join(tmpHome, "npm bin");
+    const target = path.join(binDir, "node_modules", "guard-fixture", "run.js");
+    const shim = path.join(binDir, "guard-fixture.cmd");
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n", "utf8");
+    await writeFile(shim, npmNodeCmdShim("node_modules\\guard-fixture\\run.js"), "utf8");
+
+    const hostileArgs = [
+      "plain",
+      "& echo injected",
+      "| whoami",
+      "%PATH%",
+      "!PROMPT!",
+      "^&",
+      "$(touch should-not-run)",
+      "quote\"and\\slash"
+    ];
+    const launcher = resolveGuardLauncher("guard-fixture", hostileArgs, {
+      platform: "win32",
+      cwd: tmpHome,
+      env: { Path: binDir, PATHEXT: ".EXE;.CMD" }
+    });
+
+    expect(launcher.command).toBe(process.execPath);
+    expect(launcher.args[0]).toBe(await realpath(target));
+    expect(JSON.parse(execFileSync(launcher.command, launcher.args, { encoding: "utf8" }))).toEqual(hostileArgs);
+  });
+
+  it("accepts canonical project-local npm cmd shims within node_modules", async () => {
+    const modules = path.join(tmpHome, "node_modules");
+    const binDir = path.join(modules, ".bin");
+    const target = path.join(modules, "guard-fixture", "run.cjs");
+    const shim = path.join(binDir, "guard-fixture.cmd");
+    await mkdir(path.dirname(target), { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(target, "process.stdout.write('local');\n", "utf8");
+    await writeFile(shim, npmNodeCmdShim("..\\guard-fixture\\run.cjs"), "utf8");
+
+    const launcher = resolveGuardLauncher(shim, [], { platform: "win32" });
+    expect(execFileSync(launcher.command, launcher.args, { encoding: "utf8" })).toBe("local");
+  });
+
+  it("refuses arbitrary Windows script launchers", async () => {
+    const cmd = path.join(tmpHome, "unsafe.cmd");
+    const bat = path.join(tmpHome, "unsafe.bat");
+    const ps1 = path.join(tmpHome, "unsafe.ps1");
+    const py = path.join(tmpHome, "unsafe.py");
+    await writeFile(cmd, "@echo off\r\necho unsafe %*\r\n", "utf8");
+    await writeFile(bat, "@echo off\r\necho unsafe %*\r\n", "utf8");
+    await writeFile(ps1, "Write-Output unsafe\r\n", "utf8");
+    await writeFile(py, "print('unsafe')\n", "utf8");
+
+    expect(() => resolveGuardLauncher(cmd, ["& whoami"], { platform: "win32" }))
+      .toThrow("not a canonical npm Node.js .cmd shim");
+    expect(() => resolveGuardLauncher(bat, ["& whoami"], { platform: "win32" }))
+      .toThrow("will not launch script");
+    expect(() => resolveGuardLauncher(ps1, [], { platform: "win32" }))
+      .toThrow("will not launch script");
+    expect(() => resolveGuardLauncher(py, [], { platform: "win32" }))
+      .toThrow("will not launch non-native executable");
+  });
+
+  it("fails closed for unresolved Windows commands and scripts", () => {
+    const missing = path.join(tmpHome, "missing-agent.cmd");
+    expect(() => resolveGuardLauncher(missing, [], { platform: "win32", env: { PATH: "" } }))
+      .toThrow(/will not launch unresolved script/i);
+    expect(() => resolveGuardLauncher("missing-agent", [], { platform: "win32", env: { PATH: "" } }))
+      .toThrow(/could not resolve executable/i);
+    expect(() => resolveGuardLauncher("missing-agent.ps1", [], { platform: "win32", env: { PATH: "" } }))
+      .toThrow(/will not launch unresolved script/i);
+  });
+
+  it("keeps explicit Windows executables shell-free", async () => {
+    const executable = path.join(tmpHome, "agent.exe");
+    const args = ["& whoami", "%PATH%", "quoted value"];
+    await writeFile(executable, "fixture", "utf8");
+
+    expect(resolveGuardLauncher(executable, args, { platform: "win32" })).toEqual({
+      command: executable,
+      args
+    });
+  });
 });
+
+function npmNodeCmdShim(relativeTarget: string): string {
+  return [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0",
+    "",
+    'IF EXIST "%dp0%\\node.exe" (',
+    '  SET "_prog=%dp0%\\node.exe"',
+    ") ELSE (",
+    '  SET "_prog=node"',
+    "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+    ")",
+    "",
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${relativeTarget}" %*`,
+    ""
+  ].join("\r\n");
+}

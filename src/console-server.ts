@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
+  mcpAuthorityEnvironment,
   resolvePackagedMcpCommand,
   uninstallAgentIntegrations,
   type AgentIntegrationOptions
@@ -539,16 +540,16 @@ export function consoleMcpSnippet(
     env: process.env,
     mcpServerPath: layout.mcpPath
   });
-  const sgwHome = agentOptions.sgwHome || process.env.SGW_HOME;
+  const env = mcpAuthorityEnvironment(agentOptions);
   const launcher = layout.isSelfContainedMacApp
-    ? path.join(path.dirname(layout.packageRoot), "bin", "s-gw")
+    ? path.posix.join(path.posix.dirname(layout.packageRoot), "bin", "s-gw")
     : "s-gw";
 
   return {
     options: {
       command: launch.command,
       args: launch.args,
-      env: sgwHome ? { SGW_HOME: sgwHome } : undefined
+      env
     },
     cliCommand: shellCommandArg(launcher)
   };
@@ -1277,6 +1278,7 @@ function policyConditionsFromBody(body: Record<string, unknown>): ApprovalPolicy
     agents: policyStringArray(body, "agents"),
     actionKinds: policyStringArray(body, "actionKinds").map(approvalPolicyActionKind),
     commands: policyStringArray(body, "commands"),
+    resolvedCommands: policyStringArray(body, "resolvedCommands"),
     injectEnvs: policyStringArray(body, "injectEnvs"),
     workingDirs: policyStringArray(body, "workingDirs"),
     sshTargets: policyStringArray(body, "sshTargets"),
@@ -1294,6 +1296,7 @@ function policyConditionPatchFromBody(body: Record<string, unknown>): Partial<Ap
     "agents",
     "actionKinds",
     "commands",
+    "resolvedCommands",
     "injectEnvs",
     "workingDirs",
     "sshTargets",
@@ -1312,6 +1315,7 @@ function policyConditionPatchFromBody(body: Record<string, unknown>): Partial<Ap
   if (hasBodyField(body, "agents")) patch.agents = policyStringArray(body, "agents");
   if (hasBodyField(body, "actionKinds")) patch.actionKinds = policyStringArray(body, "actionKinds").map(approvalPolicyActionKind);
   if (hasBodyField(body, "commands")) patch.commands = policyStringArray(body, "commands");
+  if (hasBodyField(body, "resolvedCommands")) patch.resolvedCommands = policyStringArray(body, "resolvedCommands");
   if (hasBodyField(body, "injectEnvs")) patch.injectEnvs = policyStringArray(body, "injectEnvs");
   if (hasBodyField(body, "workingDirs")) patch.workingDirs = policyStringArray(body, "workingDirs");
   if (hasBodyField(body, "sshTargets")) patch.sshTargets = policyStringArray(body, "sshTargets");
@@ -1355,6 +1359,7 @@ function assertKnownPolicyFields(body: Record<string, unknown>): void {
     "agents",
     "actionKinds",
     "commands",
+    "resolvedCommands",
     "injectEnvs",
     "workingDirs",
     "sshTargets",

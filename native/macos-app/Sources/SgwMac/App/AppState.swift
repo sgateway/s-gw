@@ -402,6 +402,9 @@ final class AppState {
     if !draft.command.isEmpty {
       args += ["--command", draft.command]
     }
+    if !draft.resolvedCommand.isEmpty {
+      args += ["--resolved-command", draft.resolvedCommand]
+    }
     if !draft.injectEnv.isEmpty {
       args += ["--inject-env", draft.injectEnv]
     }

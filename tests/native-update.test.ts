@@ -13,7 +13,7 @@ describe("native macOS update lifecycle", () => {
       readFile(path.join(root, "src/install.ts"), "utf8")
     ]);
 
-    expect(app).toContain("state.start()\n  }");
+    expect(app.replaceAll("\r\n", "\n")).toContain("state.start()\n  }");
     expect(app).not.toContain(".onAppear { appState.start() }");
     expect(state).not.toContain("private var updateTask");
     expect(helper).toContain("final class UpdateMonitor");
@@ -116,6 +116,16 @@ describe("native macOS update lifecycle", () => {
     expect(settings).toContain("release.isMacInstaller ? \"Download Installer\" : \"Install Package\"");
     expect(runner).toContain("managedRuntimeEnvironment()");
     expect(runner).toContain('"com.s-gw.sgw.console", "com.s-gw.sgw.menubar"');
-    expect(runner).toContain('"SGW_HOME", "SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT"');
+    for (const key of [
+      "SGW_HOME",
+      "SGW_RECOVERY_HOME",
+      "SGW_KEYCHAIN_SERVICE",
+      "SGW_KEYCHAIN_ACCOUNT",
+      "SGW_SECRET_KEYCHAIN_SERVICE",
+      "SGW_SECRET_BACKEND",
+      "SGW_EXECUTION_ENGINE"
+    ]) {
+      expect(runner).toContain(`"${key}"`);
+    }
   });
 });

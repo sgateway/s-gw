@@ -1,9 +1,9 @@
-import { chmod, copyFile, link, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { scanTextToOnePassword } from "../src/gateway.js";
-import { listOnePasswordSecretReferences, onePasswordStatus } from "../src/onepassword.js";
+import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "../src/onepassword.js";
 import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
@@ -48,7 +48,7 @@ describe("1Password metadata importer", () => {
     const status = onePasswordStatus();
 
     expect(status.available).toBe(true);
-    expect(status.command).toBe(fakeRealOp);
+    expect(status.command).toBe(await realpath(fakeRealOp));
     expect(status.version).toBe(process.version);
   });
 
@@ -76,6 +76,46 @@ describe("1Password metadata importer", () => {
       })
     ]);
     expect(JSON.stringify(refs)).not.toContain("plain text note");
+  });
+
+  it.skipIf(process.platform === "win32")("passes only 1Password and process basics to the op child", async () => {
+    const fakeOp = path.join(tmpHome, "op-clean-env");
+    const capture = path.join(tmpHome, "op-env.json");
+    await writeFile(fakeOp, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.env));
+process.stdout.write("isolated-op-secret-value\\n");
+`, { mode: 0o700 });
+    await chmod(fakeOp, 0o700);
+
+    const previous = {
+      testMode: process.env.SGW_TEST_MODE,
+      aws: process.env.AWS_SECRET_ACCESS_KEY,
+      opToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
+      nodeOptions: process.env.NODE_OPTIONS
+    };
+    delete process.env.SGW_TEST_MODE;
+    process.env.SGW_OP_CLI = fakeOp;
+    process.env.SGW_MASTER_PASSPHRASE = "must-not-reach-op";
+    process.env.AWS_SECRET_ACCESS_KEY = "must-not-reach-op";
+    process.env.OP_SERVICE_ACCOUNT_TOKEN = "expected-op-token";
+    process.env.NODE_OPTIONS = "--require=/must-not-run.cjs";
+
+    try {
+      await expect(readOnePasswordReference(opRef("item", "field")))
+        .resolves.toBe("isolated-op-secret-value");
+      const childEnv = JSON.parse(await readFile(capture, "utf8"));
+      expect(childEnv.OP_SERVICE_ACCOUNT_TOKEN).toBe("expected-op-token");
+      expect(childEnv.SGW_MASTER_PASSPHRASE).toBeUndefined();
+      expect(childEnv.SGW_OP_CLI).toBeUndefined();
+      expect(childEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(childEnv.NODE_OPTIONS).toBeUndefined();
+    } finally {
+      restoreEnv("SGW_TEST_MODE", previous.testMode);
+      restoreEnv("AWS_SECRET_ACCESS_KEY", previous.aws);
+      restoreEnv("OP_SERVICE_ACCOUNT_TOKEN", previous.opToken);
+      restoreEnv("NODE_OPTIONS", previous.nodeOptions);
+    }
   });
 
   it("captures scanned text into a 1Password-backed handle without storing the raw value locally", async () => {
@@ -118,10 +158,14 @@ describe("1Password metadata importer", () => {
 async function writeFakeOp(): Promise<string> {
   const fakeOp = path.join(tmpHome, process.platform === "win32" ? "op.exe" : "op");
   const preload = path.join(tmpHome, "fake op preload.cjs");
-  try {
-    await link(process.execPath, fakeOp);
-  } catch {
+  if (process.platform === "win32") {
     await copyFile(process.execPath, fakeOp);
+  } else {
+    try {
+      await link(process.execPath, fakeOp);
+    } catch {
+      await copyFile(process.execPath, fakeOp);
+    }
   }
   await chmod(fakeOp, 0o755);
   await writeFile(preload, `
@@ -183,7 +227,13 @@ if (sameExecutable) {
   process.exit(0);
 }
 `);
-  const preloadOption = `--require="${preload.replaceAll('"', '\\"')}"`;
+  const preloadPath = process.platform === "win32" ? preload.replaceAll("\\", "/") : preload;
+  const preloadOption = `--require="${preloadPath.replaceAll('"', '\\"')}"`;
   process.env.NODE_OPTIONS = [originalNodeOptions, preloadOption].filter(Boolean).join(" ");
   return fakeOp;
+}
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
 }

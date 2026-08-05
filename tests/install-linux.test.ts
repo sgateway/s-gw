@@ -42,6 +42,11 @@ afterEach(async () => {
     "SGW_FAKE_SYSTEMD_CAPTURE",
     "SGW_FAKE_SECRET_DB",
     "SGW_FAKE_SECRET_LOOKUP_ERROR",
+    "SGW_KEYCHAIN_ACCOUNT",
+    "SGW_KEYCHAIN_SERVICE",
+    "SGW_SECRET_BACKEND",
+    "SGW_SECRET_KEYCHAIN_SERVICE",
+    "SGW_EXECUTION_ENGINE",
     "XDG_CONFIG_HOME"
   ]) {
     delete process.env[key];
@@ -110,6 +115,19 @@ describeLinux("Linux systemd user service", () => {
       unlock: "existing-env"
     });
     expect(setup.opened).toBeUndefined();
+  });
+
+  it("refuses environment-only background setup before creating a ledger or unit", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "synthetic-background-environment-unlock";
+
+    expect(() => runLinuxCli([
+      "setup",
+      "--no-open-app",
+      "--no-menubar",
+      "--no-agents"
+    ])).toThrow(/Linux background startup will not persist or inherit SGW_MASTER_PASSPHRASE/i);
+    await expect(lstat(path.join(process.env.SGW_HOME!, "store.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(systemdUserServicePath())).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("installs, starts, stops, and uninstalls a hardened owner-only unit", async () => {
@@ -209,6 +227,26 @@ describeLinux("Linux systemd user service", () => {
     expect(execStart).toContain("recovery%%$$home");
     expect(writable).toContain("ledger%%$home");
     expect(writable).toContain("recovery%%$home");
+  });
+
+  it("normalizes credential backend and execution engine in the systemd unit", () => {
+    process.env.SGW_SECRET_BACKEND = " KEYCHAIN ";
+    process.env.SGW_EXECUTION_ENGINE = " RuSt ";
+
+    const unit = buildSystemdUserUnit();
+    const execStart = unit.split("\n").find((line) => line.startsWith("ExecStart="));
+    expect(execStart).toContain('"SGW_SECRET_BACKEND=keychain"');
+    expect(execStart).toContain('"SGW_EXECUTION_ENGINE=rust"');
+  });
+
+  it.each([
+    ["SGW_SECRET_BACKEND", "windows-credential-manager"],
+    ["SGW_SECRET_BACKEND", "keychain\nmalformed"],
+    ["SGW_EXECUTION_ENGINE", "native"],
+    ["SGW_EXECUTION_ENGINE", "rust\u007fmalformed"]
+  ])("rejects an invalid systemd authority value for %s", (key, value) => {
+    process.env[key] = value;
+    expect(() => buildSystemdUserUnit()).toThrow(new RegExp(key));
   });
 });
 
