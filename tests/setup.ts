@@ -1,7 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeEach } from "vitest";
+import { afterAll, beforeAll, beforeEach } from "vitest";
 
 const originalEnvironment = {
   TEMP: process.env.TEMP,
@@ -17,7 +18,7 @@ if (windowsTestRoot) {
   process.env.TEMP = windowsTestRoot;
   process.env.TMP = windowsTestRoot;
 }
-const suiteHome = mkdtempSync(path.join(testHomeRoot, "sgw-vitest-"));
+const suiteHome = path.join(testHomeRoot, `sgw-vitest-${randomUUID()}`);
 const suiteRecoveryHome = `${suiteHome}-recovery`;
 
 function useDisposableHomes(): void {
@@ -29,6 +30,13 @@ function useDisposableHomes(): void {
 }
 
 useDisposableHomes();
+beforeAll(() => {
+  if (windowsTestRoot) {
+    mkdirSync(path.dirname(windowsTestRoot), { recursive: true });
+    mkdirSync(windowsTestRoot, { mode: 0o700 });
+  }
+  mkdirSync(suiteHome, { mode: 0o700 });
+});
 beforeEach(useDisposableHomes);
 
 afterAll(() => {
@@ -52,6 +60,5 @@ function makeWindowsTestRoot(): string | undefined {
   const localAppData = process.env.LOCALAPPDATA?.trim()
     || path.join(os.homedir(), "AppData", "Local");
   const tempParent = path.join(localAppData, "Temp");
-  mkdirSync(tempParent, { recursive: true });
-  return mkdtempSync(path.join(tempParent, "sgw-vitest-root-"));
+  return path.join(tempParent, `sgw-vitest-root-${randomUUID()}`);
 }
