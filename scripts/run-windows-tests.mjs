@@ -4,12 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { filesForWindowsTestGroup, parseWindowsTestGroup } from "./windows-test-groups.mjs";
 
 if (process.platform !== "win32") {
   throw new Error("The private Windows test runner is only available on Windows.");
 }
 
 const sourceRoot = await realpath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
+const testGroup = parseWindowsTestGroup(process.argv.slice(2));
 try {
   await Promise.all([
     access(path.join(sourceRoot, "dist", "cli.js")),
@@ -48,7 +50,8 @@ try {
   await symlink(path.join(sourceRoot, "node_modules"), path.join(stagedRoot, "node_modules"), "junction");
 
   const vitest = path.join(stagedRoot, "node_modules", "vitest", "vitest.mjs");
-  testResult = spawnSync(privateNode, [vitest, "run", "--no-file-parallelism"], {
+  const testFiles = filesForWindowsTestGroup(testGroup, await discoverTestFiles(stagedRoot));
+  testResult = spawnSync(privateNode, [vitest, "run", "--no-file-parallelism", ...testFiles], {
     cwd: stagedRoot,
     env: { ...process.env, npm_execpath: path.join(privateNpmRoot, "bin", "npm-cli.js") },
     stdio: "inherit",
@@ -121,5 +124,24 @@ $null = [System.IO.Directory]::CreateDirectory($env:SGW_WINDOWS_PRIVATE_TEST_ROO
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error((result.stderr || result.stdout || "").trim() || "Could not create the private Windows test root.");
+  }
+}
+
+async function discoverTestFiles(root) {
+  const found = [];
+  await walk(path.join(root, "tests"), "tests", found);
+  return found;
+}
+
+async function walk(directory, relativeDirectory, found) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const relativePath = `${relativeDirectory}/${entry.name}`;
+    if (entry.isDirectory()) {
+      if (relativePath === "tests/fixtures") continue;
+      await walk(path.join(directory, entry.name), relativePath, found);
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".test.ts")) found.push(relativePath);
   }
 }
