@@ -44,6 +44,8 @@ export const consoleLabel = "com.s-gw.sgw.console";
 export const menuBarLabel = "com.s-gw.sgw.menubar";
 export const systemdUnitName = "s-gw.service";
 
+const windowsProcessInspectionTimeoutMs = 15_000;
+
 export interface PackageLayout {
   packageRoot: string;
   nodePath: string;
@@ -811,12 +813,13 @@ export function stopWindowsSurfaces(options: WindowsSurfaceScope = {}): WindowsS
 }
 
 export function startWindowsConsole(options: MenuBarOptions = {}): WindowsOpenResult {
+  requireWindows("Windows console start");
+  assertWindowsBackgroundUnlock();
   return spawnWindowsConsole(options).result;
 }
 
 function spawnWindowsConsole(options: MenuBarOptions): { child: ChildProcess; result: WindowsOpenResult } {
   requireWindows("Windows console start");
-  assertWindowsBackgroundUnlock();
   const layout = getPackageLayout();
   const { port, url } = windowsConsoleEndpoint(options);
   const child = spawn(process.execPath, [
@@ -846,37 +849,58 @@ function spawnWindowsConsole(options: MenuBarOptions): { child: ChildProcess; re
 }
 
 export async function ensureWindowsConsole(options: MenuBarOptions = {}): Promise<WindowsOpenResult> {
+  return (await ensureWindowsConsoleState(options)).result;
+}
+
+async function ensureWindowsConsoleState(
+  options: MenuBarOptions,
+  unlockVerified = false
+): Promise<{ result: WindowsOpenResult; helperPids: number[] }> {
   requireWindows("Windows console start");
-  assertWindowsBackgroundUnlock();
   const layout = getPackageLayout();
   const { port, url } = windowsConsoleEndpoint(options);
   const instanceKey = getSgwInstanceKey();
-  findRunningWindowsHelpers(
-    layout.windowsHelperScriptPath,
-    port,
-    url,
-    windowsHelperInstanceKey(url)
-  );
+  const helperInstanceKey = windowsHelperInstanceKey(url);
   const health = await windowsConsoleHealth(url);
   if (health.ready) {
     if (health.instanceKey !== instanceKey) {
       throw new Error(`Port ${port} already has an s-gw console for another credential home. Stop it or choose another port.`);
     }
     assertWindowsConsoleListener(port, layout.cliPath);
+    const helperPids = findRunningWindowsHelpers(
+      layout.windowsHelperScriptPath,
+      port,
+      url,
+      helperInstanceKey
+    );
     return {
-      scriptPath: layout.cliPath,
-      launcherPath: process.execPath,
-      consoleUrl: url
+      result: {
+        scriptPath: layout.cliPath,
+        launcherPath: process.execPath,
+        consoleUrl: url
+      },
+      helperPids
     };
   }
 
+  findRunningWindowsHelpers(layout.windowsHelperScriptPath, port, url, helperInstanceKey);
+  if (!unlockVerified) assertWindowsBackgroundUnlock();
   const started = spawnWindowsConsole({ ...options, port, consoleUrl: url });
   try {
     const listenerPid = await waitForWindowsConsole(url, instanceKey, port, layout.cliPath);
+    const helperPids = findRunningWindowsHelpers(
+      layout.windowsHelperScriptPath,
+      port,
+      url,
+      helperInstanceKey
+    );
     return {
-      ...started.result,
-      pid: listenerPid,
-      reusedExisting: listenerPid !== started.child.pid
+      result: {
+        ...started.result,
+        pid: listenerPid,
+        reusedExisting: listenerPid !== started.child.pid
+      },
+      helperPids
     };
   } catch (error) {
     try {
@@ -908,7 +932,7 @@ export async function installWindowsLoginService(options: {
     tray: options.tray === true
   });
   if (options.start) {
-    return startWindowsLoginServiceForShortcut(shortcut);
+    return startWindowsLoginServiceForShortcut(shortcut, undefined, true);
   }
   const config = await installedWindowsStartupConfig(layout.nodePath, layout.cliPath, undefined, shortcut);
   return windowsLoginServiceStatusForConfig(config, shortcut);
@@ -925,8 +949,10 @@ export async function startInstalledWindowsLoginService(
 
 async function startWindowsLoginServiceForShortcut(
   shortcut: WindowsStartupShortcutStatus,
-  expectedPayload?: string
+  expectedPayload?: string,
+  unlockVerified = false
 ): Promise<WindowsLoginServiceStatus> {
+  const credentialTestEnvironment = windowsCredentialTestEnvironment();
   const layout = getPackageLayout();
   const config = await installedWindowsStartupConfig(
     layout.nodePath,
@@ -935,9 +961,13 @@ async function startWindowsLoginServiceForShortcut(
     shortcut
   );
   const restore = applyWindowsStartupConfig(config);
+  Object.assign(process.env, credentialTestEnvironment);
   try {
-    assertWindowsBackgroundUnlock();
-    await ensureWindowsConsole({ port: config.port, consoleUrl: consoleUrl(config.port) });
+    if (!unlockVerified) assertWindowsBackgroundUnlock();
+    await ensureWindowsConsoleState(
+      { port: config.port, consoleUrl: consoleUrl(config.port) },
+      true
+    );
     if (config.tray) {
       await openWindowsHelper({ port: config.port, consoleUrl: consoleUrl(config.port) });
     }
@@ -1154,10 +1184,18 @@ function trustedWindowsConsoleListener(port: number, cliPath: string): number | 
       SGW_CONSOLE_CLI_PATH: cliPath,
       SGW_CONSOLE_NODE_PATH: process.execPath
     }),
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: windowsProcessInspectionTimeoutMs,
+    windowsHide: true
   });
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+      throw new Error(`Timed out inspecting the Windows listener on port ${port}.`);
+    }
+    throw new Error(`Could not inspect the Windows listener on port ${port}: ${result.error.message}`);
+  }
   if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || `Could not inspect the Windows listener on port ${port}.`);
+    throw new Error((result.stderr || "").trim() || `Could not inspect the Windows listener on port ${port}.`);
   }
 
   let payload: Record<string, unknown>;
@@ -1409,9 +1447,9 @@ export async function openWindowsHelper(options: MenuBarOptions = {}): Promise<W
   const endpoint = windowsConsoleEndpoint(options);
   const port = endpoint.port;
   const url = endpoint.baseUrl;
-  await ensureWindowsConsole({ ...options, port, consoleUrl: url });
+  const consoleState = await ensureWindowsConsoleState({ ...options, port, consoleUrl: url });
   const instanceKey = windowsHelperInstanceKey(url);
-  const existingPid = findRunningWindowsHelpers(layout.windowsHelperScriptPath, port, url, instanceKey)[0];
+  const existingPid = consoleState.helperPids[0];
   if (existingPid) {
     return {
       scriptPath: layout.windowsHelperScriptPath,
@@ -1422,6 +1460,7 @@ export async function openWindowsHelper(options: MenuBarOptions = {}): Promise<W
     };
   }
 
+  assertWindowsBackgroundUnlock();
   const launched = launchWindowsHelper(
     layout.windowsHelperBootstrapPath,
     layout.windowsHelperScriptPath,
@@ -1631,6 +1670,16 @@ async function stopSpawnedWindowsProcess(child: ChildProcess, label: string): Pr
 }
 
 function findRunningWindowsHelpers(scriptPath: string, port: number, url: string, instanceKey: string): number[] {
+  return inspectRunningWindowsHelpers(scriptPath, port, url, instanceKey, false);
+}
+
+function inspectRunningWindowsHelpers(
+  scriptPath: string,
+  port: number,
+  url: string,
+  instanceKey: string,
+  settle: boolean
+): number[] {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
@@ -1642,32 +1691,62 @@ function findRunningWindowsHelpers(scriptPath: string, port: number, url: string
     "$instancePattern = '(?i)(?:^|\\s)-InstanceKey(?:\\s+|:)\"?([a-f0-9]{64})\"?(?:\\s|$)'",
     "$powerShellName = [IO.Path]::GetFileName($env:SGW_HELPER_POWERSHELL_PATH).Replace(\"'\", \"''\")",
     "$processFilter = \"Name = '$powerShellName'\"",
+    "$settle = $env:SGW_HELPER_SETTLE -eq '1'",
+    "$clock = [Diagnostics.Stopwatch]::StartNew()",
+    "$previousPid = 0",
+    "$stable = $false",
     "$helperProcesses = @()",
-    "Get-CimInstance Win32_Process -Filter $processFilter | ForEach-Object {",
-    "  $line = [string]$_.CommandLine",
-    "  if (-not $line -or $line -notmatch $helperPattern) { return }",
-    "  $processInstanceKey = if ($line -match $instancePattern) { [string]$Matches[1] } else { '' }",
-    "  $usesDefaultPort = $env:SGW_HELPER_PORT -eq '8718' -and $line -notmatch $anyPortPattern",
-    "  if ($line -notmatch $portPattern -and -not $usesDefaultPort) { return }",
-    "  $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
-    "  if ($null -eq $owner -or $owner.ReturnValue -ne 0) { return }",
-    "  $helperProcesses += [PSCustomObject]@{ pid = [int]$_.ProcessId; ownerSid = [string]$owner.Sid; sessionId = [int]$_.SessionId; instanceKey = $processInstanceKey; exactPath = [bool]($line -match $exactPathPattern) }",
-    "}",
-    "[PSCustomObject]@{ currentSid = $currentSid; currentSessionId = $currentSessionId; processes = $helperProcesses } | ConvertTo-Json -Depth 3 -Compress"
+    "do {",
+    "  $helperProcesses = @()",
+    "  Get-CimInstance Win32_Process -Filter $processFilter | ForEach-Object {",
+    "    $line = [string]$_.CommandLine",
+    "    if (-not $line -or $line -notmatch $helperPattern) { return }",
+    "    $processInstanceKey = if ($line -match $instancePattern) { [string]$Matches[1] } else { '' }",
+    "    $usesDefaultPort = $env:SGW_HELPER_PORT -eq '8718' -and $line -notmatch $anyPortPattern",
+    "    if ($line -notmatch $portPattern -and -not $usesDefaultPort) { return }",
+    "    $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue",
+    "    if ($null -eq $owner -or $owner.ReturnValue -ne 0) { return }",
+    "    $helperProcesses += [PSCustomObject]@{ pid = [int]$_.ProcessId; ownerSid = [string]$owner.Sid; sessionId = [int]$_.SessionId; instanceKey = $processInstanceKey; exactPath = [bool]($line -match $exactPathPattern) }",
+    "  }",
+    "  if (-not $settle) { break }",
+    "  $sessionProcesses = @($helperProcesses | Where-Object { [string]$_.ownerSid -ieq $currentSid -and [int]$_.sessionId -eq $currentSessionId })",
+    "  $matching = @($sessionProcesses | Where-Object { $_.exactPath -eq $true -and [string]$_.instanceKey -ieq $env:SGW_HELPER_INSTANCE_KEY })",
+    "  if ($sessionProcesses.Count -ne $matching.Count) { break }",
+    "  if ($sessionProcesses.Count -eq 1 -and $matching.Count -eq 1) {",
+    "    $matchingPid = [int]$matching[0].pid",
+    "    if ($matchingPid -eq $previousPid) { $stable = $true; break }",
+    "    $previousPid = $matchingPid",
+    "  } else {",
+    "    $previousPid = 0",
+    "  }",
+    "  if ($clock.ElapsedMilliseconds -ge 10000) { break }",
+    "  Start-Sleep -Milliseconds 100",
+    "} while ($true)",
+    "[PSCustomObject]@{ currentSid = $currentSid; currentSessionId = $currentSessionId; processes = $helperProcesses; stable = $stable } | ConvertTo-Json -Depth 3 -Compress"
   ].join("\n");
   const powershell = trustedWindowsPowerShellSync();
   const result = spawnSync(powershell, ["-NoProfile", "-Command", script], {
     cwd: path.dirname(powershell),
     encoding: "utf8",
     env: windowsEnvironment(url, {
+      SGW_HELPER_INSTANCE_KEY: instanceKey,
       SGW_HELPER_PORT: String(port),
       SGW_HELPER_POWERSHELL_PATH: powershell,
-      SGW_HELPER_SCRIPT_PATH: scriptPath
+      SGW_HELPER_SCRIPT_PATH: scriptPath,
+      SGW_HELPER_SETTLE: settle ? "1" : "0"
     }),
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: windowsProcessInspectionTimeoutMs,
+    windowsHide: true
   });
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+      throw new Error("Timed out inspecting the running s-gw Windows helper.");
+    }
+    throw new Error(`Could not inspect the running s-gw Windows helper: ${result.error.message}`);
+  }
   if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || "Could not inspect the running s-gw Windows helper.");
+    throw new Error((result.stderr || "").trim() || "Could not inspect the running s-gw Windows helper.");
   }
 
   let payload: Record<string, unknown>;
@@ -1687,23 +1766,15 @@ function findRunningWindowsHelpers(scriptPath: string, port: number, url: string
   if (conflicts.length > 0) {
     throw new Error(`Another s-gw Windows helper is already running in this session for port ${port}. Run s-gw stop before changing installation or credential authority.`);
   }
-  return sessionProcesses.map((item) => item.pid).sort((a, b) => a - b);
+  const pids = sessionProcesses.map((item) => item.pid).sort((a, b) => a - b);
+  if (settle && payload.stable !== true) {
+    throw new Error(`s-gw Windows helper did not settle to one process; found ${pids.length}.`);
+  }
+  return pids;
 }
 
 function waitForWindowsHelper(scriptPath: string, port: number, url: string, instanceKey: string): number {
-  const signal = new Int32Array(new SharedArrayBuffer(4));
-  let lastPids: number[] = [];
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    Atomics.wait(signal, 0, 0, 100);
-    lastPids = findRunningWindowsHelpers(scriptPath, port, url, instanceKey);
-    if (lastPids.length !== 1) continue;
-
-    Atomics.wait(signal, 0, 0, 100);
-    const confirmed = findRunningWindowsHelpers(scriptPath, port, url, instanceKey);
-    if (confirmed.length === 1 && confirmed[0] === lastPids[0]) return confirmed[0];
-    lastPids = confirmed;
-  }
-  throw new Error(`s-gw Windows helper did not settle to one process; found ${lastPids.length}.`);
+  return inspectRunningWindowsHelpers(scriptPath, port, url, instanceKey, true)[0];
 }
 
 function windowsHelperInstanceKey(url: string): string {
@@ -2312,7 +2383,19 @@ export function windowsBackgroundEnvironment(
 }
 
 function windowsEnvironment(url: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return windowsBackgroundEnvironment(url, extra);
+  return windowsBackgroundEnvironment(url, {
+    ...windowsCredentialTestEnvironment(),
+    ...extra
+  });
+}
+
+function windowsCredentialTestEnvironment(): NodeJS.ProcessEnv {
+  const helper = process.env.SGW_WINDOWS_CREDENTIAL_HELPER?.trim();
+  if (process.env.SGW_TEST_MODE !== "1" || !helper) return {};
+  return {
+    SGW_TEST_MODE: "1",
+    SGW_WINDOWS_CREDENTIAL_HELPER: path.resolve(helper)
+  };
 }
 
 export function assertMacBackgroundUnlock(): void {

@@ -29,7 +29,7 @@ const windowsCredentialHelperName = "s-gw-credential.ps1";
 const keychainRepairTimeoutMs = 10_000;
 const staleKeychainRepairMs = 30_000;
 const defaultSecretToolTimeoutMs = 10_000;
-const windowsCredentialHelperTimeoutMs = 120_000;
+const windowsCredentialHelperTimeoutMs = 30_000;
 const maxSecretToolInputBytes = 8_191;
 
 export interface KeychainInfo {

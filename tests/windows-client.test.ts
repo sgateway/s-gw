@@ -26,13 +26,19 @@ const keychainAccount = `vitest-${process.pid}`;
 const windowsProcessTestTimeout = 300_000;
 let authorityEnvironment: NodeJS.ProcessEnv | undefined;
 let suiteEnvironment: NodeJS.ProcessEnv | undefined;
+let credentialFixturePath: string | undefined;
 
-beforeAll(() => {
+beforeAll(async () => {
   if (process.platform !== "win32") return;
   suiteEnvironment = { ...process.env };
   delete process.env.SGW_DISABLE_KEYCHAIN;
   delete process.env.SGW_MASTER_PASSPHRASE;
-  delete process.env.SGW_WINDOWS_CREDENTIAL_HELPER;
+  credentialFixturePath = path.join(
+    windowsTestRoot(),
+    `sgw-windows-credential-fixture-${process.pid}-${Date.now()}.ps1`
+  );
+  await writeFile(credentialFixturePath, windowsCredentialFixture());
+  process.env.SGW_WINDOWS_CREDENTIAL_HELPER = credentialFixturePath;
   process.env.SGW_KEYCHAIN_SERVICE = keychainService;
   process.env.SGW_KEYCHAIN_ACCOUNT = keychainAccount;
   setKeychainPassphrase(`windows-client-test-${process.pid}`);
@@ -43,7 +49,7 @@ beforeEach(() => {
   authorityEnvironment = { ...process.env };
   delete process.env.SGW_DISABLE_KEYCHAIN;
   delete process.env.SGW_MASTER_PASSPHRASE;
-  delete process.env.SGW_WINDOWS_CREDENTIAL_HELPER;
+  if (credentialFixturePath) process.env.SGW_WINDOWS_CREDENTIAL_HELPER = credentialFixturePath;
   process.env.SGW_KEYCHAIN_SERVICE = keychainService;
   process.env.SGW_KEYCHAIN_ACCOUNT = keychainAccount;
 });
@@ -60,6 +66,7 @@ afterAll(async () => {
     await uninstallWindowsLoginService();
   } finally {
     try {
+      if (credentialFixturePath) process.env.SGW_WINDOWS_CREDENTIAL_HELPER = credentialFixturePath;
       deleteKeychainPassphrase();
     } finally {
       process.env = suiteEnvironment;
@@ -67,6 +74,41 @@ afterAll(async () => {
     }
   }
 }, windowsProcessTestTimeout);
+
+function windowsCredentialFixture(): string {
+  return [
+    "[CmdletBinding()]",
+    "param(",
+    "  [Parameter(Mandatory = $true, Position = 0)]",
+    "  [ValidateSet('get', 'set', 'delete', 'status')]",
+    "  [string]$Command,",
+    "  [Parameter(Mandatory = $true)] [string]$Service,",
+    "  [Parameter(Mandatory = $true)] [string]$Account,",
+    "  [string]$Label = 's-gw test credential'",
+    ")",
+    "$ErrorActionPreference = 'Stop'",
+    "$storePath = \"$PSCommandPath.value\"",
+    "switch ($Command) {",
+    "  'get' {",
+    "    if (-not [IO.File]::Exists($storePath)) { exit 44 }",
+    "    [Console]::Out.Write([IO.File]::ReadAllText($storePath))",
+    "  }",
+    "  'set' {",
+    "    $value = [Console]::In.ReadToEnd()",
+    "    if (-not $value) { throw 'Cannot store an empty test credential.' }",
+    "    [IO.File]::WriteAllText($storePath, $value, [Text.UTF8Encoding]::new($false))",
+    "  }",
+    "  'delete' {",
+    "    $deleted = [IO.File]::Exists($storePath)",
+    "    if ($deleted) { [IO.File]::Delete($storePath) }",
+    "    [Console]::Out.WriteLine((@{ deleted = $deleted } | ConvertTo-Json -Compress))",
+    "  }",
+    "  'status' {",
+    "    [Console]::Out.WriteLine((@{ supported = $true; configured = [IO.File]::Exists($storePath) } | ConvertTo-Json -Compress))",
+    "  }",
+    "}"
+  ].join("\n");
+}
 
 describe("Windows client packaging", () => {
   it("selects helpers only from the current Windows user session", () => {
@@ -101,6 +143,7 @@ describe("Windows client packaging", () => {
     const helperLauncher = await readFile(layout.windowsHelperLauncherPath, "utf8");
     const credential = await readFile(layout.windowsCredentialHelperPath, "utf8");
     const launcher = await readFile(path.join(repoRoot, "dist/windows/s-gw-client.cmd"), "utf8");
+    const installSource = await readFile(path.join(repoRoot, "src/install.ts"), "utf8");
 
     expect(client).toContain("Start-ConsoleDaemon");
     expect(client).toContain("--app=$Url");
@@ -136,6 +179,20 @@ describe("Windows client packaging", () => {
     expect(credential).toContain("[Console]::In.ReadToEnd()");
     expect(launcher).toContain("app open");
     expect(launcher).not.toContain("s-gw-client.ps1");
+
+    const inspectionSource = installSource.slice(
+      installSource.indexOf("function inspectRunningWindowsHelpers"),
+      installSource.indexOf("function waitForWindowsHelper")
+    );
+    const settleSource = installSource.slice(
+      installSource.indexOf("function waitForWindowsHelper"),
+      installSource.indexOf("function windowsHelperInstanceKey")
+    );
+    expect(inspectionSource.match(/spawnSync\(/g)).toHaveLength(1);
+    expect(inspectionSource).toContain("SGW_HELPER_SETTLE");
+    expect(inspectionSource).not.toMatch(/\$pid\s*=/i);
+    expect(settleSource).toContain("inspectRunningWindowsHelpers");
+    expect(settleSource).not.toContain("findRunningWindowsHelpers");
 
     const combined = `${client}\n${helper}\n${credential}`;
     expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");
@@ -334,6 +391,41 @@ describe("Windows client packaging", () => {
       await rm(`${home}-recovery`, { recursive: true, force: true });
       await rm(otherHome, { recursive: true, force: true });
       await rm(`${otherHome}-recovery`, { recursive: true, force: true });
+    }
+  }, windowsProcessTestTimeout);
+
+  it("keeps a healthy console but refuses a new tray with only foreground unlock", async () => {
+    if (process.platform !== "win32") return;
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-unlock-"));
+    const port = await freePort();
+    const oldHome = process.env.SGW_HOME;
+    const oldRecoveryHome = process.env.SGW_RECOVERY_HOME;
+    process.env.SGW_HOME = home;
+    process.env.SGW_RECOVERY_HOME = `${home}-recovery`;
+
+    try {
+      await ensureWindowsConsole({ port });
+      await waitForHealth(port);
+      expect(windowsHelperPids(port)).toEqual([]);
+
+      expect(deleteKeychainPassphrase()).toBe(true);
+      process.env.SGW_MASTER_PASSPHRASE = "foreground-only-helper-passphrase";
+      await expect(openWindowsHelper({ port }))
+        .rejects.toThrow(/will not persist or inherit SGW_MASTER_PASSPHRASE/i);
+
+      await waitForHealth(port);
+      expect(windowsHelperPids(port)).toEqual([]);
+    } finally {
+      delete process.env.SGW_MASTER_PASSPHRASE;
+      try {
+        setKeychainPassphrase(`windows-client-test-restored-${process.pid}`);
+      } finally {
+        stopWindowsSurfaces({ port });
+        restoreEnv("SGW_HOME", oldHome);
+        restoreEnv("SGW_RECOVERY_HOME", oldRecoveryHome);
+        await rm(home, { recursive: true, force: true });
+        await rm(`${home}-recovery`, { recursive: true, force: true });
+      }
     }
   }, windowsProcessTestTimeout);
 
