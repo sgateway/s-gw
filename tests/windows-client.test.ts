@@ -191,6 +191,7 @@ describe("Windows client packaging", () => {
     expect(inspectionSource).not.toMatch(/\$pid\s*=/i);
     expect(settleSource).toContain("inspectRunningWindowsHelpers");
     expect(settleSource).not.toContain("findRunningWindowsHelpers");
+    expect(installSource).toContain("SGW_TEST_HOME_ROOT: path.resolve(testRoot)");
 
     const combined = `${client}\n${helper}\n${credential}`;
     expect(combined).not.toContain("SGW_MASTER_PASSPHRASE");

@@ -2392,8 +2392,13 @@ function windowsEnvironment(url: string, extra: NodeJS.ProcessEnv = {}): NodeJS.
 function windowsCredentialTestEnvironment(): NodeJS.ProcessEnv {
   const helper = process.env.SGW_WINDOWS_CREDENTIAL_HELPER?.trim();
   if (process.env.SGW_TEST_MODE !== "1" || !helper) return {};
+  const testRoot = process.env.SGW_TEST_HOME_ROOT?.trim();
+  if (!testRoot) {
+    throw new Error("SGW_TEST_HOME_ROOT is required for the isolated Windows credential fixture.");
+  }
   return {
     SGW_TEST_MODE: "1",
+    SGW_TEST_HOME_ROOT: path.resolve(testRoot),
     SGW_WINDOWS_CREDENTIAL_HELPER: path.resolve(helper)
   };
 }
