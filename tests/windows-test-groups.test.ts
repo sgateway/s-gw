@@ -46,7 +46,9 @@ describe("Windows test groups", () => {
     expect(workflow).toContain("name: Windows preview client");
     expect(workflow).toContain("needs: windows_shards");
     expect(workflow).toContain("WINDOWS_RESULT: ${{ needs.windows_shards.result }}");
-    expect(workflow).toContain("SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS: 120000");
+    expect(workflow).toContain(
+      "SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS: ${{ matrix.group == 'acl' && '120000' || '' }}"
+    );
     expect(workflow).toContain("SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000");
     expect(workflow).toContain("SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000");
     expect(workflow).toContain("SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000");
