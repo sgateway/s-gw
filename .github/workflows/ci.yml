@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, store, client, credential, acl]
+        group: [core, store, client-package, client-session, client-startup, credential, acl]
     env:
       SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000
       SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000

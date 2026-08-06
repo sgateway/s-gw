@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { filesForWindowsTestGroup, parseWindowsTestGroup } from "./windows-test-groups.mjs";
+import {
+  filesForWindowsTestGroup,
+  parseWindowsTestGroup,
+  testNamePatternForWindowsTestGroup
+} from "./windows-test-groups.mjs";
 
 if (process.platform !== "win32") {
   throw new Error("The private Windows test runner is only available on Windows.");
@@ -51,7 +55,11 @@ try {
 
   const vitest = path.join(stagedRoot, "node_modules", "vitest", "vitest.mjs");
   const testFiles = filesForWindowsTestGroup(testGroup, await discoverTestFiles(stagedRoot));
-  testResult = spawnSync(privateNode, [vitest, "run", "--no-file-parallelism", ...testFiles], {
+  const testNamePattern = testNamePatternForWindowsTestGroup(testGroup);
+  const vitestArgs = [vitest, "run", "--no-file-parallelism"];
+  if (testNamePattern) vitestArgs.push("--testNamePattern", testNamePattern);
+  vitestArgs.push(...testFiles);
+  testResult = spawnSync(privateNode, vitestArgs, {
     cwd: stagedRoot,
     env: { ...process.env, npm_execpath: path.join(privateNpmRoot, "bin", "npm-cli.js") },
     stdio: "inherit",
