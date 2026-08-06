@@ -33,11 +33,9 @@ beforeAll(async () => {
   suiteEnvironment = { ...process.env };
   delete process.env.SGW_DISABLE_KEYCHAIN;
   delete process.env.SGW_MASTER_PASSPHRASE;
-  credentialFixturePath = path.join(
-    windowsTestRoot(),
-    `sgw-windows-credential-fixture-${process.pid}-${Date.now()}.ps1`
-  );
-  await writeFile(credentialFixturePath, windowsCredentialFixture());
+  const fixtureRoot = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-credential-fixture-"));
+  credentialFixturePath = path.join(fixtureRoot, "s-gw-credential.ps1");
+  await writeFile(credentialFixturePath, windowsCredentialFixture(), { flag: "wx", mode: 0o600 });
   process.env.SGW_WINDOWS_CREDENTIAL_HELPER = credentialFixturePath;
   process.env.SGW_KEYCHAIN_SERVICE = keychainService;
   process.env.SGW_KEYCHAIN_ACCOUNT = keychainAccount;
