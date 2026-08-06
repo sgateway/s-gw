@@ -972,10 +972,24 @@ async function startWindowsLoginServiceForShortcut(
     if (config.tray) {
       await openWindowsHelper({ port: config.port, consoleUrl: consoleUrl(config.port) });
     }
-    return await windowsLoginServiceStatusForConfig(config, shortcut);
+    return await waitForWindowsLoginServiceStatus(config, shortcut);
   } finally {
     restore();
   }
+}
+
+async function waitForWindowsLoginServiceStatus(
+  config: WindowsStartupConfig,
+  shortcut: WindowsStartupShortcutStatus
+): Promise<WindowsLoginServiceStatus> {
+  let latest = await windowsLoginServiceStatusForConfig(config, shortcut);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (latest.active && (!config.tray || latest.helperActive)) return latest;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    latest = await windowsLoginServiceStatusForConfig(config, shortcut);
+  }
+  if (latest.active && (!config.tray || latest.helperActive)) return latest;
+  throw new Error(latest.error || "Windows login startup did not remain active after launch.");
 }
 
 export async function stopInstalledWindowsLoginService(): Promise<WindowsLoginServiceStatus> {
