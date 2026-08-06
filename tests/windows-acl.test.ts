@@ -4,12 +4,33 @@ import path from "node:path";
 import { expect, it } from "vitest";
 import {
   createPrivateWindowsSshDirectory,
-  verifyPrivateWindowsKeyFile
+  verifyPrivateWindowsKeyFile,
+  windowsAclOperationTimeoutMs
 } from "../src/windows-acl.js";
 import {
   trustedWindowsPowerShellSync,
   windowsSystemEnvironment
 } from "../src/windows-system.js";
+
+it("allows a bounded Windows ACL timeout only in isolated tests", () => {
+  const oldTestMode = process.env.SGW_TEST_MODE;
+  const oldTimeout = process.env.SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS;
+  try {
+    delete process.env.SGW_TEST_MODE;
+    process.env.SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS = "120000";
+    expect(windowsAclOperationTimeoutMs()).toBe(30_000);
+
+    process.env.SGW_TEST_MODE = "1";
+    expect(windowsAclOperationTimeoutMs()).toBe(120_000);
+    process.env.SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS = "120001";
+    expect(windowsAclOperationTimeoutMs()).toBe(30_000);
+  } finally {
+    if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+    else process.env.SGW_TEST_MODE = oldTestMode;
+    if (oldTimeout === undefined) delete process.env.SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS;
+    else process.env.SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS = oldTimeout;
+  }
+});
 
 it.skipIf(process.platform !== "win32")(
   "protects a generated SSH key for only the current user and SYSTEM",

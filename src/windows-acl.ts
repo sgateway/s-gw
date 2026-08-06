@@ -8,7 +8,8 @@ import {
   windowsSystemEnvironment
 } from "./windows-system.js";
 
-const ACL_TIMEOUT_MS = 30_000;
+const defaultAclOperationTimeoutMs = 30_000;
+const maxAclOperationTestTimeoutMs = 120_000;
 
 const WINDOWS_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -387,10 +388,11 @@ async function runAclOperation(mode: string, target: string, expectedSid?: strin
   });
 
   let timedOut = false;
+  const timeoutMs = windowsAclOperationTimeoutMs();
   const timeout = setTimeout(() => {
     timedOut = true;
     child.kill("SIGKILL");
-  }, ACL_TIMEOUT_MS);
+  }, timeoutMs);
   const status = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal }));
@@ -415,6 +417,14 @@ async function runAclOperation(mode: string, target: string, expectedSid?: strin
     throw new Error("Windows ACL verification did not confirm the current user boundary.");
   }
   return parsed;
+}
+
+export function windowsAclOperationTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultAclOperationTimeoutMs;
+  const configured = Number(process.env.SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= maxAclOperationTestTimeoutMs
+    ? configured
+    : defaultAclOperationTimeoutMs;
 }
 
 export async function trustedWindowsSystemExecutable(...parts: string[]): Promise<string> {

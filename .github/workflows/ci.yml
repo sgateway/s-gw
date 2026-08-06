@@ -69,6 +69,7 @@ jobs:
       matrix:
         group: [core, store, client-package, client-session, client-startup, credential, acl]
     env:
+      SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS: 120000
       SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000
       SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000
       SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000
