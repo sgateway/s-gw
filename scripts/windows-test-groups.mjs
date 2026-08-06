@@ -1,7 +1,8 @@
 const dedicatedGroups = Object.freeze({
   store: ["tests/store.test.ts"],
   client: ["tests/windows-client.test.ts"],
-  credential: ["tests/windows-acl.test.ts", "tests/windows-credential-e2e.test.ts"]
+  credential: ["tests/windows-credential-e2e.test.ts"],
+  acl: ["tests/windows-acl.test.ts"]
 });
 
 export const windowsTestGroups = Object.freeze(["all", "core", ...Object.keys(dedicatedGroups)]);

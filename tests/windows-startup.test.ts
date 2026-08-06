@@ -10,7 +10,8 @@ import {
   applyWindowsStartupConfig,
   buildWindowsStartupConfig,
   decodeWindowsStartupConfig,
-  encodeWindowsStartupConfig
+  encodeWindowsStartupConfig,
+  windowsStartupOperationTimeoutMs
 } from "../src/windows-startup.js";
 import {
   trustedWindowsPowerShellSync,
@@ -49,6 +50,26 @@ afterEach(async () => {
 });
 
 describe("Windows login startup contract", () => {
+  it("allows a bounded startup timeout only in isolated tests", () => {
+    const oldTestMode = process.env.SGW_TEST_MODE;
+    const oldTimeout = process.env.SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS;
+    try {
+      delete process.env.SGW_TEST_MODE;
+      process.env.SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS = "120000";
+      expect(windowsStartupOperationTimeoutMs()).toBe(30_000);
+
+      process.env.SGW_TEST_MODE = "1";
+      expect(windowsStartupOperationTimeoutMs()).toBe(120_000);
+      process.env.SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS = "120001";
+      expect(windowsStartupOperationTimeoutMs()).toBe(30_000);
+    } finally {
+      if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+      else process.env.SGW_TEST_MODE = oldTestMode;
+      if (oldTimeout === undefined) delete process.env.SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS;
+      else process.env.SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS = oldTimeout;
+    }
+  });
+
   it("round-trips alternate authority paths, port, tray, and non-ASCII metadata", () => {
     process.env.SGW_MASTER_PASSPHRASE = "sentinel-master-passphrase";
     process.env.AWS_SECRET_ACCESS_KEY = "sentinel-cloud-secret";

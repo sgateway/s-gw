@@ -29,7 +29,8 @@ const windowsCredentialHelperName = "s-gw-credential.ps1";
 const keychainRepairTimeoutMs = 10_000;
 const staleKeychainRepairMs = 30_000;
 const defaultSecretToolTimeoutMs = 10_000;
-const windowsCredentialHelperTimeoutMs = 30_000;
+const defaultWindowsCredentialHelperTimeoutMs = 30_000;
+const maxWindowsCredentialHelperTestTimeoutMs = 120_000;
 const maxSecretToolInputBytes = 8_191;
 
 export interface KeychainInfo {
@@ -1238,6 +1239,7 @@ function testOnlyHelperOverride(name: string): string | undefined {
 
 function runWindowsCredentialHelper(helperPath: string, args: string[], input?: string): string {
   const powershell = trustedWindowsPowerShellSync();
+  const timeoutMs = windowsCredentialHelperTimeoutMs();
   const result = spawnSync(powershell, [
     "-NoLogo",
     "-NoProfile",
@@ -1253,13 +1255,13 @@ function runWindowsCredentialHelper(helperPath: string, args: string[], input?: 
     encoding: "utf8",
     env: windowsSystemEnvironment(),
     stdio: ["pipe", "pipe", "pipe"],
-    timeout: windowsCredentialHelperTimeoutMs,
+    timeout: timeoutMs,
     killSignal: "SIGKILL"
   });
 
   if (result.error) {
     if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-      throw new Error(`Windows Credential Manager helper timed out after ${windowsCredentialHelperTimeoutMs} ms.`);
+      throw new Error(`Windows Credential Manager helper timed out after ${timeoutMs} ms.`);
     }
     throw result.error;
   }
@@ -1268,4 +1270,12 @@ function runWindowsCredentialHelper(helperPath: string, args: string[], input?: 
   }
 
   return result.stdout;
+}
+
+export function windowsCredentialHelperTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultWindowsCredentialHelperTimeoutMs;
+  const configured = Number(process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= maxWindowsCredentialHelperTestTimeoutMs
+    ? configured
+    : defaultWindowsCredentialHelperTimeoutMs;
 }

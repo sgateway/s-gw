@@ -34,11 +34,14 @@ describe("Windows test groups", () => {
 
   it("keeps the stable aggregate CI check over every shard", async () => {
     const workflow = await readFile(path.resolve(".github/workflows/ci.yml"), "utf8");
-    expect(workflow).toContain("group: [core, store, client, credential]");
+    expect(workflow).toContain("group: [core, store, client, credential, acl]");
     expect(workflow).toContain("name: macOS native surfaces");
     expect(workflow).toContain("name: Windows preview client");
     expect(workflow).toContain("needs: windows_shards");
     expect(workflow).toContain("WINDOWS_RESULT: ${{ needs.windows_shards.result }}");
+    expect(workflow).toContain("SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000");
+    expect(workflow).toContain("SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000");
+    expect(workflow).toContain("SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000");
   });
 });
 

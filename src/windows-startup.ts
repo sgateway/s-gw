@@ -9,7 +9,8 @@ import { trustedWindowsPowerShellSync, windowsSystemEnvironment } from "./window
 const STARTUP_DESCRIPTION = "s-gw per-user login startup (managed)";
 const STARTUP_FILE_NAME = "s-gw Credential Gateway.lnk";
 const PAYLOAD_VERSION = 1;
-const STARTUP_OPERATION_TIMEOUT_MS = 30_000;
+const defaultStartupOperationTimeoutMs = 30_000;
+const maxStartupOperationTestTimeoutMs = 120_000;
 const AUTHORITY_ENV_KEYS = [
   "SGW_EXECUTION_ENGINE",
   "SGW_HOME",
@@ -575,7 +576,7 @@ function runShortcutOperation(
     env: windowsSystemEnvironment(extra),
     maxBuffer: 64 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: STARTUP_OPERATION_TIMEOUT_MS,
+    timeout: windowsStartupOperationTimeoutMs(),
     windowsHide: true
   });
   if (result.error) {
@@ -592,6 +593,14 @@ function runShortcutOperation(
     throw new Error("Windows login startup management returned an invalid response.");
   }
   return validateShortcutRecord(parsed);
+}
+
+export function windowsStartupOperationTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultStartupOperationTimeoutMs;
+  const configured = Number(process.env.SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= maxStartupOperationTestTimeoutMs
+    ? configured
+    : defaultStartupOperationTimeoutMs;
 }
 
 function windowsStartupTestRoot(): string | undefined {

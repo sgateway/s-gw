@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +18,7 @@ if (windowsTestRoot) {
   process.env.TEMP = windowsTestRoot;
   process.env.TMP = windowsTestRoot;
 }
-const suiteHome = path.join(testHomeRoot, `sgw-vitest-${randomUUID()}`);
+const suiteHome = path.join(testHomeRoot, `sgw-vitest-${testPathSuffix()}`);
 const suiteRecoveryHome = `${suiteHome}-recovery`;
 
 function useDisposableHomes(): void {
@@ -60,5 +60,9 @@ function makeWindowsTestRoot(): string | undefined {
   const localAppData = process.env.LOCALAPPDATA?.trim()
     || path.join(os.homedir(), "AppData", "Local");
   const tempParent = path.join(localAppData, "Temp");
-  return path.join(tempParent, `sgw-vitest-root-${randomUUID()}`);
+  return path.join(tempParent, `sgw-vitest-root-${testPathSuffix()}`);
+}
+
+function testPathSuffix(): string {
+  return randomBytes(5).toString("base64url").slice(0, 6);
 }

@@ -44,7 +44,8 @@ export const consoleLabel = "com.s-gw.sgw.console";
 export const menuBarLabel = "com.s-gw.sgw.menubar";
 export const systemdUnitName = "s-gw.service";
 
-const windowsProcessInspectionTimeoutMs = 15_000;
+const defaultWindowsProcessInspectionTimeoutMs = 15_000;
+const maxWindowsProcessInspectionTestTimeoutMs = 120_000;
 
 export interface PackageLayout {
   packageRoot: string;
@@ -1185,7 +1186,7 @@ function trustedWindowsConsoleListener(port: number, cliPath: string): number | 
       SGW_CONSOLE_NODE_PATH: process.execPath
     }),
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: windowsProcessInspectionTimeoutMs,
+    timeout: windowsProcessInspectionTimeoutMs(),
     windowsHide: true
   });
   if (result.error) {
@@ -1736,7 +1737,7 @@ function inspectRunningWindowsHelpers(
       SGW_HELPER_SETTLE: settle ? "1" : "0"
     }),
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: windowsProcessInspectionTimeoutMs,
+    timeout: windowsProcessInspectionTimeoutMs(),
     windowsHide: true
   });
   if (result.error) {
@@ -1775,6 +1776,14 @@ function inspectRunningWindowsHelpers(
 
 function waitForWindowsHelper(scriptPath: string, port: number, url: string, instanceKey: string): number {
   return inspectRunningWindowsHelpers(scriptPath, port, url, instanceKey, true)[0];
+}
+
+export function windowsProcessInspectionTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultWindowsProcessInspectionTimeoutMs;
+  const configured = Number(process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= maxWindowsProcessInspectionTestTimeoutMs
+    ? configured
+    : defaultWindowsProcessInspectionTimeoutMs;
 }
 
 function windowsHelperInstanceKey(url: string): string {

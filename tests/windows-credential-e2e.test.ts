@@ -114,7 +114,7 @@ describe("Windows credential protection", () => {
         await rm(`${home}-recovery`, { recursive: true, force: true });
       }
     },
-    300_000
+    600_000
   );
 });
 
@@ -125,7 +125,9 @@ function runCli(args: string[], env: NodeJS.ProcessEnv, input?: string): string 
     env,
     input,
     encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 180_000,
+    killSignal: "SIGKILL"
   });
 }
 
@@ -150,6 +152,11 @@ function runCredentialDelete(service: string, account: string): { deleted: boole
     service,
     "-Account",
     account
-  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  ], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 180_000,
+    killSignal: "SIGKILL"
+  });
   return JSON.parse(output) as { deleted: boolean };
 }

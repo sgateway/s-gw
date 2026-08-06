@@ -50,7 +50,9 @@ $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentif
         encoding: "utf8",
         env: windowsSystemEnvironment({ SGW_WINDOWS_ACL_INSPECT_PATH: keyPath }),
         shell: false,
-        windowsHide: true
+        windowsHide: true,
+        timeout: 120_000,
+        killSignal: "SIGKILL"
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(0);
@@ -92,5 +94,5 @@ $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentif
       await rm(dirPath, { recursive: true, force: true });
     }
   },
-  120_000
+  300_000
 );

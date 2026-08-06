@@ -13,7 +13,8 @@ import {
   pinPackagedKeychainHelper,
   repairMacKeychainItemAccess,
   setKeychainPassphrase,
-  unlockStatus
+  unlockStatus,
+  windowsCredentialHelperTimeoutMs
 } from "../src/unlock.js";
 
 let tmpDir = "";
@@ -48,6 +49,26 @@ afterEach(async () => {
 });
 
 describe("unlock passphrase provider", () => {
+  it("allows a bounded Windows helper timeout only in isolated tests", () => {
+    const oldTestMode = process.env.SGW_TEST_MODE;
+    const oldTimeout = process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS;
+    try {
+      delete process.env.SGW_TEST_MODE;
+      process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS = "120000";
+      expect(windowsCredentialHelperTimeoutMs()).toBe(30_000);
+
+      process.env.SGW_TEST_MODE = "1";
+      expect(windowsCredentialHelperTimeoutMs()).toBe(120_000);
+      process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS = "120001";
+      expect(windowsCredentialHelperTimeoutMs()).toBe(30_000);
+    } finally {
+      if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+      else process.env.SGW_TEST_MODE = oldTestMode;
+      if (oldTimeout === undefined) delete process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS;
+      else process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS = oldTimeout;
+    }
+  });
+
   it.skipIf(process.platform !== "darwin")("refuses raw helper overrides outside isolated test mode", async () => {
     const helper = path.join(tmpDir, "s-gw-keychain-helper");
     await writeFile(helper, "#!/bin/sh\nexit 0\n", { mode: 0o700 });

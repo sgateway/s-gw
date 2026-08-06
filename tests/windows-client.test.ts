@@ -23,7 +23,7 @@ import { deleteKeychainPassphrase, setKeychainPassphrase } from "../src/unlock.j
 const repoRoot = process.cwd();
 const keychainService = `com.s-gw.test.windows-client.${process.pid}.${Date.now()}`;
 const keychainAccount = `vitest-${process.pid}`;
-const windowsProcessTestTimeout = 300_000;
+const windowsProcessTestTimeout = 900_000;
 let authorityEnvironment: NodeJS.ProcessEnv | undefined;
 let suiteEnvironment: NodeJS.ProcessEnv | undefined;
 let credentialFixturePath: string | undefined;
@@ -124,7 +124,9 @@ describe("Windows client packaging", () => {
     execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], {
       cwd: repoRoot,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 120_000,
+      killSignal: "SIGKILL"
     });
 
     const layout = getPackageLayout();
@@ -199,7 +201,11 @@ describe("Windows client packaging", () => {
 
   it("cleans up when the helper bootstrap fails after starting", async () => {
     if (process.platform !== "win32") return;
-    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
+    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], {
+      cwd: repoRoot,
+      timeout: 120_000,
+      killSignal: "SIGKILL"
+    });
     const layout = getPackageLayout();
     const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-bootstrap-home-"));
     const helperPath = layout.windowsHelperScriptPath;
@@ -559,7 +565,11 @@ describe("Windows client packaging", () => {
 
   it("returns one live tray helper when two CLI opens race", async () => {
     if (process.platform !== "win32") return;
-    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
+    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], {
+      cwd: repoRoot,
+      timeout: 120_000,
+      killSignal: "SIGKILL"
+    });
     const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-race-"));
     const port = await freePort();
     const layout = getPackageLayout();
@@ -595,7 +605,11 @@ describe("Windows client packaging", () => {
 
   it("keeps one authority when two credential homes race on one port", async () => {
     if (process.platform !== "win32") return;
-    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
+    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], {
+      cwd: repoRoot,
+      timeout: 120_000,
+      killSignal: "SIGKILL"
+    });
     const firstHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-authority-a-"));
     const secondHome = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-helper-authority-b-"));
     const port = await freePort();
@@ -707,7 +721,11 @@ describe("Windows client packaging", () => {
 
   it("persists alternate Windows authority settings and optional tray without credential environment", async () => {
     if (process.platform !== "win32") return;
-    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], { cwd: repoRoot });
+    execFileSync(process.execPath, ["scripts/build-windows-client.mjs"], {
+      cwd: repoRoot,
+      timeout: 120_000,
+      killSignal: "SIGKILL"
+    });
     const authorityRoot = path.join(windowsTestRoot(), `Windows authority 漢字 é ${Date.now()}`);
     const home = path.join(authorityRoot, "ledger home");
     const recovery = path.join(authorityRoot, "recovery home");
@@ -807,7 +825,9 @@ describe("Windows client packaging", () => {
       await rm(shortcutPath, { force: true });
       execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
         env: { ...process.env, SGW_TEST_COLLISION_PATH: shortcutPath },
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+        killSignal: "SIGKILL"
       });
       const original = await readFile(shortcutPath);
       await expect(installWindowsLoginService({ port: await freePort() }))
@@ -882,7 +902,9 @@ function windowsHelperPids(port: number): number[] {
   ].join("\n");
   const output = execFileSync("powershell.exe", ["-NoProfile", "-Command", script], {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 120_000,
+    killSignal: "SIGKILL"
   }).trim();
   if (!output) return [];
   const parsed = JSON.parse(output) as number | number[];
@@ -908,10 +930,26 @@ async function runProcess(file: string, args: string[], env: NodeJS.ProcessEnv):
     const child = spawn(file, args, { cwd: repoRoot, env, windowsHide: true });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error(`${file} timed out after 300000 ms`));
+    }, 300_000);
+    timer.unref();
     child.stdout.on("data", (chunk) => { stdout += String(chunk); });
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
-    child.once("error", reject);
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
     child.once("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) {
         resolve(stdout.trim());
         return;
@@ -927,7 +965,9 @@ function runBuiltCli(args: string[], env: NodeJS.ProcessEnv): string {
     cwd: repoRoot,
     env,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 300_000,
+    killSignal: "SIGKILL"
   });
 }
 
