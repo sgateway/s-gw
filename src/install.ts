@@ -46,6 +46,9 @@ export const systemdUnitName = "s-gw.service";
 
 const defaultWindowsProcessInspectionTimeoutMs = 15_000;
 const maxWindowsProcessInspectionTestTimeoutMs = 120_000;
+const defaultWindowsHelperLaunchTimeoutMs = 15_000;
+const defaultWindowsHelperCleanupTimeoutMs = 10_000;
+const maxWindowsHelperOperationTestTimeoutMs = 120_000;
 
 export interface PackageLayout {
   packageRoot: string;
@@ -1538,7 +1541,7 @@ function launchWindowsHelper(
       env: windowsEnvironment(url),
       maxBuffer: 64 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 15_000,
+      timeout: windowsHelperOperationTimeoutMs(defaultWindowsHelperLaunchTimeoutMs),
       windowsHide: true
     }
   );
@@ -1653,7 +1656,7 @@ function stopLaunchedWindowsHelper(
       SGW_HELPER_SCRIPT_PATH: scriptPath
     }),
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 10_000,
+    timeout: windowsHelperOperationTimeoutMs(defaultWindowsHelperCleanupTimeoutMs),
     windowsHide: true
   });
   if (result.error) {
@@ -1798,6 +1801,14 @@ export function windowsProcessInspectionTimeoutMs(): number {
   return Number.isInteger(configured) && configured > 0 && configured <= maxWindowsProcessInspectionTestTimeoutMs
     ? configured
     : defaultWindowsProcessInspectionTimeoutMs;
+}
+
+export function windowsHelperOperationTimeoutMs(defaultTimeoutMs = defaultWindowsHelperLaunchTimeoutMs): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultTimeoutMs;
+  const configured = Number(process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= maxWindowsHelperOperationTestTimeoutMs
+    ? configured
+    : defaultTimeoutMs;
 }
 
 function windowsHelperInstanceKey(url: string): string {

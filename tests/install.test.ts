@@ -12,6 +12,7 @@ import {
   macAppProcessRecordPath,
   menuBarLabel,
   packageHealth,
+  windowsHelperOperationTimeoutMs,
   windowsProcessInspectionTimeoutMs
 } from "../src/install.js";
 import { CURRENT_VERSION } from "../src/version.js";
@@ -20,6 +21,29 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 
 describe("customer package layout", () => {
+  it("allows a bounded Windows helper timeout only in isolated tests", () => {
+    const oldTestMode = process.env.SGW_TEST_MODE;
+    const oldTimeout = process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS;
+    try {
+      delete process.env.SGW_TEST_MODE;
+      process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS = "120000";
+      expect(windowsHelperOperationTimeoutMs()).toBe(15_000);
+      expect(windowsHelperOperationTimeoutMs(10_000)).toBe(10_000);
+
+      process.env.SGW_TEST_MODE = "1";
+      expect(windowsHelperOperationTimeoutMs()).toBe(120_000);
+      expect(windowsHelperOperationTimeoutMs(10_000)).toBe(120_000);
+      process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS = "120001";
+      expect(windowsHelperOperationTimeoutMs()).toBe(15_000);
+      expect(windowsHelperOperationTimeoutMs(10_000)).toBe(10_000);
+    } finally {
+      if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+      else process.env.SGW_TEST_MODE = oldTestMode;
+      if (oldTimeout === undefined) delete process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS;
+      else process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS = oldTimeout;
+    }
+  });
+
   it("allows a bounded Windows process inspection timeout only in isolated tests", () => {
     const oldTestMode = process.env.SGW_TEST_MODE;
     const oldTimeout = process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS;

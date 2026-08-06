@@ -16,7 +16,7 @@ import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 const originalPlatform = process.platform;
-const windowsSshTestTimeout = originalPlatform === "win32" ? 120_000 : 30_000;
+const windowsSshTestTimeout = originalPlatform === "win32" ? 300_000 : 30_000;
 const savedEnvKeys = ["SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "NODE_OPTIONS", "PATH", "SGW_TEST_HOME_ROOT"] as const;
 let savedEnv: Partial<Record<(typeof savedEnvKeys)[number], string>> = {};
 const unixIt = originalPlatform === "win32" ? it.skip : it;

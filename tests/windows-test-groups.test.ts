@@ -50,6 +50,9 @@ describe("Windows test groups", () => {
       "SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS: ${{ matrix.group == 'acl' && '120000' || '' }}"
     );
     expect(workflow).toContain("SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000");
+    expect(workflow).toContain(
+      "SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS: ${{ startsWith(matrix.group, 'client-') && '120000' || '' }}"
+    );
     expect(workflow).toContain("SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000");
     expect(workflow).toContain("SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000");
   });
