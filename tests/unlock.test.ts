@@ -39,7 +39,9 @@ afterEach(async () => {
   delete process.env.SGW_FAKE_KEYCHAIN_VALUE;
   delete process.env.SGW_FAKE_KEYCHAIN_CAPTURE;
   delete process.env.SGW_FAKE_KEYCHAIN_GET_DENIED;
-  delete process.env.SGW_FAKE_SECURITY_CAPTURE;
+  delete process.env.SGW_FAKE_INSPECTOR_CAPTURE;
+  delete process.env.SGW_FAKE_INSPECTOR_FAILURE;
+  delete process.env.SGW_ALLOW_SECURITY_CLI;
   delete process.env.SGW_FAKE_KEYCHAIN_DB;
   delete process.env.SGW_HOME;
   delete process.env.SGW_RECOVERY_HOME;
@@ -122,15 +124,16 @@ describe("unlock passphrase provider", () => {
     expect(captured.args.join(" ")).not.toContain("native helper passphrase");
   });
 
-  it("checks Keychain status without asking the helper to reveal the passphrase", async () => {
+  it("checks Keychain status through the metadata-only inspector", async () => {
     if (process.platform !== "darwin") {
       return;
     }
 
-    const capturePath = path.join(tmpDir, "security-args.json");
-    process.env.SGW_FAKE_SECURITY_CAPTURE = capturePath;
+    const capturePath = path.join(tmpDir, "inspector-args.json");
+    process.env.SGW_FAKE_INSPECTOR_CAPTURE = capturePath;
     process.env.SGW_FAKE_KEYCHAIN_GET_DENIED = "1";
     await installFakeHelper("configured keychain passphrase");
+    process.env.SGW_KEYCHAIN_STATUS_CLI = await installSecurityStatusTrap();
 
     const status = unlockStatus();
     expect(status.activeSource).toBe("macos-keychain");
@@ -138,13 +141,61 @@ describe("unlock passphrase provider", () => {
 
     const args = JSON.parse(await readText(capturePath)) as string[];
     expect(args).toEqual([
+      "exists",
+      "--service",
+      "com.s-gw.test",
+      "--account",
+      "unit-test"
+    ]);
+  });
+
+  it("uses the security CLI only when its compatibility fallback is explicit", async () => {
+    if (process.platform !== "darwin") return;
+
+    const capturePath = path.join(tmpDir, "security-fallback-args.json");
+    process.env.SGW_FAKE_KEYCHAIN_GET_DENIED = "1";
+    await installFakeHelper("configured keychain passphrase");
+    process.env.SGW_KEYCHAIN_INSPECTOR = path.join(tmpDir, "missing-inspector");
+    process.env.SGW_ALLOW_SECURITY_CLI = "1";
+    process.env.SGW_KEYCHAIN_STATUS_CLI = await installFakeSecurityStatus(capturePath);
+
+    const status = unlockStatus();
+    expect(status.activeSource).toBe("macos-keychain");
+    expect(status.keychain.state).toBe("configured");
+    expect(JSON.parse(await readText(capturePath))).toEqual([
       "find-generic-password",
       "-a",
       "unit-test",
       "-s",
       "com.s-gw.test"
     ]);
-    expect(args).not.toContain("-w");
+  });
+
+  it("reports a missing Keychain item when the inspector exits 44", async () => {
+    if (process.platform !== "darwin") return;
+
+    process.env.SGW_FAKE_KEYCHAIN_GET_DENIED = "1";
+    await installFakeHelper("");
+
+    const status = unlockStatus();
+    expect(status.activeSource).toBe("none");
+    expect(status.keychain.configured).toBe(false);
+    expect(status.keychain.state).toBe("missing");
+    expect(status.keychain.error).toBeUndefined();
+  });
+
+  it("fails closed when the Keychain inspector cannot determine status", async () => {
+    if (process.platform !== "darwin") return;
+
+    process.env.SGW_FAKE_KEYCHAIN_GET_DENIED = "1";
+    process.env.SGW_FAKE_INSPECTOR_FAILURE = "Synthetic inspector failure";
+    await installFakeHelper("configured keychain passphrase");
+
+    const status = unlockStatus();
+    expect(status.activeSource).toBe("none");
+    expect(status.keychain.configured).toBe(false);
+    expect(status.keychain.state).toBe("unavailable");
+    expect(status.keychain.error).toContain("Synthetic inspector failure");
   });
 
   it("keeps the first installed helper identity in the s-gw data directory", async () => {
@@ -378,6 +429,7 @@ if (command === "get") {
   process.stdout.write(passphrase + "\\n");
   process.exit(0);
 }
+
 if (command === "set") {
   let input = "";
   process.stdin.setEncoding("utf8");
@@ -401,21 +453,46 @@ process.exit(2);
   await chmod(fakePath, 0o700);
   process.env.SGW_KEYCHAIN_HELPER = fakePath;
 
-  const fakeSecurity = path.join(tmpDir, "security");
+  const fakeInspector = path.join(tmpDir, "s-gw-keychain-inspector");
   await writeFile(
-    fakeSecurity,
+    fakeInspector,
     `#!/usr/bin/env node
 const fs = require("fs");
 const args = process.argv.slice(2);
-if (process.env.SGW_FAKE_SECURITY_CAPTURE) {
-  fs.writeFileSync(process.env.SGW_FAKE_SECURITY_CAPTURE, JSON.stringify(args));
+if (process.env.SGW_FAKE_INSPECTOR_CAPTURE) {
+  fs.writeFileSync(process.env.SGW_FAKE_INSPECTOR_CAPTURE, JSON.stringify(args));
 }
-if (args[0] !== "find-generic-password" || args.includes("-w")) process.exit(2);
+if (args[0] !== "exists") process.exit(64);
+if (process.env.SGW_FAKE_INSPECTOR_FAILURE) {
+  process.stderr.write(process.env.SGW_FAKE_INSPECTOR_FAILURE + "\\n");
+  process.exit(70);
+}
 process.exit(process.env.SGW_FAKE_KEYCHAIN_VALUE ? 0 : 44);
 `
   );
-  await chmod(fakeSecurity, 0o700);
-  process.env.SGW_KEYCHAIN_STATUS_CLI = fakeSecurity;
+  await chmod(fakeInspector, 0o700);
+  process.env.SGW_KEYCHAIN_INSPECTOR = fakeInspector;
+}
+
+async function installSecurityStatusTrap(): Promise<string> {
+  const trapPath = path.join(tmpDir, "security-status-trap");
+  await writeFile(trapPath, "#!/bin/sh\nexit 91\n");
+  await chmod(trapPath, 0o700);
+  return trapPath;
+}
+
+async function installFakeSecurityStatus(capturePath: string): Promise<string> {
+  const fakePath = path.join(tmpDir, "security-status-fallback");
+  await writeFile(
+    fakePath,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(process.argv.slice(2)));
+process.exit(0);
+`
+  );
+  await chmod(fakePath, 0o700);
+  return fakePath;
 }
 
 async function installRepairHarness(input: { service: string; account: string; value: string }): Promise<{
@@ -450,12 +527,15 @@ async function installRepairHarness(input: { service: string; account: string; v
 const crypto = require("crypto");
 const fs = require("fs");
 const args = process.argv.slice(2);
+const command = args[0];
 const value = name => args[args.indexOf(name) + 1];
 const candidates = [];
 for (let i = 0; i < args.length; i++) if (args[i] === "--candidate") candidates.push(args[i + 1]);
 const db = JSON.parse(fs.readFileSync(process.env.SGW_FAKE_KEYCHAIN_DB, "utf8"));
 const item = db.items[value("--service") + "\\0" + value("--account")];
 if (!item) process.exit(44);
+if (command === "exists") process.exit(0);
+if (command !== "trusted-helper") process.exit(64);
 const identity = path => {
   try { return crypto.createHash("sha256").update(fs.readFileSync(path)).digest("hex"); }
   catch { return ""; }
@@ -468,11 +548,6 @@ process.stdout.write(JSON.stringify({ trustedHelpers: candidates.filter(path => 
 const fs = require("fs");
 const args = process.argv.slice(2);
 const db = JSON.parse(fs.readFileSync(process.env.SGW_FAKE_KEYCHAIN_DB, "utf8"));
-if (args[0] === "find-generic-password") {
-  const account = args[args.indexOf("-a") + 1];
-  const service = args[args.indexOf("-s") + 1];
-  process.exit(db.items[service + "\\0" + account] ? 0 : 44);
-}
 if (args[0] === "dump-keychain") {
   for (const [key, item] of Object.entries(db.items)) {
     const split = key.indexOf("\\0");

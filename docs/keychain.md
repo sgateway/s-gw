@@ -48,7 +48,7 @@ Automatic capture paths, including guard mode and the local console API, prefer 
 4. During approved execution, s-gw reads the credential from the local store and injects it into the local child process.
 5. Command output is sanitized back to handles before it is returned.
 
-On macOS, routine status, dashboard, and menu refreshes inspect only Keychain metadata and should not open a password prompt. Linux `secret-tool` has no metadata-only lookup, so a status check asks the already-unlocked Secret Service for the item and discards the value without printing or serializing it. If an unexpected macOS Keychain password dialog appears, cancel it and run `s-gw unlock keychain repair`; current releases fail closed before starting an unverified helper.
+On macOS, routine status uses the packaged native inspector and asks Security.framework for attributes only; it does not call `/usr/bin/security` or request the password data. The app and menu helper keep four-second approval polling, but cache this runtime status for five minutes between launches, activations, manual refreshes, and relevant setup or service changes. Set `SGW_ALLOW_SECURITY_CLI=1` only as an explicit compatibility fallback when the packaged inspector is unavailable; that fallback may be visible to endpoint monitoring. Linux `secret-tool` has no metadata-only lookup, so a status check asks the already-unlocked Secret Service for the item and discards the value without printing or serializing it. If an unexpected macOS Keychain password dialog appears, cancel it and run `s-gw unlock keychain repair`; current releases fail closed before starting an unverified helper.
 
 ## 1Password Migration Later
 

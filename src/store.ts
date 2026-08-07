@@ -48,6 +48,7 @@ const defaultApprovalSettings: ApprovalSettings = {
 };
 
 const maxApprovalDurationMs = 30 * 24 * 60 * 60 * 1000;
+const macosSecurityCli = "/usr/bin/security";
 // Concurrent clients may need to serialize a durable control-plane write on a slow disk.
 const lockTimeoutMs = 30_000;
 const windowsLockRenameAttempts = 20;
@@ -2899,6 +2900,7 @@ function executionAdmissionContext(
   assertActionAllowed(secret, normalizedAction);
   assertBoundHandlesAllowed(store, handle, normalizedAction);
   const admittedAction = actionForAdmission(normalizedAction);
+  assertCredentialBackedExecutableAllowed(admittedAction);
   const policyRule = matchingApprovalPolicyRuleForAction(store, secret, admittedAction, agent.name, now);
   const grant = activeApprovalGrant(store, handle, admittedAction, agent.name, now, loginSessionId);
   return { secret, action: admittedAction, agent, loginSessionId, now, policyRule, grant };
@@ -3355,6 +3357,7 @@ function approvalActionKey(handle: string, action: CommandAction): string {
     kind: normalized.kind,
     command: normalizeCommandGrant(normalized.command),
     resolvedCommand: normalized.kind === "env_command" ? normalized.resolvedCommand || "" : "",
+    ...(normalized.kind === "env_command" ? { args: normalized.args } : {}),
     injectEnv: normalized.injectEnv,
     env: normalized.env || [],
     workingDir: normalized.workingDir ? path.resolve(normalized.workingDir) : "",
@@ -4264,6 +4267,8 @@ export function assertActionAllowed(secret: SecretRecord, action: CommandAction)
     }
   }
 
+  assertCredentialBackedExecutableAllowed(action);
+
   if (!action.injectEnv) {
     throw new Error("injectEnv is required so the secret has a narrow local binding.");
   }
@@ -4289,6 +4294,12 @@ export function assertActionAllowed(secret: SecretRecord, action: CommandAction)
   const requestedCommand = normalizeCommandGrant(action.command);
   if (allowed.length === 0 || !allowed.includes(requestedCommand)) {
     throw new Error(`Command '${action.command}' is not allowed for handle ${secret.handle}.`);
+  }
+}
+
+function assertCredentialBackedExecutableAllowed(action: CommandAction): void {
+  if (action.kind === "env_command" && action.resolvedCommand === macosSecurityCli) {
+    throw new Error("Credential-backed execution of /usr/bin/security is not allowed.");
   }
 }
 

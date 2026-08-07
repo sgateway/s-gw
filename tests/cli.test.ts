@@ -685,10 +685,8 @@ public static class FakeAwsWrapper {
         "--wrapper",
         wrapper,
         "--",
-        "ec2",
-        "describe-instances",
-        "--region",
-        "us-west-2"
+        "sts",
+        "get-caller-identity"
       ], {
         cwd: repoRoot,
         env,
@@ -702,8 +700,35 @@ public static class FakeAwsWrapper {
       expect(run.summary.stdout).toContain(`<<SGW_SECRET:${access.handle}>>`);
       expect(run.summary.stdout).not.toContain("aws-secret-shortcut-value-123456789");
       expect(run.summary.stdout).not.toContain(fakeAwsAccessKey());
-      expect(run.summary.stdout).toContain("args=ec2 describe-instances --region us-west-2");
+      expect(run.summary.stdout).toContain("args=sts get-caller-identity");
       expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(beforeRun);
+
+      const changedArgs = JSON.parse(runCliSync([
+        "src/cli.ts",
+        "aws",
+        "run",
+        "--wrapper",
+        wrapper,
+        "--",
+        "ec2",
+        "describe-instances",
+        "--region",
+        "us-west-2"
+      ], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+
+      expect(changedArgs.approvalRequired).toBe(true);
+      expect(changedArgs.request.state).toBe("pending");
+      expect(changedArgs.request.action.args).toEqual([
+        "ec2",
+        "describe-instances",
+        "--region",
+        "us-west-2"
+      ]);
 
       const raw = runCliSync([
         "src/cli.ts",

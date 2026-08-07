@@ -160,9 +160,22 @@ struct DecisionGuardTests {
     runRouteAndSizingTest()
     runApprovalFlowTest()
     runLaunchLockTest(scratch)
+    runRuntimeStatusScheduleTest()
     await runPersistentUpdateMonitorTest()
 
     print("ALL_MENUBAR_TESTS_OK")
+  }
+
+  static func runRuntimeStatusScheduleTest() {
+    let start = Date(timeIntervalSince1970: 1_800_000_000)
+    var schedule = HelperStatusRefreshSchedule(interval: 5 * 60)
+
+    check(schedule.isDue(at: start), "menu helper should read runtime status on launch")
+    schedule.markAttempt(at: start)
+    check(!schedule.isDue(at: start.addingTimeInterval(5 * 60 - 1)),
+          "four-second helper polls must reuse cached runtime status")
+    check(schedule.isDue(at: start.addingTimeInterval(5 * 60)),
+          "menu helper should refresh runtime status after five minutes")
   }
 
   // Test 1: a double-fire while a decision is in flight reaches the CLI exactly

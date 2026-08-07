@@ -8,8 +8,8 @@ import { executeApprovedRequest, executeReusablePermit } from "../src/executor.j
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
-import { SecretStore } from "../src/store.js";
-import type { StoreFile } from "../src/types.js";
+import { assertActionAllowed, SecretStore } from "../src/store.js";
+import type { CommandAction, StoreFile } from "../src/types.js";
 import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-installed-upgrade.js";
 
 let tmpHome = "";
@@ -2880,7 +2880,7 @@ describe("SecretStore", () => {
     expect(denied.error).toContain("Denied by approval policy");
   });
 
-  it("reuses a timed approval when the same agent changes command arguments", async () => {
+  it("requires a new approval when the same agent changes command arguments", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
       name: "codex wrapper credential",
@@ -2910,11 +2910,12 @@ describe("SecretStore", () => {
     });
 
     const next = await store.createRequest(record.handle, secondAction, "Codex wrapper follow-up");
-    expect(next.state).toBe("approved");
-    expect(next.approvalGrantId).toBe(approved.approvalGrantId);
+    expect(approved.approvalGrantId).toBeTruthy();
+    expect(next.state).toBe("pending");
+    expect(next.approvalGrantId).toBeUndefined();
   });
 
-  it("migrates old approval grants that were keyed to command arguments", async () => {
+  it("migrates argument-agnostic approval grants to the last approved arguments", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
       name: "legacy wrapper credential",
@@ -2942,22 +2943,78 @@ describe("SecretStore", () => {
       durationMs: 8 * 60 * 60 * 1000,
       agentScope: "same-agent"
     });
-    const legacyKey = legacyApprovalActionKey(record.handle, firstAction);
-
     const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    const storedFirstAction = raw.requests.find((request: { id: string }) => request.id === first.id).action as CommandAction;
+    const legacyKey = argumentAgnosticApprovalActionKey(record.handle, storedFirstAction);
     raw.approvalGrants[0].actionKey = legacyKey;
     await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
 
-    const direct = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up");
-    expect(direct.kind).toBe("reusable");
+    const matching = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat");
+    expect(matching.kind).toBe("reusable");
+
+    const changed = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up");
+    expect(changed.kind).toBe("request");
 
     const next = await store.createRequest(record.handle, secondAction, "Codex legacy wrapper follow-up");
-    expect(next.state).toBe("approved");
-    expect(next.approvalGrantId).toBe(approved.approvalGrantId);
+    expect(approved.approvalGrantId).toBeTruthy();
+    expect(next.state).toBe("pending");
+    expect(next.approvalGrantId).toBeUndefined();
 
     const grants = await store.listApprovalGrants();
     expect(grants).toHaveLength(1);
     expect(grants[0].actionKey).not.toBe(legacyKey);
+  });
+
+  it("rejects credential-backed macOS Keychain utility execution even when policy allows it", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "macOS Keychain utility token",
+      type: "password",
+      value: "keychain-utility-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_KEYCHAIN_UTILITY_TOKEN",
+        allowedCommands: ["security"]
+      }
+    });
+    const action: CommandAction = {
+      kind: "env_command",
+      command: "security",
+      resolvedCommand: "/usr/bin/security",
+      args: ["find-generic-password", "-w", "-s", "example"],
+      injectEnv: "SGW_KEYCHAIN_UTILITY_TOKEN",
+      env: [],
+      workingDir: tmpHome,
+      timeoutMs: 30_000
+    };
+
+    expect(() => assertActionAllowed(record, action)).toThrow(
+      "Credential-backed execution of /usr/bin/security is not allowed."
+    );
+  });
+
+  it("rejects the macOS Keychain utility after resolving a bare command name", async () => {
+    if (process.platform !== "darwin") return;
+
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "resolved macOS Keychain utility token",
+      type: "password",
+      value: "resolved-keychain-utility-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_RESOLVED_KEYCHAIN_TOKEN",
+        allowedCommands: ["security"]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: "security",
+      args: ["find-generic-password", "-w", "-s", "example"],
+      injectEnv: "SGW_RESOLVED_KEYCHAIN_TOKEN",
+      workingDir: tmpHome
+    });
+
+    await expect(store.createRequest(record.handle, action, "Codex resolved Keychain utility request")).rejects.toThrow(
+      "Credential-backed execution of /usr/bin/security is not allowed."
+    );
   });
 
   it("can reuse an approval across agents when explicitly scoped that way", async () => {
@@ -3319,15 +3376,17 @@ async function backdateRequest(requestId: string, agoMs: number, fields = ["upda
   await writeFile(storePath, `${JSON.stringify(store, null, 2)}\n`);
 }
 
-function legacyApprovalActionKey(handle: string, action: ReturnType<typeof buildEnvCommandAction>): string {
+function argumentAgnosticApprovalActionKey(handle: string, action: CommandAction): string {
   const command = path.isAbsolute(action.command) ? path.normalize(action.command) : action.command.trim();
   const payload = {
     handle,
     kind: action.kind,
     command,
-    args: action.args,
+    resolvedCommand: action.kind === "env_command" ? action.resolvedCommand || "" : "",
     injectEnv: action.injectEnv,
-    workingDir: action.workingDir ? path.resolve(action.workingDir) : ""
+    env: action.env || [],
+    workingDir: action.workingDir ? path.resolve(action.workingDir) : "",
+    ssh: ""
   };
 
   return createHash("sha256").update(JSON.stringify(payload)).digest("base64url");

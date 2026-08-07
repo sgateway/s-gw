@@ -189,7 +189,7 @@ s-gw approval set --mode timed-session --duration 15m
 s-gw approval set --mode login-session
 ```
 
-`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint, so approving one command does not authorize unrelated commands or credentials.
+`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint. Environment-command fingerprints include the exact executable path, arguments, credential bindings, and working directory. Owned SSH approvals use the target and port so commands can share the same s-gw-controlled connection. Changing an environment command's arguments requires a new approval.
 
 For managed installs, use approval policy rules for per-agent and per-credential defaults that should survive restarts:
 

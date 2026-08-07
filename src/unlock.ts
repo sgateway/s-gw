@@ -1030,11 +1030,17 @@ function runKeychainGet(info: KeychainInfo): string {
 
 function keychainItemExists(info: KeychainInfo): boolean {
   if (process.platform === "darwin") {
-    const result = spawnSync(
-      keychainStatusCliPath(),
-      ["find-generic-password", "-a", info.account, "-s", info.service],
-      { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] }
-    );
+    const inspector = findPackagedKeychainInspector();
+    if (!inspector) {
+      if (process.env.SGW_ALLOW_SECURITY_CLI === "1") {
+        return keychainItemExistsWithSecurityCli(info);
+      }
+      throw new Error("The macOS Keychain inspector is missing. Reinstall s-gw before accessing credentials.");
+    }
+    const result = spawnSync(inspector, ["exists", "--service", info.service, "--account", info.account], {
+      encoding: "utf8",
+      stdio: ["ignore", "ignore", "pipe"]
+    });
 
     if (result.error) {
       throw result.error;
@@ -1045,7 +1051,7 @@ function keychainItemExists(info: KeychainInfo): boolean {
     if (result.status === 44) {
       return false;
     }
-    throw new Error(result.stderr.trim() || `Keychain status check failed with status ${result.status}`);
+    throw new Error(result.stderr.trim() || `Keychain inspector failed with status ${result.status}`);
   }
 
   if (info.provider === "windows-helper" && info.helperPath) {
@@ -1074,6 +1080,18 @@ function keychainItemExists(info: KeychainInfo): boolean {
   }
 
   return false;
+}
+
+function keychainItemExistsWithSecurityCli(info: KeychainInfo): boolean {
+  const result = spawnSync(
+    keychainStatusCliPath(),
+    ["find-generic-password", "-a", info.account, "-s", info.service],
+    { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] }
+  );
+  if (result.error) throw result.error;
+  if (result.status === 0) return true;
+  if (result.status === 44) return false;
+  throw new Error(result.stderr.trim() || `Keychain status check failed with status ${result.status}`);
 }
 
 function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw local unlock passphrase"): void {
