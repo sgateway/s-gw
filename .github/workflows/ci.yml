@@ -57,13 +57,23 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run build:native
-      - run: npx vitest run tests/install-macos.test.ts tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
+      - run: npm run build
+      - run: npm test -- --no-file-parallelism
 
-  windows-preview:
-    name: Windows preview client
+  windows_shards:
+    name: Windows tests (${{ matrix.group }})
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, store, client-package, client-session, client-startup, credential, acl]
+    env:
+      SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS: ${{ matrix.group == 'acl' && '120000' || '' }}
+      SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000
+      SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS: ${{ startsWith(matrix.group, 'client-') && '120000' || '' }}
+      SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000
+      SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -72,6 +82,17 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm run build:windows-client
-      - run: npx tsc -p tsconfig.json
-      - run: npx vitest run tests/windows-client.test.ts tests/installers.test.ts tests/agents.test.ts tests/agent-install.test.ts tests/agent-install-windows.test.ts
+      - run: npm run build
+      - run: npm run test:windows -- --group ${{ matrix.group }}
+
+  windows-preview:
+    name: Windows preview client
+    runs-on: ubuntu-latest
+    needs: windows_shards
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Verify Windows test shards
+        env:
+          WINDOWS_RESULT: ${{ needs.windows_shards.result }}
+        run: test "$WINDOWS_RESULT" = success

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
+  mcpAuthorityEnvironment,
   resolvePackagedMcpCommand,
   uninstallAgentIntegrations,
   type AgentIntegrationOptions
@@ -23,6 +24,7 @@ import {
 } from "./gateway.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { assertMacRuntimeForManagedSurfaces, getPackageLayout, readinessForUnlock } from "./install.js";
+import { getSgwInstanceKey } from "./paths.js";
 import { SecretStore, type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput } from "./store.js";
 import { unlockStatus } from "./unlock.js";
 import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
@@ -150,12 +152,13 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   };
 
   await store.init();
+  const instanceKey = getSgwInstanceKey(path.dirname(store.storePath));
   void updateChecker.check();
   const updateTimer = setInterval(() => void updateChecker.check(true), UPDATE_CHECK_INTERVAL_MS);
   updateTimer.unref();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions).catch((error) => {
+    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey).catch((error) => {
       sendError(res, error);
     });
   });
@@ -200,7 +203,8 @@ async function handleRequest(
   token: string,
   uiDir: string,
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
-  agentOptions: AgentIntegrationOptions
+  agentOptions: AgentIntegrationOptions,
+  instanceKey: string
 ): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (url.pathname.startsWith("/api/")) {
@@ -208,7 +212,7 @@ async function handleRequest(
       throw new HttpError(403, "Missing or invalid local console token.");
     }
 
-    await handleApi(req, res, url, store, updateChecker, agentOptions);
+    await handleApi(req, res, url, store, updateChecker, agentOptions, instanceKey);
     return;
   }
 
@@ -227,10 +231,16 @@ async function handleApi(
   url: URL,
   store: SecretStore,
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
-  agentOptions: AgentIntegrationOptions
+  agentOptions: AgentIntegrationOptions,
+  instanceKey: string
 ): Promise<void> {
   if (req.method === "GET" && url.pathname === "/api/health") {
-    sendJson(res, 200, { ok: true, name: "s-gw", version });
+    sendJson(res, 200, {
+      ok: true,
+      name: "s-gw",
+      version,
+      instanceKey
+    });
     return;
   }
 
@@ -530,16 +540,16 @@ export function consoleMcpSnippet(
     env: process.env,
     mcpServerPath: layout.mcpPath
   });
-  const sgwHome = agentOptions.sgwHome || process.env.SGW_HOME;
+  const env = mcpAuthorityEnvironment(agentOptions);
   const launcher = layout.isSelfContainedMacApp
-    ? path.join(path.dirname(layout.packageRoot), "bin", "s-gw")
+    ? path.posix.join(path.posix.dirname(layout.packageRoot), "bin", "s-gw")
     : "s-gw";
 
   return {
     options: {
       command: launch.command,
       args: launch.args,
-      env: sgwHome ? { SGW_HOME: sgwHome } : undefined
+      env
     },
     cliCommand: shellCommandArg(launcher)
   };
@@ -825,6 +835,7 @@ function flowProviderLabel(provider?: string): string {
   if (value === "ssh") return "SSH";
   if (value === "onepassword") return "1Password";
   if (value === "keychain" || value === "macos-keychain") return "macOS Keychain";
+  if (value === "linux-secret-service") return "Linux Secret Service";
   if (value === "windows-credential-manager") return "Windows Credential Manager";
   return titleCase(value);
 }
@@ -1267,6 +1278,7 @@ function policyConditionsFromBody(body: Record<string, unknown>): ApprovalPolicy
     agents: policyStringArray(body, "agents"),
     actionKinds: policyStringArray(body, "actionKinds").map(approvalPolicyActionKind),
     commands: policyStringArray(body, "commands"),
+    resolvedCommands: policyStringArray(body, "resolvedCommands"),
     injectEnvs: policyStringArray(body, "injectEnvs"),
     workingDirs: policyStringArray(body, "workingDirs"),
     sshTargets: policyStringArray(body, "sshTargets"),
@@ -1284,6 +1296,7 @@ function policyConditionPatchFromBody(body: Record<string, unknown>): Partial<Ap
     "agents",
     "actionKinds",
     "commands",
+    "resolvedCommands",
     "injectEnvs",
     "workingDirs",
     "sshTargets",
@@ -1302,6 +1315,7 @@ function policyConditionPatchFromBody(body: Record<string, unknown>): Partial<Ap
   if (hasBodyField(body, "agents")) patch.agents = policyStringArray(body, "agents");
   if (hasBodyField(body, "actionKinds")) patch.actionKinds = policyStringArray(body, "actionKinds").map(approvalPolicyActionKind);
   if (hasBodyField(body, "commands")) patch.commands = policyStringArray(body, "commands");
+  if (hasBodyField(body, "resolvedCommands")) patch.resolvedCommands = policyStringArray(body, "resolvedCommands");
   if (hasBodyField(body, "injectEnvs")) patch.injectEnvs = policyStringArray(body, "injectEnvs");
   if (hasBodyField(body, "workingDirs")) patch.workingDirs = policyStringArray(body, "workingDirs");
   if (hasBodyField(body, "sshTargets")) patch.sshTargets = policyStringArray(body, "sshTargets");
@@ -1345,6 +1359,7 @@ function assertKnownPolicyFields(body: Record<string, unknown>): void {
     "agents",
     "actionKinds",
     "commands",
+    "resolvedCommands",
     "injectEnvs",
     "workingDirs",
     "sshTargets",
@@ -1435,6 +1450,7 @@ function providerLabel(provider: string): string {
     generic: "Generic",
     keychain: "macOS Keychain",
     "macos-keychain": "macOS Keychain",
+    "linux-secret-service": "Linux Secret Service",
     "windows-credential-manager": "Windows Credential Manager",
     "api-token": "API Tokens",
     credential: "Credentials"

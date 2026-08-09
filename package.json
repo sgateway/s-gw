@@ -67,6 +67,7 @@
     "check:rust": "node scripts/check-rust-core.mjs",
     "pretest": "npm run build:rust-core",
     "test": "vitest run",
+    "test:windows": "node scripts/run-windows-tests.mjs",
     "test:watch": "vitest",
     "verify": "npm run build && npm run check:rust && npm test && npm audit && npm run package:dry-run",
     "prepublishOnly": "npm run validate:npm-package",

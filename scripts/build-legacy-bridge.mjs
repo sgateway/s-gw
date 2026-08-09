@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ export function buildLegacyBridge(packagePath, outputPath, expectedVersion) {
 
     manifest.name = "s-gw";
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    run("npm", ["pack", "--ignore-scripts", "--pack-destination", workDir, packageDir]);
+    runNpm(["pack", "--ignore-scripts", "--pack-destination", workDir, packageDir]);
 
     const packed = path.join(workDir, `s-gw-${expectedVersion}.tgz`);
     cpSync(packed, path.resolve(outputPath));
@@ -28,13 +28,30 @@ export function buildLegacyBridge(packagePath, outputPath, expectedVersion) {
   }
 }
 
+function runNpm(args) {
+  if (process.platform !== "win32") {
+    run("npm", args);
+    return;
+  }
+
+  const candidates = [
+    process.env.npm_execpath,
+    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+  ].filter(Boolean);
+  const npmCli = candidates.find((candidate) => /\.(?:c?m?js)$/i.test(candidate) && existsSync(candidate));
+  if (!npmCli) {
+    throw new Error("Could not locate the npm CLI for the Windows legacy bridge build.");
+  }
+  run(process.execPath, [npmCli, ...args]);
+}
+
 function run(command, args) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
   if (result.status === 0) return;
-  const details = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+  const details = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error?.message || ""}`.trim();
   throw new Error(`${command} failed${details ? `:\n${details}` : "."}`);
 }
 

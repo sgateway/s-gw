@@ -1,9 +1,10 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
+import { getSgwInstanceKey } from "../src/paths.js";
 import { ReleaseChecker } from "../src/update-check.js";
 
 let tmpHome = "";
@@ -21,6 +22,7 @@ beforeEach(async () => {
   process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
   process.env.SGW_MASTER_PASSPHRASE = "console e2e passphrase";
   process.env.SGW_DISABLE_KEYCHAIN = "1";
+  process.env.SGW_SECRET_BACKEND = "local";
 });
 
 afterEach(async () => {
@@ -37,6 +39,17 @@ afterEach(async () => {
 });
 
 describe("local console server", () => {
+  it("identifies the credential home on the unauthenticated health endpoint", async () => {
+    running = await startConsoleServer({ port: 0 });
+
+    const health = await fetchJson("api/health");
+    expect(health).toMatchObject({
+      ok: true,
+      name: "s-gw",
+      instanceKey: getSgwInstanceKey(tmpHome)
+    });
+  });
+
   it("serves the console with a session token and protects local API writes", async () => {
     running = await startConsoleServer({ port: 0 });
 
@@ -75,21 +88,46 @@ describe("local console server", () => {
     expect(omnigent.mcp.snippet).toBeNull();
   });
 
-  it("renders self-contained MCP snippets without relying on PATH", () => {
+  it("renders self-contained MCP snippets with only the validated authority environment", () => {
     const runtime = "/Applications/s-gw.app/Contents/Resources/s-gw-runtime";
-    const mcp = consoleMcpSnippet({ sgwHome: "/secure/s-gw", platform: "darwin" }, {
-      packageRoot: path.join(runtime, "package"),
-      nodePath: path.join(runtime, "node", "bin", "node"),
-      mcpPath: path.join(runtime, "package", "dist", "mcp-server.js"),
+    const primaryHome = path.join(tmpHome, "primary-ledger");
+    const recoveryHome = path.join(tmpHome, "recovery-ledger");
+    const mcp = consoleMcpSnippet({
+      homeDir: tmpHome,
+      sgwHome: primaryHome,
+      platform: "darwin",
+      env: {
+        HOME: tmpHome,
+        SGW_RECOVERY_HOME: "recovery-ledger",
+        SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+        SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+        SGW_SECRET_BACKEND: " LOCAL ",
+        SGW_EXECUTION_ENGINE: " RUST ",
+        SGW_MASTER_PASSPHRASE: "must-not-be-written",
+        AWS_SECRET_ACCESS_KEY: "must-not-be-written"
+      }
+    }, {
+      packageRoot: path.posix.join(runtime, "package"),
+      nodePath: path.posix.join(runtime, "node", "bin", "node"),
+      mcpPath: path.posix.join(runtime, "package", "dist", "mcp-server.js"),
       isSelfContainedMacApp: true
     });
 
     expect(mcp.options).toEqual({
-      command: path.join(runtime, "node", "bin", "node"),
-      args: [path.join(runtime, "package", "dist", "mcp-server.js")],
-      env: { SGW_HOME: "/secure/s-gw" }
+      command: path.posix.join(runtime, "node", "bin", "node"),
+      args: [path.posix.join(runtime, "package", "dist", "mcp-server.js")],
+      env: {
+        SGW_HOME: primaryHome,
+        SGW_RECOVERY_HOME: recoveryHome,
+        SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+        SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+        SGW_SECRET_BACKEND: "local",
+        SGW_EXECUTION_ENGINE: "rust"
+      }
     });
-    expect(mcp.cliCommand).toBe(path.join(runtime, "bin", "s-gw"));
+    expect(mcp.cliCommand).toBe(path.posix.join(runtime, "bin", "s-gw"));
   });
 
   it("installs and uninstalls a detected agent through the console API", async () => {
@@ -321,6 +359,7 @@ describe("local console server", () => {
       method: "POST",
       body: { ...commandBody, reason: "Console grant", agentName: "Codex" }
     });
+    expect(first.action.resolvedCommand).toBe(realpathSync.native(process.execPath));
     const approved = await fetchJson(`api/requests/${first.id}/approve`, {
       method: "POST",
       body: {
@@ -411,6 +450,7 @@ describe("local console server", () => {
         envBindings: [{ handle: "s-gw:api-token:console", injectEnv: "SGW_CONSOLE_POLICY_TOKEN" }],
         actionKinds: ["env_command"],
         commands: [process.execPath],
+        resolvedCommands: [realpathSync.native(process.execPath)],
         injectEnvs: ["SGW_CONSOLE_POLICY_TOKEN"],
         sshPorts: [2222]
       }
@@ -420,6 +460,7 @@ describe("local console server", () => {
     expect(created.conditions.envBindings).toEqual([
       { handle: "s-gw:api-token:console", injectEnv: "SGW_CONSOLE_POLICY_TOKEN" }
     ]);
+    expect(created.conditions.resolvedCommands).toEqual([realpathSync.native(process.execPath)]);
     expect(created.conditions.sshPorts).toEqual([2222]);
     const createdAt = created.createdAt;
 
@@ -453,6 +494,7 @@ describe("local console server", () => {
       agents: ["claude"],
       envBindings: [{ handle: "s-gw:api-token:console", injectEnv: "SGW_CONSOLE_POLICY_TOKEN" }],
       commands: [process.execPath],
+      resolvedCommands: [realpathSync.native(process.execPath)],
       injectEnvs: ["SGW_CONSOLE_POLICY_TOKEN"],
       sshPorts: [2200, 2222]
     });
@@ -649,6 +691,10 @@ describe("local console server", () => {
 
   it("shows real SSH destinations without treating shell text as a host", async () => {
     running = await startConsoleServer({ port: 0 });
+    const toolDir = path.join(tmpHome, "usage-flow-tools");
+    mkdirSync(toolDir, { recursive: true });
+    const sshCommand = writeFixtureExecutable(path.join(toolDir, "ssh"));
+    const wrapperCommand = writeFixtureExecutable(path.join(toolDir, "openclaw-sgw-wrapper"));
     const created = await fetchJson("api/secrets", {
       method: "POST",
       body: {
@@ -657,7 +703,7 @@ describe("local console server", () => {
         provider: "ssh",
         value: "usage-flow-ssh-secret-value-1234567890",
         injectEnv: "SGW_USAGE_FLOW_SSH_KEY",
-        allowedCommands: ["/usr/bin/ssh", "/private/tmp/openclaw-sgw-ssh"]
+        allowedCommands: [sshCommand, wrapperCommand]
       }
     });
 
@@ -665,7 +711,7 @@ describe("local console server", () => {
       method: "POST",
       body: {
         handle: created.handle,
-        command: "/usr/bin/ssh",
+        command: sshCommand,
         args: ["-p", "2222", "ubuntu@ec2-01.internal", "hostname"],
         injectEnv: "SGW_USAGE_FLOW_SSH_KEY",
         reason: "Codex SSH destination"
@@ -675,7 +721,7 @@ describe("local console server", () => {
       method: "POST",
       body: {
         handle: created.handle,
-        command: "/private/tmp/openclaw-sgw-ssh",
+        command: wrapperCommand,
         args: ["node -e 'console.log(pkg.name + \"@\" + pkg.version)'"],
         injectEnv: "SGW_USAGE_FLOW_SSH_KEY",
         reason: "Codex local wrapper"
@@ -734,6 +780,17 @@ describe("local console server", () => {
     expect(state.credentials.some((item: { provider: string }) => item.provider === "openai")).toBe(true);
   });
 });
+
+function writeFixtureExecutable(requestedPath: string): string {
+  const executablePath = process.platform === "win32" ? `${requestedPath}.exe` : requestedPath;
+  if (process.platform === "win32") {
+    copyFileSync(process.execPath, executablePath);
+  } else {
+    writeFileSync(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  chmodSync(executablePath, 0o700);
+  return requestedPath;
+}
 
 async function fetchJson(pathName: string, options: { method?: string; body?: unknown } = {}) {
   const response = await fetch(consoleUrl(pathName), {

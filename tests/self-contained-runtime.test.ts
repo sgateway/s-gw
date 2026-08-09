@@ -15,8 +15,8 @@ afterEach(async () => {
   await Promise.all(tmpDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-describe("self-contained macOS runtime", () => {
-  it.skipIf(process.platform !== "darwin")("resolves only a complete app-bundled Node and CLI runtime", async () => {
+describe.skipIf(process.platform !== "darwin")("self-contained macOS runtime", () => {
+  it("resolves only a complete app-bundled Node and CLI runtime", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sgw-runtime-layout-"));
     tmpDirs.push(root);
     const app = path.join(root, "s-gw.app");

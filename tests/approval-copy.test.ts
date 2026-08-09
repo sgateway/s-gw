@@ -19,4 +19,18 @@ describe("approval surface copy", () => {
       expect(text).toContain(approvalCopy);
     }
   });
+
+  it("shows the pinned executable on native and web approval surfaces", async () => {
+    const [nativeModel, nativeView, webView] = await Promise.all([
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/Models/Models.swift"), "utf8"),
+      readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/Views/ApprovalsView.swift"), "utf8"),
+      readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8")
+    ]);
+
+    expect(nativeModel).toContain("var resolvedCommand: String?");
+    expect(nativeView).toContain("request.action.resolvedCommand");
+    expect(nativeView).toContain("Not pinned (legacy request)");
+    expect(webView).toContain('["Executable", request.action.kind === "env_command"');
+    expect(webView).toContain("Not pinned (legacy request)");
+  });
 });

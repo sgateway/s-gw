@@ -12,12 +12,14 @@ npm install -g @s-gw/s-gw
 
 For normal use, run `s-gw setup`. The demonstration below instead uses a temporary home and an environment-provided passphrase so it leaves the operating system credential store untouched.
 
-## Run The Trust Loop
+## Run The Trust Loop On macOS Or Linux
 
 Create a disposable store:
 
 ```bash
-export SGW_HOME="$(mktemp -d)/home"
+DEMO_ROOT="$(mktemp -d)"
+export SGW_HOME="$DEMO_ROOT/home"
+export SGW_RECOVERY_HOME="$DEMO_ROOT/recovery"
 PASS="$(openssl rand -base64 32)"
 printf -v SGW_MASTER_PASSPHRASE '%s' "$PASS"
 export SGW_MASTER_PASSPHRASE
@@ -88,8 +90,60 @@ The child process reads `demo-token-value`, but the returned output contains an 
 Remove the disposable store:
 
 ```bash
-rm -rf "$SGW_HOME"
-unset SGW_HOME SGW_MASTER_PASSPHRASE HANDLE REQUEST REQUEST_ID
+rm -rf "$DEMO_ROOT"
+unset DEMO_ROOT SGW_HOME SGW_RECOVERY_HOME SGW_MASTER_PASSPHRASE PASS HANDLE REQUEST REQUEST_ID
+```
+
+## Run The Trust Loop On Windows
+
+Run the following in PowerShell. It uses a disposable store and the trusted Windows PowerShell executable as the approved child command:
+
+```powershell
+$DemoRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sgw-quickstart-" + [guid]::NewGuid().ToString("N"))
+$env:SGW_HOME = Join-Path $DemoRoot "home"
+$RandomBytes = New-Object byte[] 32
+$Random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try { $Random.GetBytes($RandomBytes) } finally { $Random.Dispose() }
+$env:SGW_MASTER_PASSPHRASE = [Convert]::ToBase64String($RandomBytes)
+$DemoCommand = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+s-gw init
+```
+
+Enroll a fake value, then create its approval request:
+
+```powershell
+"demo-token-value" | s-gw secret add `
+  --name demo-token `
+  --type api-token `
+  --value-stdin `
+  --inject-env DEMO_TOKEN `
+  --allow-command $DemoCommand
+
+$Handle = (s-gw secret list | ConvertFrom-Json)[0].handle
+$Request = s-gw request env-command $Handle `
+  --command $DemoCommand `
+  --arg=-NoProfile `
+  --arg=-NonInteractive `
+  --arg=-Command `
+  --arg='[Console]::Write($env:DEMO_TOKEN)' `
+  --inject-env DEMO_TOKEN `
+  --reason "Read the disposable token" | ConvertFrom-Json
+```
+
+The first execution is refused while pending. Approve locally, then execute again:
+
+```powershell
+s-gw execute $Request.id
+s-gw approve $Request.id
+s-gw execute $Request.id
+```
+
+The successful response contains an s-gw handle in place of the fake value. Remove the disposable data and process-local variables when finished:
+
+```powershell
+Remove-Item -LiteralPath $DemoRoot -Recurse -Force
+Remove-Item Env:\SGW_HOME, Env:\SGW_MASTER_PASSPHRASE -ErrorAction SilentlyContinue
+Remove-Variable DemoRoot, RandomBytes, Random, DemoCommand, Handle, Request -ErrorAction SilentlyContinue
 ```
 
 ## Next Steps

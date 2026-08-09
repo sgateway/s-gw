@@ -38,7 +38,18 @@ describe("platform installers", () => {
     expect(builder).toContain('const packageFile = `s-gw-${version}.tgz`');
     expect(builder).toContain("SHA256SUMS.txt");
     expect(inspectorSource).toContain("validateTrustedApplication");
+    expect(inspectorSource).toContain('case "exists"');
+    const existsFunction = inspectorSource.match(/func keychainItemExists[\s\S]*?\n}/)?.[0] || "";
+    expect(existsFunction).toContain("kSecReturnAttributes");
+    expect(existsFunction).toContain("kSecUseAuthenticationUIFail");
+    expect(existsFunction).not.toContain("standardOutput");
     expect(inspectorSource).not.toContain("kSecReturnData");
+    const helperSource = await readFile(path.join(root, "native/macos-keychain/SgwKeychain.swift"), "utf8");
+    expect(helperSource).toContain('case "status"');
+    const statusFunction = helperSource.match(/func credentialStatus[\s\S]*?\n}/)?.[0] || "";
+    expect(statusFunction).toContain("kSecReturnAttributes");
+    expect(statusFunction).toContain("kSecUseAuthenticationUIFail");
+    expect(statusFunction).not.toContain("kSecReturnData");
     const publishWorkflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
     expect(publishWorkflow).toContain("dist/native/darwin-arm64/s-gw-keychain-inspector");
     const validator = await readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8");
@@ -79,6 +90,7 @@ describe("platform installers", () => {
       expect(files).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
     }
+    expect(files).toContain("dist/windows/s-gw-helper-bootstrap.ps1");
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);
@@ -167,7 +179,7 @@ describe("platform installers", () => {
       ].join("; ");
       execFileSync("powershell.exe", ["-NoProfile", "-Command", parseCommand], { stdio: "pipe" });
     }
-  });
+  }, 20_000);
 
   it("builds and verifies updater assets independently from npm publishing", async () => {
     const [workflow, builder, validator] = await Promise.all([

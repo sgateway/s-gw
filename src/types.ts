@@ -46,6 +46,7 @@ export interface ApprovalPolicyConditions {
   agents?: string[];
   actionKinds?: ApprovalPolicyActionKind[];
   commands?: string[];
+  resolvedCommands?: string[];
   injectEnvs?: string[];
   workingDirs?: string[];
   sshTargets?: string[];
@@ -140,6 +141,7 @@ export interface CommandEnvBinding {
 export interface CommandAction {
   kind: "env_command" | "ssh_session";
   command: string;
+  resolvedCommand?: string;
   args: string[];
   injectEnv: string;
   env?: CommandEnvBinding[];
@@ -166,6 +168,7 @@ export interface RequestRecord {
   reason: string;
   agentName?: string;
   agentSource?: AgentIdentitySource;
+  loginSessionId?: string;
   action: CommandAction;
   state: RequestState;
   createdAt: string;

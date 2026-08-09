@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
@@ -186,7 +188,7 @@ describe("Windows managed agent registration", () => {
     expect(installed[0]).toMatchObject({ state: "installed", changed: true });
   });
 
-  it("launches the packaged MCP server and completes a Windows stdio handshake", () => {
+  it("launches the packaged MCP server and completes a Windows stdio handshake", async () => {
     if (process.platform !== "win32") return;
     const homeDir = testHome();
     const options = windowsOptions(homeDir, ["claudecode"]);
@@ -200,29 +202,25 @@ describe("Windows managed agent registration", () => {
       args: string[];
       env: Record<string, string>;
     };
-    const initialize = `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "s-gw-windows-test", version: "1.0.0" }
-      }
-    })}\n`;
-    const child = spawnSync(server.command, server.args, {
-      input: initialize,
-      encoding: "utf8",
-      timeout: 10_000,
-      windowsHide: true,
-      env: { ...process.env, ...server.env }
+    const transport = new StdioClientTransport({
+      command: server.command,
+      args: server.args,
+      cwd: process.cwd(),
+      env: { ...process.env, ...server.env } as Record<string, string>,
+      stderr: "pipe"
     });
+    const client = new Client({ name: "s-gw-windows-test", version: "1.0.0" });
 
-    expect(child.error).toBeUndefined();
-    expect(child.status).toBe(0);
-    const response = JSON.parse(child.stdout.trim());
-    expect(response).toMatchObject({ id: 1, result: { serverInfo: { name: "s-gw" } } });
-  });
+    await client.connect(transport);
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(["sgw_list_handles", "sgw_request_execution"])
+      );
+    } finally {
+      await client.close();
+    }
+  }, 20_000);
 
   it("treats tracked Windows config paths as case-insensitive", () => {
     const homeDir = testHome();

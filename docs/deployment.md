@@ -29,6 +29,16 @@ s-gw setup
 
 On Windows, run the same commands in PowerShell. Windows 10/11 support is preview software, but npm is the expected install path for the PowerShell client, tray helper, and local web console.
 
+On Ubuntu or Debian Linux, install the Secret Service command-line client before setup:
+
+```bash
+sudo apt install libsecret-tools
+npm install -g @s-gw/s-gw
+s-gw setup
+```
+
+The user's desktop keyring must be unlocked. Setup stores a generated ledger unlock secret in Secret Service, initializes the ledger, and installs a `systemd --user` console service tied to `graphical-session.target`. The unit starts the console through a clean environment, passing only required runtime paths and non-secret configuration. It neither contains nor inherits `SGW_MASTER_PASSPHRASE` or unrelated user-manager credentials.
+
 For an npm-based Apple Silicon Mac installation, `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs `s-gw.app` in `/Applications` (or `~/Applications` when required), installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI. Do not use npm setup to manage a machine that already has the self-contained app installed.
 
 ### macOS App (Apple Silicon)
@@ -179,7 +189,7 @@ s-gw approval set --mode timed-session --duration 15m
 s-gw approval set --mode login-session
 ```
 
-`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint, so approving one command does not authorize unrelated commands or credentials.
+`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint. Environment-command fingerprints include the exact executable path, arguments, credential bindings, and working directory. Owned SSH approvals use the target and port so commands can share the same s-gw-controlled connection. Changing an environment command's arguments requires a new approval.
 
 For managed installs, use approval policy rules for per-agent and per-credential defaults that should survive restarts:
 
@@ -209,14 +219,16 @@ s-gw console
 
 The console binds to `127.0.0.1`, serves the UI from the installed package, and injects a per-session token into the page. That token is required for local API writes such as approving or denying requests, so another browser origin cannot silently drive the credential API with a plain form post.
 
-For a background setup, install the per-user console LaunchAgent instead:
+For a background setup, install the per-user console service:
 
 ```bash
 s-gw service install --start
 s-gw service status
 ```
 
-This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at login and writes logs under `~/.s-gw/logs`.
+This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at desktop login. macOS uses a LaunchAgent; Linux uses an enabled, owner-level systemd unit at `~/.config/systemd/user/s-gw.service`. The Linux unit is owner-readable, applies process hardening, uses a clean runtime environment, and does not persist unlock material. It is attached to the graphical-session lifecycle so a lingering headless user manager does not start it before desktop keyring unlock.
+
+For an intentional headless Linux session without Secret Service, provide `SGW_MASTER_PASSPHRASE` through the session's approved secret-injection mechanism and run `s-gw setup --no-service --no-open-app`. Continue with `s-gw console --no-open` in that same environment. Automatic capture uses the encrypted local ledger while this environment unlock is active. `s-gw service install` fails closed in this mode because copying the passphrase into systemd configuration would make it persistent and discoverable.
 
 Launch the native menu-bar helper:
 
@@ -252,6 +264,10 @@ s-gw helper open
 ```
 
 On Windows, `s-gw app open` launches `dist\windows\s-gw-client.ps1`. It starts the local console on `127.0.0.1` if needed, then opens the UI in Edge or Chrome app mode. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
+
+`s-gw setup` and `s-gw start` also start the loopback console directly, so `--no-open-app` leaves a usable headless runtime instead of depending on a browser window. The tray helper and client verify that the console belongs to the same Windows user, login session, credential home, and credential-store namespace before opening it. Repeated setup, start, and helper-open commands reuse one tray process per user session and port.
+
+Use `--no-menubar` to suppress the tray helper. `--no-service` requires `--no-menubar` because the helper cannot run without its matching console. Custom Windows console URLs must use loopback HTTP and the same port supplied through `--port`. Use `s-gw stop` to stop only the current user's console, client, and helper processes in the current login session.
 
 The Windows Credential Manager helper is staged at `dist\windows\s-gw-credential.ps1`. It uses the Windows credential APIs and receives new values on stdin, so unlock passphrases and secret values are not passed as process arguments. Signed `.exe` wrappers, login-start registration, and MSIX/installer packaging are still separate hardening work.
 
@@ -363,7 +379,7 @@ The native app and browser console expose the same action on a stuck request. Re
 | --- | --- | --- | --- |
 | macOS arm64 | Primary development platform | Native Swift helper using Security.framework | Native app, menu helper, and Keychain path are covered by local tests. |
 | macOS Intel | Build-from-source candidate | Native Swift helper using Security.framework | Expected to work when built on Intel macOS with Node >= 20 and Swift toolchain, but not yet QA-tested here. |
-| Linux | Experimental CLI | `SGW_MASTER_PASSPHRASE` fallback | Needs a Secret Service/libsecret helper before desktop support. |
+| Linux x64/arm64 | Preview | Secret Service through trusted `secret-tool`; explicit environment fallback | systemd user service and local console; the keyring must be unlocked in the user session. |
 | Windows | Preview client/helper | Windows Credential Manager helper | PowerShell client opens the local console in browser app mode; tray helper supports queue/status actions. Needs Windows QA, signing, and installer work before production support. |
 
 The current preview is developed primarily on macOS with the native Keychain helper. Windows has a packaged preview path through Credential Manager, but the client and helper still require broader QA, signing, and installer hardening.
@@ -421,27 +437,49 @@ For an offline npm upgrade, verify the downloaded `s-gw-VERSION.tgz` with either
 
 ## Uninstall
 
-Remove the tool:
+Disconnect integrations while the CLI is still available:
+
+```bash
+s-gw agent uninstall
+```
+
+On macOS, remove both desktop services:
 
 ```bash
 s-gw menubar uninstall
 s-gw service uninstall
-npm uninstall -g @s-gw/s-gw
 ```
 
-Remove local unlock material:
+On Linux, remove the systemd user service:
+
+```bash
+s-gw service uninstall
+```
+
+On Windows, stop the local client and helper:
+
+```powershell
+s-gw stop
+```
+
+Remove local unlock material before uninstalling the package:
 
 ```bash
 s-gw unlock keychain delete
 ```
 
-Remove local ledger if desired:
+Move `s-gw.app` from Applications to Trash, then remove the npm package:
 
 ```bash
-rm -rf ~/.s-gw
+npm uninstall -g @s-gw/s-gw
 ```
 
-Also remove the MCP server entry from each configured coding tool.
+The encrypted ledger and recovery checkpoints are preserved by default. Remove
+both only when you deliberately want to discard local s-gw state:
+
+```bash
+rm -rf ~/.s-gw ~/.s-gw-recovery
+```
 
 ## Packaging Checklist
 
@@ -475,7 +513,9 @@ For Windows preview packages, also verify:
 - Windows scripts exist under `dist/windows`;
 - `s-gw unlock keychain set --value-stdin` stores unlock material through Credential Manager;
 - `s-gw app open` starts the local console and opens the client shell;
+- `s-gw start --no-open-app --no-menubar` starts a healthy headless console, and `s-gw stop` stops it;
 - `s-gw helper open` creates a tray icon and sees pending requests;
+- a synthetic Credential Manager secret stays local, cannot execute before approval, and is tokenized in returned output after approval;
 - helper approve/deny actions use the CLI and do not require the console API token;
 - installer/startup registration does not log raw secrets or command stdin.
 

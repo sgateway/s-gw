@@ -25,6 +25,15 @@ if (packed.name !== packageInfo.name || packed.version !== packageInfo.version) 
 }
 
 const files = new Map(packed.files.map((entry) => [entry.path, entry]));
+const requiredFiles = [
+  "dist/windows/s-gw-helper-bootstrap.ps1"
+];
+for (const filePath of requiredFiles) {
+  if (!files.has(filePath)) {
+    throw new Error(`npm package is missing required runtime file: ${filePath}`);
+  }
+}
+
 const requiredExecutables = [
   `dist/native/${target}/s-gw-core`,
   `dist/native/${target}/s-gw-keychain-helper`,

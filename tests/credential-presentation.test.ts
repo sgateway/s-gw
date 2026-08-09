@@ -27,4 +27,9 @@ describe("credential presentation", () => {
     expect(credentialBackendLabel("windows-credential-manager", "Win32")).toBe("Windows Credential Manager");
     expect(credentialBackendLabel("tpm", "Win32")).toBe("Windows TPM");
   });
+
+  it("names Linux Secret Service without generic local wording", () => {
+    expect(credentialBackendLabel("local", "Linux x86_64")).toBe("Encrypted local store");
+    expect(credentialBackendLabel("linux-secret-service", "Linux x86_64")).toBe("Linux Secret Service");
+  });
 });

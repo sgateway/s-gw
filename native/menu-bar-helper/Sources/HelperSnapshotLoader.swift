@@ -6,6 +6,31 @@ struct CliRunResult: Sendable {
   let stderr: String?
 }
 
+struct HelperStatusRefreshSchedule {
+  static let fallbackInterval: TimeInterval = 5 * 60
+
+  let interval: TimeInterval
+  private(set) var lastAttempt: Date?
+
+  init(interval: TimeInterval = fallbackInterval) {
+    self.interval = interval
+  }
+
+  func isDue(at date: Date) -> Bool {
+    guard let lastAttempt else { return true }
+    return date.timeIntervalSince(lastAttempt) >= interval
+  }
+
+  mutating func markAttempt(at date: Date) {
+    lastAttempt = date
+  }
+}
+
+struct HelperLoadResult: Sendable {
+  let state: HelperState
+  let status: StatusPayload?
+}
+
 func runSgwCli(
   node: String,
   cli: String,
@@ -48,14 +73,14 @@ struct HelperSnapshotLoader: Sendable {
   let consoleURL: URL
   let environment: [String: String]
 
-  func load() -> HelperState {
-    let status = readStatus()
+  func load(cachedStatus: StatusPayload?, refreshRuntimeStatus: Bool) -> HelperLoadResult {
+    let status = refreshRuntimeStatus ? (readStatus() ?? cachedStatus) : cachedStatus
     let store = readStore(path: status?.storePath)
     let requests = readRequests()
 
     var snapshot = HelperState()
     snapshot.daemonRunning = checkDaemon() || (status?.launchAgents?.console.loaded ?? false)
-    snapshot.unlockSource = status?.unlock.activeSource ?? readUnlockSource()
+    snapshot.unlockSource = status?.unlock.activeSource ?? "unknown"
     snapshot.pending = requests
       .filter { $0.state == "pending" }
       .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
@@ -70,7 +95,7 @@ struct HelperSnapshotLoader: Sendable {
     snapshot.highRiskCount = store.secrets.filter(\.isHighRisk).count
     snapshot.onePasswordAvailable = readOnePasswordAvailable()
     snapshot.lastUpdated = Date()
-    return snapshot
+    return HelperLoadResult(state: snapshot, status: status)
   }
 
   private func runCli(_ args: [String]) -> String? {
@@ -92,11 +117,6 @@ struct HelperSnapshotLoader: Sendable {
   private func readRequests() -> [RequestRecord] {
     guard let output = runCli(["requests"]) else { return [] }
     return (try? JSONDecoder().decode([RequestRecord].self, from: Data(output.utf8))) ?? []
-  }
-
-  private func readUnlockSource() -> String {
-    guard let output = runCli(["unlock", "status"]) else { return "unknown" }
-    return (try? JSONDecoder().decode(UnlockStatus.self, from: Data(output.utf8)).activeSource) ?? "unknown"
   }
 
   private func readStore(path: String?) -> StoreSnapshot {

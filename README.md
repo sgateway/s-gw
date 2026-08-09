@@ -62,7 +62,7 @@ Public demo: [s-gw.com](https://s-gw.com).
 
 ## Why Teams Use It
 
-- **Local custody:** raw values stay in macOS Keychain, Windows Credential Manager, 1Password, or the encrypted local ledger.
+- **Local custody:** raw values stay in macOS Keychain, Linux Secret Service, Windows Credential Manager, 1Password, or the encrypted local ledger.
 - **Action-scoped access:** grants bind to the agent, handle, command, environment variable, working directory, target, approval mode, and optional time window.
 - **Useful handles:** agents can request real work with stable handle names instead of seeing keys, passwords, tokens, or SSH material.
 - **Output sanitization:** command output is scanned before it returns to the agent, replacing detected credential values with handles.
@@ -105,6 +105,8 @@ s-gw status
 ```
 
 On Windows, run the same commands in PowerShell. Windows support is preview software: it uses the TypeScript execution path and includes the PowerShell client, tray helper, and local web console.
+
+On Linux, install `secret-tool` first (`sudo apt install libsecret-tools` on Ubuntu/Debian). An unlocked desktop Secret Service is the normal persistent unlock provider; `s-gw setup` also installs and starts an owner-level `systemd --user` console service for the graphical session. A headless host without Secret Service can use an explicitly supplied `SGW_MASTER_PASSPHRASE` with `s-gw setup --no-service --no-open-app`, but s-gw never copies that value into a unit file or background-service environment.
 
 For an Apple Silicon Mac desktop bundle, [GitHub Releases](https://github.com/sgateway/s-gw/releases) also provides a self-contained `s-gw.dmg`. Drag `s-gw.app` to **Applications**, then open it and complete setup. The app includes its own Node runtime, CLI, MCP server, native helpers, and menu-bar helper; it does not require Node.js or npm on the host. Setup is intentionally blocked until the app is in `/Applications` or `~/Applications`.
 
@@ -217,7 +219,7 @@ The model can complete the task without receiving the raw access key.
 | macOS 14+ on Apple Silicon | Primary development platform | Keychain | Native app, menu helper, local web console |
 | macOS 14+ on Intel | Build-from-source candidate; not QA-tested | Source-built Keychain helper | Source-built native surfaces or local web console |
 | Windows 10/11 | Preview | Credential Manager | PowerShell client, tray helper, local web console |
-| Linux | Experimental CLI | Environment-provided unlock material | Local web console |
+| Linux | Preview | Secret Service; explicit environment fallback | systemd user service, local web console |
 
 Published Apple Silicon macOS DMGs are self-contained. Releases are Developer ID signed and notarized when credentials are available; otherwise the release notes and DMG README state that a Gatekeeper override is required. The Windows package remains unsigned preview software. Build locally with `npm run build:installers`; local DMGs are ad-hoc signed.
 
@@ -232,7 +234,7 @@ Read the [threat model](docs/threat-model.md) before relying on s-gw for sensiti
 - The public broker and client source distribution is preview quality; the compiled Rust execution core is proprietary.
 - macOS is the primary development and test platform.
 - Windows Credential Manager support is present but still needs broader native QA.
-- Linux currently depends on environment-provided unlock material.
+- Linux uses Secret Service for persistent unlock material and a hardened systemd user service. Environment unlock is a non-persistent headless fallback only.
 - The Windows desktop package remains an unsigned preview. macOS releases without Developer ID signing are marked unsigned in their release notes and require a Gatekeeper override.
 - The repository is prepared for open-source collaboration, but security-sensitive changes should come with focused tests and threat-model updates when behavior changes.
 

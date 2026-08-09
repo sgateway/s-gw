@@ -1,14 +1,22 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { getSgwHome } from "./paths.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
 import type { CommandAction, ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
+import {
+  createPrivateWindowsSshDirectory,
+  trustedWindowsSystemExecutable,
+  trustedWindowsSystemRoot,
+  verifyPrivateWindowsKeyFile
+} from "./windows-acl.js";
 
 export const SGW_SSH_SESSION_COMMAND = "s-gw:ssh-session";
+export const WINDOWS_SSH_KEY_ONLY_ERROR = "Windows owned SSH supports ssh-key and private-key handles only; password and keyboard-interactive authentication are disabled.";
+export const WINDOWS_SSH_CLOSE_MESSAGE = "Windows uses one-shot SSH commands; there is no persistent s-gw SSH session to close.";
 
 export interface SshSessionInput {
   target: string;
@@ -89,15 +97,33 @@ export async function runOwnedSshSession(
 
   const target = normalizeSshTarget(request.action.ssh?.target || "");
   const port = normalizeSshPort(request.action.ssh?.port);
-  const sshPath = process.env.SGW_SSH_CLI || "ssh";
+  const sshPath = await resolveSshClient();
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
   const captureCap = maxOutput + Math.max(secretValue.length, 0);
-  const socketPath = await controlSocketPath(home, request.handle, target, port);
-  const auth = await prepareSshAuth(secretRecord, secretValue);
+  let auth: PreparedSshAuth | undefined;
 
   try {
+    assertSshCredentialSupported(secretRecord);
+    if (process.platform === "win32") {
+      auth = await prepareSshAuth(secretRecord, secretValue);
+      return await runWindowsSshCommand(request, sshPath, target, port, auth, secretValue, maxOutput, captureCap);
+    }
+
+    auth = await prepareSshAuth(secretRecord, secretValue);
+    const socketPath = await controlSocketPath(home, request.handle, target, port);
     if (!(await controlMasterIsActive(sshPath, socketPath, target, port, request.action.timeoutMs, captureCap))) {
-      await openControlMaster(sshPath, socketPath, target, port, request.action.timeoutMs, auth, captureCap);
+      await openControlMaster(
+        sshPath,
+        socketPath,
+        target,
+        port,
+        request.action.timeoutMs,
+        auth,
+        captureCap,
+        maxOutput,
+        request.handle,
+        secretValue
+      );
     }
 
     const remoteArgs = request.action.args.length > 0 ? request.action.args : ["true"];
@@ -111,37 +137,149 @@ export async function runOwnedSshSession(
         target,
         ...remoteArgs
       ],
-      { timeoutMs: request.action.timeoutMs, env: baseSshEnv(), maxOutputBytes: captureCap }
+      {
+        timeoutMs: request.action.timeoutMs,
+        env: await baseSshEnv(),
+        maxOutputBytes: captureCap,
+        rejectOnNonZero: false
+      }
     );
 
-    const cleanStdout = capBytes(sanitizeKnownSecrets(result.stdout, [{ handle: request.handle, value: secretValue }]), maxOutput);
-    const cleanStderr = capBytes(sanitizeKnownSecrets(result.stderr, [{ handle: request.handle, value: secretValue }]), maxOutput);
-    return {
-      exitCode: result.timedOut ? 124 : result.exitCode,
-      signal: result.signal,
-      stdout: cleanStdout,
-      stderr: cleanStderr,
-      proof: proofFor(request, cleanStdout, cleanStderr),
-      durationMs: result.durationMs,
-      timeoutMs: request.action.timeoutMs,
-      timedOut: result.timedOut,
-      sanitized: cleanStdout !== result.stdout || cleanStderr !== result.stderr
-    };
+    return sshSummary(request, result, secretValue, maxOutput);
+  } catch (error) {
+    throw sanitizedSshError(error, request.handle, secretValue, maxOutput);
   } finally {
-    await auth.cleanup();
+    await auth?.cleanup();
   }
 }
 
 export async function closeOwnedSshSession(input: { handle: string; target: string; port?: number; home?: string }): Promise<ProcessResult> {
   const target = normalizeSshTarget(input.target);
   const port = normalizeSshPort(input.port);
+  if (process.platform === "win32") {
+    return {
+      exitCode: 0,
+      signal: null,
+      stdout: `${WINDOWS_SSH_CLOSE_MESSAGE}\n`,
+      stderr: "",
+      durationMs: 0,
+      timedOut: false
+    };
+  }
   const socketPath = await controlSocketPath(input.home || getSgwHome(), input.handle, target, port);
-  return runProcess(process.env.SGW_SSH_CLI || "ssh", ["-S", socketPath, "-O", "exit", "-p", String(port), target], {
+  const sshPath = await resolveSshClient();
+  return runProcess(sshPath, ["-S", socketPath, "-O", "exit", "-p", String(port), target], {
     timeoutMs: 10_000,
-    env: baseSshEnv(),
+    env: await baseSshEnv(),
     maxOutputBytes: 16_384,
     rejectOnNonZero: false
   });
+}
+
+export function assertSshCredentialSupported(secret: SecretRecord): void {
+  if (process.platform !== "win32") {
+    return;
+  }
+  if (secret.type !== "ssh-key" && secret.type !== "private-key") {
+    throw new Error(WINDOWS_SSH_KEY_ONLY_ERROR);
+  }
+}
+
+async function runWindowsSshCommand(
+  request: RequestRecord,
+  sshPath: string,
+  target: string,
+  port: number,
+  auth: PreparedSshAuth,
+  secretValue: string,
+  maxOutput: number,
+  captureCap: number
+): Promise<ExecutionSummary> {
+  const remoteArgs = request.action.args.length > 0 ? request.action.args : ["true"];
+  const sshArgs = [
+    "-T",
+    "-F", "none",
+    "-o", "ClearAllForwardings=yes",
+    "-o", "ForwardAgent=no",
+    "-o", "ForwardX11=no",
+    "-o", "PermitLocalCommand=no",
+    "-o", "IdentityAgent=none",
+    "-o", "PasswordAuthentication=no",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "GSSAPIAuthentication=no",
+    "-o", "HostbasedAuthentication=no",
+    "-o", "PubkeyAuthentication=yes",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "BatchMode=yes",
+    ...auth.args,
+    "-p", String(port),
+    target,
+    ...remoteArgs
+  ];
+  if (!auth.validateBeforeSpawn) {
+    throw new Error("The Windows SSH private key has no pre-spawn validation.");
+  }
+  await auth.validateBeforeSpawn();
+  const result = await runProcess(
+    sshPath,
+    sshArgs,
+    {
+      timeoutMs: request.action.timeoutMs,
+      env: auth.env,
+      maxOutputBytes: captureCap,
+      rejectOnNonZero: false
+    }
+  );
+  return sshSummary(request, result, secretValue, maxOutput);
+}
+
+async function resolveSshClient(): Promise<string> {
+  const configured = process.env.SGW_SSH_CLI?.trim();
+  if (configured) {
+    return resolveIsolatedTestSshClient(configured);
+  }
+
+  if (process.platform === "win32") {
+    return trustedWindowsSystemExecutable("OpenSSH", "ssh.exe");
+  }
+
+  const candidate = "/usr/bin/ssh";
+  const info = await lstat(candidate).catch(() => undefined);
+  if (!info?.isFile() || info.isSymbolicLink() || info.uid !== 0 || (info.mode & 0o022) !== 0) {
+    throw new Error("The trusted system SSH client is unavailable at /usr/bin/ssh.");
+  }
+  const actual = await realpath(candidate).catch(() => "");
+  if (!actual || actual !== candidate) {
+    throw new Error("The trusted system SSH client path could not be validated.");
+  }
+  return actual;
+}
+
+async function resolveIsolatedTestSshClient(configured: string): Promise<string> {
+  if (process.env.SGW_TEST_MODE !== "1") {
+    throw new Error("SGW_SSH_CLI is available only in isolated test mode.");
+  }
+  if (!path.isAbsolute(configured)) {
+    throw new Error("SGW_SSH_CLI must be an absolute path in isolated test mode.");
+  }
+
+  const info = await lstat(configured).catch(() => undefined);
+  if (!info?.isFile() || info.isSymbolicLink()) {
+    throw new Error("The configured Windows SSH client is not a regular local file.");
+  }
+  const actual = await realpath(configured).catch(() => "");
+  if (!actual || !sameWindowsPath(actual, configured)) {
+    throw new Error("The configured test SSH client path could not be validated.");
+  }
+  const configuredRoot = process.env.SGW_TEST_HOME_ROOT?.trim();
+  if (!configuredRoot) {
+    throw new Error("SGW_TEST_HOME_ROOT is required for a test SSH client override.");
+  }
+  const testRoot = await realpath(path.resolve(configuredRoot)).catch(() => "");
+  if (!testRoot || !isPathInside(actual, testRoot)) {
+    throw new Error("The configured test SSH client must stay inside SGW_TEST_HOME_ROOT.");
+  }
+  return actual;
 }
 
 async function controlMasterIsActive(
@@ -159,7 +297,7 @@ async function controlMasterIsActive(
 
   const result = await runProcess(sshPath, ["-S", socketPath, "-O", "check", "-p", String(port), target], {
     timeoutMs: timeoutMs > 0 ? Math.min(timeoutMs, 10_000) : 10_000,
-    env: baseSshEnv(),
+    env: await baseSshEnv(),
     maxOutputBytes,
     rejectOnNonZero: false
   });
@@ -173,7 +311,10 @@ async function openControlMaster(
   port: number,
   timeoutMs: number,
   auth: PreparedSshAuth,
-  maxOutputBytes: number
+  captureBytes: number,
+  maxOutputBytes: number,
+  handle: string,
+  secretValue: string
 ): Promise<void> {
   const result = await runProcess(
     sshPath,
@@ -192,12 +333,13 @@ async function openControlMaster(
       ...auth.args,
       target
     ],
-    { timeoutMs, env: auth.env, maxOutputBytes, rejectOnNonZero: false }
+    { timeoutMs, env: auth.env, maxOutputBytes: captureBytes, rejectOnNonZero: false }
   );
 
   if (result.exitCode !== 0) {
     const detail = result.stderr || result.stdout || `ssh exited ${result.exitCode}`;
-    throw new Error(`Could not open s-gw-owned SSH session to ${target}: ${detail.trim()}`);
+    const cleanDetail = sanitizeKnownSecrets(detail, [{ handle, value: secretValue }]);
+    throw new Error(`Could not open s-gw-owned SSH session to ${target}: ${capBytes(cleanDetail.trim(), maxOutputBytes)}`);
   }
 }
 
@@ -205,48 +347,69 @@ interface PreparedSshAuth {
   args: string[];
   env: NodeJS.ProcessEnv;
   cleanup: () => Promise<void>;
+  validateBeforeSpawn?: () => Promise<void>;
 }
 
 async function prepareSshAuth(secret: SecretRecord, value: string): Promise<PreparedSshAuth> {
-  const env = baseSshEnv();
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-ssh-"));
+  const env = await baseSshEnv();
+  const windowsDir = process.platform === "win32" ? await createPrivateWindowsSshDirectory() : undefined;
+  const tmpDir = windowsDir?.dirPath || await mkdtemp(path.join(os.tmpdir(), "sgw-ssh-"));
   let cleaned = false;
   const cleanup = async () => {
     if (cleaned) {
       return;
     }
-    cleaned = true;
     await rm(tmpDir, { recursive: true, force: true });
+    if (await fileExists(tmpDir)) {
+      throw new Error("Could not remove the temporary SSH credential directory.");
+    }
+    cleaned = true;
   };
 
-  if (secret.type === "ssh-key" || secret.type === "private-key" || looksLikePrivateKey(value)) {
-    const keyPath = path.join(tmpDir, "identity");
-    await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
-    await chmod(keyPath, 0o600);
+  try {
+    if (secret.type === "ssh-key" || secret.type === "private-key" || looksLikePrivateKey(value)) {
+      const keyPath = path.join(tmpDir, "identity");
+      let validateBeforeSpawn: (() => Promise<void>) | undefined;
+      if (process.platform === "win32") {
+        await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { flag: "wx" });
+        validateBeforeSpawn = await verifyPrivateWindowsKeyFile(keyPath, windowsDir!.sid);
+      } else {
+        await writeFile(keyPath, value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
+        await chmod(keyPath, 0o600);
+      }
+      return {
+        args: ["-i", keyPath, "-o", "IdentitiesOnly=yes"],
+        env,
+        cleanup,
+        validateBeforeSpawn
+      };
+    }
+
+    const passPath = path.join(tmpDir, "password");
+    const askpassPath = path.join(tmpDir, "askpass.sh");
+    await writeFile(passPath, value, { mode: 0o600 });
+    await chmod(passPath, 0o600);
+    await writeFile(askpassPath, '#!/bin/sh\ncat "$SGW_ASKPASS_FILE"\n', { mode: 0o700 });
+    await chmod(askpassPath, 0o700);
     return {
-      args: ["-i", keyPath, "-o", "IdentitiesOnly=yes"],
-      env,
+      args: ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no"],
+      env: {
+        ...env,
+        DISPLAY: env.DISPLAY || "sgw-local",
+        SSH_ASKPASS_REQUIRE: "force",
+        SSH_ASKPASS: askpassPath,
+        SGW_ASKPASS_FILE: passPath
+      },
       cleanup
     };
+  } catch (error) {
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      throw new Error(`SSH credential preparation failed, and its temporary directory could not be removed: ${errorMessage(cleanupError)}`);
+    }
+    throw error;
   }
-
-  const passPath = path.join(tmpDir, "password");
-  const askpassPath = path.join(tmpDir, "askpass.sh");
-  await writeFile(passPath, value, { mode: 0o600 });
-  await chmod(passPath, 0o600);
-  await writeFile(askpassPath, '#!/bin/sh\ncat "$SGW_ASKPASS_FILE"\n', { mode: 0o700 });
-  await chmod(askpassPath, 0o700);
-  return {
-    args: ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no"],
-    env: {
-      ...env,
-      DISPLAY: env.DISPLAY || "sgw-local",
-      SSH_ASKPASS_REQUIRE: "force",
-      SSH_ASKPASS: askpassPath,
-      SGW_ASKPASS_FILE: passPath
-    },
-    cleanup
-  };
 }
 
 function looksLikePrivateKey(value: string): boolean {
@@ -267,15 +430,31 @@ async function controlSocketPath(home: string, handle: string, target: string, p
   return path.join(dir, `ctl-${digest}`);
 }
 
-function baseSshEnv(): NodeJS.ProcessEnv {
+async function baseSshEnv(): Promise<NodeJS.ProcessEnv> {
+  if (process.platform === "win32") {
+    const systemRoot = await trustedWindowsSystemRoot();
+    const env: NodeJS.ProcessEnv = {
+      SystemRoot: systemRoot,
+      WINDIR: systemRoot,
+      PATH: `${path.join(systemRoot, "System32")};${systemRoot}`
+    };
+    for (const key of ["USERPROFILE", "TEMP", "TMP"]) {
+      const value = process.env[key];
+      if (value) {
+        env[key] = value;
+      }
+    }
+    return env;
+  }
+
   const env: NodeJS.ProcessEnv = {};
-  for (const key of ["HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR", "USER"]) {
+  for (const key of ["HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "SHELL", "TERM", "TMPDIR", "USER"]) {
     const value = process.env[key];
     if (value) {
       env[key] = value;
     }
   }
-  env.PATH ||= "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+  env.PATH = "/usr/bin:/bin";
   return env;
 }
 
@@ -315,15 +494,19 @@ async function runProcess(
     stderr = appendBounded(stderr, chunk.toString("utf8"), options.maxOutputBytes);
   });
 
-  const status = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (code, signal) => resolve({ code, signal }));
-  });
-  if (timeout) {
-    clearTimeout(timeout);
-  }
-  if (killTimer) {
-    clearTimeout(killTimer);
+  let status: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    status = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    });
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    if (killTimer) {
+      clearTimeout(killTimer);
+    }
   }
 
   const result = {
@@ -355,6 +538,49 @@ function capBytes(text: string, maxBytes: number): string {
     return text;
   }
   return text.slice(0, maxBytes) + "\n<<SGW_OUTPUT_TRUNCATED>>";
+}
+
+function sshSummary(
+  request: RequestRecord,
+  result: ProcessResult,
+  secretValue: string,
+  maxOutput: number
+): ExecutionSummary {
+  const known = [{ handle: request.handle, value: secretValue }];
+  const sanitizedStdout = sanitizeKnownSecrets(result.stdout, known);
+  const sanitizedStderr = sanitizeKnownSecrets(result.stderr, known);
+  const cleanStdout = capBytes(sanitizedStdout, maxOutput);
+  const cleanStderr = capBytes(sanitizedStderr, maxOutput);
+  return {
+    exitCode: result.timedOut ? 124 : result.exitCode,
+    signal: result.signal,
+    stdout: cleanStdout,
+    stderr: cleanStderr,
+    proof: proofFor(request, cleanStdout, cleanStderr),
+    durationMs: result.durationMs,
+    timeoutMs: request.action.timeoutMs,
+    timedOut: result.timedOut,
+    sanitized: cleanStdout !== result.stdout || cleanStderr !== result.stderr
+  };
+}
+
+function sanitizedSshError(error: unknown, handle: string, secretValue: string, maxOutput: number): Error {
+  const message = sanitizeKnownSecrets(errorMessage(error), [{ handle, value: secretValue }]);
+  return new Error(capBytes(message, maxOutput));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return path.normalize(left).replace(/[\\/]+$/, "").toLowerCase()
+    === path.normalize(right).replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function isPathInside(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function proofFor(request: RequestRecord, stdout: string, stderr: string): string {

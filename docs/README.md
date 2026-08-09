@@ -12,7 +12,7 @@
 
 - [Agent integrations](integrations.md): Codex, Claude Code, Cursor, OpenCode, and VS Code configuration.
 - [Agent profiles](agents.md): known clients, aliases, config paths, and compatibility status.
-- [macOS Keychain and Windows Credential Manager](keychain.md): operating system credential-store handles.
+- [macOS Keychain, Linux Secret Service, and Windows Credential Manager](keychain.md): operating system credential-store handles.
 - [1Password](onepassword.md): optional `op://` reference-backed handles.
 
 ## Security Details

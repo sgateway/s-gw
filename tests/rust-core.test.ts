@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -118,6 +118,56 @@ describe("Rust execution core", () => {
     const failed = await store.getRequest(request.id);
     expect(failed.state).toBe("failed");
     expect(failed.error).not.toContain(secret);
+  });
+
+  it("passes the pinned absolute executable to the Rust core", async () => {
+    if (process.platform === "win32") return;
+
+    const commandLink = path.join(tmpHome, "approved-node-link");
+    await symlink(process.execPath, commandLink);
+    const fakeCore = path.join(tmpHome, "command-capture-core");
+    await writeFile(fakeCore, [
+      "#!/usr/bin/env node",
+      "const { createHash } = require('node:crypto');",
+      "let input = '';",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const request = JSON.parse(input);",
+      "  const stdout = request.command;",
+      "  const proof = createHash('sha256')",
+      "    .update(request.requestId).update(request.handle).update(stdout).update('')",
+      "    .digest('base64url').slice(0, 24);",
+      "  console.log(JSON.stringify({",
+      "    exitCode: 0, signal: null, stdout, stderr: '',",
+      "    proof: `s-gw-proof:${request.requestId}:${proof}`,",
+      "    durationMs: 1, timeoutMs: request.timeoutMs, timedOut: false, sanitized: false",
+      "  }));",
+      "});"
+    ].join("\n"), { mode: 0o700 });
+    await chmod(fakeCore, 0o700);
+
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "pinned Rust command",
+      type: "credential",
+      value: "pinned-rust-command-secret-value-123456789",
+      policy: { allowedCommands: [commandLink], maxOutputBytes: 4096 }
+    });
+    const request = await store.createRequest(
+      record.handle,
+      buildEnvCommandAction({ command: commandLink, args: ["-e", "0"], injectEnv: "SGW_RUST_PIN" }),
+      "Rust pinned command input test"
+    );
+    await store.approveRequest(request.id);
+
+    const summary = await executeApprovedRequest(store, request.id, {
+      engine: "rust",
+      coreBinary: fakeCore
+    });
+    expect(request.action.command).toBe(commandLink);
+    expect(request.action.resolvedCommand).toBe(await realpath(process.execPath));
+    expect(summary.stdout).toBe(await realpath(process.execPath));
+    expect(summary.stdout).not.toBe(commandLink);
   });
 
   coreIt("terminates commands at the approved timeout", async () => {
@@ -261,7 +311,11 @@ describe("Rust execution core", () => {
     await store.addApprovalPolicyRule({
       name: "Allow reusable launch fallback",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [await realpath(process.execPath)]
+      }
     });
     const admission = await store.prepareOneShotExecution(record.handle, action, "Codex reusable launch fallback");
     expect(admission.kind).toBe("reusable");

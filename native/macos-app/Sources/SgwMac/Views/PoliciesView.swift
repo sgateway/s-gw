@@ -339,6 +339,14 @@ struct PoliciesView: View {
     if !matchesString(conditions.agents, request.agentName) { return false }
     if !matchesString(conditions.actionKinds, request.action.kind) { return false }
     if !matchesString(conditions.commands, request.action.command) { return false }
+    if request.action.kind == "env_command" {
+      if rule.decision == .allow && (conditions.resolvedCommands?.isEmpty != false) { return false }
+      if let executables = conditions.resolvedCommands, !executables.isEmpty {
+        guard let resolved = request.action.resolvedCommand, executables.contains(resolved) else { return false }
+      }
+    } else if conditions.resolvedCommands?.isEmpty == false {
+      return false
+    }
     if !matchesString(conditions.injectEnvs, request.action.injectEnv) { return false }
     if !matchesString(conditions.workingDirs, request.action.workingDir ?? "") { return false }
     if !matchesString(conditions.sshTargets, request.action.ssh?.target ?? "") { return false }

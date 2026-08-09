@@ -19,6 +19,7 @@ import { CURRENT_VERSION } from "../src/version.js";
 
 const execFileAsync = promisify(execFile);
 const tmpDirs: string[] = [];
+const packageIntegrationTimeout = process.platform === "win32" ? 180_000 : 40_000;
 
 afterEach(async () => {
   for (const dir of tmpDirs.splice(0)) {
@@ -27,6 +28,69 @@ afterEach(async () => {
 });
 
 describe("scoped package migration", () => {
+  it("never runs a Windows npm cmd shim through a command shell", async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      await expect(planPackageUpdate({ npmCommand: "C:\\Program Files\\nodejs\\npm.cmd" }))
+        .rejects.toThrow(/require npm-cli\.js.*will not execute npm through a command shell/i);
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+    }
+  });
+
+  it("does not pass broker or ambient credential variables to npm", async () => {
+    const tmp = await tempDir("sgw-package-clean-env-");
+    const npmPrefix = path.join(tmp, "prefix");
+    const npmRoot = path.join(npmPrefix, "lib", "node_modules");
+    const npmCli = path.join(tmp, "npm-cli.js");
+    const logPath = path.join(tmp, "npm-env.jsonl");
+    await mkdir(npmRoot, { recursive: true });
+    await writeFile(npmCli, `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(process.env) + "\\n");
+if (args[0] === "pack") {
+  process.stdout.write(${JSON.stringify(JSON.stringify([{ name: "@s-gw/s-gw", version: CURRENT_VERSION }]))});
+} else if (args[0] === "root") {
+  process.stdout.write(${JSON.stringify(`${npmRoot}\n`)});
+} else if (args[0] === "prefix") {
+  process.stdout.write(${JSON.stringify(`${npmPrefix}\n`)});
+} else if (args[0] === "list") {
+  process.stdout.write(${JSON.stringify('{"dependencies":{}}\n')});
+} else {
+  process.stderr.write("unexpected npm arguments: " + JSON.stringify(args));
+  process.exitCode = 2;
+}
+`);
+
+    const plan = await planPackageUpdate({
+      npmCommand: npmCli,
+      npmPrefix,
+      sgwHome: path.join(tmp, "home"),
+      env: {
+        ...process.env,
+        HOME: tmp,
+        USERPROFILE: tmp,
+        SGW_MASTER_PASSPHRASE: "must-not-reach-npm",
+        AWS_SECRET_ACCESS_KEY: "must-not-reach-npm",
+        OP_SERVICE_ACCOUNT_TOKEN: "must-not-reach-npm",
+        NODE_OPTIONS: "--require=/must-not-run"
+      }
+    });
+    expect(plan.target.version).toBe(CURRENT_VERSION);
+
+    const calls = (await readFile(logPath, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const env of calls) {
+      expect(env.HOME).toBe(tmp);
+      expect(env.SGW_MASTER_PASSPHRASE).toBeUndefined();
+      expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(env.OP_SERVICE_ACCOUNT_TOKEN).toBeUndefined();
+      expect(env.NODE_OPTIONS).toBeUndefined();
+    }
+  });
+
   it("replaces a previous unscoped package without mutating the real npm prefix or s-gw home", async () => {
     const tmp = await tempDir("sgw-package-migration-");
     const npmPrefix = path.join(tmp, "npm-prefix");
@@ -87,10 +151,10 @@ describe("scoped package migration", () => {
       SGW_RECOVERY_HOME: `${sgwHome}-recovery`
     };
     const output = process.platform === "win32"
-      ? await execFileAsync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${command}"`], { env })
+      ? await execFileAsync(command, [], { env, shell: true })
       : await execFileAsync(command, [], { env });
     expect(output.stdout.trim()).toBe(`@s-gw/s-gw ${CURRENT_VERSION}`);
-  }, 30_000);
+  }, 60_000);
 
   it("preserves the installed macOS helper before replacing a scoped package", async () => {
     if (process.platform !== "darwin") {
@@ -203,7 +267,7 @@ describe("scoped package migration", () => {
     expect(installed.installed.binDir).toBe(process.platform === "win32" ? npmPrefix : path.join(npmPrefix, "bin"));
     expect(installed.installed.legacy).toBeNull();
     expect(installed.installed.scoped.version).toBe(CURRENT_VERSION);
-  }, 40_000);
+  }, packageIntegrationTimeout);
 
   it("builds a release bridge that upgrades the legacy package without a bin collision", async () => {
     const tmp = await tempDir("sgw-legacy-bridge-");
@@ -230,7 +294,7 @@ describe("scoped package migration", () => {
     const installed = await inspectGlobalSgwInstall({ npmPrefix });
     expect(installed.legacy?.version).toBe(CURRENT_VERSION);
     expect(installed.scoped).toBeNull();
-  }, 40_000);
+  }, packageIntegrationTimeout);
 
   it("reports a concrete legacy rollback when scoped installation fails", async () => {
     const tmp = await tempDir("sgw-package-rollback-");
@@ -285,7 +349,7 @@ describe("scoped package migration", () => {
     expect((thrown as PackageUpdateError).recoveryCommands.join("\n")).not.toContain("s-gw@0.1.0");
     expect((thrown as PackageUpdateError).recoveryCommands[0]).toContain("@s-gw/s-gw");
     const rollbackTarget = (thrown as PackageUpdateError).recoveryCommands[1]
-      .split(" -- ").at(-1)?.replace(/^'|'$/g, "");
+      .split(" -- ").at(-1)?.replace(/^['"]|['"]$/g, "");
     expect(rollbackTarget).toContain("sgw-legacy-rollback-");
     expect(rollbackTarget).not.toBe(replacedResolvedArtifact);
     expect(await readFile(rollbackTarget || "", "utf8")).toBe("rollback copy");

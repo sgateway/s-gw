@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { verifyPinnedCommand } from "./command-path.js";
 import {
   assertActionAllowed,
   type ExecutionLaunch,
@@ -9,7 +10,7 @@ import {
   type SecretStore
 } from "./store.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
-import { runOwnedSshSession } from "./ssh.js";
+import { assertSshCredentialSupported, runOwnedSshSession } from "./ssh.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 
 export interface ExecutionOptions {
@@ -48,7 +49,14 @@ export async function executeReusablePermit(
   let nativeLaunch = false;
   try {
     return await store.launchReusableExecution(permit, (request) => {
-      const launch = launchReusableEnvCommand(request, prepared.secretRecord, prepared.secretValue, prepared.extraSecrets, options);
+      const launch = launchReusableEnvCommand(
+        request,
+        prepared.command,
+        prepared.secretRecord,
+        prepared.secretValue,
+        prepared.extraSecrets,
+        options
+      );
       nativeLaunch = launch.nativeLaunch;
       return launch;
     });
@@ -58,9 +66,22 @@ export async function executeReusablePermit(
     }
 
     return store.launchReusableExecution(permit, (request) => {
-      return startTypeScriptEnvCommand(request, prepared.secretRecord, prepared.secretValue, prepared.extraSecrets);
+      return startTypeScriptEnvCommand(
+        request,
+        prepared.command,
+        prepared.secretRecord,
+        prepared.secretValue,
+        prepared.extraSecrets
+      );
     });
   }
+}
+
+function commandForExecution(request: RequestRecord): string {
+  if (request.action.kind !== "env_command") {
+    throw new Error("Pinned command validation only supports environment-command actions.");
+  }
+  return verifyPinnedCommand(request.action.command, request.action.resolvedCommand);
 }
 
 async function executeRequest(
@@ -69,33 +90,43 @@ async function executeRequest(
   options: ExecutionOptions,
   executionOptions: { cacheOnePassword?: boolean } = {}
 ): Promise<ExecutionSummary> {
+  const command = request.action.kind === "env_command"
+    ? commandForExecution(request)
+    : undefined;
   const secretRecord = await store.getSecretRecord(request.handle);
   assertActionAllowed(secretRecord, request.action);
+  if (request.action.kind === "ssh_session") {
+    assertSshCredentialSupported(secretRecord);
+  }
   const secretValue = await store.revealSecretForLocalUse(request.handle, request, {
     cache: executionOptions.cacheOnePassword !== false
   });
+  if (request.action.kind === "ssh_session") {
+    return runOwnedSshSession(request, secretRecord, secretValue, store.home);
+  }
   const extraSecrets = await resolveExtraSecrets(store, request, executionOptions);
-  return request.action.kind === "ssh_session"
-    ? runOwnedSshSession(request, secretRecord, secretValue, store.home)
-    : runEnvCommand(request, secretRecord, secretValue, extraSecrets, options);
+  return runEnvCommand(request, command!, secretRecord, secretValue, extraSecrets, options);
 }
 
 interface PreparedEnvExecution {
+  command: string;
   secretRecord: SecretRecord;
   secretValue: string;
   extraSecrets: ResolvedEnvSecret[];
 }
 
 async function prepareEnvExecution(store: SecretStore, request: RequestRecord): Promise<PreparedEnvExecution> {
+  const command = commandForExecution(request);
   const secretRecord = await store.getSecretRecord(request.handle);
   assertActionAllowed(secretRecord, request.action);
   const secretValue = await store.revealSecretForLocalUse(request.handle, request);
   const extraSecrets = await resolveExtraSecrets(store, request);
-  return { secretRecord, secretValue, extraSecrets };
+  return { command, secretRecord, secretValue, extraSecrets };
 }
 
 async function runEnvCommand(
   request: RequestRecord,
+  command: string,
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[],
@@ -108,14 +139,14 @@ async function runEnvCommand(
       if (engine === "rust") {
         throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
       }
-      return startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets).completion;
+      return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets).completion;
     }
 
     try {
-      return await startRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets).completion;
+      return await startRustEnvCommand(coreBinary, request, command, secretRecord, secretValue, extraSecrets).completion;
     } catch (error) {
       if (engine === "auto" && isNativeLaunchError(error)) {
-        return startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets).completion;
+        return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets).completion;
       }
       if (engine === "rust" && isNativeLaunchError(error)) {
         throw new Error(`Rust execution core could not be launched: ${coreBinary}. ${errorMessage(error)}`);
@@ -127,7 +158,7 @@ async function runEnvCommand(
     throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
   }
 
-  return startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets).completion;
+  return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets).completion;
 }
 
 interface ReusableEnvLaunch extends ExecutionLaunch<ExecutionSummary> {
@@ -136,6 +167,7 @@ interface ReusableEnvLaunch extends ExecutionLaunch<ExecutionSummary> {
 
 function launchReusableEnvCommand(
   request: RequestRecord,
+  command: string,
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[],
@@ -148,10 +180,10 @@ function launchReusableEnvCommand(
       if (engine === "rust") {
         throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
       }
-      return { ...startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
+      return { ...startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
     }
 
-    const launch = startRustEnvCommand(coreBinary, request, secretRecord, secretValue, extraSecrets);
+    const launch = startRustEnvCommand(coreBinary, request, command, secretRecord, secretValue, extraSecrets);
     if (engine !== "rust") {
       return { ...launch, nativeLaunch: true };
     }
@@ -169,12 +201,13 @@ function launchReusableEnvCommand(
     throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
   }
 
-  return { ...startTypeScriptEnvCommand(request, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
+  return { ...startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
 }
 
 function startRustEnvCommand(
   coreBinary: string,
   request: RequestRecord,
+  command: string,
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[]
@@ -212,7 +245,7 @@ function startRustEnvCommand(
       version: 1,
       requestId: request.id,
       handle: request.handle,
-      command: request.action.command,
+      command,
       args: request.action.args,
       injectEnv: request.action.injectEnv,
       secretValue,
@@ -414,6 +447,7 @@ function buildCoreEnv(): NodeJS.ProcessEnv {
 
 function startTypeScriptEnvCommand(
   request: RequestRecord,
+  command: string,
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[]
@@ -430,7 +464,7 @@ function startTypeScriptEnvCommand(
   // truncating raw output first could cut a secret in half and leak the prefix.
   const captureCap = maxOutput + longestSecretBytes;
   const env = buildExecutionEnv(request.action.injectEnv, secretValue, extraSecrets);
-  const child = spawn(request.action.command, request.action.args, {
+  const child = spawn(command, request.action.args, {
     cwd: request.action.workingDir,
     env,
     shell: false,
