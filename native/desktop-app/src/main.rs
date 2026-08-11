@@ -665,7 +665,7 @@ fn command_exists(command: &str) -> bool {
 
 fn runtime_instance_key(runtime: &CliRuntime) -> Option<String> {
     let output = cli_command(runtime)
-        .arg("status")
+        .arg("__desktop-instance-key")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()

@@ -62,6 +62,7 @@ describe("Windows and Linux desktop app", () => {
     expect(rustSource).toContain("is_console_navigation");
     expect(rustSource).toContain("NewWindowResponse::Deny");
     expect(rustSource).toContain("parse_health_response");
+    expect(rustSource).toContain('arg("__desktop-instance-key")');
     expect(rustSource).toContain('run_lifecycle(&runtime, "setup"');
     expect(rustSource).toContain('"Open browser backup"');
     expect(rustSource).not.toContain("#[tauri::command]");

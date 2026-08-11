@@ -61,6 +61,7 @@ import {
 } from "./install.js";
 import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "./onepassword.js";
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
+import { getSgwInstanceKey } from "./paths.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { normalizeCommandGrant, SecretStore } from "./store.js";
 import {
@@ -118,6 +119,11 @@ async function main(): Promise<void> {
     const payload = getFlag(parsed.flags, "payload");
     if (!payload) throw new Error("Windows login startup requires its managed payload.");
     await startInstalledWindowsLoginService(payload);
+    return;
+  }
+
+  if (first === "__desktop-instance-key") {
+    printJson({ instanceKey: getSgwInstanceKey() });
     return;
   }
 

@@ -68,6 +68,48 @@ describe("command suggestions", () => {
   });
 });
 
+describe("desktop instance identity command", () => {
+  it("prints a stable identity without initializing the secret store", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sgw-desktop-instance-key-"));
+    const home = path.join(root, "home");
+    const sgwHome = path.join(root, "state", ".s-gw");
+    const recoveryHome = path.join(root, "state", ".s-gw-recovery");
+    const env = {
+      ...process.env,
+      HOME: home,
+      SGW_DISABLE_UPDATE_CHECK: "1",
+      SGW_HOME: sgwHome,
+      SGW_RECOVERY_HOME: recoveryHome,
+      SGW_TEST_HOME_ROOT: root,
+      SGW_TEST_MODE: "1"
+    };
+
+    try {
+      await mkdir(home, { recursive: true });
+      const first = JSON.parse(runCliSync(["src/cli.ts", "__desktop-instance-key"], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+      const second = JSON.parse(runCliSync(["src/cli.ts", "__desktop-instance-key"], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+
+      expect(first).toEqual(second);
+      expect(Object.keys(first)).toEqual(["instanceKey"]);
+      expect(first.instanceKey).toMatch(/^[a-f0-9]{64}$/);
+      expect(existsSync(sgwHome)).toBe(false);
+      expect(existsSync(recoveryHome)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("CLI unknown-command behavior (end to end)", () => {
   it.each(["--help", "-h"])("prints setup help for %s without running setup", async (helpFlag) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-setup-help-"));
