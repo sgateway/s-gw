@@ -1,7 +1,9 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   desktopAppCandidates,
@@ -14,6 +16,7 @@ import { getSgwInstanceKey } from "../src/paths.js";
 
 const root = process.cwd();
 const appRoot = path.join(root, "native/desktop-app");
+const execFileAsync = promisify(execFile);
 
 describe("Windows and Linux desktop app", () => {
   it("finds packaged and installed native executables without replacing the browser fallback", () => {
@@ -30,49 +33,85 @@ describe("Windows and Linux desktop app", () => {
     expect(linux).toContain("/usr/bin/s-gw-desktop");
   });
 
-  it("ships a locked-down Tauri shell and platform-native installer targets", async () => {
-    const [cargoRaw, buildSource, baseRaw, windowsRaw, linuxRaw, rustSource, loadingPage] = await Promise.all([
+  it("ships a compiled native UI with no WebView or bundled web page", async () => {
+    const [cargoRaw, buildSource, packageSource, packageRaw, workflowSource, smokeSource, rustFiles] = await Promise.all([
       readFile(path.join(appRoot, "Cargo.toml"), "utf8"),
       readFile(path.join(appRoot, "build.rs"), "utf8"),
-      readFile(path.join(appRoot, "tauri.conf.json"), "utf8"),
-      readFile(path.join(appRoot, "tauri.windows.conf.json"), "utf8"),
-      readFile(path.join(appRoot, "tauri.linux.conf.json"), "utf8"),
-      readFile(path.join(appRoot, "src/main.rs"), "utf8"),
-      readFile(path.join(appRoot, "frontend/index.html"), "utf8")
+      readFile(path.join(root, "scripts/package-desktop-app.mjs"), "utf8"),
+      readFile(path.join(root, "package.json"), "utf8"),
+      readFile(path.join(root, ".github/workflows/ci.yml"), "utf8"),
+      readFile(path.join(root, "scripts/verify-desktop-deb.sh"), "utf8"),
+      readdir(path.join(appRoot, "src"))
     ]);
-    const base = JSON.parse(baseRaw);
-    const windows = JSON.parse(windowsRaw);
-    const linux = JSON.parse(linuxRaw);
+    const rustSource = (
+      await Promise.all(
+        rustFiles
+          .filter((name) => name.endsWith(".rs"))
+          .map((name) => readFile(path.join(appRoot, "src", name), "utf8"))
+      )
+    ).join("\n");
+    const packageInfo = JSON.parse(packageRaw);
 
-    expect(cargoRaw).toContain('tauri = { version = "=2.11.5"');
-    expect(cargoRaw).toContain('features = ["tray-icon"]');
-    expect(cargoRaw).toContain('tauri-plugin-single-instance = "=2.4.3"');
-    expect(cargoRaw).not.toContain("tauri-plugin-autostart");
-    expect(base.app.windows).toEqual([]);
-    expect(base.app.security.csp).toContain("connect-src 'none'");
-    expect(base.bundle.resources).toEqual(["runtime/"]);
-    expect(windows.bundle.targets).toEqual(["nsis"]);
-    expect(windows.bundle.windows.nsis.installMode).toBe("currentUser");
-    expect(linux.bundle.targets).toEqual(["deb"]);
-    expect(linux.bundle.linux.deb.depends).toContain("libsecret-tools");
+    expect(cargoRaw).toContain('eframe = { version = "=0.36.1"');
+    expect(cargoRaw).toContain('egui = "=0.36.1"');
+    expect(cargoRaw).toContain('egui_extras = "=0.36.1"');
+    expect(cargoRaw).toContain('tray-icon = "=0.24.2"');
+    expect(cargoRaw).toContain('gtk = "=0.18.2"');
+    expect(cargoRaw).toContain('single-instance = "=0.3.3"');
+    expect(cargoRaw).toContain('open = "=5.4.1"');
+    expect(cargoRaw).not.toMatch(/\btauri\b/iu);
+    expect(cargoRaw).not.toMatch(/\bwry\b/iu);
+    expect(packageInfo.devDependencies["@crabnebula/packager"]).toBe("0.11.2");
+    expect(packageInfo.devDependencies["@tauri-apps/cli"]).toBeUndefined();
 
-    expect(rustSource).toContain("WebviewUrl::App");
-    expect(rustSource).toContain(".incognito(true)");
-    expect(rustSource).toContain(".browser_extensions_enabled(false)");
-    expect(rustSource).toContain("is_console_navigation");
-    expect(rustSource).toContain("NewWindowResponse::Deny");
+    expect(rustSource).toContain("eframe::run_native");
+    expect(rustSource).toContain("impl eframe::App");
     expect(rustSource).toContain("parse_health_response");
-    expect(rustSource).toContain('arg("__desktop-instance-key")');
+    expect(rustSource).toContain('"__desktop-instance-key"');
     expect(rustSource).toContain("current_windows_default_instance_key");
     expect(rustSource).toContain("GetUserNameW");
     expect(rustSource).toContain("GetUserProfileDirectoryW");
-    expect(rustSource).toContain('run_lifecycle(&runtime, "setup"');
     expect(rustSource).toContain('"Open browser backup"');
-    expect(rustSource).not.toContain("#[tauri::command]");
-    expect(loadingPage).not.toContain("<script");
+    expect(rustSource).toContain("gtk::init()");
+    expect(rustSource).toContain("gtk::main_iteration_do(false)");
+    expect(buildSource).not.toContain("tauri_build");
     expect(buildSource).toContain('env::var("PROFILE").as_deref() != Ok("release")');
     expect(buildSource).toContain("desktop runtime target does not match the Rust target");
     expect(buildSource).toContain('runtime_root.join("package/dist/cli.js")');
+
+    expect(packageSource).toContain('formats: ["nsis"]');
+    expect(packageSource).toContain('formats: ["deb"]');
+    expect(packageSource).toContain('installMode: "currentUser"');
+    for (const dependency of [
+      "libayatana-appindicator3-1",
+      "libgtk-3-0",
+      "libsecret-tools",
+      "libxdo3"
+    ]) {
+      expect(packageSource).toContain(`"${dependency}"`);
+      expect(workflowSource).toContain(dependency);
+    }
+    expect(workflowSource).toContain('grep -Fq "$dependency"');
+    expect(workflowSource).toContain("Clean-install and launch deb");
+    expect(workflowSource).toContain("ubuntu:22.04");
+    expect(workflowSource).toContain("verify-desktop-deb.sh");
+    expect(smokeSource).toContain("xauth");
+    expect(smokeSource).toContain("xvfb-run");
+    expect(smokeSource).toContain("timeout 8s");
+    expect(packageSource).not.toMatch(/webview|webkit/iu);
+
+    await expect(access(path.join(appRoot, "frontend"))).rejects.toThrow();
+    await expect(access(path.join(appRoot, "tauri.conf.json"))).rejects.toThrow();
+    await expect(access(path.join(appRoot, "tauri.windows.conf.json"))).rejects.toThrow();
+    await expect(access(path.join(appRoot, "tauri.linux.conf.json"))).rejects.toThrow();
+
+    const metadata = await execFileAsync(
+      "cargo",
+      ["metadata", "--locked", "--format-version", "1", "--manifest-path", path.join(appRoot, "Cargo.toml")],
+      { maxBuffer: 20 * 1024 * 1024 }
+    );
+    const packageNames = (JSON.parse(metadata.stdout).packages as Array<{ name: string }>).map((item) => item.name);
+    expect(packageNames.filter((name) => /^(tauri|wry|webview2-com|webkit2gtk|javascriptcore-rs)/u.test(name))).toEqual([]);
   });
 
   it("pins and verifies the bundled Node runtimes", async () => {
@@ -122,7 +161,7 @@ describe("Windows and Linux desktop app", () => {
     expect(env.XDG_RUNTIME_DIR).toBe("/run/user/1000");
     expect(env.OPENAI_API_KEY).toBeUndefined();
     expect(env.SGW_MASTER_PASSPHRASE).toBeUndefined();
-    expect(env.SGW_CONSOLE_URL).toBe("http://127.0.0.1:8718/");
+    expect(env.SGW_CONSOLE_URL).toBeUndefined();
   });
 
   it("passes only explicit authority overrides to the desktop process", () => {

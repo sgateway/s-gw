@@ -1,7 +1,7 @@
 [package]
 name = "s-gw-desktop"
 version = "0.1.19"
-description = "Native Windows and Linux desktop shell for s-gw"
+description = "Native Windows and Linux desktop application for s-gw"
 authors = ["Barry Yuan"]
 edition = "2021"
 rust-version = "1.96.1"
@@ -11,20 +11,36 @@ repository = "https://github.com/sgateway/s-gw"
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
+eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
+egui = "=0.36.1"
+egui_extras = "=0.36.1"
+image = { version = "=0.25.6", default-features = false, features = ["png"] }
+open = "=5.4.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "=0.10.9"
-tauri = { version = "=2.11.5", features = ["tray-icon"] }
-tauri-plugin-opener = "=2.5.4"
-tauri-plugin-single-instance = "=2.4.3"
+single-instance = "=0.3.3"
+tray-icon = "=0.24.2"
+url = "=2.5.7"
+zeroize = "=1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "=0.18.2"
+
+[dev-dependencies]
+egui_kittest = "=0.36.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
   "Win32_System_Threading",
   "Win32_System_WindowsProgramming",
   "Win32_UI_Shell"

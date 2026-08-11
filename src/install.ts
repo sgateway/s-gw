@@ -1400,14 +1400,14 @@ export async function openDesktopApp(options: MenuBarOptions = {}): Promise<Desk
   const port = options.port ?? 8718;
   const url = options.consoleUrl || consoleUrl(port);
   const args = [
-    "--console-url",
-    url,
     "--instance-key",
     getSgwInstanceKey(),
     "--node-path",
     layout.nodePath,
     "--cli-path",
     layout.cliPath,
+    "--console-url",
+    url,
     "--authority-args"
   ];
   const appEnvironment = desktopAppEnvironment(url);
@@ -1525,7 +1525,10 @@ export function desktopAppEnvironment(
   platform: NodeJS.Platform = process.platform
 ): NodeJS.ProcessEnv {
   if (platform === "win32") {
-    return windowsBackgroundEnvironment(url);
+    const env = windowsBackgroundEnvironment(url);
+    delete env.SGW_CONSOLE_URL;
+    delete env.SGW_APP_PATH;
+    return env;
   }
 
   const user = os.userInfo();
@@ -1534,7 +1537,6 @@ export function desktopAppEnvironment(
     HOME: user.homedir,
     USER: user.username,
     LOGNAME: user.username,
-    SGW_CONSOLE_URL: url,
     SGW_DISABLE_UPDATE_CHECK: "1"
   };
   for (const name of [

@@ -60,13 +60,52 @@ describe("Windows test groups", () => {
     expect(workflow).toContain("runner: windows-latest");
     expect(workflow).toContain("runtime_target: win32-x64");
     expect(workflow).toContain("artifact_name: s-gw-windows-x64-nsis");
+    expect(workflow).toContain(
+      "artifact_path: native/desktop-app/target/release/bundle/nsis/*.exe"
+    );
     expect(workflow).toContain("name: Ubuntu 22.04 x64 deb");
     expect(workflow).toContain("runner: ubuntu-22.04");
     expect(workflow).toContain("runtime_target: linux-x64");
     expect(workflow).toContain("artifact_name: s-gw-linux-x64-deb");
+    expect(workflow).toContain(
+      "artifact_path: native/desktop-app/target/release/bundle/deb/*.deb"
+    );
     expect(workflow).toContain("name: Verify Windows MSVC host");
     expect(workflow).toContain("cargo audit --file native/desktop-app/Cargo.lock");
     expect(workflow).toContain("retention-days: 14");
+  });
+
+  it("keeps desktop packages native while retaining the browser fallback", async () => {
+    const workflow = await readFile(path.resolve(".github/workflows/ci.yml"), "utf8");
+
+    expect(workflow).not.toContain("libwebkit2gtk-4.1-dev");
+    for (const dependency of [
+      "libayatana-appindicator3-dev",
+      "libgtk-3-dev",
+      "libwayland-dev",
+      "libx11-dev",
+      "libxcb-render0-dev",
+      "libxcb-shape0-dev",
+      "libxcb-xfixes0-dev",
+      "libxdo-dev",
+      "libxkbcommon-dev"
+    ]) {
+      expect(workflow).toContain(dependency);
+    }
+    expect(workflow).toContain("name: Verify native Rust dependency graph (Linux)");
+    expect(workflow).toContain("name: Verify native Rust dependency graph (Windows)");
+    expect(workflow).toContain(
+      "cargo metadata --locked --format-version 1"
+    );
+    expect(workflow).toContain("for required in eframe tray-icon");
+    expect(workflow).toContain("foreach ($required in @('eframe', 'tray-icon'))");
+    expect(workflow).toContain("tauri($|-)|wry($|-)|webview2|webkit|javascriptcore");
+    expect(workflow).toContain("ldd \"$unpacked/usr/bin/s-gw-desktop\"");
+    expect(workflow).toContain("[IO.File]::ReadAllBytes($desktop.FullName)");
+    expect(workflow).toContain("test -f \"$(dirname \"$cli_path\")/console-ui/index.html\"");
+    expect(workflow).toContain(
+      String.raw`[\\/]runtime[\\/]package[\\/]dist[\\/]console-ui[\\/]index\.html$`
+    );
   });
 
   it("assigns every Windows client test to one shard", async () => {

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Categories=Development;
+Comment=Local credential control for AI coding agents.
+Exec=s-gw-desktop
+Icon=s-gw-desktop
+Name=s-gw
+Terminal=false
+Type=Application

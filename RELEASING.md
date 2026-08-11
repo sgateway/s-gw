@@ -42,7 +42,7 @@ npm run test:desktop-app
 npm run build:desktop-app
 ```
 
-The desktop build stages the production npm package and a checksum-pinned Node runtime before invoking Tauri. Cross-building these installers is not supported; build NSIS on Windows and the Debian package on Linux.
+The desktop build stages the production npm package and a checksum-pinned Node runtime before building the native Rust UI and invoking the package builder. Cross-building these installers is not supported; build NSIS on Windows and the Debian package on Linux.
 
 ## Artifacts
 
@@ -50,9 +50,9 @@ The desktop build stages the production npm package and a checksum-pinned Node r
 
 `npm run build:desktop-app` writes the platform-native preview under `native/desktop-app/target/release/bundle`: an NSIS installer under `nsis` on Windows or a Debian package under `deb` on Linux. These files are unsigned CI artifacts in the current release process. The publish workflow does not upload them to GitHub Releases, and they must not be described as supported public downloads.
 
-The installed desktop app bundles Node.js 24, the production s-gw package, and the loopback console assets. Users do not need a separate Node.js or npm installation. Windows uses a per-user NSIS install and requires Microsoft Edge WebView2; the installer is configured to download the WebView2 bootstrapper if necessary. The Linux x64 package requires WebKitGTK, `libsecret-tools`, a graphical session, and an unlocked Secret Service keyring.
+The installed desktop app bundles Node.js 24, the production s-gw package, and the explicit browser-backup assets. Users do not need a separate Node.js or npm installation. The primary Windows/Linux interface is native-rendered and has no WebView dependency. Windows uses a per-user NSIS install. The Linux x64 package declares its GTK 3, AppIndicator, `libxdo`, and `libsecret-tools` runtime dependencies and requires a graphical session with an unlocked Secret Service keyring.
 
-Building requires Node.js 20 or newer and the Rust toolchain. Windows builds need the MSVC Rust target and the normal Tauri Windows build prerequisites. Ubuntu/Debian build hosts need the Tauri WebKitGTK 4.1 and AppIndicator development packages in addition to the ordinary compiler toolchain.
+Building requires Node.js 20 or newer and the Rust toolchain. Windows builds need the MSVC Rust target and Visual Studio C++ build tools. Ubuntu/Debian build hosts need the ordinary compiler toolchain plus GTK 3, AppIndicator, X11/Wayland, XDO, and graphics development packages used by the native UI and tray.
 
 The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. The default `notarized` release mode requires Developer ID signing, hardened runtime, Apple notarization, stapling, and Gatekeeper assessment. The `release-assets` workflow fails closed unless these repository secrets are present:
 

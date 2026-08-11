@@ -17,21 +17,20 @@ describe("release version alignment", () => {
       throw new Error(`Private s-gw Rust core checkout is required: ${coreRoot}`);
     }
 
-    const [packageRaw, lockRaw, serverRaw, pluginRaw, desktopCargoRaw, desktopLockRaw, desktopConfigRaw] = await Promise.all([
-      readFile(path.join(root, "package.json"), "utf8"),
-      readFile(path.join(root, "package-lock.json"), "utf8"),
-      readFile(path.join(root, "server.json"), "utf8"),
-      readFile(path.join(root, ".codex-plugin", "plugin.json"), "utf8"),
-      readFile(path.join(root, "native/desktop-app/Cargo.toml"), "utf8"),
-      readFile(path.join(root, "native/desktop-app/Cargo.lock"), "utf8"),
-      readFile(path.join(root, "native/desktop-app/tauri.conf.json"), "utf8")
-    ]);
+    const [packageRaw, lockRaw, serverRaw, pluginRaw, desktopCargoRaw, desktopLockRaw] =
+      await Promise.all([
+        readFile(path.join(root, "package.json"), "utf8"),
+        readFile(path.join(root, "package-lock.json"), "utf8"),
+        readFile(path.join(root, "server.json"), "utf8"),
+        readFile(path.join(root, ".codex-plugin", "plugin.json"), "utf8"),
+        readFile(path.join(root, "native/desktop-app/Cargo.toml"), "utf8"),
+        readFile(path.join(root, "native/desktop-app/Cargo.lock"), "utf8")
+      ]);
 
     const pkg = JSON.parse(packageRaw);
     const lock = JSON.parse(lockRaw);
     const server = JSON.parse(serverRaw);
     const plugin = JSON.parse(pluginRaw);
-    const desktopConfig = JSON.parse(desktopConfigRaw);
 
     expect(CURRENT_VERSION).toBe(pkg.version);
     expect(lock.version).toBe(pkg.version);
@@ -44,7 +43,6 @@ describe("release version alignment", () => {
     expect(desktopLockRaw.match(desktopLockPattern)?.[1]).toBe(pkg.version);
     // Git may check lockfiles out as CRLF on Windows.
     expect(desktopLockRaw.replace(/\r?\n/g, "\r\n").match(desktopLockPattern)?.[1]).toBe(pkg.version);
-    expect(desktopConfig.version).toBe("../../package.json");
     if (hasPrivateCore) {
       const [cargoRaw, cargoLockRaw] = await Promise.all([
         readFile(coreManifest, "utf8"),

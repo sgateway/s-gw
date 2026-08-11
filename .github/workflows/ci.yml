@@ -95,12 +95,21 @@ jobs:
             build-essential \
             file \
             libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
             libsecret-tools \
             libssl-dev \
-            libwebkit2gtk-4.1-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
             libxdo-dev \
-            librsvg2-dev \
-            patchelf
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            patchelf \
+            pkg-config
 
       - name: Install Rust
         run: |
@@ -123,6 +132,52 @@ jobs:
           cargo audit --file native/desktop-app/Cargo.lock
 
       - run: npm ci --ignore-scripts
+
+      - name: Verify native Rust dependency graph (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata_file="$RUNNER_TEMP/desktop-cargo-metadata.json"
+          cargo metadata --locked --format-version 1 \
+            --manifest-path native/desktop-app/Cargo.toml > "$metadata_file"
+          mapfile -t package_names < <(jq -r '.packages[].name' "$metadata_file")
+          for required in eframe tray-icon; do
+            if ! printf '%s\n' "${package_names[@]}" | grep -Fxq "$required"; then
+              printf 'Required native desktop dependency is missing: %s\n' "$required" >&2
+              exit 1
+            fi
+          done
+          blocked="$(printf '%s\n' "${package_names[@]}" \
+            | grep -Ei '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)' || true)"
+          if test -n "$blocked"; then
+            printf 'Forbidden WebView dependency in desktop graph:\n%s\n' "$blocked" >&2
+            exit 1
+          fi
+
+      - name: Verify native Rust dependency graph (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $metadataJson = (& cargo metadata --locked --format-version 1 `
+            --manifest-path native/desktop-app/Cargo.toml | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the native desktop dependency graph."
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $packageNames = @($metadata.packages | ForEach-Object { $_.name })
+          foreach ($required in @('eframe', 'tray-icon')) {
+            if ($required -cnotin $packageNames) {
+              throw "Required native desktop dependency is missing: $required"
+            }
+          }
+          $blocked = @($packageNames | Where-Object {
+            $_ -match '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)'
+          })
+          if ($blocked.Count -gt 0) {
+            throw "Forbidden WebView dependency in desktop graph: $($blocked -join ', ')"
+          }
+
       - run: npm run check:desktop-app
       - run: npm run test:desktop-app
       - run: npm run build:desktop-app
@@ -140,7 +195,18 @@ jobs:
           test "$(dpkg-deb -f "${installers[0]}" Package)" = "s-gw"
           test "$(dpkg-deb -f "${installers[0]}" Version)" = "$version"
           test "$(dpkg-deb -f "${installers[0]}" Architecture)" = "amd64"
-          dpkg-deb -f "${installers[0]}" Depends | grep -Fq 'libsecret-tools'
+          depends="$(dpkg-deb -f "${installers[0]}" Depends)"
+          for dependency in \
+            libayatana-appindicator3-1 \
+            libgtk-3-0 \
+            libsecret-tools \
+            libxdo3; do
+            printf '%s\n' "$depends" | grep -Fq "$dependency"
+          done
+          if printf '%s\n' "$depends" | grep -Eiq '(webview2|webkit|javascriptcore)'; then
+            printf 'Forbidden WebView dependency in deb metadata: %s\n' "$depends" >&2
+            exit 1
+          fi
           dpkg-deb --info "${installers[0]}" >/dev/null
           unpacked="$(mktemp -d)"
           dpkg-deb --extract "${installers[0]}" "$unpacked"
@@ -153,11 +219,42 @@ jobs:
           test -x "$unpacked/usr/bin/s-gw-desktop"
           test -f "$unpacked/usr/share/applications/s-gw.desktop"
           test -f "$(dirname "$cli_path")/console-ui/index.html"
+          blocked_files="$(find "$unpacked" -type f \( \
+            -iname '*tauri*' -o -iname '*wry*' -o -iname '*webview2*' -o \
+            -iname '*webkit*' -o -iname '*javascriptcore*' \) -print)"
+          if test -n "$blocked_files"; then
+            printf 'Forbidden WebView files in deb payload:\n%s\n' "$blocked_files" >&2
+            exit 1
+          fi
+          desktop_imports="$(ldd "$unpacked/usr/bin/s-gw-desktop")"
+          if printf '%s\n' "$desktop_imports" | grep -Eiq '(webview2|webkit|javascriptcore)'; then
+            printf 'Forbidden WebView library linked by desktop executable:\n%s\n' "$desktop_imports" >&2
+            exit 1
+          fi
+          binary_markers="$(strings "$unpacked/usr/bin/s-gw-desktop" \
+            | grep -Ei '(tauri|webview2|webkit|javascriptcore|(^|[^[:alnum:]_])wry([^[:alnum:]_]|$))' || true)"
+          if test -n "$binary_markers"; then
+            printf 'Forbidden WebView marker in desktop executable:\n%s\n' "$binary_markers" >&2
+            exit 1
+          fi
           test "$(jq -r .name "$package_path")" = "@s-gw/s-gw"
           test "$(jq -r .version "$package_path")" = "$version"
           test "$("$node_path" --version)" = "v24.18.0"
           "$node_path" "$cli_path" help >/dev/null
           sha256sum "${installers[0]}"
+
+      - name: Clean-install and launch deb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(native/desktop-app/target/release/bundle/deb/*.deb)
+          test "${#installers[@]}" -eq 1
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            ubuntu:22.04 \
+            bash /workspace/scripts/verify-desktop-deb.sh "/workspace/${installers[0]}"
 
       - name: Verify NSIS installer
         if: runner.os == 'Windows'
@@ -197,6 +294,41 @@ jobs:
             Select-Object -First 1
           if (-not $node -or -not $cli -or -not $desktop -or -not $package -or -not $console) {
             throw "NSIS installer is missing the desktop executable or embedded runtime."
+          }
+          $blockedFiles = @(Get-ChildItem $unpacked -Recurse -File | Where-Object {
+            $_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)'
+          })
+          if ($blockedFiles.Count -gt 0) {
+            throw "Forbidden WebView files in NSIS payload: $($blockedFiles.FullName -join ', ')"
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $visualStudio = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $visualStudio) {
+            throw "Could not locate the Visual Studio C++ tools."
+          }
+          $visualStudio = $visualStudio.Trim()
+          $dumpbin = Get-ChildItem (Join-Path $visualStudio 'VC\Tools\MSVC') `
+            -Recurse -File -Filter 'dumpbin.exe' |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]Hostx64[\\/]x64[\\/]dumpbin\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            throw "Could not locate dumpbin.exe."
+          }
+          $desktopImports = (& $dumpbin.FullName /dependents $desktop.FullName | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect the desktop executable imports."
+          }
+          if ($desktopImports -match '(webview2|webkit|javascriptcore)') {
+            throw "Forbidden WebView library linked by desktop executable: $($Matches[0])"
+          }
+          $desktopBytes = [IO.File]::ReadAllBytes($desktop.FullName)
+          $desktopText = [Text.Encoding]::ASCII.GetString($desktopBytes)
+          if ($desktopText -match '(tauri|webview2|webkit|javascriptcore|(?:^|[^a-z0-9_])wry(?:[^a-z0-9_]|$))') {
+            throw "Forbidden WebView marker in desktop executable: $($Matches[0])"
           }
           $packageInfo = Get-Content $package.FullName -Raw | ConvertFrom-Json
           if ($packageInfo.name -cne '@s-gw/s-gw' -or $packageInfo.version -cne $version) {

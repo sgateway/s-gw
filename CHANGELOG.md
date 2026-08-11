@@ -6,7 +6,7 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ### Added
 
-- Unsigned Windows x64 NSIS and Linux x64 Debian desktop previews now provide a native window and tray around the verified local console, bundle their own pinned Node.js runtime, and retain the identity-checked loopback browser UI as a backup.
+- Unsigned Windows x64 NSIS and Linux x64 Debian desktop previews now provide a native-rendered Rust interface and tray with no embedded browser or WebView, bundle their own pinned Node.js runtime, and retain the identity-checked loopback UI only as an explicit browser backup.
 
 ### Fixed
 

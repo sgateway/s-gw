@@ -61,11 +61,11 @@ The equivalent bundled MCP command is `.../bin/s-gw-mcp`; setup writes the absol
 
 ### Windows And Linux Desktop Apps (Unsigned Preview)
 
-Windows x64 and Linux x64 have a shared Tauri desktop app with an operating-system window, tray menu, and single-instance behavior. The app starts or reuses the local s-gw service and loads the management UI only after verifying the service identity on `http://127.0.0.1:<port>/`. Links open in the default browser, downloads and extra app windows are denied, and navigation to any other app origin is blocked.
+Windows x64 and Linux x64 share a Rust `eframe`/egui desktop app with a native-rendered window, tray menu, and single-instance behavior. The normal app reads state and performs actions through the bundled local CLI. It does not start the HTTP console, embed a WebView, or load a localhost page.
 
-That identity check uses a deterministic, non-secret fingerprint of the local s-gw authority. It catches wrong homes, namespaces, and accidental port conflicts; it is not authentication against a malicious process already running as the same operating-system user. The preview fails closed when the health response is missing, foreign, or belongs to a different fingerprint. Listener process ownership validation remains part of the supported-distribution hardening work.
+The CLI passes a deterministic, non-secret fingerprint of the local s-gw authority to the native process. The app rejects a conflicting credential home. The browser backup separately verifies the same identity before opening its loopback URL; it fails closed when the health response is missing, foreign, or belongs to a different fingerprint.
 
-The desktop bundle contains a checksum-pinned Node.js 24 runtime, the production s-gw package, and the console assets. The installed app does not require Node.js or npm on the host. It still uses the loopback console internally so the CLI, desktop app, and browser backup share one local service and one credential store; it does not connect to a hosted s-gw UI.
+The desktop bundle contains a checksum-pinned Node.js 24 runtime, the production s-gw package, and browser-backup console assets. The installed app does not require Node.js or npm on the host. Only the explicit browser backup starts or reuses the identity-checked loopback console; neither interface connects to a hosted s-gw UI.
 
 Build the app on the target operating system:
 
@@ -76,14 +76,14 @@ npm run test:desktop-app
 npm run build:desktop-app
 ```
 
-The build host needs Node.js 20 or newer and a Rust toolchain. Windows also needs the MSVC Rust target and Visual Studio C++ build tools. Ubuntu/Debian needs the normal compiler toolchain plus the WebKitGTK 4.1, AppIndicator, SSL, XDO, and SVG development packages required by Tauri.
+The build host needs Node.js 20 or newer and a Rust toolchain. Windows also needs the MSVC Rust target and Visual Studio C++ build tools. Ubuntu/Debian needs the normal compiler toolchain plus GTK 3, AppIndicator, XDO, X11/Wayland, and graphics development packages used by egui and the tray.
 
-Tauri writes an NSIS installer under `native/desktop-app/target/release/bundle/nsis` on Windows and a Debian package under `native/desktop-app/target/release/bundle/deb` on Linux. Cross-compilation is not supported. The build downloads the configured Node archive from `nodejs.org`, verifies its pinned SHA-256 digest, and installs production-only npm dependencies into the staged runtime.
+The package builder writes an NSIS installer under `native/desktop-app/target/release/bundle/nsis` on Windows and a Debian package under `native/desktop-app/target/release/bundle/deb` on Linux. Cross-compilation is not supported. The build downloads the configured Node archive from `nodejs.org`, verifies its pinned SHA-256 digest, and installs production-only npm dependencies into the staged runtime.
 
 Runtime requirements:
 
-- Windows 10/11 x64 uses a per-user NSIS installation and Microsoft Edge WebView2. If WebView2 is absent, the installer may need network access to download its bootstrapper.
-- Linux x64 requires a graphical desktop, WebKitGTK, `libsecret-tools`, and an unlocked Secret Service keyring. The Debian package declares `libsecret-tools`; install the package through the system package manager so its declared dependencies are resolved.
+- Windows 10/11 x64 uses a per-user NSIS installation and does not require WebView2.
+- Linux x64 requires a graphical desktop and an unlocked Secret Service keyring. The Debian package declares `libayatana-appindicator3-1`, `libgtk-3-0`, `libsecret-tools`, and `libxdo3`; install it through the system package manager so those dependencies are resolved.
 
 These installers are unsigned CI previews. They are not currently uploaded as supported GitHub Release downloads. Windows users may see SmartScreen or publisher warnings, and the Linux package has no production repository signature. Production distribution requires platform signing, checksums, clean-machine install/uninstall tests, and supported-OS QA.
 
@@ -99,7 +99,7 @@ Use the browser backup explicitly when the app cannot run or when browser develo
 s-gw app open --browser
 ```
 
-The tray menu has the same **Open browser backup** action. If the native executable is missing, `s-gw app open` falls back to the existing PowerShell client on Windows and the default browser on Linux.
+The tray menu has the same **Open browser backup** action. If the native executable is missing or cannot start, `s-gw app open` fails with guidance to run `s-gw app open --browser`; it never switches interfaces silently.
 
 ### Local Tarball Or Source
 
@@ -221,7 +221,7 @@ Launch the preferred management app for the current platform:
 s-gw app open
 ```
 
-On macOS this opens the native Swift app. On Windows or Linux it prefers the installed Tauri desktop app, then uses the platform fallback if the executable is absent. The app shows daemon health, credential-store status, credential handles, pending approvals, configured agents, and audit events. It uses the installed local CLI and store; raw secret values are only provided to local approved execution paths.
+On macOS this opens the native Swift app. On Windows or Linux it opens the installed native-rendered Rust desktop app and reports an actionable error when the executable is absent. The app shows daemon health, credential-store status, credential handles, pending approvals, configured agents, and recent activity through the installed local CLI and store; raw secret values are only provided to local approved execution paths.
 
 Open the same loopback UI in the default browser instead:
 
@@ -311,7 +311,7 @@ s-gw app open --browser
 s-gw helper open
 ```
 
-On Windows, `s-gw app open` prefers the installed native executable. When that executable is absent, it launches `dist\windows\s-gw-client.ps1`, which starts the local console on `127.0.0.1` if needed and opens the UI in Edge or Chrome app mode. `s-gw app open --browser` always uses the default browser. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
+On Windows, `s-gw app open` opens the installed native executable and reports an error with explicit browser-backup guidance when it is unavailable. `s-gw app open --browser` starts or reuses the verified loopback console and uses the default browser. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
 
 `s-gw setup` and `s-gw start` also start the loopback console directly, so `--no-open-app` leaves a usable headless runtime instead of depending on a browser window. The tray helper and client verify that the console belongs to the same Windows user, login session, credential home, and credential-store namespace before opening it. Repeated setup, start, and helper-open commands reuse one tray process per user session and port.
 
@@ -429,11 +429,11 @@ The native app and browser console expose the same action on a stuck request. Re
 | --- | --- | --- | --- |
 | macOS arm64 | Primary development platform | Native Swift helper using Security.framework | Native app, menu helper, and Keychain path are covered by local tests. |
 | macOS Intel | Build-from-source candidate | Native Swift helper using Security.framework | Expected to work when built on Intel macOS with Node >= 20 and Swift toolchain, but not yet QA-tested here. |
-| Linux x64 | Unsigned desktop preview | Secret Service through trusted `secret-tool`; explicit environment fallback | Tauri desktop app, systemd user service, and browser backup; the keyring must be unlocked in the user session. |
+| Linux x64 | Unsigned desktop preview | Secret Service through trusted `secret-tool`; explicit environment fallback | Native-rendered Rust desktop app, systemd user service, and browser backup; the keyring must be unlocked in the user session. |
 | Linux arm64 | npm preview | Secret Service through trusted `secret-tool`; explicit environment fallback | systemd user service and browser backup; no native desktop installer is built yet. |
-| Windows 10/11 x64 | Unsigned desktop preview | Windows Credential Manager helper | Tauri desktop app and tray with PowerShell/browser backup. Needs Windows QA and Authenticode signing before supported distribution. |
+| Windows 10/11 x64 | Unsigned desktop preview | Windows Credential Manager helper | Native-rendered Rust desktop app and tray with an explicit browser backup. Needs Windows QA and Authenticode signing before supported distribution. |
 
-The current preview is developed primarily on macOS with the native Keychain helper. Windows and Linux x64 desktop installers must be built and tested on their target CI runners and remain unsigned preview artifacts. The localhost address shown by either app is an intentional loopback boundary for the local management service, not a remote deployment requirement.
+The current preview is developed primarily on macOS with the native Keychain helper. Windows and Linux x64 desktop installers must be built and tested on their target CI runners and remain unsigned preview artifacts. A localhost address appears only when the separate browser backup is active; it is an intentional loopback boundary, not a remote deployment requirement.
 
 ## Coding Tool Support
 
@@ -569,7 +569,7 @@ For Windows desktop preview packages, also verify:
 - close hides the main window, tray open restores it, and **Open browser backup** uses the default browser;
 - Windows scripts exist under `dist/windows`;
 - `s-gw unlock keychain set --value-stdin` stores unlock material through Credential Manager;
-- `s-gw app open` starts the local console and opens the client shell;
+- `s-gw app open` opens the native-rendered app without starting a console or browser;
 - `s-gw app open --browser` opens the same local UI without starting the native executable;
 - `s-gw start --no-open-app --no-menubar` starts a healthy headless console, and `s-gw stop` stops it;
 - `s-gw helper open` creates a tray icon and sees pending requests;
@@ -580,7 +580,7 @@ For Windows desktop preview packages, also verify:
 For Linux desktop preview packages, also verify:
 
 - `npm run check:desktop-app`, `npm run test:desktop-app`, and `npm run build:desktop-app` pass on Linux x64;
-- the Debian package resolves WebKitGTK and `libsecret-tools` dependencies on a clean supported desktop;
+- the Debian package resolves its native graphics, tray, and `libsecret-tools` dependencies on a clean supported desktop;
 - the installed `/usr/bin/s-gw-desktop` opens without host Node.js or npm and refuses an unrelated loopback service;
 - an unlocked Secret Service keyring supports setup, restart, and a full approval/execution flow;
 - `s-gw app open --browser` remains usable after the native window is closed;

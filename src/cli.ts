@@ -37,7 +37,6 @@ import {
   openDesktopApp,
   openMacApp,
   openMenuBarHelper,
-  openWindowsClient,
   openWindowsHelper,
   packageHealth,
   refreshMacRuntimeServices,
@@ -2388,16 +2387,9 @@ async function openPreferredUi(port: number, consoleUrl: string) {
     try {
       const opened = await openDesktopApp({ port, consoleUrl });
       return { kind: "desktop-app", ...opened };
-    } catch {
-      if (process.platform === "win32") {
-        const opened = await openWindowsClient({ port, consoleUrl });
-        return { kind: "windows-client", ...opened };
-      }
-
-      const service = await ensureBrowserConsole(port);
-      await waitForConsoleAuthority(consoleUrl);
-      await openBrowser(consoleUrl);
-      return { kind: "web-console", consoleUrl, service };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`${detail} To use the browser backup, run \`s-gw app open --browser\`.`);
     }
   }
 

@@ -57,7 +57,7 @@
     "build:macos-app": "node scripts/build-macos-app.mjs",
     "build:menubar": "node scripts/build-menu-bar-helper.mjs",
     "build:windows-client": "npm run build:rust-core && node scripts/build-windows-client.mjs",
-    "build:desktop-app": "npm run build && node scripts/stage-desktop-runtime.mjs && tauri build --config native/desktop-app/tauri.conf.json",
+    "build:desktop-app": "npm run build && node scripts/stage-desktop-runtime.mjs && node scripts/package-desktop-app.mjs",
     "build:installers": "npm run build && node scripts/build-installers.mjs && npm run validate:release-assets",
     "dev:macos-app": "scripts/dev-macos-app.sh",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.console.json --noEmit",
@@ -115,8 +115,8 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@crabnebula/packager": "0.11.2",
     "@tailwindcss/vite": "^4.3.2",
-    "@tauri-apps/cli": "2.11.4",
     "@types/d3-sankey": "^0.12.5",
     "@types/node": "^24.0.0",
     "@types/react": "^19.2.17",

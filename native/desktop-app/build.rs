@@ -27,7 +27,6 @@ struct PackageInfo {
 
 fn main() {
     validate_release_runtime();
-    tauri_build::build()
 }
 
 fn validate_release_runtime() {
