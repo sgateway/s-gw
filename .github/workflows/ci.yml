@@ -87,6 +87,10 @@ jobs:
           node-version: 24
           cache: npm
 
+      # npm 11 rejects an unpublished optional packager binary before platform filtering.
+      - name: Pin desktop npm
+        run: npm install --global npm@10.9.8
+
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |

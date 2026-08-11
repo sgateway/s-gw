@@ -71,6 +71,8 @@ describe("Windows test groups", () => {
       "artifact_path: native/desktop-app/target/release/bundle/deb/*.deb"
     );
     expect(workflow).toContain("name: Verify Windows MSVC host");
+    expect(workflow).toContain("name: Pin desktop npm");
+    expect(workflow).toContain("npm install --global npm@10.9.8");
     expect(workflow).toContain("cargo audit --file native/desktop-app/Cargo.lock");
     expect(workflow).toContain("retention-days: 14");
   });
