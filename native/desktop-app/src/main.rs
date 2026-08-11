@@ -6,16 +6,52 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::{DownloadEvent, NewWindowResponse, WebviewWindowBuilder};
+use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, WebviewWindowBuilder};
 use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 
 const DEFAULT_CONSOLE_URL: &str = "http://127.0.0.1:8718/";
 const MAIN_WINDOW: &str = "main";
+static LOADING_STATUS: Mutex<LoadingStatusState> = Mutex::new(LoadingStatusState {
+    generation: 0,
+    current: None,
+});
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadingStatus {
+    generation: u64,
+    title: String,
+    detail: String,
+}
+
+#[derive(Debug, Default)]
+struct LoadingStatusState {
+    generation: u64,
+    current: Option<LoadingStatus>,
+}
+
+impl LoadingStatusState {
+    fn set(&mut self, title: &str, detail: &str) -> LoadingStatus {
+        self.generation += 1;
+        let status = LoadingStatus {
+            generation: self.generation,
+            title: title.into(),
+            detail: detail.into(),
+        };
+        self.current = Some(status.clone());
+        status
+    }
+
+    fn clear(&mut self) {
+        self.generation += 1;
+        self.current = None;
+    }
+}
 
 #[derive(Clone, Debug)]
 struct DesktopSettings {
@@ -321,6 +357,12 @@ fn build_main_window(
             }
             NewWindowResponse::Deny
         })
+        .on_page_load(|window, payload| {
+            if matches!(payload.event(), PageLoadEvent::Finished) && is_bundled_page(payload.url())
+            {
+                replay_loading_status(&window);
+            }
+        })
         .on_download(|_webview, event| !matches!(event, DownloadEvent::Requested { .. }))
         .build()
 }
@@ -553,6 +595,7 @@ fn start_console_task(app: AppHandle, window: WebviewWindow, settings: DesktopSe
 }
 
 fn navigate_to_console(app: &AppHandle, window: &WebviewWindow, console_url: &Url) {
+    clear_loading_status();
     if window.navigate(console_url.clone()).is_ok() {
         return;
     }
@@ -777,14 +820,41 @@ fn decode_chunked_body(body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn loading_error_script(status: &LoadingStatus) -> String {
+    let title =
+        serde_json::to_string(&status.title).unwrap_or_else(|_| "\"s-gw needs attention\"".into());
+    let detail = serde_json::to_string(&status.detail)
+        .unwrap_or_else(|_| "\"Open the browser backup.\"".into());
+    let generation = status.generation;
+    format!(
+        "(() => {{const next={{generation:{generation},title:{title},detail:{detail}}};const current=window.__sgwDesktopStatus;if(!current||Number(current.generation)<=next.generation){{window.__sgwDesktopStatus=next;}}const status=window.__sgwDesktopStatus;const titleNode=document.getElementById('status-title');const detailNode=document.getElementById('status-detail');if(status&&titleNode&&detailNode){{titleNode.textContent=status.title;detailNode.textContent=status.detail;}}}})();"
+    )
+}
+
 fn show_loading_error(window: &WebviewWindow, title: &str, detail: &str) {
-    let title = serde_json::to_string(title).unwrap_or_else(|_| "\"s-gw needs attention\"".into());
-    let detail =
-        serde_json::to_string(detail).unwrap_or_else(|_| "\"Open the browser backup.\"".into());
-    let script = format!(
-        "document.getElementById('status-title').textContent={title};document.getElementById('status-detail').textContent={detail};"
-    );
-    let _ = window.eval(&script);
+    let status = LOADING_STATUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .set(title, detail);
+    let _ = window.eval(loading_error_script(&status));
+}
+
+fn replay_loading_status(window: &WebviewWindow) {
+    let status = LOADING_STATUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .current
+        .clone();
+    if let Some(status) = status {
+        let _ = window.eval(loading_error_script(&status));
+    }
+}
+
+fn clear_loading_status() {
+    LOADING_STATUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
@@ -808,6 +878,42 @@ mod tests {
         assert!(validate_instance_key(&"a".repeat(64)).is_ok());
         assert!(validate_instance_key(&"g".repeat(64)).is_err());
         assert!(validate_instance_key(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn loading_status_keeps_only_the_latest_update() {
+        let mut state = LoadingStatusState::default();
+        let first = state.set("First", "Old detail");
+        let second = state.set("Second", "New detail");
+
+        assert!(second.generation > first.generation);
+        assert_eq!(state.current, Some(second.clone()));
+
+        state.clear();
+        assert!(state.current.is_none());
+
+        let third = state.set("Third", "After navigation");
+        assert!(third.generation > second.generation);
+    }
+
+    #[test]
+    fn loading_error_script_escapes_status_content() {
+        let title = "Needs \"attention\"";
+        let detail = "Retry after startup\nwithout widening access.";
+        let script = loading_error_script(&LoadingStatus {
+            generation: 17,
+            title: title.into(),
+            detail: detail.into(),
+        });
+
+        let title_json = serde_json::to_string(title).unwrap();
+        let detail_json = serde_json::to_string(detail).unwrap();
+        assert!(script.contains(&format!(
+            "generation:17,title:{title_json},detail:{detail_json}"
+        )));
+        assert!(script.contains("Number(current.generation)<=next.generation"));
+        assert!(script.contains("if(status&&titleNode&&detailNode)"));
+        assert!(!script.contains("Retry after startup\nwithout"));
     }
 
     #[test]
