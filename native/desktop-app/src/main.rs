@@ -722,10 +722,12 @@ fn runtime_instance_key(runtime: &CliRuntime) -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
-        return current_windows_default_instance_key();
+        current_windows_default_instance_key()
     }
     #[cfg(not(target_os = "windows"))]
-    None
+    {
+        None
+    }
 }
 
 #[cfg(target_os = "windows")]
