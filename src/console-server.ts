@@ -957,13 +957,17 @@ async function serveUi(
   }
 
   let body = await readFile(target);
+  const scriptNonce = randomBytes(18).toString("base64");
   if (path.basename(target) === "local-console.html" || path.basename(target) === "index.html") {
-    body = Buffer.from(injectConsoleToken(body.toString("utf8"), token));
+    body = Buffer.from(injectConsoleToken(body.toString("utf8"), token, scriptNonce));
   }
 
   res.writeHead(200, {
     "Content-Type": contentType(target),
-    "Cache-Control": "no-store"
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": consoleContentSecurityPolicy(scriptNonce),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff"
   });
 
   if (req.method === "HEAD") {
@@ -998,9 +1002,29 @@ function shouldServeSpaFallback(pathname: string, uiDir: string): boolean {
   return ext === "";
 }
 
-function injectConsoleToken(html: string, token: string): string {
-  const script = `<script>window.SGW_CONSOLE_TOKEN=${JSON.stringify(token)};window.SGW_CONSOLE_LIVE=true;</script>`;
-  return html.includes("</head>") ? html.replace("</head>", `${script}\n</head>`) : `${script}\n${html}`;
+function injectConsoleToken(html: string, token: string, nonce: string): string {
+  const withNonces = html.replace(/<script(?![^>]*\bnonce=)/giu, `<script nonce="${nonce}"`);
+  const script = `<script nonce="${nonce}">window.SGW_CONSOLE_TOKEN=${JSON.stringify(token)};window.SGW_CONSOLE_LIVE=true;</script>`;
+  return withNonces.includes("</head>")
+    ? withNonces.replace("</head>", `${script}\n</head>`)
+    : `${script}\n${withNonces}`;
+}
+
+function consoleContentSecurityPolicy(nonce: string): string {
+  return [
+    "default-src 'self'",
+    `script-src 'nonce-${nonce}'`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    "connect-src 'self'",
+    "worker-src 'none'",
+    "frame-src 'none'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'"
+  ].join("; ");
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {

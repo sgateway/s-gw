@@ -33,7 +33,7 @@
 Stop handing raw credentials to coding agents. s-gw gives agents typed handles, asks you to approve bounded local actions, resolves the credential inside a constrained process on your machine, and returns sanitized output instead of secret values.
 
 > [!IMPORTANT]
-> s-gw is an early preview. Storage formats and interfaces may change, Windows support is still experimental, and the project has not completed an independent security audit. Do not treat it as a replacement for endpoint security or a hardened enterprise secrets platform yet.
+> s-gw is an early preview. Storage formats and interfaces may change, Windows and Linux desktop support is still experimental, and the project has not completed an independent security audit. Do not treat it as a replacement for endpoint security or a hardened enterprise secrets platform yet.
 >
 > The TypeScript broker, clients, and documentation in this repository are Apache-2.0 licensed. Distributed packages also contain a proprietary compiled Rust execution core whose source is maintained separately.
 
@@ -67,7 +67,7 @@ Public demo: [s-gw.com](https://s-gw.com).
 - **Useful handles:** agents can request real work with stable handle names instead of seeing keys, passwords, tokens, or SSH material.
 - **Output sanitization:** command output is scanned before it returns to the agent, replacing detected credential values with handles.
 - **Agent-aware setup:** Codex, Claude Code, Cursor, OpenCode, Gemini CLI, GitHub Copilot, VS Code, and other MCP clients get profile-specific configuration.
-- **Local operator UI:** the macOS app, menu helper, CLI, and web console show approvals, credential inventory, policies, usage flow, activity, and audit history.
+- **Local operator UI:** native desktop apps, tray or menu helpers, the CLI, and the web console show approvals, credential inventory, policies, usage flow, activity, and audit history.
 
 ## How It Works
 
@@ -90,8 +90,9 @@ The agent never needs the unlock passphrase or raw credential. Approval is scope
 | `s-gw` CLI | Setup, credential enrollment, approvals, policies, agent snippets, guard mode, and diagnostics. |
 | `s-gw-mcp` / `s-gw mcp` | Stdio MCP server for agent-facing handle discovery and request creation. |
 | Native macOS app | Approval queue, credential inventory, policy rules, usage flow, activity, and audit review. |
+| Windows and Linux desktop apps | Installed preview apps with a native window, tray controls, and a bundled local runtime. |
 | Menu-bar helper | Fast visibility into pending approvals and local daemon status. |
-| Local web console | Browser-accessible fallback UI bound to `127.0.0.1`. |
+| Local web console | Browser backup bound to `127.0.0.1`; it remains available when a desktop app cannot run. |
 | Guard mode | Launch agents with credential-looking environment values replaced by s-gw handles. |
 
 ## Quick Start
@@ -104,15 +105,19 @@ s-gw setup
 s-gw status
 ```
 
-On Windows, run the same commands in PowerShell. Windows support is preview software: it uses the TypeScript execution path and includes the PowerShell client, tray helper, and local web console.
+On Windows, run the same commands in PowerShell. Windows support is preview software: the npm package uses the TypeScript execution path and includes the PowerShell client, tray helper, and local web console.
 
 On Linux, install `secret-tool` first (`sudo apt install libsecret-tools` on Ubuntu/Debian). An unlocked desktop Secret Service is the normal persistent unlock provider; `s-gw setup` also installs and starts an owner-level `systemd --user` console service for the graphical session. A headless host without Secret Service can use an explicitly supplied `SGW_MASTER_PASSPHRASE` with `s-gw setup --no-service --no-open-app`, but s-gw never copies that value into a unit file or background-service environment.
+
+Windows x64 and Linux x64 also have installable desktop-app builds. The app provides an operating-system window and tray while keeping the management service on verified IPv4 loopback; it is not a remotely hosted web application. It packages its own pinned Node runtime and s-gw CLI, so the installed app does not require host Node.js or npm. When the native executable is installed, `s-gw app open` prefers it. Use `s-gw app open --browser` to open the loopback UI in the default browser instead.
+
+These Windows NSIS and Linux Debian packages are currently unsigned CI previews, not supported public release downloads. Windows requires WebView2 and may download its bootstrapper during installation when it is absent. Linux requires a graphical session, WebKitGTK, `libsecret-tools`, and an unlocked Secret Service keyring. See [deployment and packaging](docs/deployment.md) for build and install details.
 
 For an Apple Silicon Mac desktop bundle, [GitHub Releases](https://github.com/sgateway/s-gw/releases) also provides a self-contained `s-gw.dmg`. Drag `s-gw.app` to **Applications**, then open it and complete setup. The app includes its own Node runtime, CLI, MCP server, native helpers, and menu-bar helper; it does not require Node.js or npm on the host. Setup is intentionally blocked until the app is in `/Applications` or `~/Applications`.
 
 An unsigned DMG requires a Gatekeeper override. Use the npm installation above instead if you do not want to use that override.
 
-The public source builds the TypeScript compatibility path. Building the native macOS surfaces also requires a Swift toolchain. Maintainer release builds additionally require access to the private Rust core checkout.
+The public source builds the TypeScript compatibility path and the Windows/Linux Tauri desktop shell. Building the native macOS surfaces also requires a Swift toolchain. Windows and Linux desktop builds require Rust and the platform Tauri prerequisites. Maintainer release builds additionally require access to the private Rust core checkout.
 
 The Apple Silicon Mac DMG is a self-contained desktop alternative. Published macOS DMGs are either Developer ID signed and notarized or explicitly documented as unsigned; unsigned builds require a Gatekeeper override but retain the standard release tag and update path. Local `npm run build:installers` output is ad-hoc signed for local verification. The npm package is the primary install and includes the native app, menu helper, Keychain helper, metadata-only Keychain inspector, and Rust core for Apple Silicon Macs. Linux and Windows use the TypeScript execution path when a matching native core is not packaged. Intel Macs must build the native Keychain and desktop surfaces from source for now; packaged arm64-only helpers are rejected before launch.
 
@@ -126,7 +131,7 @@ s-gw setup
 s-gw status
 ```
 
-`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. The self-contained macOS app runs its bundled runtime in place; npm installs copy the thin app into `/Applications`, falling back to `~/Applications` when needed. Setup backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
+`s-gw setup` generates local unlock material, stores it in the operating system credential store, initializes the encrypted ledger, starts the local UI surfaces available on the current platform, and safely connects detected supported agents. The self-contained macOS app and the Windows/Linux desktop previews run their bundled runtimes in place; npm installs copy the thin macOS app into `/Applications`, falling back to `~/Applications` when needed. Setup backs up existing agent config, preserves unrelated settings, installs the packaged s-gw skill where supported, and reports per-agent conflicts. Use `--no-agents` to skip agent registration.
 
 Add a credential from your terminal without placing the value in chat or a process argument:
 
@@ -218,10 +223,11 @@ The model can complete the task without receiving the raw access key.
 | --- | --- | --- | --- |
 | macOS 14+ on Apple Silicon | Primary development platform | Keychain | Native app, menu helper, local web console |
 | macOS 14+ on Intel | Build-from-source candidate; not QA-tested | Source-built Keychain helper | Source-built native surfaces or local web console |
-| Windows 10/11 | Preview | Credential Manager | PowerShell client, tray helper, local web console |
-| Linux | Preview | Secret Service; explicit environment fallback | systemd user service, local web console |
+| Windows 10/11 x64 | Unsigned desktop preview | Credential Manager | Native desktop app and tray; PowerShell client and browser backup |
+| Linux x64 desktop | Unsigned desktop preview | Secret Service; explicit environment fallback | Native desktop app and tray; systemd user service and browser backup |
+| Linux arm64 | npm preview | Secret Service; explicit environment fallback | systemd user service and browser backup |
 
-Published Apple Silicon macOS DMGs are self-contained. Releases are Developer ID signed and notarized when credentials are available; otherwise the release notes and DMG README state that a Gatekeeper override is required. The Windows package remains unsigned preview software. Build locally with `npm run build:installers`; local DMGs are ad-hoc signed.
+Published Apple Silicon macOS DMGs are self-contained. Releases are Developer ID signed and notarized when credentials are available; otherwise the release notes and DMG README state that a Gatekeeper override is required. Windows NSIS and Linux Debian desktop packages are currently unsigned CI artifacts and are not uploaded as supported release downloads. Build either one on its target operating system with `npm run build:desktop-app`; build the existing release artifacts with `npm run build:installers`.
 
 ## Security Model
 
@@ -233,9 +239,9 @@ Read the [threat model](docs/threat-model.md) before relying on s-gw for sensiti
 
 - The public broker and client source distribution is preview quality; the compiled Rust execution core is proprietary.
 - macOS is the primary development and test platform.
-- Windows Credential Manager support is present but still needs broader native QA.
-- Linux uses Secret Service for persistent unlock material and a hardened systemd user service. Environment unlock is a non-persistent headless fallback only.
-- The Windows desktop package remains an unsigned preview. macOS releases without Developer ID signing are marked unsigned in their release notes and require a Gatekeeper override.
+- Windows Credential Manager support and the Windows x64 desktop app are present but still need broader native QA and code signing.
+- Linux uses Secret Service for persistent unlock material and a hardened systemd user service. The Linux x64 desktop app is an unsigned preview; environment unlock is a non-persistent headless fallback only.
+- Windows and Linux desktop installers are CI previews until they are signed and validated on supported target systems. macOS releases without Developer ID signing are marked unsigned in their release notes and require a Gatekeeper override.
 - The repository is prepared for open-source collaboration, but security-sensitive changes should come with focused tests and threat-model updates when behavior changes.
 
 ## Documentation

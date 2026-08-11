@@ -101,6 +101,7 @@ describe("customer package layout", () => {
     expect(path.basename(layout.macAppPath)).toBe("s-gw.app");
     expect(layout.macAppBinaryPath).toBe(path.join(layout.macAppPath, "Contents", "MacOS", "s-gw"));
     expect(path.basename(layout.menuBarAppPath)).toBe("s-gw Menu Bar.app");
+    expect(path.basename(layout.desktopAppPath)).toMatch(/^s-gw-desktop(?:\.exe)?$/);
     expect(layout.windowsClientScriptPath).toBe(
       path.join(layout.packageRoot, "dist", "windows", "s-gw-client.ps1")
     );
@@ -175,6 +176,7 @@ describe("customer package layout", () => {
       expect(health).toContain("s-gw-client.ps1");
       expect(health).toContain("s-gw-helper.ps1");
       expect(health).toContain("s-gw-helper-bootstrap.ps1");
+      expect(health).toContain("s-gw-desktop");
       expect(health).not.toContain("do not serialize this value");
       expect(packageHealth().version).toBe(CURRENT_VERSION);
     } finally {

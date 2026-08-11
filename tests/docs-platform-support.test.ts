@@ -13,8 +13,9 @@ describe("platform support documentation", () => {
       readFile(path.join(root, "docs/community-launch.md"), "utf8")
     ]);
 
-    expect(readme).toContain("| Linux | Preview | Secret Service; explicit environment fallback |");
-    expect(deployment).toContain("| Linux x64/arm64 | Preview | Secret Service through trusted `secret-tool`;");
+    expect(readme).toContain("| Linux x64 desktop | Unsigned desktop preview | Secret Service; explicit environment fallback |");
+    expect(readme).toContain("| Linux arm64 | npm preview | Secret Service; explicit environment fallback |");
+    expect(deployment).toContain("| Linux x64 | Unsigned desktop preview | Secret Service through trusted `secret-tool`;");
     expect(index).toContain(
       "[macOS Keychain, Linux Secret Service, and Windows Credential Manager](keychain.md)"
     );

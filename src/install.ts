@@ -65,6 +65,7 @@ export interface PackageLayout {
   macAppBinaryPath: string;
   menuBarAppPath: string;
   menuBarBinaryPath: string;
+  desktopAppPath: string;
   windowsClientScriptPath: string;
   windowsClientLauncherPath: string;
   windowsHelperScriptPath: string;
@@ -165,6 +166,12 @@ export interface WindowsOpenResult {
   reusedExisting?: boolean;
 }
 
+export interface DesktopAppOpenResult {
+  appPath: string;
+  consoleUrl: string;
+  pid?: number;
+}
+
 export interface WindowsHelperProcess {
   pid: number;
   ownerSid: string;
@@ -224,6 +231,7 @@ export function getPackageLayout(): PackageLayout {
   const installedMacAppPath = runtime?.appPath || standaloneAppPath || path.join(macApplicationsDirectory(), "s-gw.app");
   const macAppPath = runtime?.appPath || (existsSync(installedMacAppPath) ? installedMacAppPath : packagedMacAppPath);
   const menuBarAppPath = runtime?.menuBarAppPath || path.join(packageRoot, "dist", "s-gw Menu Bar.app");
+  const desktopAppPath = resolveDesktopAppPath(packageRoot, nativeTarget);
 
   return {
     packageRoot,
@@ -245,6 +253,7 @@ export function getPackageLayout(): PackageLayout {
       "MacOS",
       "s-gw-menu-bar-helper"
     ),
+    desktopAppPath,
     windowsClientScriptPath: path.join(packageRoot, "dist", "windows", "s-gw-client.ps1"),
     windowsClientLauncherPath: path.join(packageRoot, "dist", "windows", "s-gw-client.cmd"),
     windowsHelperScriptPath: path.join(packageRoot, "dist", "windows", "s-gw-helper.ps1"),
@@ -252,6 +261,38 @@ export function getPackageLayout(): PackageLayout {
     windowsHelperLauncherPath: path.join(packageRoot, "dist", "windows", "s-gw-helper.cmd"),
     windowsCredentialHelperPath: path.join(packageRoot, "dist", "windows", "s-gw-credential.ps1")
   };
+}
+
+export function desktopAppCandidates(
+  packageRoot: string,
+  nativeTarget = `${process.platform}-${process.arch}`,
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env
+): string[] {
+  const platformPath = platform === "win32" ? path.win32 : path.posix;
+  const executable = platform === "win32" ? "s-gw-desktop.exe" : "s-gw-desktop";
+  const candidates: string[] = [];
+  const configured = environment.SGW_DESKTOP_APP_PATH?.trim();
+  if (configured) candidates.push(platformPath.resolve(configured));
+
+  candidates.push(platformPath.join(packageRoot, "dist", "native", nativeTarget, executable));
+
+  if (platform === "win32") {
+    const localAppData = environment.LOCALAPPDATA?.trim();
+    if (localAppData) {
+      candidates.push(platformPath.join(localAppData, "s-gw", executable));
+      candidates.push(platformPath.join(localAppData, "Programs", "s-gw", executable));
+    }
+  } else if (platform === "linux") {
+    candidates.push("/usr/bin/s-gw-desktop", "/usr/local/bin/s-gw-desktop");
+  }
+
+  return [...new Set(candidates)];
+}
+
+function resolveDesktopAppPath(packageRoot: string, nativeTarget: string): string {
+  const candidates = desktopAppCandidates(packageRoot, nativeTarget);
+  return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
 }
 
 export function packageHealth(port = 8718) {
@@ -268,6 +309,7 @@ export function packageHealth(port = 8718) {
 
   return {
     version: CURRENT_VERSION,
+    instanceKey: getSgwInstanceKey(),
     packageRoot: layout.packageRoot,
     selfContainedMacApp: layout.isSelfContainedMacApp,
     nodePath: pathStatus(layout.nodePath),
@@ -282,6 +324,7 @@ export function packageHealth(port = 8718) {
     macAppBinaryPath: pathStatus(layout.macAppBinaryPath),
     menuBarAppPath: pathStatus(layout.menuBarAppPath),
     menuBarBinaryPath: pathStatus(layout.menuBarBinaryPath),
+    desktopAppPath: pathStatus(layout.desktopAppPath),
     windowsClientScriptPath: pathStatus(layout.windowsClientScriptPath),
     windowsClientLauncherPath: pathStatus(layout.windowsClientLauncherPath),
     windowsHelperScriptPath: pathStatus(layout.windowsHelperScriptPath),
@@ -1344,6 +1387,185 @@ export function openMacApp(options: MenuBarOptions = {}): MacAppOpenResult {
   return { appPath: layout.macAppPath, consoleUrl: url, reusedExisting: false };
 }
 
+export async function openDesktopApp(options: MenuBarOptions = {}): Promise<DesktopAppOpenResult> {
+  if (process.platform !== "win32" && process.platform !== "linux") {
+    throw new Error("The cross-platform desktop app is only available on Windows and Linux.");
+  }
+
+  const layout = getPackageLayout();
+  if (!existsSync(layout.desktopAppPath)) {
+    throw new Error(`Native desktop app is missing. Expected executable at ${layout.desktopAppPath}`);
+  }
+
+  const port = options.port ?? 8718;
+  const url = options.consoleUrl || consoleUrl(port);
+  const args = [
+    "--console-url",
+    url,
+    "--instance-key",
+    getSgwInstanceKey(),
+    "--node-path",
+    layout.nodePath,
+    "--cli-path",
+    layout.cliPath,
+    "--authority-args"
+  ];
+  const appEnvironment = desktopAppEnvironment(url);
+  args.push(...desktopAuthorityArguments(process.env, appEnvironment));
+  const child = spawn(layout.desktopAppPath, args, {
+    detached: true,
+    env: appEnvironment,
+    shell: false,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  await waitForDesktopLaunch(child);
+  child.unref();
+
+  return {
+    appPath: layout.desktopAppPath,
+    consoleUrl: url,
+    pid: child.pid
+  };
+}
+
+function waitForDesktopLaunch(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let graceTimer: NodeJS.Timeout | undefined;
+    const startupTimer = setTimeout(() => reject(new Error("Timed out starting the native desktop app.")), 3_000);
+    child.once("spawn", () => {
+      clearTimeout(startupTimer);
+      graceTimer = setTimeout(resolve, 750);
+    });
+    child.once("exit", (code) => {
+      clearTimeout(startupTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      if (code === 0) resolve();
+      else reject(new Error(`Native desktop app exited during launch with status ${code ?? "unknown"}.`));
+    });
+    child.once("error", (error) => {
+      clearTimeout(startupTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      reject(new Error(`Could not start the native desktop app: ${error.message}`));
+    });
+  });
+}
+
+const desktopAuthorityEnvironmentNames = [
+  "SGW_EXECUTION_ENGINE",
+  "SGW_HOME",
+  "SGW_KEYCHAIN_ACCOUNT",
+  "SGW_KEYCHAIN_SERVICE",
+  "SGW_RECOVERY_HOME",
+  "SGW_SECRET_BACKEND",
+  "SGW_SECRET_KEYCHAIN_SERVICE"
+] as const;
+
+export function desktopAuthorityArguments(
+  inherited: NodeJS.ProcessEnv,
+  normalized: NodeJS.ProcessEnv
+): string[] {
+  const args: string[] = [];
+  for (const name of desktopAuthorityEnvironmentNames) {
+    if (!inherited[name]?.trim()) continue;
+    const value = normalized[name];
+    if (!value) throw new Error(`Missing normalized ${name} for the desktop app.`);
+    args.push("--authority", `${name}=${value}`);
+  }
+  return args;
+}
+
+export async function waitForConsoleAuthority(
+  consoleUrl: string,
+  expectedKey = getSgwInstanceKey(),
+  timeoutMs = 12_000
+): Promise<void> {
+  const endpoint = new URL(consoleUrl);
+  if (endpoint.protocol !== "http:"
+    || endpoint.hostname !== "127.0.0.1"
+    || !endpoint.port
+    || endpoint.username
+    || endpoint.password
+    || endpoint.pathname !== "/"
+    || endpoint.search
+    || endpoint.hash) {
+    throw new Error("The desktop console must use explicit IPv4 loopback HTTP.");
+  }
+  const healthUrl = new URL("api/health", endpoint);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let response: Response;
+    try {
+      response = await fetch(healthUrl, { signal: AbortSignal.timeout(750) });
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      continue;
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = await response.json() as Record<string, unknown>;
+    } catch {
+      throw new Error(`Refusing to open an unverified local service at ${consoleUrl}`);
+    }
+    if (response.ok
+      && payload.ok === true
+      && payload.name === "s-gw"
+      && payload.instanceKey === expectedKey) {
+      return;
+    }
+    throw new Error(`Refusing to open an unverified local service at ${consoleUrl}`);
+  }
+  throw new Error(`Timed out waiting for the verified s-gw console at ${consoleUrl}`);
+}
+
+export function desktopAppEnvironment(
+  url: string,
+  inherited: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): NodeJS.ProcessEnv {
+  if (platform === "win32") {
+    return windowsBackgroundEnvironment(url);
+  }
+
+  const user = os.userInfo();
+  const env: NodeJS.ProcessEnv = {
+    ...launchdBaseEnvironment(inherited),
+    HOME: user.homedir,
+    USER: user.username,
+    LOGNAME: user.username,
+    SGW_CONSOLE_URL: url,
+    SGW_DISABLE_UPDATE_CHECK: "1"
+  };
+  for (const name of [
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "LANG",
+    "LANGUAGE",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_DATA_DIRS",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE"
+  ]) {
+    copyDesktopSessionValue(env, inherited, name);
+  }
+  for (const name of Object.keys(inherited)) {
+    if (name.startsWith("LC_")) copyDesktopSessionValue(env, inherited, name);
+  }
+  return env;
+}
+
+function copyDesktopSessionValue(target: NodeJS.ProcessEnv, source: NodeJS.ProcessEnv, name: string): void {
+  const value = source[name];
+  if (!value) return;
+  if (value.length > 8_192 || /[\0\r\n]/u.test(value)) {
+    throw new Error(`Invalid ${name} value for the desktop app.`);
+  }
+  target[name] = value;
+}
+
 export function installMacAppBundle(options: MacAppInstallOptions = {}): MacAppInstallResult {
   requireMac("mac app install");
   const layout = getPackageLayout();
@@ -2292,7 +2514,7 @@ async function ensureLogDir(sgwHome?: string): Promise<string> {
   return logs;
 }
 
-function launchdBaseEnvironment(inherited: Record<string, string> = {}): Record<string, string> {
+function launchdBaseEnvironment(inherited: NodeJS.ProcessEnv = {}): Record<string, string> {
   const layout = getPackageLayout();
   const inheritedHome = boundedAuthorityValue("SGW_HOME", inherited.SGW_HOME);
   const sgwHome = absoluteAuthorityPath("SGW_HOME", inheritedHome || getSgwHome());

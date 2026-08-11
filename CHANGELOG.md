@@ -4,6 +4,10 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Added
+
+- Unsigned Windows x64 NSIS and Linux x64 Debian desktop previews now provide a native window and tray around the verified local console, bundle their own pinned Node.js runtime, and retain the identity-checked loopback browser UI as a backup.
+
 ### Fixed
 
 - The macOS app now restarts installed-but-unloaded local services when it opens, and LaunchAgent setup no longer issues a redundant blocking `kickstart` after loading a `RunAtLoad` job.

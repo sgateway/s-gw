@@ -17,17 +17,21 @@ describe("release version alignment", () => {
       throw new Error(`Private s-gw Rust core checkout is required: ${coreRoot}`);
     }
 
-    const [packageRaw, lockRaw, serverRaw, pluginRaw] = await Promise.all([
+    const [packageRaw, lockRaw, serverRaw, pluginRaw, desktopCargoRaw, desktopLockRaw, desktopConfigRaw] = await Promise.all([
       readFile(path.join(root, "package.json"), "utf8"),
       readFile(path.join(root, "package-lock.json"), "utf8"),
       readFile(path.join(root, "server.json"), "utf8"),
-      readFile(path.join(root, ".codex-plugin", "plugin.json"), "utf8")
+      readFile(path.join(root, ".codex-plugin", "plugin.json"), "utf8"),
+      readFile(path.join(root, "native/desktop-app/Cargo.toml"), "utf8"),
+      readFile(path.join(root, "native/desktop-app/Cargo.lock"), "utf8"),
+      readFile(path.join(root, "native/desktop-app/tauri.conf.json"), "utf8")
     ]);
 
     const pkg = JSON.parse(packageRaw);
     const lock = JSON.parse(lockRaw);
     const server = JSON.parse(serverRaw);
     const plugin = JSON.parse(pluginRaw);
+    const desktopConfig = JSON.parse(desktopConfigRaw);
 
     expect(CURRENT_VERSION).toBe(pkg.version);
     expect(lock.version).toBe(pkg.version);
@@ -35,6 +39,9 @@ describe("release version alignment", () => {
     expect(server.version).toBe(pkg.version);
     expect(server.packages[0].version).toBe(pkg.version);
     expect(plugin.version).toBe(pkg.version);
+    expect(desktopCargoRaw.match(/^version\s*=\s*"([^"]+)"/m)?.[1]).toBe(pkg.version);
+    expect(desktopLockRaw.match(/\[\[package\]\]\nname = "s-gw-desktop"\nversion = "([^"]+)"/)?.[1]).toBe(pkg.version);
+    expect(desktopConfig.version).toBe("../../package.json");
     if (hasPrivateCore) {
       const [cargoRaw, cargoLockRaw] = await Promise.all([
         readFile(coreManifest, "utf8"),

@@ -55,6 +55,18 @@ describe("Windows test groups", () => {
     );
     expect(workflow).toContain("SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000");
     expect(workflow).toContain("SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000");
+    expect(workflow).toContain("name: Desktop app (${{ matrix.name }})");
+    expect(workflow).toContain("name: Windows x64 NSIS");
+    expect(workflow).toContain("runner: windows-latest");
+    expect(workflow).toContain("runtime_target: win32-x64");
+    expect(workflow).toContain("artifact_name: s-gw-windows-x64-nsis");
+    expect(workflow).toContain("name: Ubuntu 22.04 x64 deb");
+    expect(workflow).toContain("runner: ubuntu-22.04");
+    expect(workflow).toContain("runtime_target: linux-x64");
+    expect(workflow).toContain("artifact_name: s-gw-linux-x64-deb");
+    expect(workflow).toContain("name: Verify Windows MSVC host");
+    expect(workflow).toContain("cargo audit --file native/desktop-app/Cargo.lock");
+    expect(workflow).toContain("retention-days: 14");
   });
 
   it("assigns every Windows client test to one shard", async () => {

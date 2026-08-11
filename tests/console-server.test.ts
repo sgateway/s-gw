@@ -53,9 +53,16 @@ describe("local console server", () => {
   it("serves the console with a session token and protects local API writes", async () => {
     running = await startConsoleServer({ port: 0 });
 
-    const html = await fetchText("/");
+    const consoleResponse = await fetch(running.url);
+    const html = await consoleResponse.text();
     expect(html).toContain("s-gw");
     expect(html).toContain("SGW_CONSOLE_TOKEN");
+    const policy = consoleResponse.headers.get("content-security-policy") || "";
+    const nonce = /script-src 'nonce-([^']+)'/u.exec(policy)?.[1];
+    expect(nonce).toBeTruthy();
+    expect(html).toContain(`nonce="${nonce}"`);
+    expect(policy).toContain("connect-src 'self'");
+    expect(policy).toContain("form-action 'none'");
 
     const rejected = await fetch(`${running.url}api/secrets`, {
       method: "POST",

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": [
+      "deb"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "libsecret-tools"
+        ]
+      }
+    }
+  }
+}
