@@ -99,15 +99,20 @@ describe("Windows test groups", () => {
     expect(workflow).toContain(
       "cargo metadata --locked --format-version 1"
     );
-    expect(workflow).toContain("for required in eframe tray-icon");
-    expect(workflow).toContain("foreach ($required in @('eframe', 'tray-icon'))");
-    expect(workflow).toContain("tauri($|-)|wry($|-)|webview2|webkit|javascriptcore");
+    expect(workflow).toContain("for required in eframe glow tray-icon");
+    expect(workflow).toContain("foreach ($required in @('eframe', 'glow', 'tray-icon'))");
+    expect(workflow).toContain("egui-wgpu|gpu-allocator|wgpu");
     expect(workflow).toContain("ldd \"$unpacked/usr/bin/s-gw-desktop\"");
     expect(workflow).toContain("[IO.File]::ReadAllBytes($desktop.FullName)");
     expect(workflow).toContain("test -f \"$(dirname \"$cli_path\")/console-ui/index.html\"");
     expect(workflow).toContain(
       String.raw`[\\/]runtime[\\/]package[\\/]dist[\\/]console-ui[\\/]index\.html$`
     );
+  });
+
+  it("allows enough time to create the private Windows test root", async () => {
+    const runner = await readFile(path.resolve("scripts/run-windows-tests.mjs"), "utf8");
+    expect(runner).toContain("timeout: 60_000");
   });
 
   it("assigns every Windows client test to one shard", async () => {

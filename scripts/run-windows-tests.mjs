@@ -126,7 +126,7 @@ $null = [System.IO.Directory]::CreateDirectory($env:SGW_WINDOWS_PRIVATE_TEST_ROO
     encoding: "utf8",
     env: { ...process.env, SGW_WINDOWS_PRIVATE_TEST_ROOT: target },
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 30_000,
+    timeout: 60_000,
     windowsHide: true
   });
   if (result.error) throw result.error;

@@ -146,7 +146,7 @@ jobs:
           cargo metadata --locked --format-version 1 \
             --manifest-path native/desktop-app/Cargo.toml > "$metadata_file"
           mapfile -t package_names < <(jq -r '.packages[].name' "$metadata_file")
-          for required in eframe tray-icon; do
+          for required in eframe glow tray-icon; do
             if ! printf '%s\n' "${package_names[@]}" | grep -Fxq "$required"; then
               printf 'Required native desktop dependency is missing: %s\n' "$required" >&2
               exit 1
@@ -156,6 +156,14 @@ jobs:
             | grep -Ei '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)' || true)"
           if test -n "$blocked"; then
             printf 'Forbidden WebView dependency in desktop graph:\n%s\n' "$blocked" >&2
+            exit 1
+          fi
+          active_tree="$(cargo tree --locked --edges normal --target x86_64-unknown-linux-gnu \
+            --manifest-path native/desktop-app/Cargo.toml)"
+          blocked_renderer="$(printf '%s\n' "$active_tree" \
+            | grep -Ei '(egui-wgpu|gpu-allocator|wgpu(-[^[:space:]]*)?) v[0-9]' || true)"
+          if test -n "$blocked_renderer"; then
+            printf 'Unsupported desktop renderer dependency:\n%s\n' "$blocked_renderer" >&2
             exit 1
           fi
 
@@ -170,7 +178,7 @@ jobs:
           }
           $metadata = $metadataJson | ConvertFrom-Json
           $packageNames = @($metadata.packages | ForEach-Object { $_.name })
-          foreach ($required in @('eframe', 'tray-icon')) {
+          foreach ($required in @('eframe', 'glow', 'tray-icon')) {
             if ($required -cnotin $packageNames) {
               throw "Required native desktop dependency is missing: $required"
             }
@@ -180,6 +188,14 @@ jobs:
           })
           if ($blocked.Count -gt 0) {
             throw "Forbidden WebView dependency in desktop graph: $($blocked -join ', ')"
+          }
+          $activeTree = (& cargo tree --locked --edges normal --target x86_64-pc-windows-msvc `
+            --manifest-path native/desktop-app/Cargo.toml | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the active Windows desktop dependency tree."
+          }
+          if ($activeTree -match '(egui-wgpu|gpu-allocator|wgpu(?:-[^\s]+)?) v\d') {
+            throw "Unsupported desktop renderer dependency: $($Matches[0])"
           }
 
       - run: npm run check:desktop-app
@@ -202,6 +218,7 @@ jobs:
           depends="$(dpkg-deb -f "${installers[0]}" Depends)"
           for dependency in \
             libayatana-appindicator3-1 \
+            libgl1 \
             libgtk-3-0 \
             libsecret-tools \
             libxdo3; do

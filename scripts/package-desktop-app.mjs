@@ -100,6 +100,7 @@ function packagingTarget(name) {
       deb: {
         depends: [
           "libayatana-appindicator3-1",
+          "libgl1",
           "libgtk-3-0",
           "libsecret-tools",
           "libxdo3"

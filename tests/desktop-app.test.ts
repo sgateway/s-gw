@@ -53,6 +53,7 @@ describe("Windows and Linux desktop app", () => {
     const packageInfo = JSON.parse(packageRaw);
 
     expect(cargoRaw).toContain('eframe = { version = "=0.36.1"');
+    expect(cargoRaw).toContain('features = ["accesskit", "default_fonts", "glow", "wayland", "x11"]');
     expect(cargoRaw).toContain('egui = "=0.36.1"');
     expect(cargoRaw).toContain('egui_extras = "=0.36.1"');
     expect(cargoRaw).toContain('tray-icon = "=0.24.2"');
@@ -84,6 +85,7 @@ describe("Windows and Linux desktop app", () => {
     expect(packageSource).toContain('installMode: "currentUser"');
     for (const dependency of [
       "libayatana-appindicator3-1",
+      "libgl1",
       "libgtk-3-0",
       "libsecret-tools",
       "libxdo3"
@@ -105,14 +107,38 @@ describe("Windows and Linux desktop app", () => {
     await expect(access(path.join(appRoot, "tauri.windows.conf.json"))).rejects.toThrow();
     await expect(access(path.join(appRoot, "tauri.linux.conf.json"))).rejects.toThrow();
 
-    const metadata = await execFileAsync(
-      "cargo",
-      ["metadata", "--locked", "--format-version", "1", "--manifest-path", path.join(appRoot, "Cargo.toml")],
-      { maxBuffer: 20 * 1024 * 1024 }
-    );
+    const [metadata, windowsTree, linuxTree] = await Promise.all([
+      execFileAsync(
+        "cargo",
+        ["metadata", "--locked", "--format-version", "1", "--manifest-path", path.join(appRoot, "Cargo.toml")],
+        { maxBuffer: 20 * 1024 * 1024 }
+      ),
+      execFileAsync(
+        "cargo",
+        [
+          "tree", "--locked", "--edges", "normal", "--target", "x86_64-pc-windows-msvc",
+          "--manifest-path", path.join(appRoot, "Cargo.toml")
+        ],
+        { maxBuffer: 20 * 1024 * 1024 }
+      ),
+      execFileAsync(
+        "cargo",
+        [
+          "tree", "--locked", "--edges", "normal", "--target", "x86_64-unknown-linux-gnu",
+          "--manifest-path", path.join(appRoot, "Cargo.toml")
+        ],
+        { maxBuffer: 20 * 1024 * 1024 }
+      )
+    ]);
     const packageNames = (JSON.parse(metadata.stdout).packages as Array<{ name: string }>).map((item) => item.name);
     expect(packageNames.filter((name) => /^(tauri|wry|webview2-com|webkit2gtk|javascriptcore-rs)/u.test(name))).toEqual([]);
-  });
+    for (const activeTree of [windowsTree.stdout, linuxTree.stdout]) {
+      expect(activeTree).toMatch(/\begui_glow v/u);
+      expect(activeTree).toMatch(/\bglow v/u);
+      expect(activeTree).toMatch(/\bglutin v/u);
+      expect(activeTree).not.toMatch(/\b(?:egui-wgpu|gpu-allocator|wgpu(?:-[a-z0-9-]+)?) v/iu);
+    }
+  }, 30_000);
 
   it("pins and verifies the bundled Node runtimes", async () => {
     const [runtimeRaw, stageSource] = await Promise.all([
