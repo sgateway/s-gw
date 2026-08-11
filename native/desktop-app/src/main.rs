@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Deserialize;
+#[cfg(any(target_os = "windows", test))]
+use serde::Serialize;
+#[cfg(any(target_os = "windows", test))]
+use sha2::{Digest, Sha256};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
@@ -14,6 +18,16 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, WebviewWindowBuilder};
 use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Security::TOKEN_QUERY;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
 
 const DEFAULT_CONSOLE_URL: &str = "http://127.0.0.1:8718/";
 const MAIN_WINDOW: &str = "main";
@@ -75,6 +89,29 @@ struct HealthResponse {
 struct StatusResponse {
     #[serde(rename = "instanceKey")]
     instance_key: Option<String>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsInstanceIdentity {
+    platform: &'static str,
+    user: WindowsInstanceUser,
+    home: String,
+    recovery_home: String,
+    keychain_service: &'static str,
+    keychain_account: String,
+    secret_backend: &'static str,
+    secret_keychain_service: &'static str,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Serialize)]
+struct WindowsInstanceUser {
+    username: String,
+    home: String,
+    uid: i32,
+    gid: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -664,20 +701,158 @@ fn command_exists(command: &str) -> bool {
 }
 
 fn runtime_instance_key(runtime: &CliRuntime) -> Option<String> {
-    let output = cli_command(runtime)
+    let child_key = cli_command(runtime)
         .arg("__desktop-instance-key")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .ok()?;
-    if !output.status.success() {
+        .ok()
+        .and_then(|output| {
+            if !output.status.success() {
+                return None;
+            }
+            let status: StatusResponse = serde_json::from_slice(&output.stdout).ok()?;
+            status
+                .instance_key
+                .and_then(|value| validate_instance_key(&value).ok())
+        });
+    if child_key.is_some() {
+        return child_key;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return current_windows_default_instance_key();
+    }
+    #[cfg(not(target_os = "windows"))]
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_default_instance_key() -> Option<String> {
+    const IDENTITY_ENV_NAMES: [&str; 6] = [
+        "SGW_HOME",
+        "SGW_RECOVERY_HOME",
+        "SGW_KEYCHAIN_SERVICE",
+        "SGW_KEYCHAIN_ACCOUNT",
+        "SGW_SECRET_BACKEND",
+        "SGW_SECRET_KEYCHAIN_SERVICE",
+    ];
+    if env::var("SGW_TEST_MODE").ok().as_deref() == Some("1")
+        || IDENTITY_ENV_NAMES
+            .iter()
+            .any(|name| env::var_os(name).is_some())
+    {
         return None;
     }
 
-    let status: StatusResponse = serde_json::from_slice(&output.stdout).ok()?;
-    status
-        .instance_key
-        .and_then(|value| validate_instance_key(&value).ok())
+    let username = current_windows_username()?;
+    let token_profile = current_windows_profile()?;
+    if let Some(value) = env::var_os("USERPROFILE") {
+        // A different value changes Node's default home, so this narrow fallback stops here.
+        if value.into_string().ok()?.as_str() != token_profile {
+            return None;
+        }
+    }
+
+    windows_default_instance_key(&username, &token_profile)
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_username() -> Option<String> {
+    let mut buffer = [0_u16; 257];
+    let mut size = buffer.len() as u32;
+    if unsafe { GetUserNameW(buffer.as_mut_ptr(), &mut size) } == 0 {
+        return None;
+    }
+    windows_string_from_buffer(&buffer, size)
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_profile() -> Option<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+
+    let profile = windows_profile_for_token(token);
+    unsafe {
+        CloseHandle(token);
+    }
+    profile
+}
+
+#[cfg(target_os = "windows")]
+fn windows_profile_for_token(token: HANDLE) -> Option<String> {
+    let mut size = 0_u32;
+    unsafe {
+        GetUserProfileDirectoryW(token, std::ptr::null_mut(), &mut size);
+    }
+    let mut buffer = windows_wide_buffer(size)?;
+    if unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut size) } == 0 {
+        return None;
+    }
+    windows_string_from_buffer(&buffer, size)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_wide_buffer(size: u32) -> Option<Vec<u16>> {
+    let len = usize::try_from(size).ok()?;
+    if !(2..=32_768).contains(&len) {
+        return None;
+    }
+    Some(vec![0_u16; len])
+}
+
+#[cfg(target_os = "windows")]
+fn windows_string_from_buffer(buffer: &[u16], size: u32) -> Option<String> {
+    let len = usize::try_from(size).ok()?;
+    if len == 0 || len > buffer.len() {
+        return None;
+    }
+    let content = if buffer[len - 1] == 0 {
+        &buffer[..len - 1]
+    } else {
+        &buffer[..len]
+    };
+    let value = String::from_utf16(content).ok()?;
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_default_instance_key(username: &str, profile: &str) -> Option<String> {
+    if username.is_empty() || username.chars().any(char::is_control) {
+        return None;
+    }
+    let bytes = profile.as_bytes();
+    let drive_path =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let unc_path = profile.starts_with("\\\\") && profile[2..].contains('\\');
+    if profile.ends_with('\\')
+        || profile.chars().any(char::is_control)
+        || (!drive_path && !unc_path)
+    {
+        return None;
+    }
+
+    let home = format!("{profile}\\.s-gw");
+    let identity = WindowsInstanceIdentity {
+        platform: "win32",
+        user: WindowsInstanceUser {
+            username: username.into(),
+            home: profile.into(),
+            uid: -1,
+            gid: -1,
+        },
+        recovery_home: format!("{home}-recovery"),
+        home,
+        keychain_service: "com.s-gw.sgw.master-passphrase",
+        keychain_account: username.into(),
+        secret_backend: "",
+        secret_keychain_service: "com.s-gw.sgw.secret",
+    };
+    let encoded = serde_json::to_vec(&identity).ok()?;
+    Some(format!("{:x}", Sha256::digest(encoded)))
 }
 
 fn run_lifecycle(runtime: &CliRuntime, action: &str, console_url: &Url) {
@@ -878,6 +1053,40 @@ mod tests {
         assert!(validate_instance_key(&"a".repeat(64)).is_ok());
         assert!(validate_instance_key(&"g".repeat(64)).is_err());
         assert!(validate_instance_key(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn matches_the_default_windows_instance_identity() {
+        let expected = "6a77cb4cb1690e58dae1e5d7325685dd54dbaac69c0871042f9c1aef368f7a79";
+
+        assert_eq!(
+            windows_default_instance_key("barrydemo", "C:\\Users\\barrydemo").as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            windows_default_instance_key("Zoë", "D:\\Users\\Zoë Example").as_deref(),
+            Some("d09b1ad5b3cc7846d18466cb78bfa6d807c73d4c90efe1c5a55fa24fbb55d7de")
+        );
+        assert!(windows_default_instance_key("barrydemo", "relative\\profile").is_none());
+        assert!(windows_default_instance_key("bad\nuser", "C:\\Users\\bad").is_none());
+        assert!(windows_default_instance_key("barrydemo", "C:\\Users\\barrydemo\\").is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reads_the_current_windows_identity() {
+        let username = current_windows_username().expect("current Windows username");
+        let profile = current_windows_profile().expect("current Windows profile");
+
+        assert!(!username.is_empty());
+        assert!(!profile.is_empty());
+        if let Some(env_profile) = env::var_os("USERPROFILE") {
+            assert_eq!(
+                env_profile.into_string().ok().as_deref(),
+                Some(profile.as_str())
+            );
+        }
+        assert!(current_windows_default_instance_key().is_some());
     }
 
     #[test]

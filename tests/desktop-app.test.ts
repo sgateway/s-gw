@@ -63,6 +63,9 @@ describe("Windows and Linux desktop app", () => {
     expect(rustSource).toContain("NewWindowResponse::Deny");
     expect(rustSource).toContain("parse_health_response");
     expect(rustSource).toContain('arg("__desktop-instance-key")');
+    expect(rustSource).toContain("current_windows_default_instance_key");
+    expect(rustSource).toContain("GetUserNameW");
+    expect(rustSource).toContain("GetUserProfileDirectoryW");
     expect(rustSource).toContain('run_lifecycle(&runtime, "setup"');
     expect(rustSource).toContain('"Open browser backup"');
     expect(rustSource).not.toContain("#[tauri::command]");
