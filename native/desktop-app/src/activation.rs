@@ -2,7 +2,6 @@
 use crate::runtime::current_windows_profile;
 use crate::runtime::validated_console_url;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -228,7 +227,7 @@ fn current_unix_millis() -> Result<u64, String> {
 fn activation_base_dir() -> Result<PathBuf, String> {
     #[cfg(unix)]
     {
-        Ok(env::temp_dir().join(format!("s-gw-desktop-activation-{}", current_euid())))
+        Ok(std::env::temp_dir().join(format!("s-gw-desktop-activation-{}", current_euid())))
     }
     #[cfg(target_os = "windows")]
     {
@@ -241,7 +240,7 @@ fn activation_base_dir() -> Result<PathBuf, String> {
     }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
-        Ok(env::temp_dir().join("s-gw-desktop-activation"))
+        Ok(std::env::temp_dir().join("s-gw-desktop-activation"))
     }
 }
 
@@ -802,7 +801,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("test clock")
             .as_nanos();
-        env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "s-gw-activation-{label}-{}-{stamp}",
             std::process::id()
         ))
