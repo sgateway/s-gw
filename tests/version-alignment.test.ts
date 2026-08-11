@@ -40,7 +40,10 @@ describe("release version alignment", () => {
     expect(server.packages[0].version).toBe(pkg.version);
     expect(plugin.version).toBe(pkg.version);
     expect(desktopCargoRaw.match(/^version\s*=\s*"([^"]+)"/m)?.[1]).toBe(pkg.version);
-    expect(desktopLockRaw.match(/\[\[package\]\]\nname = "s-gw-desktop"\nversion = "([^"]+)"/)?.[1]).toBe(pkg.version);
+    const desktopLockPattern = /\[\[package\]\]\r?\nname = "s-gw-desktop"\r?\nversion = "([^"]+)"/;
+    expect(desktopLockRaw.match(desktopLockPattern)?.[1]).toBe(pkg.version);
+    // Git may check lockfiles out as CRLF on Windows.
+    expect(desktopLockRaw.replace(/\r?\n/g, "\r\n").match(desktopLockPattern)?.[1]).toBe(pkg.version);
     expect(desktopConfig.version).toBe("../../package.json");
     if (hasPrivateCore) {
       const [cargoRaw, cargoLockRaw] = await Promise.all([
@@ -48,7 +51,7 @@ describe("release version alignment", () => {
         readFile(path.join(coreRoot, "Cargo.lock"), "utf8")
       ]);
       const cargoVersion = cargoRaw.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-      const cargoLockVersion = cargoLockRaw.match(/\[\[package\]\]\nname = "sgw-core"\nversion = "([^"]+)"/)?.[1];
+      const cargoLockVersion = cargoLockRaw.match(/\[\[package\]\]\r?\nname = "sgw-core"\r?\nversion = "([^"]+)"/)?.[1];
       expect(cargoVersion).toBe(pkg.version);
       expect(cargoLockVersion).toBe(pkg.version);
     }
