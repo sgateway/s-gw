@@ -221,7 +221,8 @@ jobs:
             libgl1 \
             libgtk-3-0 \
             libsecret-tools \
-            libxdo3; do
+            libxdo3 \
+            libxkbcommon-x11-0; do
             printf '%s\n' "$depends" | grep -Fq "$dependency"
           done
           if printf '%s\n' "$depends" | grep -Eiq '(webview2|webkit|javascriptcore)'; then

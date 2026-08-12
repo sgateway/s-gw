@@ -103,7 +103,8 @@ function packagingTarget(name) {
           "libgl1",
           "libgtk-3-0",
           "libsecret-tools",
-          "libxdo3"
+          "libxdo3",
+          "libxkbcommon-x11-0"
         ],
         section: "utils",
         desktopTemplate: resolve(appRoot, "s-gw-desktop.hidden.desktop"),

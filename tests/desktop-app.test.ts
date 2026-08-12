@@ -88,7 +88,8 @@ describe("Windows and Linux desktop app", () => {
       "libgl1",
       "libgtk-3-0",
       "libsecret-tools",
-      "libxdo3"
+      "libxdo3",
+      "libxkbcommon-x11-0"
     ]) {
       expect(packageSource).toContain(`"${dependency}"`);
       expect(workflowSource).toContain(dependency);
