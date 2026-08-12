@@ -33,8 +33,8 @@ afterEach(async () => {
 
   process.env = oldEnv;
   if (tmpHome) {
-    await rm(tmpHome, { recursive: true, force: true });
-    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+    await rm(tmpHome, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 });
+    await rm(`${tmpHome}-recovery`, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 });
   }
 });
 
@@ -742,7 +742,7 @@ describe("local console server", () => {
         expect.objectContaining({ targetType: "Local command", target: "node -e 'console.log(pkg.name + \"@\" + pkg.version)'" })
       ])
     );
-  });
+  }, 15_000);
 
   it("reports a ready readiness verdict when an unlock source is configured", async () => {
     running = await startConsoleServer({ port: 0 });
