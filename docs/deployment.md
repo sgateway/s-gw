@@ -12,7 +12,7 @@ The supported local model is:
 4. Enroll secrets from the local terminal, not from chat.
 5. Configure each coding tool to launch the local stdio MCP server.
 6. Launch CLI agents through guard mode when environment credential interception is needed.
-7. Approve secret-backed actions locally with the native macOS app or `s-gw approve <request-id>`.
+7. Approve secret-backed actions locally with a native desktop app or `s-gw approve <request-id>`.
 
 Raw credentials stay in the local encrypted ledger and are decrypted only inside an approved local execution path.
 
@@ -27,7 +27,17 @@ npm install -g @s-gw/s-gw
 s-gw setup
 ```
 
-On Windows, run the same commands in PowerShell. Windows 10/11 support is preview software, but npm is the expected install path for the PowerShell client, tray helper, and local web console.
+On Windows, run the same commands in PowerShell. Windows 10/11 support is preview software, but npm remains the expected public install path for the PowerShell client, tray helper, and local web console.
+
+On Ubuntu or Debian Linux, install the Secret Service command-line client before setup:
+
+```bash
+sudo apt install libsecret-tools
+npm install -g @s-gw/s-gw
+s-gw setup
+```
+
+The user's desktop keyring must be unlocked. Setup stores a generated ledger unlock secret in Secret Service, initializes the ledger, and installs a `systemd --user` console service tied to `graphical-session.target`. The unit starts the console through a clean environment, passing only required runtime paths and non-secret configuration. It neither contains nor inherits `SGW_MASTER_PASSPHRASE` or unrelated user-manager credentials.
 
 For an npm-based Apple Silicon Mac installation, `s-gw setup` generates a strong local unlock secret, stores it in macOS Keychain, initializes the encrypted ledger, installs `s-gw.app` in `/Applications` (or `~/Applications` when required), installs and starts the console LaunchAgent, installs and starts the menu-bar helper, and opens the native macOS app. The browser console remains installed as a fallback local UI. Do not use npm setup to manage a machine that already has the self-contained app installed.
 
@@ -48,6 +58,48 @@ For an external configuration that needs an executable path, such as a Kubernete
 ```
 
 The equivalent bundled MCP command is `.../bin/s-gw-mcp`; setup writes the absolute bundled Node and MCP paths into supported agent configurations automatically.
+
+### Windows And Linux Desktop Apps (Unsigned Preview)
+
+Windows x64 and Linux x64 share a Rust `eframe`/egui desktop app with a native-rendered window, tray menu, and single-instance behavior. The normal app reads state and performs actions through the bundled local CLI. It does not start the HTTP console, embed a WebView, or load a localhost page.
+
+The CLI passes a deterministic, non-secret fingerprint of the local s-gw authority to the native process. The app rejects a conflicting credential home. The browser backup separately verifies the same identity before opening its loopback URL; it fails closed when the health response is missing, foreign, or belongs to a different fingerprint.
+
+The desktop bundle contains a checksum-pinned Node.js 24 runtime, the production s-gw package, and browser-backup console assets. The installed app does not require Node.js or npm on the host. Only the explicit browser backup starts or reuses the identity-checked loopback console; neither interface connects to a hosted s-gw UI.
+
+Build the app on the target operating system:
+
+```bash
+npm ci
+npm run check:desktop-app
+npm run test:desktop-app
+npm run build:desktop-app
+```
+
+The build host needs Node.js 20 or newer and a Rust toolchain. Windows also needs the MSVC Rust target and Visual Studio C++ build tools. Ubuntu/Debian needs the normal compiler toolchain plus GTK 3, AppIndicator, XDO, X11/Wayland, and graphics development packages used by egui and the tray.
+
+The package builder writes an NSIS installer under `native/desktop-app/target/release/bundle/nsis` on Windows and a Debian package under `native/desktop-app/target/release/bundle/deb` on Linux. Cross-compilation is not supported. The build downloads the configured Node archive from `nodejs.org`, verifies its pinned SHA-256 digest, and installs production-only npm dependencies into the staged runtime.
+
+Runtime requirements:
+
+- Windows 10/11 x64 uses a per-user NSIS installation and does not require WebView2.
+- Linux x64 requires a graphical desktop and an unlocked Secret Service keyring. The Debian package declares `libayatana-appindicator3-1`, `libgtk-3-0`, `libsecret-tools`, and `libxdo3`; install it through the system package manager so those dependencies are resolved.
+
+These installers are unsigned CI previews. They are not currently uploaded as supported GitHub Release downloads. Windows users may see SmartScreen or publisher warnings, and the Linux package has no production repository signature. Production distribution requires platform signing, checksums, clean-machine install/uninstall tests, and supported-OS QA.
+
+After installation, open the desktop executable from the operating-system application menu. An npm or source CLI also prefers the installed executable:
+
+```bash
+s-gw app open
+```
+
+Use the browser backup explicitly when the app cannot run or when browser developer tools are needed:
+
+```bash
+s-gw app open --browser
+```
+
+The tray menu has the same **Open browser backup** action. If the native executable is missing or cannot start, `s-gw app open` fails with guidance to run `s-gw app open --browser`; it never switches interfaces silently.
 
 ### Local Tarball Or Source
 
@@ -163,13 +215,19 @@ s-gw guard run claude-code -- --help
 
 Guard mode tokenizes credential-looking environment values before the agent starts. It does not yet claim OS-wide prompt, file, shell, or terminal interception; those should be added through explicit agent config installers and command wrappers with backups and dry-run previews.
 
-Launch the native macOS management app:
+Launch the preferred management app for the current platform:
 
 ```bash
 s-gw app open
 ```
 
-The app shows daemon health, Keychain status, credential handles, pending approvals, configured agents, and audit events. It uses the installed local CLI and store; raw secret values are only provided to local approved execution paths.
+On macOS this opens the native Swift app. On Windows or Linux it opens the installed native-rendered Rust desktop app and reports an actionable error when the executable is absent. The app shows daemon health, credential-store status, credential handles, pending approvals, configured agents, and recent activity through the installed local CLI and store; raw secret values are only provided to local approved execution paths.
+
+Open the same loopback UI in the default browser instead:
+
+```bash
+s-gw app open --browser
+```
 
 Choose the approval mode in the app's Settings panel, or configure it from the CLI:
 
@@ -179,7 +237,7 @@ s-gw approval set --mode timed-session --duration 15m
 s-gw approval set --mode login-session
 ```
 
-`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint, so approving one command does not authorize unrelated commands or credentials.
+`per-transaction` asks for every request. `timed-session` and `login-session` reuse approval only for the same handle and local action fingerprint. Environment-command fingerprints include the exact executable path, arguments, credential bindings, and working directory. Owned SSH approvals use the target and port so commands can share the same s-gw-controlled connection. Changing an environment command's arguments requires a new approval.
 
 For managed installs, use approval policy rules for per-agent and per-credential defaults that should survive restarts:
 
@@ -201,22 +259,24 @@ s-gw approval policy add \
 
 Policy rules can match credential handles, types, providers, minimum severity, agent names, action kinds, commands, injected environment names, working directories, SSH targets, and SSH ports. `allow` skips the approval popup for matching requests, `ask` keeps the normal approval/grant flow, and `deny` blocks matching requests before local execution.
 
-Launch the fallback browser console when needed:
+Run the browser console in the foreground when needed:
 
 ```bash
 s-gw console
 ```
 
-The console binds to `127.0.0.1`, serves the UI from the installed package, and injects a per-session token into the page. That token is required for local API writes such as approving or denying requests, so another browser origin cannot silently drive the credential API with a plain form post.
+The console binds to `127.0.0.1`, serves the UI from the installed package, and injects a per-session token into the page. That token is required for local API writes such as approving or denying requests, so another browser origin cannot silently drive the credential API with a plain form post. `s-gw app open --browser` is the simpler choice when the background service is already running.
 
-For a background setup, install the per-user console LaunchAgent instead:
+For a background setup, install the per-user console service:
 
 ```bash
 s-gw service install --start
 s-gw service status
 ```
 
-This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at login and writes logs under `~/.s-gw/logs`.
+This starts `s-gw console --host 127.0.0.1 --port 8718 --no-open` at desktop login. macOS uses a LaunchAgent; Linux uses an enabled, owner-level systemd unit at `~/.config/systemd/user/s-gw.service`. The Linux unit is owner-readable, applies process hardening, uses a clean runtime environment, and does not persist unlock material. It is attached to the graphical-session lifecycle so a lingering headless user manager does not start it before desktop keyring unlock.
+
+For an intentional headless Linux session without Secret Service, provide `SGW_MASTER_PASSPHRASE` through the session's approved secret-injection mechanism and run `s-gw setup --no-service --no-open-app`. Continue with `s-gw console --no-open` in that same environment. Automatic capture uses the encrypted local ledger while this environment unlock is active. `s-gw service install` fails closed in this mode because copying the passphrase into systemd configuration would make it persistent and discoverable.
 
 Launch the native menu-bar helper:
 
@@ -241,21 +301,25 @@ s-gw menubar status
 
 The standalone helper is the only menu-bar owner. It is a small `LSUIElement` app bundled at `dist/s-gw Menu Bar.app`, remains available when the main app is closed, opens the native app by default, and keeps the web console as a fallback action.
 
-### Windows Preview Client
+### Windows Browser And Tray Backup
 
-The package also stages a Windows client and tray helper:
+The npm package continues to stage the PowerShell client and tray helper as the Windows backup path:
 
 ```powershell
 npm run build:windows-client
-s-gw app open
+s-gw app open --browser
 s-gw helper open
 ```
 
-On Windows, `s-gw app open` launches `dist\windows\s-gw-client.ps1`. It starts the local console on `127.0.0.1` if needed, then opens the UI in Edge or Chrome app mode. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
+On Windows, `s-gw app open` opens the installed native executable and reports an error with explicit browser-backup guidance when it is unavailable. `s-gw app open --browser` starts or reuses the verified loopback console and uses the default browser. `s-gw helper open` launches `dist\windows\s-gw-helper.ps1`, a lightweight tray helper that shows pending approvals, opens the approval queue, and can approve or deny the oldest pending request through the local CLI.
 
-The Windows Credential Manager helper is staged at `dist\windows\s-gw-credential.ps1`. It uses the Windows credential APIs and receives new values on stdin, so unlock passphrases and secret values are not passed as process arguments. Signed `.exe` wrappers, login-start registration, and MSIX/installer packaging are still separate hardening work.
+`s-gw setup` and `s-gw start` also start the loopback console directly, so `--no-open-app` leaves a usable headless runtime instead of depending on a browser window. The tray helper and client verify that the console belongs to the same Windows user, login session, credential home, and credential-store namespace before opening it. Repeated setup, start, and helper-open commands reuse one tray process per user session and port.
 
-### Local Installer Artifacts
+Use `--no-menubar` to suppress the tray helper. `--no-service` requires `--no-menubar` because the helper cannot run without its matching console. Custom Windows console URLs must use loopback HTTP and the same port supplied through `--port`. Use `s-gw stop` to stop only the current user's console, client, and helper processes in the current login session.
+
+The Windows Credential Manager helper is staged at `dist\windows\s-gw-credential.ps1`. It uses the Windows credential APIs and receives new values on stdin, so unlock passphrases and secret values are not passed as process arguments. The native app adds a per-user NSIS package, but Authenticode signing and broader Windows QA remain required before supported distribution.
+
+### Existing Release Installer Artifacts
 
 Build both platform downloads from the current source and package version:
 
@@ -271,6 +335,8 @@ The command rebuilds the native clients and console, then writes these files und
 - `s-gw-VERSION.tgz`, used by both installers and the in-app updater;
 - `0-s-gw-legacy-VERSION.tgz`, a release-only unscoped bridge for the original `0.1.0` updater;
 - `SHA256SUMS.txt` and per-artifact `.sha256` files.
+
+The Windows NSIS and Linux Debian desktop previews are built separately with `npm run build:desktop-app`; `npm run build:installers` does not add them to `dist/installers` or to a public release.
 
 The release build validates the scoped tarball, legacy bridge, generated checksum formats, and the mounted macOS app before upload. The bridge contains the same versioned code under the old unscoped package identity and is never published to npm. Checksum assets are uploaded first, followed by the bridge as the first `.tgz`, so the original `0.1.0` updater can upgrade in place without the scoped binary collision. That recovery release must be published as a normal, non-prerelease GitHub release because `0.1.0` reads the `/releases/latest` endpoint. npm updaters select the exact `s-gw-VERSION.tgz` asset instead. The Windows installer scripts require Node.js 20 or newer, install the bundled package globally, and run `s-gw setup`; the macOS app does none of those things. Neither installer contains credentials or pre-seeded unlock material. The Windows ZIP remains a preview until it is validated on Windows and replaced or supplemented by a signed installer format.
 
@@ -363,10 +429,11 @@ The native app and browser console expose the same action on a stuck request. Re
 | --- | --- | --- | --- |
 | macOS arm64 | Primary development platform | Native Swift helper using Security.framework | Native app, menu helper, and Keychain path are covered by local tests. |
 | macOS Intel | Build-from-source candidate | Native Swift helper using Security.framework | Expected to work when built on Intel macOS with Node >= 20 and Swift toolchain, but not yet QA-tested here. |
-| Linux | Experimental CLI | `SGW_MASTER_PASSPHRASE` fallback | Needs a Secret Service/libsecret helper before desktop support. |
-| Windows | Preview client/helper | Windows Credential Manager helper | PowerShell client opens the local console in browser app mode; tray helper supports queue/status actions. Needs Windows QA, signing, and installer work before production support. |
+| Linux x64 | Unsigned desktop preview | Secret Service through trusted `secret-tool`; explicit environment fallback | Native-rendered Rust desktop app, systemd user service, and browser backup; the keyring must be unlocked in the user session. |
+| Linux arm64 | npm preview | Secret Service through trusted `secret-tool`; explicit environment fallback | systemd user service and browser backup; no native desktop installer is built yet. |
+| Windows 10/11 x64 | Unsigned desktop preview | Windows Credential Manager helper | Native-rendered Rust desktop app and tray with an explicit browser backup. Needs Windows QA and Authenticode signing before supported distribution. |
 
-The current preview is developed primarily on macOS with the native Keychain helper. Windows has a packaged preview path through Credential Manager, but the client and helper still require broader QA, signing, and installer hardening.
+The current preview is developed primarily on macOS with the native Keychain helper. Windows and Linux x64 desktop installers must be built and tested on their target CI runners and remain unsigned preview artifacts. A localhost address appears only when the separate browser backup is active; it is an intentional loopback boundary, not a remote deployment requirement.
 
 ## Coding Tool Support
 
@@ -394,7 +461,7 @@ Supported means s-gw has a documented standard MCP stdio path. Profiled means `s
 
 The CLI and local console cache ordinary successful responses from the public `sgateway/s-gw` GitHub Releases feed for six hours. Drafts, prereleases, and incomplete asset uploads are ignored by the automatic update channel. If GitHub's unauthenticated Releases API is rate-limited, clients fall back to the repository's public Atom release feed; the macOS app then checks the deterministic package and checksum URLs before offering an upgrade. The CLI prints a notice in interactive terminals and supports `s-gw update check`, the local console shows an update banner, and the Windows tray helper shows a notification plus a release link. The login-started macOS menu helper checks immediately and every 15 minutes, while the main app performs one startup check and supports manual checks. Both otherwise reuse the six-hour release-feed cache, so the helper's poll does not force a GitHub request or create a new update record each time. A failed request does not advance that timestamp, so the helper retries on its next poll. The main app persists the available release and its banner across restarts in a locked, atomic state file shared with the helper. The menu helper is the only automatic macOS-alert sender: it first confirms that macOS alerts are enabled, reserves a queue attempt, and records an accepted request as a bounded attempt—not proof that macOS displayed it. It retries an unacknowledged update after one day and then one week, stopping after three accepted queue attempts. Dismissing the app banner or opening the notification acknowledges that version; **Notify Again** in the app's Updates settings deliberately starts a new bounded reminder sequence.
 
-The release workflow runs the full verification suite, then builds the scoped package, legacy bridge, platform installers, `SHA256SUMS.txt`, and per-file `.sha256` assets. It refuses to upload an update package whose identity or checksum cannot be verified, uploads only to a draft release, verifies every remote asset, and makes the release public afterward. A self-contained macOS app verifies that the release includes the matching DMG and checksum, then opens the release page. Download the DMG, quit s-gw, replace the copy in Applications, and reopen it. On first launch after the version or bundle location changes, the app restarts any running console and menu-bar LaunchAgents so they use the new bundled runtime. npm installs retain the verified tarball update flow. The original `0.1.0` app can take the legacy bridge on its next update check; once that fixed app is installed, later releases migrate it to the scoped package automatically. Other clients open the release page for the platform installer. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
+The release workflow runs the full verification suite, then builds the scoped package, legacy bridge, existing release installers, `SHA256SUMS.txt`, and per-file `.sha256` assets. It refuses to upload an update package whose identity or checksum cannot be verified, uploads only to a draft release, verifies every remote asset, and makes the release public afterward. A self-contained macOS app verifies that the release includes the matching DMG and checksum, then opens the release page. Download the DMG, quit s-gw, replace the copy in Applications, and reopen it. On first launch after the version or bundle location changes, the app restarts any running console and menu-bar LaunchAgents so they use the new bundled runtime. npm installs retain the verified tarball update flow. The original `0.1.0` app can take the legacy bridge on its next update check; once that fixed app is installed, later releases migrate it to the scoped package automatically. The Windows and Linux desktop previews do not have a published installer update channel yet; use the npm update path or install a newly verified preview build. Update checks fail quietly when GitHub is unavailable and never block local credential operations.
 
 For an npm installation, review the update plan, then install it:
 
@@ -421,27 +488,51 @@ For an offline npm upgrade, verify the downloaded `s-gw-VERSION.tgz` with either
 
 ## Uninstall
 
-Remove the tool:
+Disconnect integrations while the CLI is still available:
+
+```bash
+s-gw agent uninstall
+```
+
+On macOS, remove both desktop services:
 
 ```bash
 s-gw menubar uninstall
 s-gw service uninstall
-npm uninstall -g @s-gw/s-gw
 ```
 
-Remove local unlock material:
+On Linux, remove the systemd user service:
+
+```bash
+s-gw service uninstall
+```
+
+On Windows, stop the local client and helper:
+
+```powershell
+s-gw stop
+```
+
+Remove the Windows or Linux desktop preview through the operating-system application manager. Removing the app does not remove the encrypted ledger or recovery checkpoints.
+
+Remove local unlock material before uninstalling the package:
 
 ```bash
 s-gw unlock keychain delete
 ```
 
-Remove local ledger if desired:
+Move `s-gw.app` from Applications to Trash, then remove the npm package:
 
 ```bash
-rm -rf ~/.s-gw
+npm uninstall -g @s-gw/s-gw
 ```
 
-Also remove the MCP server entry from each configured coding tool.
+The encrypted ledger and recovery checkpoints are preserved by default. Remove
+both only when you deliberately want to discard local s-gw state:
+
+```bash
+rm -rf ~/.s-gw ~/.s-gw-recovery
+```
 
 ## Packaging Checklist
 
@@ -470,14 +561,30 @@ For macOS production packages, also verify:
 - macOS installers are signed and notarized, or explicitly documented as unsigned with the required Gatekeeper override;
 - install/uninstall leaves no raw secrets in logs or shell history.
 
-For Windows preview packages, also verify:
+For Windows desktop preview packages, also verify:
 
+- `npm run check:desktop-app`, `npm run test:desktop-app`, and `npm run build:desktop-app` pass on Windows x64;
+- the NSIS installer performs a per-user install and the installed `s-gw-desktop.exe` opens without host Node.js or npm;
+- the app rejects a loopback service whose instance identity does not match the local CLI;
+- close hides the main window, tray open restores it, and **Open browser backup** uses the default browser;
 - Windows scripts exist under `dist/windows`;
 - `s-gw unlock keychain set --value-stdin` stores unlock material through Credential Manager;
-- `s-gw app open` starts the local console and opens the client shell;
+- `s-gw app open` opens the native-rendered app without starting a console or browser;
+- `s-gw app open --browser` opens the same local UI without starting the native executable;
+- `s-gw start --no-open-app --no-menubar` starts a healthy headless console, and `s-gw stop` stops it;
 - `s-gw helper open` creates a tray icon and sees pending requests;
+- a synthetic Credential Manager secret stays local, cannot execute before approval, and is tokenized in returned output after approval;
 - helper approve/deny actions use the CLI and do not require the console API token;
 - installer/startup registration does not log raw secrets or command stdin.
+
+For Linux desktop preview packages, also verify:
+
+- `npm run check:desktop-app`, `npm run test:desktop-app`, and `npm run build:desktop-app` pass on Linux x64;
+- the Debian package resolves its native graphics, tray, and `libsecret-tools` dependencies on a clean supported desktop;
+- the installed `/usr/bin/s-gw-desktop` opens without host Node.js or npm and refuses an unrelated loopback service;
+- an unlocked Secret Service keyring supports setup, restart, and a full approval/execution flow;
+- `s-gw app open --browser` remains usable after the native window is closed;
+- install and uninstall leave the encrypted ledger and recovery checkpoints untouched unless the user explicitly removes them.
 
 ## What The Package Contains
 

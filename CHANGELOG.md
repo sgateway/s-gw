@@ -4,10 +4,26 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.20 - 2026-08-12
+
+### Added
+
+- Windows now uses Credential Manager-backed unlock and protected per-user startup integration, while Linux uses Secret Service with a protected local fallback and a managed systemd user service.
+- Cross-platform SSH, agent setup, service health, repair, reinstall, and uninstall flows now provide the same local credential-protection lifecycle on macOS, Windows, and Linux.
+- Unsigned Windows x64 NSIS and Linux x64 Debian desktop previews now provide a native-rendered Rust interface and tray with no embedded browser or WebView, bundle their own pinned Node.js runtime, and retain the identity-checked loopback UI only as an explicit browser backup.
+
+### Changed
+
+- The shared Windows and Linux desktop interface now matches the established s-gw experience with grouped navigation, responsive dashboards, request history, usage-flow summaries, accessible controls, and platform-native dark window chrome.
+- Routine macOS status checks use the metadata-only Keychain inspector and a bounded cache, reducing repeated permission prompts without changing approval polling.
+
 ### Fixed
 
 - The macOS app now restarts installed-but-unloaded local services when it opens, and LaunchAgent setup no longer issues a redundant blocking `kickstart` after loading a `RunAtLoad` job.
 - Windows agent integration updates now retry transient filesystem contention while another process releases the integration lock.
+- Windows desktop refreshes now hide packaged Node.js and credential-helper consoles instead of flashing command windows during background polling.
+- Windows service, startup, ACL, helper, console, tray, and lock handling now validate exact user-session ownership and clean up only identities created by the active operation.
+- Linux service and credential lifecycle operations fail closed on unsafe paths, stale ownership, or unavailable keyring state while keeping ordinary-user repair and port changes deterministic.
 
 ## 0.1.19 - 2026-07-21
 

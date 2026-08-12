@@ -1,5 +1,6 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,11 +8,13 @@ import { executeApprovedRequest, executeReusablePermit } from "../src/executor.j
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
-import { SecretStore } from "../src/store.js";
-import type { StoreFile } from "../src/types.js";
+import { assertActionAllowed, SecretStore } from "../src/store.js";
+import type { CommandAction, StoreFile } from "../src/types.js";
 import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-installed-upgrade.js";
 
 let tmpHome = "";
+let originalNodeOptions: string | undefined;
+const resolvedNodeExecutable = realpathSync.native(process.execPath);
 
 function fakeAwsAccessKey(): string {
   return ["A", "KIA", "IOSFODNN7EXAMPLE"].join("");
@@ -80,6 +83,7 @@ function canonicalFixtureValue(value: unknown): unknown {
 }
 
 beforeEach(async () => {
+  originalNodeOptions = process.env.NODE_OPTIONS;
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-test-"));
   process.env.SGW_HOME = tmpHome;
   process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
@@ -100,9 +104,15 @@ afterEach(async () => {
   delete process.env.SGW_LOGIN_SESSION_ID;
   delete process.env.SGW_RECOVERY_HOME;
   delete process.env.AWS_SECRET_ACCESS_KEY;
+  if (originalNodeOptions === undefined) {
+    delete process.env.NODE_OPTIONS;
+  } else {
+    process.env.NODE_OPTIONS = originalNodeOptions;
+  }
   if (tmpHome) {
-    await rm(tmpHome, { recursive: true, force: true });
-    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+    const cleanup = { recursive: true, force: true, maxRetries: 4, retryDelay: 250 };
+    await rm(tmpHome, cleanup);
+    await rm(`${tmpHome}-recovery`, cleanup);
   }
 });
 
@@ -189,15 +199,76 @@ describe("SecretStore", () => {
       approvalPolicyRules: [policy]
     }, null, 2)}\n`, { mode: 0o600 });
 
-    await store.addSecret({
+    const record = await store.addSecret({
       name: "unrelated legacy credential",
       type: "api-token",
       value: fakeOpenAiToken("legacy_policy"),
-      policy: { injectEnv: "LEGACY_POLICY_TOKEN" }
+      policy: { injectEnv: "LEGACY_POLICY_TOKEN", allowedCommands: [process.execPath] }
     });
 
     const persisted = JSON.parse(await readFile(store.storePath, "utf8"));
     expect(persisted.approvalPolicyRules).toEqual([policy]);
+
+    const request = await store.createRequest(record.handle, buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "LEGACY_POLICY_TOKEN"
+    }), "Codex legacy policy request");
+    expect(request.state).toBe("pending");
+  });
+
+  it("does not reuse a pinned allow policy after a bare command resolves elsewhere", async () => {
+    const firstBin = path.join(tmpHome, "first-bin");
+    const secondBin = path.join(tmpHome, "second-bin");
+    const executableName = process.platform === "win32" ? "policy-tool.exe" : "policy-tool";
+    const firstTool = path.join(firstBin, executableName);
+    const secondTool = path.join(secondBin, executableName);
+    await mkdir(firstBin);
+    await mkdir(secondBin);
+    if (process.platform === "win32") {
+      await copyFile(process.execPath, firstTool);
+      await copyFile(process.execPath, secondTool);
+    } else {
+      await writeFile(firstTool, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      await writeFile(secondTool, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    }
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = firstBin;
+      const store = new SecretStore();
+      const record = await store.addSecret({
+        name: "path-bound policy token",
+        type: "api-token",
+        value: fakeOpenAiToken("path_bound_policy"),
+        policy: { injectEnv: "PATH_BOUND_POLICY_TOKEN", allowedCommands: ["policy-tool"] }
+      });
+      await store.addApprovalPolicyRule({
+        name: "Allow one policy-tool executable",
+        decision: "allow",
+        conditions: {
+          handles: [record.handle],
+          commands: ["policy-tool"],
+          resolvedCommands: [realpathSync.native(firstTool)]
+        }
+      });
+      const action = buildEnvCommandAction({
+        command: "policy-tool",
+        injectEnv: "PATH_BOUND_POLICY_TOKEN"
+      });
+
+      const approved = await store.createRequest(record.handle, action, "Codex pinned policy request");
+      expect(approved.state).toBe("approved");
+      expect(approved.action.resolvedCommand).toBe(realpathSync.native(firstTool));
+
+      process.env.PATH = secondBin;
+      const pending = await store.createRequest(record.handle, action, "Codex changed PATH request");
+      expect(pending.state).toBe("pending");
+      expect(pending.action.resolvedCommand).toBe(realpathSync.native(secondTool));
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
   });
 
   it("updates the injection environment without reading the secret", async () => {
@@ -1004,6 +1075,23 @@ describe("SecretStore", () => {
     expect(rule.name).toBe("Recovered dead lock");
   });
 
+  it("recovers an empty lock directory left by an interrupted release", async () => {
+    const store = new SecretStore();
+    await store.init();
+    const lockPath = `${store.storePath}.lock`;
+    await mkdir(lockPath, { mode: 0o700 });
+    const stale = new Date(Date.now() - 5_000);
+    await utimes(lockPath, stale, stale);
+
+    const rule = await store.addApprovalPolicyRule({
+      name: "Recovered interrupted release",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    expect(rule.name).toBe("Recovered interrupted release");
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("fails closed when recovery evidence exists but no valid ledger remains", async () => {
     const store = new SecretStore();
     await store.addSecret({
@@ -1020,23 +1108,27 @@ describe("SecretStore", () => {
     await expect(readFile(store.storePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("serializes concurrent recovery so every reader gets the same ledger", async () => {
-    const store = new SecretStore();
-    const secret = await store.addSecret({
-      name: "concurrent recovery token",
-      type: "api-token",
-      value: fakeOpenAiToken("concurrent_recovery"),
-      policy: { injectEnv: "CONCURRENT_RECOVERY_TOKEN" }
-    });
-    await rm(store.storePath);
+  it(
+    "serializes concurrent recovery so every reader gets the same ledger",
+    async () => {
+      const store = new SecretStore();
+      const secret = await store.addSecret({
+        name: "concurrent recovery token",
+        type: "api-token",
+        value: fakeOpenAiToken("concurrent_recovery"),
+        policy: { injectEnv: "CONCURRENT_RECOVERY_TOKEN" }
+      });
+      await rm(store.storePath);
 
-    const results = await Promise.all(
-      Array.from({ length: 20 }, () => new SecretStore().listHandles())
-    );
-    for (const handles of results) {
-      expect(handles.map((item) => item.handle)).toContain(secret.handle);
-    }
-  });
+      const results = await Promise.all(
+        Array.from({ length: 20 }, () => new SecretStore().listHandles())
+      );
+      for (const handles of results) {
+        expect(handles.map((item) => item.handle)).toContain(secret.handle);
+      }
+    },
+    30_000
+  );
 
   it("refuses to use the live s-gw home while running tests", () => {
     const oldHome = process.env.SGW_HOME;
@@ -1686,13 +1778,50 @@ describe("SecretStore", () => {
     });
 
     const first = await store.createRequest(record.handle, action, "login session first");
-    await store.approveRequest(first.id);
-    const sameLogin = await store.createRequest(record.handle, action, "same login");
-    expect(sameLogin.state).toBe("approved");
-
     process.env.SGW_LOGIN_SESSION_ID = "login-session-b";
+    const approved = await store.approveRequest(first.id);
+    const grant = (await store.listApprovalGrants()).find((item) => item.id === approved.approvalGrantId);
+    expect(grant?.loginSessionId).toBe("login-session-a");
+
     const differentLogin = await store.createRequest(record.handle, action, "different login");
     expect(differentLogin.state).toBe("pending");
+
+    process.env.SGW_LOGIN_SESSION_ID = "login-session-a";
+    const sameLogin = await store.createRequest(record.handle, action, "same login");
+    expect(sameLogin.state).toBe("approved");
+  });
+
+  it("approves only once when a request has no native login-session identity", async () => {
+    const store = new SecretStore();
+    await store.setApprovalSettings({ mode: "login-session" });
+    const record = await store.addSecret({
+      name: "unidentified login token",
+      type: "api-token",
+      value: "unidentified-login-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_UNIDENTIFIED_LOGIN_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('approved')"],
+      injectEnv: "SGW_UNIDENTIFIED_LOGIN_TOKEN"
+    });
+    const first = await store.createRequest(record.handle, action, "unidentified login first");
+    const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    delete raw.requests.find((request: { id: string }) => request.id === first.id).loginSessionId;
+    await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
+
+    const reloaded = new SecretStore();
+    expect((await reloaded.getRequest(first.id)).loginSessionId).toBeUndefined();
+    const approved = await reloaded.approveRequest(first.id);
+    expect(approved.state).toBe("approved");
+    expect(approved.approvalGrantId).toBeUndefined();
+    expect(await reloaded.listApprovalGrants()).toEqual([]);
+
+    const second = await reloaded.createRequest(record.handle, action, "unidentified login second");
+    expect(second.state).toBe("pending");
   });
 
   it("can reuse an approval for the same agent and duration from the approval choice", async () => {
@@ -1762,7 +1891,8 @@ describe("SecretStore", () => {
       conditions: {
         handles: [record.handle],
         agents: ["Codex"],
-        commands: [process.execPath]
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
       }
     });
     const action = buildEnvCommandAction({
@@ -1808,7 +1938,11 @@ describe("SecretStore", () => {
     await store.addApprovalPolicyRule({
       name: "Allow opaque permit execution",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -1848,7 +1982,11 @@ describe("SecretStore", () => {
     const rule = await store.addApprovalPolicyRule({
       name: "Allow gated one-shot permit execution",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -1859,15 +1997,24 @@ describe("SecretStore", () => {
     expect(admission.kind).toBe("reusable");
     if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
 
-    const execution = executeReusablePermit(store, admission.permit, { engine: "typescript" });
+    const executionFailure = executeReusablePermit(store, admission.permit, { engine: "typescript" }).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    let setupFailure: unknown;
     try {
       await waitForFile(enteredPath);
       await store.setApprovalPolicyRuleEnabled(rule.id, false);
+    } catch (error) {
+      setupFailure = error;
     } finally {
       await writeFile(releasePath, "release\n");
     }
 
-    await expect(execution).rejects.toThrow(/authorization changed|approval policy changed/i);
+    const failure = await executionFailure;
+    if (setupFailure) throw setupFailure;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/authorization changed|approval policy changed/i);
   });
 
   it("caches policy-authorized 1Password one-shot execution after the first run", async () => {
@@ -1887,7 +2034,11 @@ describe("SecretStore", () => {
     const rule = await store.addApprovalPolicyRule({
       name: "Allow policy-cached 1Password execution",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -1914,7 +2065,7 @@ describe("SecretStore", () => {
 
     await store.setApprovalPolicyRuleEnabled(rule.id, false);
     expect(JSON.parse(await readFile(store.storePath, "utf8")).secrets[0].cache).toBeUndefined();
-  });
+  }, 15_000);
 
   it("runs grant-authorized one-shot commands without changing grant usage metadata", async () => {
     const store = new SecretStore();
@@ -1950,7 +2101,7 @@ describe("SecretStore", () => {
     if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
     await store.clearApprovalGrants();
     await expect(executeReusablePermit(store, admission.permit)).rejects.toThrow(/authorization changed|grant is no longer valid/i);
-  });
+  }, 30_000);
 
   it("coalesces repeated unapproved one-shot commands into one pending request", async () => {
     const store = new SecretStore();
@@ -2050,7 +2201,11 @@ describe("SecretStore", () => {
       name: "Allow only the primary secret",
       priority: 200,
       decision: "allow",
-      conditions: { handles: [primary.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [primary.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
 
     const incomplete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
@@ -2062,11 +2217,15 @@ describe("SecretStore", () => {
       name: "Allow both injected secrets",
       priority: 100,
       decision: "allow",
-      conditions: { handles: [primary.handle, extra.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [primary.handle, extra.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const complete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
     expect(complete.kind).toBe("reusable");
-  });
+  }, 15_000);
 
   it("matches each injected secret against its own policy environment binding", async () => {
     const store = new SecretStore();
@@ -2171,6 +2330,7 @@ describe("SecretStore", () => {
         agents: ["Codex"],
         providers: ["github"],
         commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable],
         injectEnvs: ["SGW_POLICY_CODEX_TOKEN"]
       }
     });
@@ -2396,6 +2556,7 @@ describe("SecretStore", () => {
       agents: ["codex"],
       actionKinds: ["env_command"],
       commands: [process.execPath],
+      resolvedCommands: [resolvedNodeExecutable],
       injectEnvs: ["SGW_SCOPED_POLICY"],
       workingDirs: [tmpHome]
     });
@@ -2520,6 +2681,7 @@ describe("SecretStore", () => {
         agents: ["Codex"],
         actionKinds: ["env_command"],
         commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable],
         injectEnvs: ["SGW_EXISTING_POLICY"]
       }
     });
@@ -2627,7 +2789,11 @@ describe("SecretStore", () => {
     const rule = await store.addApprovalPolicyRule({
       name: "Allow revocable policy request",
       decision: "allow",
-      conditions: { handles: [record.handle], commands: [process.execPath] }
+      conditions: {
+        handles: [record.handle],
+        commands: [process.execPath],
+        resolvedCommands: [resolvedNodeExecutable]
+      }
     });
     const action = buildEnvCommandAction({
       command: process.execPath,
@@ -2715,7 +2881,7 @@ describe("SecretStore", () => {
     expect(denied.error).toContain("Denied by approval policy");
   });
 
-  it("reuses a timed approval when the same agent changes command arguments", async () => {
+  it("requires a new approval when the same agent changes command arguments", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
       name: "codex wrapper credential",
@@ -2745,11 +2911,12 @@ describe("SecretStore", () => {
     });
 
     const next = await store.createRequest(record.handle, secondAction, "Codex wrapper follow-up");
-    expect(next.state).toBe("approved");
-    expect(next.approvalGrantId).toBe(approved.approvalGrantId);
+    expect(approved.approvalGrantId).toBeTruthy();
+    expect(next.state).toBe("pending");
+    expect(next.approvalGrantId).toBeUndefined();
   });
 
-  it("migrates old approval grants that were keyed to command arguments", async () => {
+  it("migrates argument-agnostic approval grants to the last approved arguments", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
       name: "legacy wrapper credential",
@@ -2777,22 +2944,78 @@ describe("SecretStore", () => {
       durationMs: 8 * 60 * 60 * 1000,
       agentScope: "same-agent"
     });
-    const legacyKey = legacyApprovalActionKey(record.handle, firstAction);
-
     const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    const storedFirstAction = raw.requests.find((request: { id: string }) => request.id === first.id).action as CommandAction;
+    const legacyKey = argumentAgnosticApprovalActionKey(record.handle, storedFirstAction);
     raw.approvalGrants[0].actionKey = legacyKey;
     await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
 
-    const direct = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up");
-    expect(direct.kind).toBe("reusable");
+    const matching = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat");
+    expect(matching.kind).toBe("reusable");
+
+    const changed = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up");
+    expect(changed.kind).toBe("request");
 
     const next = await store.createRequest(record.handle, secondAction, "Codex legacy wrapper follow-up");
-    expect(next.state).toBe("approved");
-    expect(next.approvalGrantId).toBe(approved.approvalGrantId);
+    expect(approved.approvalGrantId).toBeTruthy();
+    expect(next.state).toBe("pending");
+    expect(next.approvalGrantId).toBeUndefined();
 
     const grants = await store.listApprovalGrants();
     expect(grants).toHaveLength(1);
     expect(grants[0].actionKey).not.toBe(legacyKey);
+  });
+
+  it("rejects credential-backed macOS Keychain utility execution even when policy allows it", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "macOS Keychain utility token",
+      type: "password",
+      value: "keychain-utility-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_KEYCHAIN_UTILITY_TOKEN",
+        allowedCommands: ["security"]
+      }
+    });
+    const action: CommandAction = {
+      kind: "env_command",
+      command: "security",
+      resolvedCommand: "/usr/bin/security",
+      args: ["find-generic-password", "-w", "-s", "example"],
+      injectEnv: "SGW_KEYCHAIN_UTILITY_TOKEN",
+      env: [],
+      workingDir: tmpHome,
+      timeoutMs: 30_000
+    };
+
+    expect(() => assertActionAllowed(record, action)).toThrow(
+      "Credential-backed execution of /usr/bin/security is not allowed."
+    );
+  });
+
+  it("rejects the macOS Keychain utility after resolving a bare command name", async () => {
+    if (process.platform !== "darwin") return;
+
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "resolved macOS Keychain utility token",
+      type: "password",
+      value: "resolved-keychain-utility-secret-value-123456789",
+      policy: {
+        injectEnv: "SGW_RESOLVED_KEYCHAIN_TOKEN",
+        allowedCommands: ["security"]
+      }
+    });
+    const action = buildEnvCommandAction({
+      command: "security",
+      args: ["find-generic-password", "-w", "-s", "example"],
+      injectEnv: "SGW_RESOLVED_KEYCHAIN_TOKEN",
+      workingDir: tmpHome
+    });
+
+    await expect(store.createRequest(record.handle, action, "Codex resolved Keychain utility request")).rejects.toThrow(
+      "Credential-backed execution of /usr/bin/security is not allowed."
+    );
   });
 
   it("can reuse an approval across agents when explicitly scoped that way", async () => {
@@ -3154,81 +3377,97 @@ async function backdateRequest(requestId: string, agoMs: number, fields = ["upda
   await writeFile(storePath, `${JSON.stringify(store, null, 2)}\n`);
 }
 
-function legacyApprovalActionKey(handle: string, action: ReturnType<typeof buildEnvCommandAction>): string {
+function argumentAgnosticApprovalActionKey(handle: string, action: CommandAction): string {
   const command = path.isAbsolute(action.command) ? path.normalize(action.command) : action.command.trim();
   const payload = {
     handle,
     kind: action.kind,
     command,
-    args: action.args,
+    resolvedCommand: action.kind === "env_command" ? action.resolvedCommand || "" : "",
     injectEnv: action.injectEnv,
-    workingDir: action.workingDir ? path.resolve(action.workingDir) : ""
+    env: action.env || [],
+    workingDir: action.workingDir ? path.resolve(action.workingDir) : "",
+    ssh: ""
   };
 
   return createHash("sha256").update(JSON.stringify(payload)).digest("base64url");
 }
 
 async function writeFakeOp(secret: string): Promise<string> {
-  const fakeOp = path.join(tmpHome, "op");
   const reference = onePasswordFixtureRef();
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.34.0\\n'
-  exit 0
-fi
-if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
-  printf '%s' '${secret}'
-  exit 0
-fi
-printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
-exit 2
+  return writeNodeBackedFakeOp("op", `
+if (args[0] === "read" && args[1] === ${JSON.stringify(reference)}) {
+  process.stdout.write(${JSON.stringify(secret)});
+  process.exit(0);
+}
+process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+process.exit(2);
 `);
-  await chmod(fakeOp, 0o755);
-  return fakeOp;
 }
 
 async function writeCountingFakeOp(secret: string, counterPath: string): Promise<string> {
-  const fakeOp = path.join(tmpHome, `op-counting-${path.basename(counterPath)}`);
   const reference = onePasswordFixtureRef();
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.34.0\\n'
-  exit 0
-fi
-if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
-  count="$(cat '${counterPath}' 2>/dev/null || printf 0)"
-  count="$((count + 1))"
-  printf '%s' "$count" > '${counterPath}'
-  printf '%s' '${secret}'
-  exit 0
-fi
-printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
-exit 2
+  return writeNodeBackedFakeOp(`op-counting-${path.basename(counterPath)}`, `
+if (args[0] === "read" && args[1] === ${JSON.stringify(reference)}) {
+  let count = 0;
+  try { count = Number.parseInt(fs.readFileSync(${JSON.stringify(counterPath)}, "utf8"), 10) || 0; } catch {}
+  fs.writeFileSync(${JSON.stringify(counterPath)}, String(count + 1));
+  process.stdout.write(${JSON.stringify(secret)});
+  process.exit(0);
+}
+process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+process.exit(2);
 `);
-  await chmod(fakeOp, 0o755);
-  return fakeOp;
 }
 
 async function writeGatedFakeOp(secret: string, enteredPath: string, releasePath: string): Promise<string> {
-  const fakeOp = path.join(tmpHome, "op-gated");
   const reference = onePasswordFixtureRef();
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.34.0\\n'
-  exit 0
-fi
-if [ "$1" = "read" ] && [ "$2" = "${reference}" ]; then
-  : > '${enteredPath}'
-  while [ ! -f '${releasePath}' ]; do
-    sleep 0.01
-  done
-  printf '%s' '${secret}'
-  exit 0
-fi
-printf 'unexpected op call: %s %s\\n' "$1" "$2" >&2
-exit 2
+  return writeNodeBackedFakeOp("op-gated", `
+if (args[0] === "read" && args[1] === ${JSON.stringify(reference)}) {
+  fs.writeFileSync(${JSON.stringify(enteredPath)}, "entered\\n");
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  while (!fs.existsSync(${JSON.stringify(releasePath)})) {
+    Atomics.wait(sleeper, 0, 0, 10);
+  }
+  process.stdout.write(${JSON.stringify(secret)});
+  process.exit(0);
+}
+process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+process.exit(2);
 `);
+}
+
+async function writeNodeBackedFakeOp(name: string, behavior: string): Promise<string> {
+  const executableName = process.platform === "win32" ? `${name}.exe` : name;
+  const fakeOp = path.join(tmpHome, executableName);
+  const preload = path.join(tmpHome, `${name} preload.cjs`);
+  if (process.platform === "win32") {
+    await copyFile(process.execPath, fakeOp);
+  } else {
+    try {
+      await link(process.execPath, fakeOp);
+    } catch {
+      await copyFile(process.execPath, fakeOp);
+    }
+  }
   await chmod(fakeOp, 0o755);
+  await writeFile(preload, `
+const fs = require("node:fs");
+const path = require("node:path");
+const fakeExecutable = ${JSON.stringify(fakeOp)};
+const actualExecutable = fs.realpathSync.native(process.execPath);
+const expectedExecutable = fs.realpathSync.native(fakeExecutable);
+const sameExecutable = process.platform === "win32"
+  ? actualExecutable.toLowerCase() === expectedExecutable.toLowerCase()
+  : actualExecutable === expectedExecutable;
+if (sameExecutable) {
+  const args = [path.basename(process.argv[1] || ""), ...process.argv.slice(2)];
+  ${behavior}
+}
+`);
+  const preloadPath = process.platform === "win32" ? preload.replaceAll("\\", "/") : preload;
+  const preloadOption = `--require="${preloadPath.replaceAll('"', '\\"')}"`;
+  process.env.NODE_OPTIONS = [originalNodeOptions, preloadOption].filter(Boolean).join(" ");
   return fakeOp;
 }
 

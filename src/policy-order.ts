@@ -9,6 +9,7 @@ export interface PolicyConditionsLike {
   agents?: string[];
   actionKinds?: string[];
   commands?: string[];
+  resolvedCommands?: string[];
   injectEnvs?: string[];
   workingDirs?: string[];
   sshTargets?: string[];
@@ -28,7 +29,7 @@ export interface PolicyRuleLike {
 
 const arrayFields: Array<keyof Pick<
   PolicyConditionsLike,
-  "handles" | "secretTypes" | "providers" | "agents" | "actionKinds" | "commands" | "injectEnvs" | "workingDirs" | "sshTargets" | "sshPorts"
+  "handles" | "secretTypes" | "providers" | "agents" | "actionKinds" | "commands" | "resolvedCommands" | "injectEnvs" | "workingDirs" | "sshTargets" | "sshPorts"
 >> = [
   "handles",
   "secretTypes",
@@ -36,6 +37,7 @@ const arrayFields: Array<keyof Pick<
   "agents",
   "actionKinds",
   "commands",
+  "resolvedCommands",
   "injectEnvs",
   "workingDirs",
   "sshTargets",
@@ -67,6 +69,10 @@ export function compareApprovalPolicyRules<T extends PolicyRuleLike>(left: T, ri
 
 export function approvalPolicyRuleCovers<T extends PolicyRuleLike>(broader: T, narrower: T): boolean {
   if (!bindingSetCovers(broader.conditions.envBindings, narrower.conditions.envBindings)) {
+    return false;
+  }
+  if (broader.decision === "allow" && !broader.conditions.resolvedCommands?.length &&
+      narrower.conditions.resolvedCommands?.length) {
     return false;
   }
 

@@ -3,6 +3,7 @@ import Security
 
 let usage = """
 Usage:
+  sgw-keychain status --service SERVICE --account ACCOUNT
   sgw-keychain get --service SERVICE --account ACCOUNT
   sgw-keychain set --service SERVICE --account ACCOUNT [--label LABEL]
   sgw-keychain delete --service SERVICE --account ACCOUNT
@@ -72,6 +73,25 @@ func getPassphrase(service: String, account: String) {
   print(value)
 }
 
+func credentialStatus(service: String, account: String) {
+  var query = baseQuery(service: service, account: account)
+  query[kSecReturnAttributes as String] = true
+  query[kSecMatchLimit as String] = kSecMatchLimitOne
+  query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+
+  var attributes: CFTypeRef?
+  let status = SecItemCopyMatching(query as CFDictionary, &attributes)
+  if status == errSecSuccess {
+    print("{\"configured\":true}")
+    return
+  }
+  if status == errSecItemNotFound {
+    print("{\"configured\":false}")
+    return
+  }
+  check(status)
+}
+
 func setPassphrase(service: String, account: String) {
   let data = FileHandle.standardInput.readDataToEndOfFile()
   guard !data.isEmpty else {
@@ -112,6 +132,8 @@ let service = requireOption("--service")
 let account = requireOption("--account")
 
 switch command {
+case "status":
+  credentialStatus(service: service, account: account)
 case "get":
   getPassphrase(service: service, account: account)
 case "set":

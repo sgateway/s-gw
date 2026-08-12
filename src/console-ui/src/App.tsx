@@ -1704,6 +1704,7 @@ function PolicyDetailPanel({
           ["Agents", policyDetailValue(conditions.agents)],
           ["Credentials", bindings.length > 0 ? bindings.join(", ") : policyDetailValue(conditions.handles, (handle) => state.handles.find((item) => item.handle === handle)?.name || shortHandle(handle))],
           ["Action", policyDetailValue([...(conditions.actionKinds || []), ...(conditions.commands || [])])],
+          ["Executables", policyDetailValue(conditions.resolvedCommands)],
           ["Scope", policyDetailValue([...(conditions.providers || []), ...(conditions.secretTypes || []), conditions.minSeverity ? `${conditions.minSeverity} and above` : ""])],
           ["Environment", policyDetailValue([...(conditions.injectEnvs || []), ...(conditions.workingDirs || [])])],
           ["SSH", policyDetailValue([...(conditions.sshTargets || []), ...(conditions.sshPorts || []).map(String)])],
@@ -3051,6 +3052,9 @@ function ApprovalSheet({
                 )],
                 ["Action", commandName(request)],
                 ["Target", requestTarget(request)],
+                ["Executable", request.action.kind === "env_command"
+                  ? request.action.resolvedCommand || "Not pinned (legacy request)"
+                  : "-"],
                 ["Authentication", handle?.name || request.handle],
                 ["Handle", shortHandle(request.handle)],
                 ["Working dir", request.action.workingDir || "-"],
@@ -3277,6 +3281,7 @@ type PolicyOptionSources = {
   handles: MultiSelectOption[];
   providers: MultiSelectOption[];
   commands: MultiSelectOption[];
+  resolvedCommands: MultiSelectOption[];
   injectEnvs: MultiSelectOption[];
   workingDirs: MultiSelectOption[];
   sshTargets: MultiSelectOption[];
@@ -3294,6 +3299,7 @@ type PolicyFormState = {
   minSeverity: string;
   actionKinds: string[];
   commands: string[];
+  resolvedCommands: string[];
   injectEnvs: string[];
   workingDirs: string[];
   sshTargets: string[];
@@ -3309,7 +3315,11 @@ function buildPolicyOptionSources(state: ConsoleState): PolicyOptionSources {
   for (const handle of state.handles) if (handle.provider) providers.add(handle.provider);
 
   const commands = new Set<string>();
-  for (const request of state.requests) commands.add(request.action.command);
+  const resolvedCommands = new Set<string>();
+  for (const request of state.requests) {
+    commands.add(request.action.command);
+    if (request.action.resolvedCommand) resolvedCommands.add(request.action.resolvedCommand);
+  }
   for (const handle of state.handles) for (const command of handle.policy.allowedCommands) commands.add(command);
 
   const injectEnvs = new Set<string>();
@@ -3333,6 +3343,7 @@ function buildPolicyOptionSources(state: ConsoleState): PolicyOptionSources {
       .sort((left, right) => (left.label || left.value).localeCompare(right.label || right.value)),
     providers: sortedPolicyOptions(providers),
     commands: sortedPolicyOptions(commands),
+    resolvedCommands: sortedPolicyOptions(resolvedCommands),
     injectEnvs: sortedPolicyOptions(injectEnvs),
     workingDirs: sortedPolicyOptions(workingDirs),
     sshTargets: sortedPolicyOptions(sshTargets),
@@ -3358,6 +3369,7 @@ function emptyPolicyForm(): PolicyFormState {
     minSeverity: "",
     actionKinds: [],
     commands: [],
+    resolvedCommands: [],
     injectEnvs: [],
     workingDirs: [],
     sshTargets: [],
@@ -3378,6 +3390,7 @@ function policyFormFromRule(rule: ApprovalPolicyRuleRecord): PolicyFormState {
     minSeverity: conditions.minSeverity || "",
     actionKinds: conditions.actionKinds || [],
     commands: conditions.commands || [],
+    resolvedCommands: conditions.resolvedCommands || [],
     injectEnvs: conditions.injectEnvs || [],
     workingDirs: conditions.workingDirs || [],
     sshTargets: conditions.sshTargets || [],
@@ -3398,6 +3411,7 @@ function policyFormToInput(form: PolicyFormState, enabled: boolean, bindingsLock
     minSeverity: form.minSeverity ? form.minSeverity as SecretSeverity : null,
     actionKinds: form.actionKinds,
     commands: form.commands,
+    resolvedCommands: form.resolvedCommands,
     workingDirs: form.workingDirs,
     sshTargets: form.sshTargets,
     sshPorts: form.sshPorts.map((port) => Number(port))
@@ -3546,6 +3560,9 @@ function PolicyFormFields({
       </PolicyField>
       <PolicyField label="Commands">
         <MultiSelectField values={form.commands} onChange={(value) => update("commands", value)} options={sources.commands} aria-label="Policy commands" />
+      </PolicyField>
+      <PolicyField label="Resolved executables" hint="Allow rules use exact executable paths; old unpinned allow rules do not authorize command execution.">
+        <MultiSelectField values={form.resolvedCommands} onChange={(value) => update("resolvedCommands", value)} options={sources.resolvedCommands} aria-label="Policy resolved executables" />
       </PolicyField>
       <PolicyField label="Action kinds">
         <MultiSelectField values={form.actionKinds} onChange={(value) => update("actionKinds", value)} options={policyActionKindOptions} allowCustom={false} aria-label="Policy action kinds" />

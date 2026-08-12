@@ -1,14 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { decryptSecret, encryptSecret, fingerprintSecret, shortId } from "./crypto.js";
 import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
+import { isAbsoluteCommand, resolveCommandExecutable, verifyPinnedCommand } from "./command-path.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
 import { arrangeApprovalPolicyRules as arrangePolicyRules, compareApprovalPolicyRules } from "./policy-order.js";
 import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, sshSessionIdentity } from "./ssh.js";
-import { ensureSgwHome, getSgwHome, getSgwRecoveryHome, getStorePath } from "./paths.js";
+import { ensureSgwHome, getSgwHome, getSgwLoginSessionId, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
   defaultSecretKeychainService,
   deleteMacKeychainItem,
@@ -48,8 +48,12 @@ const defaultApprovalSettings: ApprovalSettings = {
 };
 
 const maxApprovalDurationMs = 30 * 24 * 60 * 60 * 1000;
+const macosSecurityCli = "/usr/bin/security";
 // Concurrent clients may need to serialize a durable control-plane write on a slow disk.
 const lockTimeoutMs = 30_000;
+const windowsLockRenameAttempts = 20;
+const windowsLockRenameDelayMs = 10;
+const emptyStoreLockStaleMs = 1_000;
 
 // A request gets claimed into "executing" right before its secret is revealed. If the
 // runner is killed, sleeps, or crashes before markExecuted/markFailed, that request is
@@ -71,6 +75,7 @@ const approvalPolicyConditionFields: Array<keyof ApprovalPolicyConditions> = [
   "agents",
   "actionKinds",
   "commands",
+  "resolvedCommands",
   "injectEnvs",
   "workingDirs",
   "sshTargets",
@@ -273,6 +278,8 @@ interface StoreLockState {
 interface StoreLockInspection {
   state?: StoreLockState;
   markerPath?: string;
+  empty?: boolean;
+  modifiedAtMs?: number;
 }
 
 interface SealedControlPlaneCheckpoint extends RecoveryCandidate {
@@ -622,17 +629,17 @@ export class SecretStore {
   }
 
   async deleteSecret(handle: string): Promise<DeleteSecretResult> {
-    let keychainRef: MacKeychainItemRef | undefined;
-    const result = await this.mutate((store) => {
+    return this.mutate((store) => {
       const index = store.secrets.findIndex((secret) => secret.handle === handle);
       if (index < 0) {
         throw new Error(`Unknown secret handle: ${handle}`);
       }
 
-      const [deleted] = store.secrets.splice(index, 1);
+      const deleted = store.secrets[index];
       if (deleted.backend === "keychain") {
-        keychainRef = keychainRefFromRecord(deleted);
+        deleteMacKeychainItem(keychainRefFromRecord(deleted));
       }
+      store.secrets.splice(index, 1);
 
       const beforeGrants = store.approvalGrants.length;
       const beforePolicies = (store.approvalPolicyRules || []).length;
@@ -676,12 +683,6 @@ export class SecretStore {
         failedRequests
       };
     });
-
-    if (keychainRef) {
-      deleteMacKeychainItem(keychainRef);
-    }
-
-    return result;
   }
 
   async getApprovalSettings(): Promise<ApprovalSettings> {
@@ -1031,6 +1032,25 @@ export class SecretStore {
         throw new Error(`Request ${id} is ${request.state}; local approval is required before execution.`);
       }
 
+      let upgradedLegacyAbsolute = false;
+      try {
+        upgradedLegacyAbsolute = request.action.kind === "env_command" &&
+          !request.action.resolvedCommand && isAbsoluteCommand(request.action.command);
+        request.action = actionReadyForExecution(request.action, true);
+        const secret = store.secrets.find((item) => item.handle === request.handle);
+        if (!secret) throw new Error(`Unknown secret handle: ${request.handle}`);
+        assertActionAllowed(secret, request.action);
+        assertBoundHandlesAllowed(store, request.handle, request.action);
+        if (upgradedLegacyAbsolute) migrateRequestGrantToPinnedAction(store, request);
+      } catch (error) {
+        const executionError = errorMessage(error);
+        request.state = "failed";
+        request.updatedAt = now;
+        request.error = executionError;
+        store.audit.push(audit("request.failed", `Request ${id} failed: ${executionError}`, request.handle, id));
+        return { request, error: executionError };
+      }
+
       const authorizationError = automaticRequestAuthorizationError(store, request, now);
       if (authorizationError) {
         request.state = "denied";
@@ -1038,7 +1058,7 @@ export class SecretStore {
         request.updatedAt = now;
         request.error = authorizationError;
         store.audit.push(audit("request.authorization_revoked", authorizationError, request.handle, id));
-        return { request, authorizationError };
+        return { request, error: authorizationError };
       }
 
       request.state = "executing";
@@ -1047,8 +1067,8 @@ export class SecretStore {
       return { request };
     });
 
-    if (claimed.authorizationError) {
-      throw new Error(claimed.authorizationError);
+    if (claimed.error) {
+      throw new Error(claimed.error);
     }
     return claimed.request;
   }
@@ -2493,7 +2513,8 @@ function keychainSecretLabel(name: string): string {
 }
 
 function credentialStoreProvider(): string {
-  return process.platform === "win32" ? "windows-credential-manager" : "macos-keychain";
+  if (process.platform === "win32") return "windows-credential-manager";
+  return process.platform === "linux" ? "linux-secret-service" : "macos-keychain";
 }
 
 function normalizeApprovalSettings(input?: Partial<ApprovalSettings>): ApprovalSettings {
@@ -2628,13 +2649,13 @@ function activeApprovalGrant(
   handle: string,
   action: CommandAction,
   agentName: string,
-  nowIso: string
+  nowIso: string,
+  loginSessionId = currentLoginSessionId()
 ): ApprovalGrant | undefined {
   const settings = normalizeApprovalSettings(store.approvalSettings);
   store.approvalSettings = settings;
 
   const actionKey = approvalActionKey(handle, action);
-  const loginSessionId = currentLoginSessionId();
   return store.approvalGrants.find((grant) => {
     if (grant.handle !== handle || grant.actionKey !== actionKey) {
       return false;
@@ -2664,7 +2685,16 @@ function createApprovalGrant(
 
   pruneExpiredApprovalGrants(store, nowIso);
 
-  const loginSessionId = currentLoginSessionId();
+  const loginSessionId = mode === "always" ? "" : request.loginSessionId;
+  if (!loginSessionId && mode !== "always") {
+    store.audit.push(audit(
+      "approval.grant.skipped",
+      `Approved legacy request ${request.id} once because it has no requester login-session identity.`,
+      request.handle,
+      request.id
+    ));
+    return undefined;
+  }
   const actionKey = approvalActionKey(request.handle, request.action);
   const durationMs = clampApprovalDuration(options.durationMs ?? settings.durationMs);
   const expiresAt = mode === "timed-session"
@@ -2698,7 +2728,7 @@ function createApprovalGrant(
     mode,
     agentScope,
     agentName: agentScope === "same-agent" ? agentName : undefined,
-    loginSessionId,
+    loginSessionId: loginSessionId || "",
     createdAt: nowIso,
     updatedAt: nowIso,
     expiresAt,
@@ -2718,6 +2748,7 @@ interface ExecutionAdmissionContext {
   secret: SecretRecord;
   action: CommandAction;
   agent: AgentIdentity;
+  loginSessionId?: string;
   now: string;
   policyRule?: ApprovalPolicyRule;
   grant?: ApprovalGrant;
@@ -2739,14 +2770,27 @@ function createRequestInStore(
   const allowedByPolicy = policyRule?.decision === "allow";
 
   if (options.coalesce && deniedByPolicy && policyRule) {
-    const existing = matchingDeniedRequest(store, handle, admission.action, agent.name, policyRule.id);
+    const existing = matchingDeniedRequest(
+      store,
+      handle,
+      admission.action,
+      agent.name,
+      admission.loginSessionId,
+      policyRule.id
+    );
     if (existing) {
       return existing;
     }
   }
 
   if (options.coalesce && !deniedByPolicy && !allowedByPolicy && !grant) {
-    const existing = matchingPendingRequest(store, handle, admission.action, agent.name);
+    const existing = matchingPendingRequest(
+      store,
+      handle,
+      admission.action,
+      agent.name,
+      admission.loginSessionId
+    );
     if (existing) {
       return existing;
     }
@@ -2758,6 +2802,7 @@ function createRequestInStore(
     reason: reason || "No reason supplied.",
     agentName: agent.name,
     agentSource: agent.source,
+    loginSessionId: admission.loginSessionId,
     action: admission.action,
     state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
     createdAt: now,
@@ -2851,11 +2896,14 @@ function executionAdmissionContext(
 
   const normalizedAction = normalizeAction(action);
   const agent = requestAgentIdentity(reason, agentContext);
+  const loginSessionId = currentLoginSessionId();
   assertActionAllowed(secret, normalizedAction);
   assertBoundHandlesAllowed(store, handle, normalizedAction);
-  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, normalizedAction, agent.name, now);
-  const grant = activeApprovalGrant(store, handle, normalizedAction, agent.name, now);
-  return { secret, action: normalizedAction, agent, now, policyRule, grant };
+  const admittedAction = actionForAdmission(normalizedAction);
+  assertCredentialBackedExecutableAllowed(admittedAction);
+  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, admittedAction, agent.name, now);
+  const grant = activeApprovalGrant(store, handle, admittedAction, agent.name, now, loginSessionId);
+  return { secret, action: admittedAction, agent, loginSessionId, now, policyRule, grant };
 }
 
 function automaticRequestAuthorizationError(
@@ -2899,7 +2947,7 @@ function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExe
     throw new Error(`Unknown secret handle: ${permit.handle}`);
   }
 
-  const action = normalizeAction(permit.action);
+  const action = actionReadyForExecution(permit.action);
   assertActionAllowed(secret, action);
   assertBoundHandlesAllowed(store, permit.handle, action);
 
@@ -2982,9 +3030,10 @@ function matchingPendingRequest(
   store: StoreFile,
   handle: string,
   action: CommandAction,
-  agentName: string
+  agentName: string,
+  loginSessionId?: string
 ): RequestRecord | undefined {
-  const key = requestDuplicateKeyFor(handle, action, agentName);
+  const key = requestDuplicateKeyFor(handle, action, agentName, loginSessionId);
   for (let index = store.requests.length - 1; index >= 0; index -= 1) {
     const request = store.requests[index];
     if (request.state === "pending" && requestDuplicateKey(request) === key) {
@@ -2999,9 +3048,10 @@ function matchingDeniedRequest(
   handle: string,
   action: CommandAction,
   agentName: string,
+  loginSessionId: string | undefined,
   policyRuleId: string
 ): RequestRecord | undefined {
-  const key = requestDuplicateKeyFor(handle, action, agentName);
+  const key = requestDuplicateKeyFor(handle, action, agentName, loginSessionId);
   for (let index = store.requests.length - 1; index >= 0; index -= 1) {
     const request = store.requests[index];
     if (
@@ -3019,15 +3069,22 @@ function requestDuplicateKey(request: RequestRecord): string {
   return requestDuplicateKeyFor(
     request.handle,
     request.action,
-    request.agentName || requestAgentName(request.reason)
+    request.agentName || requestAgentName(request.reason),
+    request.loginSessionId || ""
   );
 }
 
-function requestDuplicateKeyFor(handle: string, action: CommandAction, agentName: string): string {
+function requestDuplicateKeyFor(
+  handle: string,
+  action: CommandAction,
+  agentName: string,
+  loginSessionId?: string
+): string {
   return JSON.stringify({
     handle,
     actionKey: approvalActionKey(handle, action),
-    agentName
+    agentName,
+    loginSessionId: loginSessionId || ""
   });
 }
 
@@ -3299,6 +3356,8 @@ function approvalActionKey(handle: string, action: CommandAction): string {
     handle,
     kind: normalized.kind,
     command: normalizeCommandGrant(normalized.command),
+    resolvedCommand: normalized.kind === "env_command" ? normalized.resolvedCommand || "" : "",
+    ...(normalized.kind === "env_command" ? { args: normalized.args } : {}),
     injectEnv: normalized.injectEnv,
     env: normalized.env || [],
     workingDir: normalized.workingDir ? path.resolve(normalized.workingDir) : "",
@@ -3442,6 +3501,18 @@ function approvalPolicyMatches(
       return false;
     }
   }
+  if (action.kind === "env_command") {
+    const resolved = action.resolvedCommand;
+    if (rule.decision === "allow" && !conditions.resolvedCommands?.length) {
+      return false;
+    }
+    if (conditions.resolvedCommands?.length &&
+        (!resolved || !conditions.resolvedCommands.some((candidate) => samePolicyExecutable(candidate, resolved)))) {
+      return false;
+    }
+  } else if (conditions.resolvedCommands?.length) {
+    return false;
+  }
   if (conditions.injectEnvs?.length) {
     if (!conditions.injectEnvs.includes(action.injectEnv)) {
       return false;
@@ -3577,6 +3648,9 @@ function durablePolicyAgentName(request: RequestRecord): string {
 
 function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddApprovalPolicyRuleInput {
   const action = request.action;
+  if (action.kind === "env_command" && !action.resolvedCommand) {
+    throw new Error("This legacy request has no pinned executable. Create a new request before creating an allow policy.");
+  }
   const bindings = policyEnvBindingsForAction(request.handle, action);
   const handles = uniqueStrings(bindings.map((binding) => binding.handle));
   const injectEnvs = uniqueStrings(bindings.map((binding) => binding.injectEnv));
@@ -3593,6 +3667,7 @@ function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddAppro
       agents: [agent],
       actionKinds: [action.kind],
       commands: [action.command],
+      resolvedCommands: action.kind === "env_command" ? [action.resolvedCommand!] : [],
       injectEnvs,
       workingDirs: action.workingDir ? [action.workingDir] : [],
       sshTargets: action.ssh?.target ? [action.ssh.target] : [],
@@ -3630,6 +3705,7 @@ function normalizeApprovalPolicyConditions(
   const secretTypes = policyStringValues(input?.secretTypes, "secretTypes", strict);
   const actionKinds = policyStringValues(input?.actionKinds, "actionKinds", strict);
   const commands = policyStringValues(input?.commands, "commands", strict);
+  const resolvedCommands = policyStringValues(input?.resolvedCommands, "resolvedCommands", strict);
   const minSeverity = normalizePolicySeverity(input?.minSeverity, strict);
 
   return {
@@ -3643,6 +3719,9 @@ function normalizeApprovalPolicyConditions(
     commands: strict
       ? commands.map((command) => normalizeCommandGrant(command))
       : commands.map((command) => safeNormalizeCommandGrant(command)).filter(Boolean) as string[],
+    resolvedCommands: strict
+      ? resolvedCommands.map(normalizeResolvedPolicyCommand)
+      : resolvedCommands.map(safeNormalizeResolvedPolicyCommand).filter(Boolean) as string[],
     injectEnvs: policyStringValues(input?.injectEnvs, "injectEnvs", strict),
     workingDirs: policyStringValues(input?.workingDirs, "workingDirs", strict).map((dir) => path.resolve(dir)),
     sshTargets: policyStringValues(input?.sshTargets, "sshTargets", strict).map((target) => normalizeSshTarget(target)),
@@ -3840,6 +3919,30 @@ function safeNormalizeCommandGrant(command: string): string | undefined {
   }
 }
 
+function normalizeResolvedPolicyCommand(command: string): string {
+  const normalized = normalizeCommandGrant(command);
+  if (!path.isAbsolute(normalized) || /[\r\n]/.test(normalized)) {
+    throw new Error(`Resolved command policy paths must be absolute executable paths: ${command}`);
+  }
+  return path.normalize(normalized);
+}
+
+function safeNormalizeResolvedPolicyCommand(command: string): string | undefined {
+  try {
+    return normalizeResolvedPolicyCommand(command);
+  } catch {
+    return undefined;
+  }
+}
+
+function samePolicyExecutable(left: string, right: string): boolean {
+  const normalizedLeft = path.normalize(left);
+  const normalizedRight = path.normalize(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
 function isValidApprovalPolicyRule(rule: ApprovalPolicyRule): boolean {
   return (
     Boolean(rule) &&
@@ -4009,22 +4112,8 @@ function severityRank(value: SecretSeverity): number {
   }
 }
 
-function currentLoginSessionId(): string {
-  const override = process.env.SGW_LOGIN_SESSION_ID?.trim();
-  if (override) {
-    return override.slice(0, 160);
-  }
-
-  const user = os.userInfo();
-  const parts = [
-    process.platform,
-    String(user.uid),
-    user.username,
-    process.env.TMPDIR || "",
-    process.env.XDG_RUNTIME_DIR || "",
-    process.env.SSH_AUTH_SOCK || ""
-  ];
-  return createHash("sha256").update(parts.join("\0")).digest("base64url").slice(0, 32);
+function currentLoginSessionId(): string | undefined {
+  return getSgwLoginSessionId();
 }
 
 function normalizePolicy(input?: Partial<SecretPolicy>, existing?: SecretPolicy): SecretPolicy {
@@ -4061,12 +4150,48 @@ function normalizeAction(action: CommandAction): CommandAction {
   return {
     kind,
     command: action.command,
+    resolvedCommand: action.resolvedCommand,
     args: Array.isArray(action.args) ? action.args : [],
     injectEnv: action.injectEnv,
     env: normalizeEnvBindings(action.env),
     workingDir: action.workingDir,
     timeoutMs: clampTimeout(action.timeoutMs)
   };
+}
+
+function actionForAdmission(action: CommandAction): CommandAction {
+  if (action.kind !== "env_command") return action;
+  return {
+    ...action,
+    resolvedCommand: resolveCommandExecutable(action.command)
+  };
+}
+
+function actionReadyForExecution(action: CommandAction, allowLegacyAbsolute = false): CommandAction {
+  const normalized = normalizeAction(action);
+  if (normalized.kind !== "env_command") return normalized;
+
+  if (!normalized.resolvedCommand) {
+    if (!allowLegacyAbsolute || !isAbsoluteCommand(normalized.command)) {
+      verifyPinnedCommand(normalized.command, undefined);
+    }
+    return {
+      ...normalized,
+      resolvedCommand: resolveCommandExecutable(normalized.command)
+    };
+  }
+
+  return {
+    ...normalized,
+    resolvedCommand: verifyPinnedCommand(normalized.command, normalized.resolvedCommand)
+  };
+}
+
+function migrateRequestGrantToPinnedAction(store: StoreFile, request: RequestRecord): void {
+  if (!request.approvalGrantId) return;
+  const grant = store.approvalGrants.find((item) => item.id === request.approvalGrantId);
+  if (!grant || grant.handle !== request.handle) return;
+  grant.actionKey = approvalActionKey(request.handle, request.action);
 }
 
 function normalizeEnvBindings(bindings?: CommandEnvBinding[]): CommandEnvBinding[] {
@@ -4142,6 +4267,8 @@ export function assertActionAllowed(secret: SecretRecord, action: CommandAction)
     }
   }
 
+  assertCredentialBackedExecutableAllowed(action);
+
   if (!action.injectEnv) {
     throw new Error("injectEnv is required so the secret has a narrow local binding.");
   }
@@ -4167,6 +4294,12 @@ export function assertActionAllowed(secret: SecretRecord, action: CommandAction)
   const requestedCommand = normalizeCommandGrant(action.command);
   if (allowed.length === 0 || !allowed.includes(requestedCommand)) {
     throw new Error(`Command '${action.command}' is not allowed for handle ${secret.handle}.`);
+  }
+}
+
+function assertCredentialBackedExecutableAllowed(action: CommandAction): void {
+  if (action.kind === "env_command" && action.resolvedCommand === macosSecurityCli) {
+    throw new Error("Credential-backed execution of /usr/bin/security is not allowed.");
   }
 }
 
@@ -4274,20 +4407,16 @@ function storeLockTimeoutMs(): number {
 
 async function removeAbandonedStoreLock(lockPath: string): Promise<void> {
   const inspection = await inspectStoreLock(lockPath);
+  if (inspection?.empty) {
+    if (Date.now() - (inspection.modifiedAtMs || 0) >= emptyStoreLockStaleMs) {
+      await removeEmptyStoreLock(lockPath);
+    }
+    return;
+  }
   if (!inspection?.state || !inspection.markerPath || !processIsDefinitelyDead(inspection.state.pid)) {
     return;
   }
-
-  const removed = await unlink(inspection.markerPath).then(
-    () => true,
-    (error) => {
-      if (isNodeError(error) && error.code === "ENOENT") return false;
-      throw error;
-    }
-  );
-  if (removed) {
-    await rmdir(lockPath).catch(() => undefined);
-  }
+  await retireStoreLock(lockPath, inspection.state.token);
 }
 
 async function assertStoreLockOwnership(lockPath: string, token: string): Promise<void> {
@@ -4302,16 +4431,48 @@ async function releaseStoreLock(lockPath: string, token: string): Promise<void> 
   if (!inspection?.state || !inspection.markerPath || inspection.state.token !== token) {
     return;
   }
+  const claimed = await removeStoreLockMarker(inspection.markerPath);
+  if (!claimed) return;
+  await removeEmptyStoreLock(lockPath).catch(() => false);
+}
 
-  const removed = await unlink(inspection.markerPath).then(
-    () => true,
-    (error) => {
+async function retireStoreLock(lockPath: string, token: string): Promise<void> {
+  const markerPath = path.join(lockPath, storeLockMarkerName(token));
+  const claimed = await removeStoreLockMarker(markerPath);
+  if (!claimed) return;
+  await removeEmptyStoreLock(lockPath);
+}
+
+async function removeStoreLockMarker(markerPath: string): Promise<boolean> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await unlink(markerPath);
+      return true;
+    } catch (error) {
       if (isNodeError(error) && error.code === "ENOENT") return false;
-      throw error;
+      if (!shouldRetryWindowsLockOperation(error) || attempt + 1 >= windowsLockRenameAttempts) {
+        throw error;
+      }
+      await sleep(windowsLockRenameDelayMs);
     }
-  );
-  if (removed) {
-    await rmdir(lockPath).catch(() => undefined);
+  }
+}
+
+async function removeEmptyStoreLock(lockPath: string): Promise<boolean> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rmdir(lockPath);
+      await syncDirectory(path.dirname(lockPath));
+      return true;
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return false;
+      if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+      if (!shouldRetryWindowsLockOperation(error)) {
+        throw error;
+      }
+      if (attempt + 1 >= windowsLockRenameAttempts) return false;
+      await sleep(windowsLockRenameDelayMs);
+    }
   }
 }
 
@@ -4334,17 +4495,11 @@ async function publishStoreLock(lockPath: string, state: StoreLockState): Promis
     marker = undefined;
     await syncDirectory(tempPath);
 
-    try {
-      await rename(tempPath, lockPath);
-      await syncDirectory(path.dirname(lockPath));
-      published = true;
-      return true;
-    } catch (error) {
-      if (await isStoreLockExistsError(error, lockPath)) {
-        return false;
-      }
-      throw error;
-    }
+    const acquired = await publishPreparedStoreLock(tempPath, lockPath);
+    if (!acquired) return false;
+    await syncDirectory(path.dirname(lockPath));
+    published = true;
+    return true;
   } finally {
     await marker?.close().catch(() => undefined);
     if (!published) {
@@ -4353,7 +4508,34 @@ async function publishStoreLock(lockPath: string, state: StoreLockState): Promis
   }
 }
 
+async function publishPreparedStoreLock(tempPath: string, lockPath: string): Promise<boolean> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(tempPath, lockPath);
+      return true;
+    } catch (error) {
+      if (await isStoreLockExistsError(error, lockPath)) return false;
+      if (!shouldRetryWindowsLockOperation(error) || attempt + 1 >= windowsLockRenameAttempts) {
+        throw error;
+      }
+      await sleep(windowsLockRenameDelayMs);
+    }
+  }
+}
+
 async function inspectStoreLock(lockPath: string): Promise<StoreLockInspection | undefined> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await inspectStoreLockOnce(lockPath);
+    } catch (error) {
+      if (!shouldRetryWindowsLockOperation(error)) throw error;
+      if (attempt + 1 >= windowsLockRenameAttempts) return {};
+      await sleep(windowsLockRenameDelayMs);
+    }
+  }
+}
+
+async function inspectStoreLockOnce(lockPath: string): Promise<StoreLockInspection | undefined> {
   let lockInfo: Awaited<ReturnType<typeof lstat>>;
   try {
     lockInfo = await lstat(lockPath);
@@ -4376,6 +4558,9 @@ async function inspectStoreLock(lockPath: string): Promise<StoreLockInspection |
       return undefined;
     }
     throw error;
+  }
+  if (entries.length === 0) {
+    return { empty: true, modifiedAtMs: lockInfo.mtimeMs };
   }
   if (entries.length !== 1) {
     return {};
@@ -4438,8 +4623,13 @@ function storeLockMarkerName(token: string): string {
 async function isStoreLockExistsError(error: unknown, lockPath: string): Promise<boolean> {
   if (!isNodeError(error)) return false;
   if (error.code === "EEXIST" || error.code === "ENOTEMPTY") return true;
-  if (error.code !== "EPERM" && error.code !== "EACCES") return false;
+  if (error.code !== "EPERM" && error.code !== "EACCES" && error.code !== "EBUSY") return false;
   return fileExists(lockPath);
+}
+
+function shouldRetryWindowsLockOperation(error: unknown): boolean {
+  return process.platform === "win32" && isNodeError(error)
+    && (error.code === "EPERM" || error.code === "EACCES" || error.code === "EBUSY");
 }
 
 function processIsDefinitelyDead(pid: number): boolean {

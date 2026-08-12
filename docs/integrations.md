@@ -2,7 +2,7 @@
 
 s-gw is intended to run locally. Coding tools should launch the local stdio MCP server instead of calling a remote service that would need to trust or store credentials.
 
-s-gw's preferred desktop backend is the local OS credential store: macOS Keychain on macOS and Windows Credential Manager on Windows preview builds. Add handles with `s-gw secret add-keychain`; reusable approval reads the credential only inside approved local execution. See [keychain.md](keychain.md).
+s-gw's preferred desktop backend is the local OS credential store: macOS Keychain, Linux Secret Service, or Windows Credential Manager. Add handles with `s-gw secret add-keychain`; reusable approval reads the credential only inside approved local execution. See [keychain.md](keychain.md).
 
 s-gw can also use 1Password as an optional source/backend for handles. Store an encrypted `op://...` reference with `s-gw secret add-1password`; reusable approval reads the local `op` CLI once, then uses s-gw's encrypted keystore copy until the approval expires or is revoked. See [onepassword.md](onepassword.md).
 
@@ -40,7 +40,7 @@ unset SGW_UNLOCK
 s-gw unlock status
 ```
 
-For automation, `SGW_MASTER_PASSPHRASE` still works as a fallback. Keep real passphrases in a local user environment or OS credential store, not in project-scoped MCP files. On Apple Silicon Macs, the normal path uses the bundled native helper at `dist/native/darwin-arm64/s-gw-keychain-helper`; on Windows preview builds it uses `dist\windows\s-gw-credential.ps1`. Both helpers receive new passphrases on stdin.
+For controlled automation, `SGW_MASTER_PASSPHRASE` still works as a non-persistent fallback. Keep real passphrases in an approved runtime environment or OS credential store, not in project-scoped MCP files or systemd units. On Apple Silicon Macs, the normal path uses the bundled native helper at `dist/native/darwin-arm64/s-gw-keychain-helper`; Linux uses the trusted system `secret-tool`; Windows preview builds use `dist\windows\s-gw-credential.ps1`. New passphrases are sent on stdin.
 
 ## Guarded Launch
 
@@ -189,7 +189,11 @@ Only after approval may the agent call `sgw_execute_request`. The executor injec
 }
 ```
 
-For SSH, use `sgw_request_ssh_session` rather than asking the agent to run raw `ssh`. s-gw opens the approved connection through its own persistent ControlMaster socket, then runs later commands over that socket with `BatchMode=yes` while the approval grant is still valid. The matching CLI flow is:
+For SSH, use `sgw_request_ssh_session` rather than asking the agent to run raw `ssh`. On macOS and Linux, s-gw opens the approved connection through its own persistent ControlMaster socket, then runs later commands over that socket with `BatchMode=yes` while the approval grant is still valid. On Windows, OpenSSH multiplexing is unavailable, so each approved action runs as a separate `ssh.exe` process. Windows SSH accepts only `ssh-key` and `private-key` handles; password and keyboard-interactive handles fail before s-gw resolves their values. The private key is written inside a fresh directory whose Windows ACL is applied and verified for the current user and SYSTEM, then removed after success, failure, or timeout. The Windows command ignores SSH config files and disables forwarding, agents, local commands, and non-key authentication.
+
+Both paths currently use `StrictHostKeyChecking=accept-new`. This is trust on first use: verify a new host fingerprint through a separate trusted channel before relying on the saved host key.
+
+The matching CLI flow is:
 
 ```bash
 s-gw secret allow-command "$HANDLE" --command s-gw:ssh-session

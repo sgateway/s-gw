@@ -178,6 +178,49 @@ describe("agent profiles", () => {
     expect(JSON.parse(planned).mcpSnippet).toBeNull();
   });
 
+  it("projects only validated authority values into manual MCP snippets", () => {
+    const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const baseEnv = cliEnv();
+    const out = execFileSync(process.execPath, [
+      tsxCli,
+      "src/cli.ts",
+      "agent",
+      "mcp-snippet",
+      "claude-code",
+      "--env",
+      "EXPLICIT_SNIPPET_VALUE=kept"
+    ], {
+      cwd: process.cwd(),
+      env: {
+        ...baseEnv,
+        SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+        SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+        SGW_SECRET_BACKEND: " KEYCHAIN ",
+        SGW_EXECUTION_ENGINE: " TypeScript ",
+        SGW_MASTER_PASSPHRASE: "must-not-be-written",
+        AWS_SECRET_ACCESS_KEY: "must-not-be-written"
+      },
+      encoding: "utf8"
+    });
+
+    const server = JSON.parse(out).mcpServers["s-gw"];
+    expect(server.env).toEqual({
+      SGW_HOME: path.resolve(baseEnv.SGW_HOME!),
+      SGW_AGENT_NAME: "Claude Code",
+      EXPLICIT_SNIPPET_VALUE: "kept",
+      SGW_RECOVERY_HOME: path.resolve(baseEnv.SGW_RECOVERY_HOME!),
+      SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+      SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+      SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+      SGW_SECRET_BACKEND: "keychain",
+      SGW_EXECUTION_ENGINE: "typescript"
+    });
+    expect(out).not.toContain("SGW_MASTER_PASSPHRASE");
+    expect(out).not.toContain("AWS_SECRET_ACCESS_KEY");
+    expect(out).not.toContain("must-not-be-written");
+  });
+
   it("exposes CodeGuard hardening plans through the CLI", () => {
     const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
     const codex = execFileSync(process.execPath, [tsxCli, "src/cli.ts", "agent", "codeguard-plan", "codex"], {

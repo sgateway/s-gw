@@ -145,6 +145,17 @@ describe("menu-bar helper approval surface contract", () => {
     expect(source).not.toContain("popoverNeedsRefreshOnClose");
   });
 
+  it("keeps approval polling fast without probing runtime status every cycle", () => {
+    const source = helperSource();
+
+    expect(source).toContain("Timer.scheduledTimer(withTimeInterval: 4");
+    expect(source).toContain("let requests = readRequests()");
+    expect(source).toContain("HelperStatusRefreshSchedule");
+    expect(source).toContain("static let fallbackInterval: TimeInterval = 5 * 60");
+    expect(source).toContain("refreshState(includeRuntimeStatus: true)");
+    expect(source).not.toContain("readUnlockSource()");
+  });
+
   it("routes deep helper actions into the native app", () => {
     const source = helperSource();
 

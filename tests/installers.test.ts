@@ -38,7 +38,18 @@ describe("platform installers", () => {
     expect(builder).toContain('const packageFile = `s-gw-${version}.tgz`');
     expect(builder).toContain("SHA256SUMS.txt");
     expect(inspectorSource).toContain("validateTrustedApplication");
+    expect(inspectorSource).toContain('case "exists"');
+    const existsFunction = inspectorSource.match(/func keychainItemExists[\s\S]*?\n}/)?.[0] || "";
+    expect(existsFunction).toContain("kSecReturnAttributes");
+    expect(existsFunction).toContain("kSecUseAuthenticationUIFail");
+    expect(existsFunction).not.toContain("standardOutput");
     expect(inspectorSource).not.toContain("kSecReturnData");
+    const helperSource = await readFile(path.join(root, "native/macos-keychain/SgwKeychain.swift"), "utf8");
+    expect(helperSource).toContain('case "status"');
+    const statusFunction = helperSource.match(/func credentialStatus[\s\S]*?\n}/)?.[0] || "";
+    expect(statusFunction).toContain("kSecReturnAttributes");
+    expect(statusFunction).toContain("kSecUseAuthenticationUIFail");
+    expect(statusFunction).not.toContain("kSecReturnData");
     const publishWorkflow = await readFile(path.join(root, ".github/workflows/publish.yml"), "utf8");
     expect(publishWorkflow).toContain("dist/native/darwin-arm64/s-gw-keychain-inspector");
     const validator = await readFile(path.join(root, "scripts/validate-release-assets.mjs"), "utf8");
@@ -79,6 +90,7 @@ describe("platform installers", () => {
       expect(files).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
     }
+    expect(files).toContain("dist/windows/s-gw-helper-bootstrap.ps1");
     expect(files.some((file) => file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);
@@ -167,7 +179,7 @@ describe("platform installers", () => {
       ].join("; ");
       execFileSync("powershell.exe", ["-NoProfile", "-Command", parseCommand], { stdio: "pipe" });
     }
-  });
+  }, 20_000);
 
   it("builds and verifies updater assets independently from npm publishing", async () => {
     const [workflow, builder, validator] = await Promise.all([
@@ -196,7 +208,7 @@ describe("platform installers", () => {
     expect(assetJob).toContain("npm run build");
     expect(assetJob).toContain("npm run check:rust");
     expect(assetJob).toContain("npx vitest run --testTimeout 15000");
-    expect(assetJob).toContain("npm audit --audit-level=high");
+    expect(assetJob).toContain("npm run audit:release");
     expect(assetJob).toContain("npm run package:dry-run");
     expect(assetJob).toContain("npm run validate:npm-package");
     expect(assetJob).toContain("npm run build:installers");
@@ -264,7 +276,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain("SGW_NPM_ALREADY_PUBLISHED=1");
     expect(npmJob).toContain('if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" != 1 ]');
     expect(npmJob).toContain("Verify an existing immutable release");
-    expect(npmJob).toContain("npm audit --audit-level=high");
+    expect(npmJob).toContain("npm run audit:release");
     expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");
@@ -305,7 +317,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain("always()");
     expect(npmJob).toContain("inputs.publish_npm_only ||");
     expect(npmJob).toContain("if: ${{ inputs.publish_npm_only }}");
-    expect(npmJob).toContain("npm audit --audit-level=high");
+    expect(npmJob).toContain("npm run audit:release");
     expect(releaseJob).toContain("!inputs.publish_npm_only");
     expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
   });

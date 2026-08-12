@@ -25,7 +25,16 @@ struct ApprovalsView: View {
             Text(request.agentName)
           }
           TableColumn("Command") { request in
-            Text(SGWText.shortPath(request.action.command))
+            let executable = request.action.resolvedCommand ?? request.action.command
+            VStack(alignment: .leading, spacing: 2) {
+              Text(SGWText.shortPath(request.action.command))
+              Text(executable)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(executable)
+            }
           }
           TableColumn("Handle") { request in
             Text(SGWText.shortHandle(request.handle))
@@ -65,6 +74,11 @@ struct RequestRow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text("\(request.agentName) requested \(SGWText.shortPath(request.action.command))")
           .font(.callout.weight(.semibold))
+        Text(request.action.resolvedCommand ?? "Not pinned (legacy request)")
+          .font(.caption2.monospaced())
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.middle)
         Text(SGWText.shortHandle(request.handle))
           .font(.caption2.monospaced())
           .foregroundStyle(.secondary)

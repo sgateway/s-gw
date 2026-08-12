@@ -51,7 +51,8 @@ The local operating system account, s-gw broker and Rust core processes, operati
 - Agent-facing interfaces use typed handles and metadata rather than raw values.
 - A secret-backed action must match the handle's allowed command or owned SSH policy.
 - Pending actions do not execute until a policy or local user decision approves them.
-- Reusable approvals are bounded by stored request attributes and expiry or login session.
+- Reusable approvals for environment commands are bound to the exact executable, arguments, credential bindings, and working directory from the approved request. Owned SSH approvals remain bound to the SSH target and port so later commands use the same s-gw-controlled connection.
+- A direct credential-backed action cannot select `/usr/bin/security` as its executable, even when a handle policy, approval policy, or reusable grant would otherwise permit it. This does not inspect commands later spawned by an approved interpreter or wrapper.
 - Credential and unlock values entered through supported commands use stdin instead of process arguments.
 - The loopback console requires a per-session token for state-changing operations.
 - Known raw credential values are replaced in captured command output before it is returned to the caller.
@@ -82,14 +83,17 @@ s-gw does not protect against:
 - broad prompt, file, terminal, or operating system interception solely through MCP registration;
 - denial of service, destructive approved commands, or incorrect user approval decisions.
 
+The Linux desktop service makes the user's home read-only rather than hiding it because npm, Node.js, and approved command targets may live there. This prevents service writes outside the s-gw ledger and recovery paths, but a compromise of the broker process could still read files already readable by that operating-system account. Install s-gw and Node.js under system paths when a stricter home-filesystem boundary is required, and review `systemd-analyze security --user s-gw.service` on the deployed host.
+
 Output sanitization is a last line of defense, not a data-loss-prevention guarantee. Keep allowed commands narrow, review destinations and arguments, and use low-privilege credentials with independent provider-side controls.
 
 ## Secure Use
 
 - Enroll credentials from a local terminal or supported UI, never from agent chat.
-- Prefer macOS Keychain or Windows Credential Manager over environment-provided unlock material.
+- Prefer macOS Keychain, Linux Secret Service, or Windows Credential Manager over environment-provided unlock material.
 - Use absolute executable paths for command grants where practical.
 - Keep reusable approvals short and scoped to one agent when possible.
+- Expect a new approval when an environment command's arguments change.
 - Treat unlimited approvals and high-severity credentials as exceptional.
 - Review SSH destinations, ports, and remote commands before approval.
 - Keep the operating system, Node.js, s-gw, and credential providers updated.

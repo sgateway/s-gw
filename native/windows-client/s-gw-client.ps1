@@ -2,10 +2,16 @@
 param(
   [int]$Port = 8718,
   [string]$ConsoleUrl = "",
+  [string]$InstanceKey = "",
   [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
+
+$expectedInstanceKey = $InstanceKey.Trim().ToLowerInvariant()
+if ($expectedInstanceKey -notmatch '^[a-f0-9]{64}$') {
+  throw 'Launch the Windows client through s-gw-client.cmd or s-gw app open.'
+}
 
 function Resolve-CliPath {
   if ($env:SGW_CLI_PATH -and (Test-Path -LiteralPath $env:SGW_CLI_PATH)) {
@@ -44,7 +50,53 @@ function Test-ConsoleReady([string]$Url) {
   $origin = Get-OriginUrl $Url
   try {
     $health = Invoke-RestMethod -Method Get -Uri ($origin + "api/health") -TimeoutSec 1
-    return ($health.ok -eq $true)
+    return ($health.ok -eq $true -and [string]$health.instanceKey -eq $expectedInstanceKey)
+  } catch {
+    return $false
+  }
+}
+
+function Test-ConsoleOwner([string]$CliPath, [string]$NodePath) {
+  try {
+    $connections = @(Get-NetTCPConnection -State Listen -LocalPort $Port | Where-Object {
+      [string]$_.LocalAddress -eq '127.0.0.1'
+    })
+    $listenerPids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($listenerPids.Count -ne 1) {
+      return $false
+    }
+
+    $listenerPid = [int]$listenerPids[0]
+    $item = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerPid" -ErrorAction Stop
+    $owner = Invoke-CimMethod -InputObject $item -MethodName GetOwnerSid -ErrorAction Stop
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $currentSessionId = [int](Get-Process -Id $PID).SessionId
+    if ($owner.ReturnValue -ne 0 -or [string]$owner.Sid -ne $currentSid -or [int]$item.SessionId -ne $currentSessionId) {
+      return $false
+    }
+
+    if (-not [string]::Equals(
+      [IO.Path]::GetFullPath([string]$item.ExecutablePath),
+      [IO.Path]::GetFullPath($NodePath),
+      [StringComparison]::OrdinalIgnoreCase
+    )) {
+      return $false
+    }
+
+    $line = [string]$item.CommandLine
+    $cliPattern = '(?i)(?:^|\s)"?' + [regex]::Escape($CliPath) + '"?(?:\s|$)'
+    $portPattern = '(?i)(?:^|\s)--port(?:\s+|:|=)"?' + [regex]::Escape([string]$Port) + '"?(?:\s|$)'
+    $anyPortPattern = '(?i)(?:^|\s)--port(?:\s+|:|=)'
+    $hostPattern = '(?i)(?:^|\s)--host(?:\s+|:|=)"?127\.0\.0\.1"?(?:\s|$)'
+    $anyHostPattern = '(?i)(?:^|\s)--host(?:\s+|:|=)'
+    $hostMatches = $line -match $hostPattern -or $line -notmatch $anyHostPattern
+    $portMatches = $line -match $portPattern -or ($Port -eq 8718 -and $line -notmatch $anyPortPattern)
+    return (
+      $line -match $cliPattern -and
+      $line -match '(?i)(?:^|\s)console(?:\s|$)' -and
+      $portMatches -and
+      $hostMatches
+    )
   } catch {
     return $false
   }
@@ -66,9 +118,9 @@ function Start-ConsoleDaemon([string]$CliPath, [string]$NodePath) {
     -RedirectStandardError (Join-Path $logs "console.err.log") | Out-Null
 }
 
-function Wait-Console([string]$Url) {
+function Wait-Console([string]$Url, [string]$CliPath, [string]$NodePath) {
   for ($i = 0; $i -lt 30; $i += 1) {
-    if (Test-ConsoleReady $Url) {
+    if ((Test-ConsoleReady $Url) -and (Test-ConsoleOwner $CliPath $NodePath)) {
       return $true
     }
     Start-Sleep -Milliseconds 250
@@ -95,10 +147,15 @@ function Open-ConsoleWindow([string]$Url) {
 $url = New-ConsoleUrl
 $cliPath = Resolve-CliPath
 $nodePath = Resolve-NodePath
+$ready = (Test-ConsoleReady $url) -and (Test-ConsoleOwner $cliPath $nodePath)
 
-if (-not $NoStart -and -not (Test-ConsoleReady $url)) {
+if ($NoStart -and -not $ready) {
+  throw "s-gw console authority did not match at $url. Stop the existing console or choose another port."
+}
+
+if (-not $NoStart -and -not $ready) {
   Start-ConsoleDaemon -CliPath $cliPath -NodePath $nodePath
-  if (-not (Wait-Console $url)) {
+  if (-not (Wait-Console $url $cliPath $nodePath)) {
     throw "s-gw console did not become ready at $url. Check $env:LOCALAPPDATA\s-gw\logs."
   }
 }

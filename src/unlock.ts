@@ -18,31 +18,36 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getSgwHome } from "./paths.js";
+import { getSgwHome, MASTER_KEYCHAIN_SERVICE, SECRET_KEYCHAIN_SERVICE } from "./paths.js";
 import { resolveSelfContainedMacRuntime } from "./self-contained-runtime.js";
+import { trustedWindowsPowerShellSync, windowsSystemEnvironment } from "./windows-system.js";
 
-const defaultService = "com.s-gw.sgw.master-passphrase";
-const defaultSecretService = "com.s-gw.sgw.secret";
 const nativeHelperName = "s-gw-keychain-helper";
 const nativeInspectorName = "s-gw-keychain-inspector";
 const keychainRepairService = "com.s-gw.sgw.keychain-repair";
 const windowsCredentialHelperName = "s-gw-credential.ps1";
 const keychainRepairTimeoutMs = 10_000;
 const staleKeychainRepairMs = 30_000;
+const defaultSecretToolTimeoutMs = 10_000;
+const defaultWindowsCredentialHelperTimeoutMs = 30_000;
+const maxWindowsCredentialHelperTestTimeoutMs = 120_000;
+const maxSecretToolInputBytes = 8_191;
 
 export interface KeychainInfo {
   supported: boolean;
   service: string;
   account: string;
-  provider: "native-helper" | "security-cli" | "windows-helper" | "none";
+  provider: "native-helper" | "security-cli" | "secret-service-cli" | "windows-helper" | "none";
   helperPath?: string;
 }
 
 export interface UnlockStatus {
   envConfigured: boolean;
-  activeSource: "env" | "macos-keychain" | "windows-credential-manager" | "none";
+  activeSource: "env" | "linux-secret-service" | "macos-keychain" | "windows-credential-manager" | "none";
   keychain: KeychainInfo & {
     configured: boolean;
+    state: "configured" | "missing" | "unavailable";
+    error?: string;
   };
 }
 
@@ -99,13 +104,16 @@ export function requireUnlockPassphrase(): string {
 export function unlockStatus(): UnlockStatus {
   const envConfigured = validPassphrase(process.env.SGW_MASTER_PASSPHRASE);
   const keychain = keychainInfo();
-  const configured = hasKeychainPassphrase();
+  const passphrase = inspectKeychainPassphrase(keychain);
+  const configured = passphrase.state === "configured";
 
   let activeSource: UnlockStatus["activeSource"] = "none";
   if (envConfigured) {
     activeSource = "env";
   } else if (configured) {
-    activeSource = process.platform === "win32" ? "windows-credential-manager" : "macos-keychain";
+    activeSource = process.platform === "win32"
+      ? "windows-credential-manager"
+      : process.platform === "linux" ? "linux-secret-service" : "macos-keychain";
   }
 
   return {
@@ -113,7 +121,8 @@ export function unlockStatus(): UnlockStatus {
     activeSource,
     keychain: {
       ...keychain,
-      configured
+      configured,
+      ...passphrase
     }
   };
 }
@@ -135,41 +144,70 @@ export function setKeychainPassphrase(passphrase: string): void {
 export function deleteKeychainPassphrase(): boolean {
   ensureLocalCredentialStore();
   preparePersistentMacHelper();
-  try {
-    if (managedMacKeychainAccessEnabled()) {
-      return deleteManagedMacKeychainItem(masterPassphraseRef());
-    }
-    runKeychainDelete(keychainInfo());
-    return true;
-  } catch {
+  if (managedMacKeychainAccessEnabled()) {
+    return deleteManagedMacKeychainItem(masterPassphraseRef());
+  }
+
+  const info = keychainInfo();
+  if (!keychainItemExists(info)) {
     return false;
   }
+  if (info.provider === "windows-helper" && info.helperPath) {
+    const output = runWindowsCredentialHelper(
+      info.helperPath,
+      ["delete", "-Service", info.service, "-Account", info.account]
+    );
+    const result = JSON.parse(output) as { deleted?: unknown };
+    if (typeof result.deleted !== "boolean") {
+      throw new Error("Windows Credential Manager delete returned an invalid response.");
+    }
+    if (keychainItemExists(info)) {
+      throw new Error(`The OS credential store did not delete the unlock value for account ${info.account}.`);
+    }
+    return result.deleted;
+  }
+  runKeychainDelete(info);
+  if (keychainItemExists(info)) {
+    throw new Error(`The OS credential store did not delete the unlock value for account ${info.account}.`);
+  }
+  return true;
 }
 
 export function hasKeychainPassphrase(): boolean {
   const info = keychainInfo();
-  if (!info.supported || info.provider === "none" || process.env.SGW_DISABLE_KEYCHAIN === "1") {
-    return false;
-  }
+  return inspectKeychainPassphrase(info).state === "configured";
+}
 
+function inspectKeychainPassphrase(
+  info: KeychainInfo
+): { state: "configured" | "missing" | "unavailable"; error?: string } {
+  if (!info.supported || info.provider === "none") {
+    return { state: "unavailable", error: missingCredentialStoreError().message };
+  }
+  if (process.env.SGW_DISABLE_KEYCHAIN === "1") {
+    return { state: "unavailable", error: "OS credential-store access is disabled by SGW_DISABLE_KEYCHAIN." };
+  }
   try {
-    return keychainItemExists(info);
-  } catch {
-    return false;
+    return { state: keychainItemExists(info) ? "configured" : "missing" };
+  } catch (error) {
+    return {
+      state: "unavailable",
+      error: error instanceof Error ? error.message : String(error)
+    };
   }
 }
 
 export function keychainInfo(): KeychainInfo {
   return {
     supported: supportsLocalCredentialStore(),
-    service: process.env.SGW_KEYCHAIN_SERVICE || defaultService,
+    service: process.env.SGW_KEYCHAIN_SERVICE || MASTER_KEYCHAIN_SERVICE,
     account: process.env.SGW_KEYCHAIN_ACCOUNT || os.userInfo().username || "local-user",
     ...keychainProvider()
   };
 }
 
 export function defaultSecretKeychainService(): string {
-  return process.env.SGW_SECRET_KEYCHAIN_SERVICE || defaultSecretService;
+  return process.env.SGW_SECRET_KEYCHAIN_SERVICE || SECRET_KEYCHAIN_SERVICE;
 }
 
 export function setMacKeychainItem(ref: MacKeychainItemRef, value: string): void {
@@ -198,18 +236,22 @@ export function getMacKeychainItem(ref: MacKeychainItemRef): string {
 }
 
 export function deleteMacKeychainItem(ref: MacKeychainItemRef): boolean {
-  try {
-    preparePersistentMacHelper();
-    if (managedMacKeychainAccessEnabled()) {
-      return deleteManagedMacKeychainItem(ref);
-    }
-    const info = keychainInfoForItem(ref);
-    ensureNativeCredentialStore(info);
-    runKeychainDelete(info);
-    return true;
-  } catch {
-    return false;
+  preparePersistentMacHelper();
+  if (managedMacKeychainAccessEnabled()) {
+    return deleteManagedMacKeychainItem(ref);
   }
+  const info = keychainInfoForItem(ref);
+  ensureNativeCredentialStore(info);
+  if (info.provider === "secret-service-cli") {
+    if (!keychainItemExists(info)) return false;
+    runKeychainDelete(info);
+    if (keychainItemExists(info)) {
+      throw new Error(`Linux Secret Service did not delete the item for account ${ref.account}.`);
+    }
+    return true;
+  }
+  runKeychainDelete(info);
+  return true;
 }
 
 export function repairKeychainPassphraseAccess(): MacKeychainAccessRepair {
@@ -255,7 +297,7 @@ function readKeychainPassphrase(): string | undefined {
 
 function ensureLocalCredentialStore(): void {
   if (!keychainInfo().supported) {
-    throw new Error("OS credential-store unlock is only available on macOS or Windows.");
+    throw new Error("OS credential-store unlock is only available on macOS, Windows, or Linux with Secret Service.");
   }
 }
 
@@ -264,7 +306,12 @@ function ensureNativeCredentialStore(info: KeychainInfo): void {
     throw new Error("OS credential-store secret storage is only available on macOS or Windows.");
   }
 
-  if ((info.provider !== "native-helper" && info.provider !== "windows-helper") || !info.helperPath) {
+  if (
+    (info.provider !== "native-helper"
+      && info.provider !== "windows-helper"
+      && info.provider !== "secret-service-cli")
+    || !info.helperPath
+  ) {
     throw missingCredentialStoreError();
   }
 }
@@ -294,6 +341,11 @@ function keychainProvider(): Pick<KeychainInfo, "provider" | "helperPath"> {
     return helperPath ? { provider: "windows-helper", helperPath } : { provider: "none" };
   }
 
+  if (process.platform === "linux") {
+    const helperPath = findLinuxSecretTool();
+    return helperPath ? { provider: "secret-service-cli", helperPath } : { provider: "none" };
+  }
+
   if (process.platform !== "darwin") {
     return { provider: "none" };
   }
@@ -311,12 +363,13 @@ function keychainProvider(): Pick<KeychainInfo, "provider" | "helperPath"> {
 }
 
 function supportsLocalCredentialStore(): boolean {
-  return process.platform === "darwin" || process.platform === "win32";
+  return process.platform === "darwin" || process.platform === "linux" || process.platform === "win32";
 }
 
 function findNativeHelper(): string | undefined {
-  const fromEnv = process.env.SGW_KEYCHAIN_HELPER;
+  const fromEnv = testOnlyHelperOverride("SGW_KEYCHAIN_HELPER");
   if (fromEnv && existsSync(fromEnv)) {
+    assertUsableHelper(fromEnv);
     return fromEnv;
   }
 
@@ -339,23 +392,29 @@ function packagedNativeHelperCandidates(): string[] {
   const nativeTarget = `${process.platform}-${process.arch}`;
   return uniquePaths([
     path.resolve(here, "native", nativeTarget, nativeHelperName),
-    path.resolve(process.cwd(), "dist", "native", nativeTarget, nativeHelperName),
     path.resolve(here, "native", nativeHelperName),
-    path.resolve(process.cwd(), "dist", "native", nativeHelperName)
+    ...(process.env.SGW_TEST_MODE === "1"
+      ? [
+          path.resolve(here, "..", "dist", "native", nativeTarget, nativeHelperName),
+          path.resolve(here, "..", "dist", "native", nativeHelperName)
+        ]
+      : [])
   ]);
 }
 
 function findPackagedKeychainInspector(): string | undefined {
   if (process.platform !== "darwin") return undefined;
 
-  const fromEnv = process.env.SGW_KEYCHAIN_INSPECTOR;
+  const fromEnv = testOnlyHelperOverride("SGW_KEYCHAIN_INSPECTOR");
   if (fromEnv) return existsSync(fromEnv) ? path.resolve(fromEnv) : undefined;
 
   const here = path.dirname(fileURLToPath(import.meta.url));
   const nativeTarget = `${process.platform}-${process.arch}`;
   const candidates = [
     path.resolve(here, "native", nativeTarget, nativeInspectorName),
-    path.resolve(process.cwd(), "dist", "native", nativeTarget, nativeInspectorName)
+    ...(process.env.SGW_TEST_MODE === "1"
+      ? [path.resolve(here, "..", "dist", "native", nativeTarget, nativeInspectorName)]
+      : [])
   ];
   return candidates.find((candidate) => existsSync(candidate));
 }
@@ -497,7 +556,7 @@ function helperHash(filePath: string): string {
 }
 
 function preparePersistentMacHelper(): void {
-  if (process.platform !== "darwin" || process.env.SGW_KEYCHAIN_HELPER) {
+  if (process.platform !== "darwin" || testOnlyHelperOverride("SGW_KEYCHAIN_HELPER")) {
     return;
   }
   if (!existsSync(persistentKeychainHelperPath())) {
@@ -527,7 +586,7 @@ let keychainAclDumpCache: string | undefined;
 const keychainRepairWait = new Int32Array(new SharedArrayBuffer(4));
 
 function managedMacKeychainAccessEnabled(): boolean {
-  return process.platform === "darwin" && !process.env.SGW_KEYCHAIN_HELPER;
+  return process.platform === "darwin" && !testOnlyHelperOverride("SGW_KEYCHAIN_HELPER");
 }
 
 function masterPassphraseRef(): MacKeychainItemRef {
@@ -898,18 +957,48 @@ function uniquePaths(values: string[]): string[] {
 }
 
 function findWindowsCredentialHelper(): string | undefined {
-  const fromEnv = process.env.SGW_WINDOWS_CREDENTIAL_HELPER || process.env.SGW_KEYCHAIN_HELPER;
+  const fromEnv = testOnlyHelperOverride("SGW_WINDOWS_CREDENTIAL_HELPER")
+    || testOnlyHelperOverride("SGW_KEYCHAIN_HELPER");
   if (fromEnv && existsSync(fromEnv)) {
-    return fromEnv;
+    return path.resolve(fromEnv);
   }
 
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
     path.resolve(here, "windows", windowsCredentialHelperName),
-    path.resolve(process.cwd(), "dist", "windows", windowsCredentialHelperName)
+    ...(process.env.SGW_TEST_MODE === "1"
+      ? [path.resolve(here, "..", "dist", "windows", windowsCredentialHelperName)]
+      : [])
   ];
 
   return candidates.find((candidate) => existsSync(candidate));
+}
+
+function findLinuxSecretTool(): string | undefined {
+  const candidates: string[] = [];
+  if (process.env.SGW_TEST_MODE === "1" && process.env.SGW_SECRET_TOOL !== undefined) {
+    candidates.push(path.resolve(process.env.SGW_SECRET_TOOL));
+  } else {
+    candidates.push("/usr/bin/secret-tool", "/bin/secret-tool");
+  }
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const info = lstatSync(candidate);
+      const currentUid = typeof process.getuid === "function" ? process.getuid() : info.uid;
+      const trustedOwner = info.uid === 0 || (process.env.SGW_TEST_MODE === "1" && info.uid === currentUid);
+      if (!info.isFile() || info.isSymbolicLink() || !trustedOwner || (info.mode & 0o022) !== 0) {
+        continue;
+      }
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Try the next fixed system path.
+    }
+  }
+
+  return undefined;
 }
 
 function runKeychainGet(info: KeychainInfo): string {
@@ -932,16 +1021,26 @@ function runKeychainGet(info: KeychainInfo): string {
     return runWindowsCredentialHelper(info.helperPath, ["get", "-Service", info.service, "-Account", info.account]);
   }
 
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    return runSecretTool(info.helperPath, ["lookup", ...secretServiceAttributes(info)]);
+  }
+
   throw missingCredentialStoreError();
 }
 
 function keychainItemExists(info: KeychainInfo): boolean {
   if (process.platform === "darwin") {
-    const result = spawnSync(
-      keychainStatusCliPath(),
-      ["find-generic-password", "-a", info.account, "-s", info.service],
-      { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] }
-    );
+    const inspector = findPackagedKeychainInspector();
+    if (!inspector) {
+      if (process.env.SGW_ALLOW_SECURITY_CLI === "1") {
+        return keychainItemExistsWithSecurityCli(info);
+      }
+      throw new Error("The macOS Keychain inspector is missing. Reinstall s-gw before accessing credentials.");
+    }
+    const result = spawnSync(inspector, ["exists", "--service", info.service, "--account", info.account], {
+      encoding: "utf8",
+      stdio: ["ignore", "ignore", "pipe"]
+    });
 
     if (result.error) {
       throw result.error;
@@ -952,7 +1051,7 @@ function keychainItemExists(info: KeychainInfo): boolean {
     if (result.status === 44) {
       return false;
     }
-    throw new Error(result.stderr.trim() || `Keychain status check failed with status ${result.status}`);
+    throw new Error(result.stderr.trim() || `Keychain inspector failed with status ${result.status}`);
   }
 
   if (info.provider === "windows-helper" && info.helperPath) {
@@ -961,10 +1060,38 @@ function keychainItemExists(info: KeychainInfo): boolean {
       ["status", "-Service", info.service, "-Account", info.account]
     );
     const status = JSON.parse(output) as { configured?: unknown };
-    return status.configured === true;
+    if (typeof status.configured !== "boolean") {
+      throw new Error("Windows Credential Manager status returned an invalid response.");
+    }
+    return status.configured;
+  }
+
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    const result = spawnSync(info.helperPath, ["lookup", ...secretServiceAttributes(info)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: secretToolTimeoutMs(),
+      killSignal: "SIGKILL"
+    });
+    assertSecretToolCompleted(result);
+    if (result.status === 0) return result.stdout.replace(/\r?\n$/, "").length > 0;
+    if (result.status === 1 && !result.stderr.trim()) return false;
+    throw new Error(result.stderr.trim() || `Secret Service status check failed with status ${result.status}`);
   }
 
   return false;
+}
+
+function keychainItemExistsWithSecurityCli(info: KeychainInfo): boolean {
+  const result = spawnSync(
+    keychainStatusCliPath(),
+    ["find-generic-password", "-a", info.account, "-s", info.service],
+    { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] }
+  );
+  if (result.error) throw result.error;
+  if (result.status === 0) return true;
+  if (result.status === 44) return false;
+  throw new Error(result.stderr.trim() || `Keychain status check failed with status ${result.status}`);
 }
 
 function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw local unlock passphrase"): void {
@@ -998,6 +1125,21 @@ function runKeychainSet(info: KeychainInfo, passphrase: string, label = "s-gw lo
     return;
   }
 
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    const byteLength = Buffer.byteLength(passphrase, "utf8");
+    if (byteLength > maxSecretToolInputBytes) {
+      throw new Error(
+        `Linux Secret Service values are limited to ${maxSecretToolInputBytes} UTF-8 bytes by secret-tool; received ${byteLength}.`
+      );
+    }
+    runSecretTool(
+      info.helperPath,
+      [`store`, `--label=${label}`, ...secretServiceAttributes(info)],
+      passphrase
+    );
+    return;
+  }
+
   throw missingCredentialStoreError();
 }
 
@@ -1017,6 +1159,11 @@ function runKeychainDelete(info: KeychainInfo): void {
     return;
   }
 
+  if (info.provider === "secret-service-cli" && info.helperPath) {
+    runSecretTool(info.helperPath, ["clear", ...secretServiceAttributes(info)]);
+    return;
+  }
+
   throw missingCredentialStoreError();
 }
 
@@ -1027,7 +1174,48 @@ function missingCredentialStoreError(): Error {
       "Public npm and DMG releases currently include Apple Silicon native surfaces; Intel Macs must build them from source."
     );
   }
+  if (process.platform === "linux") {
+    return new Error(
+      "Linux Secret Service is unavailable. Install libsecret-tools and start an unlocked user keyring, " +
+      "or use SGW_MASTER_PASSPHRASE for an explicit foreground/headless session."
+    );
+  }
   return new Error("No local OS credential-store provider is available. Run `npm run build:native`.");
+}
+
+function secretServiceAttributes(info: Pick<KeychainInfo, "service" | "account">): string[] {
+  return ["application", "s-gw", "service", info.service, "account", info.account];
+}
+
+function runSecretTool(helperPath: string, args: string[], input?: string): string {
+  const result = spawnSync(helperPath, args, {
+    input,
+    encoding: "utf8",
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    timeout: secretToolTimeoutMs(),
+    killSignal: "SIGKILL"
+  });
+  assertSecretToolCompleted(result);
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Linux Secret Service helper failed with status ${result.status}`);
+  }
+  return result.stdout;
+}
+
+function secretToolTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultSecretToolTimeoutMs;
+  const configured = Number(process.env.SGW_SECRET_TOOL_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= defaultSecretToolTimeoutMs
+    ? configured
+    : defaultSecretToolTimeoutMs;
+}
+
+function assertSecretToolCompleted(result: ReturnType<typeof spawnSync>): void {
+  if (!result.error) return;
+  if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+    throw new Error(`Linux Secret Service helper timed out after ${secretToolTimeoutMs()} ms.`);
+  }
+  throw result.error;
 }
 
 function runNativeHelper(helperPath: string, args: string[], input?: string): string {
@@ -1052,19 +1240,61 @@ function runSecurity(args: string[]): string {
 }
 
 function keychainStatusCliPath(): string {
-  return process.env.SGW_KEYCHAIN_STATUS_CLI || "/usr/bin/security";
+  return testOnlyHelperOverride("SGW_KEYCHAIN_STATUS_CLI") || "/usr/bin/security";
+}
+
+function testOnlyHelperOverride(name: string): string | undefined {
+  const configured = process.env[name];
+  if (!configured) return undefined;
+  if (process.env.SGW_TEST_MODE !== "1") {
+    throw new Error(`${name} is restricted to isolated s-gw tests; reinstall s-gw to restore its packaged helper.`);
+  }
+  if (configured.includes("\0") || /[\r\n]/.test(configured)) {
+    throw new Error(`Invalid ${name} test helper path.`);
+  }
+  return path.resolve(configured);
 }
 
 function runWindowsCredentialHelper(helperPath: string, args: string[], input?: string): string {
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath, ...args], {
+  const powershell = trustedWindowsPowerShellSync();
+  const timeoutMs = windowsCredentialHelperTimeoutMs();
+  const result = spawnSync(powershell, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    helperPath,
+    ...args
+  ], {
+    cwd: path.dirname(powershell),
     input,
     encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"]
+    env: windowsSystemEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    timeout: timeoutMs,
+    killSignal: "SIGKILL"
   });
 
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+      throw new Error(`Windows Credential Manager helper timed out after ${timeoutMs} ms.`);
+    }
+    throw result.error;
+  }
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `Windows Credential Manager helper failed with status ${result.status}`);
   }
 
   return result.stdout;
+}
+
+export function windowsCredentialHelperTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return defaultWindowsCredentialHelperTimeoutMs;
+  const configured = Number(process.env.SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= maxWindowsCredentialHelperTestTimeoutMs
+    ? configured
+    : defaultWindowsCredentialHelperTimeoutMs;
 }

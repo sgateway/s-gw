@@ -1,0 +1,15 @@
+{
+  "nodeVersion": "24.18.0",
+  "targets": {
+    "linux-x64": {
+      "archive": "node-v24.18.0-linux-x64.tar.xz",
+      "url": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz",
+      "sha256": "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
+    },
+    "win32-x64": {
+      "archive": "node-v24.18.0-win-x64.zip",
+      "url": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-win-x64.zip",
+      "sha256": "0ae68406b42d7725661da979b1403ec9926da205c6770827f33aac9d8f26e821"
+    }
+  }
+}

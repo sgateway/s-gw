@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import path from "node:path";
 import process from "node:process";
 import { resolveAgentProfile, type AgentProfile } from "./agents.js";
 import { addLocalSecret, preferredLocalSecretBackend } from "./gateway.js";
@@ -52,6 +54,11 @@ export interface GuardRunPlan {
 export interface GuardRunPreparation {
   plan: GuardRunPlan;
   env: Record<string, string>;
+}
+
+export interface GuardLauncher {
+  command: string;
+  args: string[];
 }
 
 const defaultAgentCommands: Record<string, string> = {
@@ -186,10 +193,15 @@ export async function runGuardedAgent(store: SecretStore, options: GuardRunOptio
     `s-gw guard mode: launching ${prepared.plan.agent.displayName}; tokenized ${prepared.plan.scrubbedEnvCount} environment credential(s).\n`
   );
 
-  const child = spawn(prepared.plan.command, prepared.plan.args, {
+  const launcher = resolveGuardLauncher(prepared.plan.command, prepared.plan.args, {
+    cwd: prepared.plan.cwd,
+    env: prepared.env
+  });
+  const child = spawn(launcher.command, launcher.args, {
     cwd: prepared.plan.cwd,
     env: prepared.env,
-    stdio: "inherit"
+    stdio: "inherit",
+    shell: false
   });
 
   return new Promise((resolve, reject) => {
@@ -202,6 +214,198 @@ export async function runGuardedAgent(store: SecretStore, options: GuardRunOptio
       resolve(code ?? 1);
     });
   });
+}
+
+export function resolveGuardLauncher(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform } = {}
+): GuardLauncher {
+  const platform = options.platform || process.platform;
+  if (platform !== "win32") {
+    return { command, args: [...args] };
+  }
+
+  const resolved = findWindowsCommand(command, options.cwd || process.cwd(), options.env || process.env);
+  if (!resolved) {
+    const extension = path.win32.extname(command).toLowerCase();
+    if ([".bat", ".cmd", ".ps1"].includes(extension)) {
+      throw new Error(`Windows guard mode will not launch unresolved script ${command}.`);
+    }
+    throw new Error(`Windows guard mode could not resolve executable ${command}.`);
+  }
+
+  const extension = path.extname(resolved).toLowerCase();
+  if (extension === ".cmd") {
+    const script = canonicalNpmNodeTarget(resolved);
+    return { command: process.execPath, args: [script, ...args] };
+  }
+  if (extension === ".bat" || extension === ".ps1") {
+    throw new Error(
+      `Windows guard mode will not launch script ${resolved}. Use a native executable or a canonical npm .cmd shim.`
+    );
+  }
+  if (extension !== ".exe" && extension !== ".com") {
+    throw new Error(`Windows guard mode will not launch non-native executable ${resolved}.`);
+  }
+
+  return { command: resolved, args: [...args] };
+}
+
+function findWindowsCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): string | undefined {
+  if (!command || command.includes("\0")) return undefined;
+
+  const extension = path.extname(command);
+  const suffixes = extension
+    ? [""]
+    : windowsPathExtensions(env).filter((suffix) => suffix !== ".PS1");
+  const hasDirectory = command.includes("/") || command.includes("\\");
+  const directories = hasDirectory
+    ? [""]
+    : windowsPath(env).split(";").map((item) => trimPathEntry(item)).filter(Boolean);
+
+  for (const directory of directories) {
+    const base = hasDirectory
+      ? path.resolve(cwd, command)
+      : path.resolve(directory, command);
+    for (const suffix of suffixes) {
+      const candidate = `${base}${suffix.toLowerCase()}`;
+      const exact = regularFile(candidate) ? candidate : windowsCaseVariant(base, suffix);
+      if (exact && regularFile(exact)) return exact;
+    }
+  }
+
+  return undefined;
+}
+
+function windowsPathExtensions(env: NodeJS.ProcessEnv): string[] {
+  const raw = envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD";
+  const allowed = new Set([".COM", ".EXE", ".BAT", ".CMD"]);
+  const out: string[] = [];
+  for (const item of raw.split(";")) {
+    const value = item.trim().toUpperCase();
+    if (!allowed.has(value) || out.includes(value)) continue;
+    out.push(value);
+  }
+  return out.length > 0 ? out : [".COM", ".EXE", ".BAT", ".CMD"];
+}
+
+function windowsPath(env: NodeJS.ProcessEnv): string {
+  return envValue(env, "PATH") || "";
+}
+
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const entry = Object.entries(env).find(([key]) => key.toUpperCase() === name);
+  return typeof entry?.[1] === "string" ? entry[1] : undefined;
+}
+
+function trimPathEntry(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function windowsCaseVariant(base: string, suffix: string): string | undefined {
+  if (!suffix) return undefined;
+  const upper = `${base}${suffix}`;
+  if (regularFile(upper)) return upper;
+  return undefined;
+}
+
+function regularFile(filePath: string): boolean {
+  try {
+    return statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function canonicalNpmNodeTarget(shimPath: string): string {
+  let source: string;
+  try {
+    source = readFileSync(shimPath, "utf8");
+  } catch (error) {
+    throw new Error(`Could not read Windows launcher ${shimPath}: ${errorMessage(error)}`);
+  }
+
+  if (source.length > 64 * 1024 || source.includes("\0")) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+  const normalized = source.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+  if (normalized.includes("\r")) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+  const lines = normalized.split("\n");
+  const header = [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0"
+  ];
+  if (!header.every((line, index) => lines[index] === line)) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+  if (!lines.includes('IF EXIST "%dp0%\\node.exe" (')
+    || !lines.includes('  SET "_prog=%dp0%\\node.exe"')
+    || !lines.includes('  SET "_prog=node"')) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+
+  const nonEmpty = lines.filter((line) => line.length > 0);
+  const launchLine = nonEmpty.at(-1) || "";
+  const match = launchLine.match(
+    /^endLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"\s+"%dp0%\\([^"]+)"\s+%\*$/
+  );
+  if (!match || (normalized.match(/%\*/g) || []).length !== 1) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+
+  const segments = match[1].split(/[\\/]+/);
+  const shimDirectory = path.dirname(shimPath);
+  const localBinShim = path.basename(shimDirectory).toLowerCase() === ".bin"
+    && path.basename(path.dirname(shimDirectory)).toLowerCase() === "node_modules";
+  const localParent = localBinShim && segments[0] === "..";
+  const targetSegments = localParent ? segments.slice(1) : segments;
+  if (targetSegments.length === 0
+    || targetSegments.some((segment) => !safeShimSegment(segment))
+    || segments.slice(localParent ? 1 : 0).includes("..")) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+  const target = path.resolve(shimDirectory, ...segments);
+  if (!/\.(?:cjs|js|mjs)$/i.test(target) || !regularFile(target)) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+
+  const shimRoot = realpathSync(localParent ? path.dirname(shimDirectory) : shimDirectory);
+  const realTarget = realpathSync(target);
+  const relative = path.relative(shimRoot, realTarget);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw unsupportedWindowsShim(shimPath);
+  }
+  return realTarget;
+}
+
+function safeShimSegment(segment: string): boolean {
+  return Boolean(segment)
+    && segment !== "."
+    && segment !== ".."
+    && !/[\x00-\x1f%!:*?"<>|&^]/.test(segment);
+}
+
+function unsupportedWindowsShim(shimPath: string): Error {
+  return new Error(
+    `Windows guard mode refused ${shimPath} because it is not a canonical npm Node.js .cmd shim. Use a native executable or reinstall the npm command.`
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function scrubEnvironment(
