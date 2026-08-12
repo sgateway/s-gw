@@ -102,6 +102,9 @@ describe("Windows test groups", () => {
     expect(workflow).toContain("for required in eframe glow tray-icon");
     expect(workflow).toContain("foreach ($required in @('eframe', 'glow', 'tray-icon'))");
     expect(workflow).toContain("egui-wgpu|gpu-allocator|wgpu");
+    expect(workflow).toContain(
+      "__TAURI__|tauri://|tauri-runtime|tauri_runtime|tauri-plugin|webview2|webkit2gtk|javascriptcore|github\\.com/tauri-apps/wry|wry::"
+    );
     expect(workflow).toContain("ldd \"$unpacked/usr/bin/s-gw-desktop\"");
     expect(workflow).toContain("[IO.File]::ReadAllBytes($desktop.FullName)");
     expect(workflow).toContain("test -f \"$(dirname \"$cli_path\")/console-ui/index.html\"");

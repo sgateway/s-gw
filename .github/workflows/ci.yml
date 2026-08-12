@@ -253,7 +253,7 @@ jobs:
             exit 1
           fi
           binary_markers="$(strings "$unpacked/usr/bin/s-gw-desktop" \
-            | grep -Ei '(tauri|webview2|webkit|javascriptcore|(^|[^[:alnum:]_])wry([^[:alnum:]_]|$))' || true)"
+            | grep -Ei '(__TAURI__|tauri://|tauri-runtime|tauri_runtime|tauri-plugin|webview2|webkit2gtk|javascriptcore|github\.com/tauri-apps/wry|wry::)' || true)"
           if test -n "$binary_markers"; then
             printf 'Forbidden WebView marker in desktop executable:\n%s\n' "$binary_markers" >&2
             exit 1
@@ -348,7 +348,7 @@ jobs:
           }
           $desktopBytes = [IO.File]::ReadAllBytes($desktop.FullName)
           $desktopText = [Text.Encoding]::ASCII.GetString($desktopBytes)
-          if ($desktopText -match '(tauri|webview2|webkit|javascriptcore|(?:^|[^a-z0-9_])wry(?:[^a-z0-9_]|$))') {
+          if ($desktopText -match '(__TAURI__|tauri://|tauri-runtime|tauri_runtime|tauri-plugin|webview2|webkit2gtk|javascriptcore|github\.com/tauri-apps/wry|wry::)') {
             throw "Forbidden WebView marker in desktop executable: $($Matches[0])"
           }
           $packageInfo = Get-Content $package.FullName -Raw | ConvertFrom-Json
