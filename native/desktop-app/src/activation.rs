@@ -302,7 +302,67 @@ fn create_private_directory(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let wide = windows_path(path)?;
+    let attributes_len = u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+        .map_err(|_| "The Windows security attributes are invalid.".to_string())?;
+    let sid = current_windows_user_sid_string()?;
+    let sddl = windows_string(&format!(
+        "O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    ))?;
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 || descriptor.is_null() {
+        let error = unsafe { GetLastError() };
+        if !descriptor.is_null() {
+            unsafe {
+                LocalFree(descriptor);
+            }
+        }
+        return Err(format!(
+            "Could not build desktop activation directory permissions: {error}"
+        ));
+    }
+
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: attributes_len,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let created = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+    let error = if created == 0 {
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+
+    if created != 0 || error == ERROR_ALREADY_EXISTS {
+        return Ok(());
+    }
+    Err(format!(
+        "Could not create desktop activation directory: {error}"
+    ))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn create_private_directory(path: &Path) -> Result<(), String> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
@@ -311,6 +371,88 @@ fn create_private_directory(path: &Path) -> Result<(), String> {
             "Could not create desktop activation directory: {error}"
         )),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_user_sid_string() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(format!(
+            "Could not inspect the current Windows user token: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let result = (|| {
+        let mut required = 0_u32;
+        unsafe {
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required);
+        }
+        let word = std::mem::size_of::<usize>();
+        let words = usize::try_from(required)
+            .ok()
+            .and_then(|size| size.checked_add(word - 1))
+            .map(|size| size / word)
+            .filter(|size| *size > 0)
+            .ok_or_else(|| "The current Windows user token is invalid.".to_string())?;
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Could not read the current Windows user token: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        windows_sid_string(token_user.User.Sid)
+    })();
+    unsafe {
+        CloseHandle(token);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sid_string(sid: windows_sys::Win32::Security::PSID) -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    let mut value = std::ptr::null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(sid, &mut value) };
+    if converted == 0 || value.is_null() {
+        let error = unsafe { GetLastError() };
+        if !value.is_null() {
+            unsafe {
+                LocalFree(value.cast());
+            }
+        }
+        return Err(format!(
+            "Could not encode the current Windows user SID: {error}"
+        ));
+    }
+    let result = (|| {
+        let length = (0..256_usize)
+            .find(|offset| unsafe { *value.add(*offset) } == 0)
+            .ok_or_else(|| "The current Windows user SID is invalid.".to_string())?;
+        String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
+            .map_err(|_| "The current Windows user SID is invalid.".to_string())
+    })();
+    unsafe {
+        LocalFree(value.cast());
+    }
+    result
 }
 
 #[cfg(unix)]

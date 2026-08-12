@@ -549,6 +549,7 @@ describe("Windows client packaging", () => {
         layout.cliPath,
         "app",
         "open",
+        "--browser",
         "--port",
         String(port)
       ], env)).rejects.toThrow(/another credential home|credential authority/i);
