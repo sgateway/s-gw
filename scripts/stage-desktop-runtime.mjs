@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -14,6 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { replaceDirectory } from "./replace-directory.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const appRoot = resolve(root, "native/desktop-app");
@@ -112,30 +112,11 @@ try {
     target: targetName
   }, null, 2)}\n`);
 
-  replaceRuntime(stagedRoot, runtimeRoot);
+  await replaceDirectory(stagedRoot, runtimeRoot);
   console.log(`Staged ${targetName} desktop runtime in ${runtimeRoot}`);
 } finally {
   rmSync(workDir, { recursive: true, force: true });
   rmSync(stagedRoot, { recursive: true, force: true });
-}
-
-function replaceRuntime(stagedPath, destination) {
-  const backup = resolve(appRoot, `.runtime-backup-${process.pid}-${Date.now()}`);
-  let movedExisting = false;
-  try {
-    if (existsSync(destination)) {
-      renameSync(destination, backup);
-      movedExisting = true;
-    }
-    renameSync(stagedPath, destination);
-  } catch (error) {
-    if (movedExisting && !existsSync(destination) && existsSync(backup)) {
-      renameSync(backup, destination);
-    }
-    throw error;
-  } finally {
-    rmSync(backup, { recursive: true, force: true });
-  }
 }
 
 async function download(url, targetPath) {

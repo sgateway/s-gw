@@ -1,7 +1,8 @@
-import { access, readFile, readdir } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
@@ -13,6 +14,7 @@ import {
   waitForConsoleAuthority
 } from "../src/install.js";
 import { getSgwInstanceKey } from "../src/paths.js";
+import { replaceDirectory } from "../scripts/replace-directory.mjs";
 
 const root = process.cwd();
 const appRoot = path.join(root, "native/desktop-app");
@@ -157,11 +159,185 @@ describe("Windows and Linux desktop app", () => {
     expect(stageSource).toContain("Embedded Node archive checksum mismatch");
     expect(stageSource).toContain('[npmCli, "ci", "--omit=dev", "--ignore-scripts"');
     expect(stageSource).toContain("Desktop runtime staging must run on");
-    expect(stageSource).toContain("replaceRuntime(stagedRoot, runtimeRoot)");
+    expect(stageSource).toContain("await replaceDirectory(stagedRoot, runtimeRoot)");
     expect(stageSource).toContain('[resolve(packageRoot, "dist/cli.js"), "help"]');
     expect(stageSource).toContain("process.env.npm_execpath");
     expect(stageSource).toContain("process.execPath");
     expect(stageSource).not.toContain('"npm.cmd"');
+  });
+
+  it("retries transient Windows locks while publishing the staged runtime", async () => {
+    const scratch = await mkdtemp(path.join(tmpdir(), "s-gw-runtime-replace-"));
+    const staged = path.join(scratch, "staged");
+    const destination = path.join(scratch, "runtime");
+    const backup = path.join(scratch, "backup");
+    const waits: number[] = [];
+    let publishAttempts = 0;
+
+    try {
+      await mkdir(staged);
+      await mkdir(destination);
+      await writeFile(path.join(staged, "ready.txt"), "ready");
+      await writeFile(path.join(destination, "old.txt"), "old");
+
+      await replaceDirectory(staged, destination, {
+        backupPath: backup,
+        platform: "win32",
+        renamePath: async (source: string, target: string) => {
+          if (source === staged && target === destination) {
+            publishAttempts += 1;
+            if (publishAttempts < 3) {
+              throw Object.assign(new Error("simulated Windows sharing violation"), { code: "EPERM" });
+            }
+          }
+          await rename(source, target);
+        },
+        wait: async (delayMs: number) => {
+          waits.push(delayMs);
+        }
+      });
+
+      await expect(readFile(path.join(destination, "ready.txt"), "utf8")).resolves.toBe("ready");
+      await expect(access(path.join(destination, "old.txt"))).rejects.toThrow();
+      await expect(access(staged)).rejects.toThrow();
+      await expect(access(backup)).rejects.toThrow();
+      expect(publishAttempts).toBe(3);
+      expect(waits).toEqual([250, 250]);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("restores the previous runtime when a replacement cannot be published", async () => {
+    const scratch = await mkdtemp(path.join(tmpdir(), "s-gw-runtime-rollback-"));
+    const staged = path.join(scratch, "staged");
+    const destination = path.join(scratch, "runtime");
+    const backup = path.join(scratch, "backup");
+
+    try {
+      await mkdir(staged);
+      await mkdir(destination);
+      await writeFile(path.join(staged, "new.txt"), "new");
+      await writeFile(path.join(destination, "current.txt"), "current");
+
+      await expect(replaceDirectory(staged, destination, {
+        backupPath: backup,
+        platform: "win32",
+        renamePath: async (source: string, target: string) => {
+          if (source === staged && target === destination) {
+            throw Object.assign(new Error("simulated permanent failure"), { code: "EIO" });
+          }
+          await rename(source, target);
+        },
+        wait: async () => undefined
+      })).rejects.toThrow("simulated permanent failure");
+
+      await expect(readFile(path.join(destination, "current.txt"), "utf8")).resolves.toBe("current");
+      await expect(readFile(path.join(staged, "new.txt"), "utf8")).resolves.toBe("new");
+      await expect(access(backup)).rejects.toThrow();
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the backup when both publish and rollback fail", async () => {
+    const scratch = await mkdtemp(path.join(tmpdir(), "s-gw-runtime-backup-"));
+    const staged = path.join(scratch, "staged");
+    const destination = path.join(scratch, "runtime");
+    const backup = path.join(scratch, "backup");
+
+    try {
+      await mkdir(staged);
+      await mkdir(destination);
+      await writeFile(path.join(staged, "new.txt"), "new");
+      await writeFile(path.join(destination, "current.txt"), "current");
+
+      await expect(replaceDirectory(staged, destination, {
+        backupPath: backup,
+        platform: "win32",
+        renamePath: async (source: string, target: string) => {
+          if (source === staged || source === backup) {
+            throw Object.assign(new Error("simulated filesystem failure"), { code: "EIO" });
+          }
+          await rename(source, target);
+        },
+        wait: async () => undefined
+      })).rejects.toThrow(`Backup: ${backup}`);
+
+      await expect(readFile(path.join(backup, "current.txt"), "utf8")).resolves.toBe("current");
+      await expect(readFile(path.join(staged, "new.txt"), "utf8")).resolves.toBe("new");
+      await expect(access(destination)).rejects.toThrow();
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the previous runtime if the destination reappears during publish", async () => {
+    const scratch = await mkdtemp(path.join(tmpdir(), "s-gw-runtime-collision-"));
+    const staged = path.join(scratch, "staged");
+    const destination = path.join(scratch, "runtime");
+    const backup = path.join(scratch, "backup");
+
+    try {
+      await mkdir(staged);
+      await mkdir(destination);
+      await writeFile(path.join(staged, "new.txt"), "new");
+      await writeFile(path.join(destination, "current.txt"), "current");
+
+      await expect(replaceDirectory(staged, destination, {
+        backupPath: backup,
+        platform: "win32",
+        renamePath: async (source: string, target: string) => {
+          if (source === staged && target === destination) {
+            await mkdir(destination);
+            await writeFile(path.join(destination, "foreign.txt"), "foreign");
+            throw Object.assign(new Error("simulated destination collision"), { code: "ENOTEMPTY" });
+          }
+          await rename(source, target);
+        },
+        wait: async () => undefined
+      })).rejects.toThrow(`Previous runtime: ${backup}`);
+
+      await expect(readFile(path.join(backup, "current.txt"), "utf8")).resolves.toBe("current");
+      await expect(readFile(path.join(destination, "foreign.txt"), "utf8")).resolves.toBe("foreign");
+      await expect(readFile(path.join(staged, "new.txt"), "utf8")).resolves.toBe("new");
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("does not remove a backup path it did not create", async () => {
+    const scratch = await mkdtemp(path.join(tmpdir(), "s-gw-runtime-existing-backup-"));
+    const staged = path.join(scratch, "staged");
+    const destination = path.join(scratch, "runtime");
+    const backup = path.join(scratch, "backup");
+
+    try {
+      await mkdir(staged);
+      await mkdir(destination);
+      await mkdir(backup);
+      await writeFile(path.join(staged, "new.txt"), "new");
+      await writeFile(path.join(destination, "current.txt"), "current");
+      await writeFile(path.join(backup, "sentinel.txt"), "sentinel");
+
+      await expect(replaceDirectory(staged, destination, {
+        backupPath: backup,
+        platform: "win32",
+        renamePath: async (source: string, target: string) => {
+          if (source === destination && target === backup) {
+            throw Object.assign(new Error("simulated backup collision"), { code: "EEXIST" });
+          }
+          await rename(source, target);
+        },
+        wait: async () => undefined
+      })).rejects.toThrow("simulated backup collision");
+
+      await expect(readFile(path.join(backup, "sentinel.txt"), "utf8")).resolves.toBe("sentinel");
+      await expect(readFile(path.join(destination, "current.txt"), "utf8")).resolves.toBe("current");
+      await expect(readFile(path.join(staged, "new.txt"), "utf8")).resolves.toBe("new");
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
 
   it("exposes only the non-secret local instance identity in status", () => {
