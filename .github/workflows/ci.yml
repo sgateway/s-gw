@@ -317,8 +317,10 @@ jobs:
           if (-not $node -or -not $cli -or -not $desktop -or -not $package -or -not $console) {
             throw "NSIS installer is missing the desktop executable or embedded runtime."
           }
+          $allowedInstallerHelper = Join-Path $unpacked '$PLUGINSDIR\nsis_tauri_utils.dll'
           $blockedFiles = @(Get-ChildItem $unpacked -Recurse -File | Where-Object {
-            $_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)'
+            ($_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)') -and
+              ($_.FullName -cne $allowedInstallerHelper)
           })
           if ($blockedFiles.Count -gt 0) {
             throw "Forbidden WebView files in NSIS payload: $($blockedFiles.FullName -join ', ')"

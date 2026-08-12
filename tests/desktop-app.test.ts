@@ -100,6 +100,9 @@ describe("Windows and Linux desktop app", () => {
     expect(workflowSource).toContain("Clean-install and launch deb");
     expect(workflowSource).toContain("ubuntu:22.04");
     expect(workflowSource).toContain("verify-desktop-deb.sh");
+    expect(workflowSource).toContain("$allowedInstallerHelper = Join-Path $unpacked '$PLUGINSDIR\\nsis_tauri_utils.dll'");
+    expect(workflowSource).toContain("$_.FullName -cne $allowedInstallerHelper");
+    expect(workflowSource).toContain("$_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)'");
     expect(smokeSource).toContain("xauth");
     expect(smokeSource).toContain("xvfb-run");
     expect(smokeSource).toContain("timeout 8s");
