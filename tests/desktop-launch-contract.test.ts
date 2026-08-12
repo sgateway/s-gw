@@ -8,7 +8,6 @@ import { describe, expect, it } from "vitest";
 import { desktopAppEnvironment } from "../src/install.js";
 
 const repoRoot = process.cwd();
-const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
 
 describe("native desktop launch contract", () => {
   it("does not pass a console URL to the Linux desktop process", () => {
@@ -77,7 +76,10 @@ describe("native desktop launch contract", () => {
         await chmod(fakeDesktop, 0o755);
 
         const result = spawnSync(process.execPath, [
-          tsxCli,
+          "--import",
+          "tsx",
+          "--import",
+          pathToFileURL(preloadPath).href,
           path.join(repoRoot, "src/cli.ts"),
           "app",
           "open",
@@ -89,7 +91,7 @@ describe("native desktop launch contract", () => {
           env: {
             ...process.env,
             HOME: home,
-            NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
+            NODE_OPTIONS: "",
             SGW_DESKTOP_APP_PATH: fakeDesktop,
             SGW_DISABLE_UPDATE_CHECK: "1",
             SGW_HOME: path.join(tmpRoot, "state"),
@@ -104,6 +106,7 @@ describe("native desktop launch contract", () => {
 
         expect(result.error).toBeUndefined();
         expect(result.status).toBe(0);
+        await waitForFile(argvLog, 2_000);
         const argv = (await readFile(argvLog, "utf8")).trim().split("\n");
         const consoleUrlIndex = argv.indexOf("--console-url");
         expect(consoleUrlIndex).toBeGreaterThanOrEqual(0);
@@ -151,7 +154,10 @@ describe("native desktop launch contract", () => {
       await chmod(fakeSystemctl, 0o755);
 
       const result = spawnSync(process.execPath, [
-        tsxCli,
+        "--import",
+        "tsx",
+        "--import",
+        pathToFileURL(preloadPath).href,
         path.join(repoRoot, "src/cli.ts"),
         "app",
         "open"
@@ -162,7 +168,7 @@ describe("native desktop launch contract", () => {
         env: {
           ...process.env,
           HOME: home,
-          NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
+          NODE_OPTIONS: "",
           SGW_DESKTOP_APP_PATH: path.join(tmpRoot, "missing", "s-gw-desktop"),
           SGW_DISABLE_UPDATE_CHECK: "1",
           SGW_HOME: path.join(tmpRoot, "state"),
@@ -204,3 +210,13 @@ describe("native desktop launch contract", () => {
     expect(windowsAndLinuxLaunch).not.toMatch(/ensureBrowserConsole|openBrowser|openWindowsClient|web-console|windows-client/u);
   });
 });
+
+async function waitForFile(filePath: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(filePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${filePath}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}

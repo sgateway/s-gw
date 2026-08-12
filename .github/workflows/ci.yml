@@ -160,6 +160,13 @@ jobs:
           fi
           active_tree="$(cargo tree --locked --edges normal --target x86_64-unknown-linux-gnu \
             --manifest-path native/desktop-app/Cargo.toml)"
+          for required_renderer in egui_glow glow glutin; do
+            if ! printf '%s\n' "$active_tree" \
+              | grep -Eq "(^|[[:space:]])${required_renderer} v[0-9]"; then
+              printf 'Required active renderer dependency is missing: %s\n' "$required_renderer" >&2
+              exit 1
+            fi
+          done
           blocked_renderer="$(printf '%s\n' "$active_tree" \
             | grep -Ei '(egui-wgpu|gpu-allocator|wgpu(-[^[:space:]]*)?) v[0-9]' || true)"
           if test -n "$blocked_renderer"; then
@@ -193,6 +200,12 @@ jobs:
             --manifest-path native/desktop-app/Cargo.toml | Out-String)
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read the active Windows desktop dependency tree."
+          }
+          foreach ($requiredRenderer in @('egui_glow', 'glow', 'glutin')) {
+            $rendererPattern = "\b$([regex]::Escape($requiredRenderer)) v\d"
+            if ($activeTree -notmatch $rendererPattern) {
+              throw "Required active renderer dependency is missing: $requiredRenderer"
+            }
           }
           if ($activeTree -match '(egui-wgpu|gpu-allocator|wgpu(?:-[^\s]+)?) v\d') {
             throw "Unsupported desktop renderer dependency: $($Matches[0])"

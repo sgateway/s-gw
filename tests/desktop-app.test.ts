@@ -1,10 +1,8 @@
 import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   desktopAppCandidates,
@@ -18,7 +16,6 @@ import { replaceDirectory } from "../scripts/replace-directory.mjs";
 
 const root = process.cwd();
 const appRoot = path.join(root, "native/desktop-app");
-const execFileAsync = promisify(execFile);
 
 describe("Windows and Linux desktop app", () => {
   it("finds packaged and installed native executables without replacing the browser fallback", () => {
@@ -103,6 +100,8 @@ describe("Windows and Linux desktop app", () => {
     expect(workflowSource).toContain("$allowedInstallerHelper = Join-Path $unpacked '$PLUGINSDIR\\nsis_tauri_utils.dll'");
     expect(workflowSource).toContain("$_.FullName -cne $allowedInstallerHelper");
     expect(workflowSource).toContain("$_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)'");
+    expect(workflowSource).toContain("@('egui_glow', 'glow', 'glutin')");
+    expect(workflowSource).toContain("for required_renderer in egui_glow glow glutin");
     expect(smokeSource).toContain("xauth");
     expect(smokeSource).toContain("xvfb-run");
     expect(smokeSource).toContain("timeout 8s");
@@ -113,38 +112,7 @@ describe("Windows and Linux desktop app", () => {
     await expect(access(path.join(appRoot, "tauri.windows.conf.json"))).rejects.toThrow();
     await expect(access(path.join(appRoot, "tauri.linux.conf.json"))).rejects.toThrow();
 
-    const [metadata, windowsTree, linuxTree] = await Promise.all([
-      execFileAsync(
-        "cargo",
-        ["metadata", "--locked", "--format-version", "1", "--manifest-path", path.join(appRoot, "Cargo.toml")],
-        { maxBuffer: 20 * 1024 * 1024 }
-      ),
-      execFileAsync(
-        "cargo",
-        [
-          "tree", "--locked", "--edges", "normal", "--target", "x86_64-pc-windows-msvc",
-          "--manifest-path", path.join(appRoot, "Cargo.toml")
-        ],
-        { maxBuffer: 20 * 1024 * 1024 }
-      ),
-      execFileAsync(
-        "cargo",
-        [
-          "tree", "--locked", "--edges", "normal", "--target", "x86_64-unknown-linux-gnu",
-          "--manifest-path", path.join(appRoot, "Cargo.toml")
-        ],
-        { maxBuffer: 20 * 1024 * 1024 }
-      )
-    ]);
-    const packageNames = (JSON.parse(metadata.stdout).packages as Array<{ name: string }>).map((item) => item.name);
-    expect(packageNames.filter((name) => /^(tauri|wry|webview2-com|webkit2gtk|javascriptcore-rs)/u.test(name))).toEqual([]);
-    for (const activeTree of [windowsTree.stdout, linuxTree.stdout]) {
-      expect(activeTree).toMatch(/\begui_glow v/u);
-      expect(activeTree).toMatch(/\bglow v/u);
-      expect(activeTree).toMatch(/\bglutin v/u);
-      expect(activeTree).not.toMatch(/\b(?:egui-wgpu|gpu-allocator|wgpu(?:-[a-z0-9-]+)?) v/iu);
-    }
-  }, 30_000);
+  });
 
   it("pins and verifies the bundled Node runtimes", async () => {
     const [runtimeRaw, stageSource] = await Promise.all([
