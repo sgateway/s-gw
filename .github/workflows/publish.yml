@@ -66,6 +66,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
+      - name: Pin release build npm
+        run: npm install --global npm@10.9.8
       - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
       - run: npm ci --ignore-scripts
 
@@ -280,6 +282,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
+      - name: Pin release build npm
+        run: npm install --global npm@10.9.8
       - run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
       - run: npm ci --ignore-scripts
       - name: Verify release source
@@ -311,6 +315,9 @@ jobs:
             "dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper"; do
             lipo "$binary" -verify_arch arm64
           done
+
+      - name: Enable npm trusted publishing
+        run: npm install --global npm@11.16.0
 
       - name: Record local npm package integrity
         run: |
