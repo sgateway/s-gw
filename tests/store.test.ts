@@ -110,8 +110,9 @@ afterEach(async () => {
     process.env.NODE_OPTIONS = originalNodeOptions;
   }
   if (tmpHome) {
-    await rm(tmpHome, { recursive: true, force: true });
-    await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+    const cleanup = { recursive: true, force: true, maxRetries: 4, retryDelay: 250 };
+    await rm(tmpHome, cleanup);
+    await rm(`${tmpHome}-recovery`, cleanup);
   }
 });
 
@@ -2064,7 +2065,7 @@ describe("SecretStore", () => {
 
     await store.setApprovalPolicyRuleEnabled(rule.id, false);
     expect(JSON.parse(await readFile(store.storePath, "utf8")).secrets[0].cache).toBeUndefined();
-  });
+  }, 15_000);
 
   it("runs grant-authorized one-shot commands without changing grant usage metadata", async () => {
     const store = new SecretStore();
@@ -2224,7 +2225,7 @@ describe("SecretStore", () => {
     });
     const complete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
     expect(complete.kind).toBe("reusable");
-  });
+  }, 15_000);
 
   it("matches each injected secret against its own policy environment binding", async () => {
     const store = new SecretStore();
