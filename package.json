@@ -1,6 +1,6 @@
 {
   "name": "@s-gw/s-gw",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "mcpName": "io.github.sgateway/s-gw",
   "description": "Local credential control for AI coding agents.",
   "type": "module",
@@ -66,13 +66,14 @@
     "package:dry-run": "npm pack --dry-run",
     "validate:npm-package": "node scripts/validate-npm-package.mjs",
     "validate:release-assets": "node scripts/validate-release-assets.mjs dist/installers",
+    "audit:release": "node scripts/audit-dependencies.mjs",
     "check:rust": "node scripts/check-rust-core.mjs",
     "pretest": "npm run build:rust-core",
     "test": "vitest run",
     "test:desktop-app": "cargo test --manifest-path native/desktop-app/Cargo.toml --locked",
     "test:windows": "node scripts/run-windows-tests.mjs",
     "test:watch": "vitest",
-    "verify": "npm run build && npm run check:rust && npm test && npm audit && npm run package:dry-run",
+    "verify": "npm run build && npm run check:rust && npm test && npm run audit:release && npm run package:dry-run",
     "prepublishOnly": "npm run validate:npm-package",
     "prepack": "npm run build"
   },

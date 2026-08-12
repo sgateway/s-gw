@@ -130,7 +130,7 @@ jobs:
           npm run check:rust
           npm run build:rust-core
           npx vitest run --testTimeout 15000
-          npm audit --audit-level=high
+          npm run audit:release
           npm run package:dry-run
       - run: npm run validate:npm-package
       - run: npm run build:installers
@@ -292,7 +292,7 @@ jobs:
           npm run build
           npm run check:rust
           npm test
-          npm audit --audit-level=high
+          npm run audit:release
           npm run package:dry-run
 
       - name: Verify release version

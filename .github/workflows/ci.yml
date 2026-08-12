@@ -43,7 +43,7 @@ jobs:
       - run: npm run check
       - run: npm run build
       - run: npm test
-      - run: npm audit --audit-level=high
+      - run: npm run audit:release
       - run: npm run package:dry-run
 
   macos-native:

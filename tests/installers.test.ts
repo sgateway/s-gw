@@ -208,7 +208,7 @@ describe("platform installers", () => {
     expect(assetJob).toContain("npm run build");
     expect(assetJob).toContain("npm run check:rust");
     expect(assetJob).toContain("npx vitest run --testTimeout 15000");
-    expect(assetJob).toContain("npm audit --audit-level=high");
+    expect(assetJob).toContain("npm run audit:release");
     expect(assetJob).toContain("npm run package:dry-run");
     expect(assetJob).toContain("npm run validate:npm-package");
     expect(assetJob).toContain("npm run build:installers");
@@ -276,7 +276,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain("SGW_NPM_ALREADY_PUBLISHED=1");
     expect(npmJob).toContain('if [ "${SGW_NPM_ALREADY_PUBLISHED:-0}" != 1 ]');
     expect(npmJob).toContain("Verify an existing immutable release");
-    expect(npmJob).toContain("npm audit --audit-level=high");
+    expect(npmJob).toContain("npm run audit:release");
     expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
     expect(npmJob).toContain("npm publish --access public --ignore-scripts");
     expect(npmJob).toContain("-verify_arch arm64");
@@ -317,7 +317,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain("always()");
     expect(npmJob).toContain("inputs.publish_npm_only ||");
     expect(npmJob).toContain("if: ${{ inputs.publish_npm_only }}");
-    expect(npmJob).toContain("npm audit --audit-level=high");
+    expect(npmJob).toContain("npm run audit:release");
     expect(releaseJob).toContain("!inputs.publish_npm_only");
     expect(registryJob).toContain("inputs.publish_npm_only || inputs.publish_release");
   });
