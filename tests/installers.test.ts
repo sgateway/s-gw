@@ -205,6 +205,10 @@ describe("platform installers", () => {
     expect(assetJob).toContain("SGW_RUST_CORE_DIR: ${{ github.workspace }}/.private/sgw-core");
     expect(assetJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(assetJob).toContain("path: .private/sgw-core");
+    expect(assetJob).toContain("name: Pin release build npm");
+    expect(assetJob).toContain("npm install --global npm@10.9.8");
+    expect(assetJob).toContain('test "$(npm --version)" = 10.9.8');
+    expect(assetJob).toContain("npm ci --ignore-scripts");
     expect(assetJob).toContain("npm run build");
     expect(assetJob).toContain("npm run check:rust");
     expect(assetJob).toContain("npx vitest run --testTimeout 15000");
@@ -270,6 +274,10 @@ describe("platform installers", () => {
     expect(npmJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(npmJob).toContain("ref: ${{ inputs.release_tag }}");
     expect(npmJob).not.toContain("github.event.release");
+    expect(npmJob).toContain("name: Pin release build npm");
+    expect(npmJob).toContain("npx --yes --package npm@10.9.8 npm ci --ignore-scripts");
+    expect(npmJob).toContain('test "$(npx --yes --package npm@10.9.8 npm --version)" = 10.9.8');
+    expect(npmJob).not.toContain("npm install --global npm@10.9.8");
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("Record local npm package integrity");
     expect(npmJob).toContain("SGW_NPM_PACKAGE_INTEGRITY");
