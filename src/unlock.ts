@@ -1273,6 +1273,7 @@ function runWindowsCredentialHelper(helperPath: string, args: string[], input?: 
     encoding: "utf8",
     env: windowsSystemEnvironment(),
     stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
     timeout: timeoutMs,
     killSignal: "SIGKILL"
   });

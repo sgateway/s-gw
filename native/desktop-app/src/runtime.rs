@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -19,7 +21,9 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Security::TOKEN_QUERY;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 #[cfg(target_os = "windows")]
@@ -424,6 +428,8 @@ fn run_json<T: DeserializeOwned>(runtime: &CliRuntime, args: &[&str]) -> Result<
 
 fn run_cli(runtime: &CliRuntime, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
     let mut command = cli_command(runtime);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
     command
         .args(args)
         .stdout(Stdio::piped())

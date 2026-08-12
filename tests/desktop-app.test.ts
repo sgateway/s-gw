@@ -126,6 +126,25 @@ describe("Windows and Linux desktop app", () => {
 
   });
 
+  it("hides background Windows CLI and credential helper processes", async () => {
+    const [runtimeSource, unlockSource] = await Promise.all([
+      readFile(path.join(appRoot, "src/runtime.rs"), "utf8"),
+      readFile(path.join(root, "src/unlock.ts"), "utf8")
+    ]);
+    const runCli = runtimeSource.slice(
+      runtimeSource.indexOf("fn run_cli"),
+      runtimeSource.indexOf("\nfn cli_command")
+    );
+    const credentialHelper = unlockSource.slice(
+      unlockSource.indexOf("function runWindowsCredentialHelper"),
+      unlockSource.indexOf("\nexport function windowsCredentialHelperTimeoutMs")
+    );
+
+    expect(runtimeSource).toContain("use std::os::windows::process::CommandExt;");
+    expect(runCli).toContain("command.creation_flags(CREATE_NO_WINDOW);");
+    expect(credentialHelper).toContain("windowsHide: true");
+  });
+
   it("pins and verifies the bundled Node runtimes", async () => {
     const [runtimeRaw, stageSource] = await Promise.all([
       readFile(path.join(appRoot, "runtime.json"), "utf8"),
