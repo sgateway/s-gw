@@ -145,6 +145,36 @@ describe("Windows and Linux desktop app", () => {
     expect(credentialHelper).toContain("windowsHide: true");
   });
 
+  it("keeps the Windows and Linux native UI on the shared desktop design", async () => {
+    const [appSource, mainSource] = await Promise.all([
+      readFile(path.join(appRoot, "src/app.rs"), "utf8"),
+      readFile(path.join(appRoot, "src/main.rs"), "utf8")
+    ]);
+    for (const label of [
+      "Overview",
+      "Approvals",
+      "Credentials",
+      "Usage Flow",
+      "Activity",
+      "Request History",
+      "Policies",
+      "Agents",
+      "Settings"
+    ]) {
+      expect(appSource).toContain(`\"${label}\"`);
+    }
+    expect(appSource).not.toContain('cfg(target_os = "windows")');
+    expect(appSource).toContain("const SIDEBAR_BG: Color32 = Color32::from_rgb(5, 9, 16);");
+    expect(appSource).toContain("const PANEL: Color32 = Color32::from_rgb(11, 17, 25);");
+    expect(appSource).toContain("ctx.set_theme(egui::Theme::Dark);");
+    expect(appSource).toContain('Self::RequestHistory => "Local request ledger"');
+    expect(appSource).toContain('Self::Settings => "Native application"');
+    expect(appSource).not.toContain('hint_text("Search this view');
+    expect(mainSource).toContain('#[cfg(not(target_os = "macos"))]');
+    expect(mainSource).toContain(".with_min_inner_size([980.0, 640.0])");
+    expect(mainSource).toContain(".with_min_inner_size([900.0, 620.0])");
+  });
+
   it("pins and verifies the bundled Node runtimes", async () => {
     const [runtimeRaw, stageSource] = await Promise.all([
       readFile(path.join(appRoot, "runtime.json"), "utf8"),

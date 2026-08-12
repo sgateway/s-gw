@@ -77,11 +77,9 @@ fn run() -> Result<(), String> {
         false
     };
     let icon = window_icon()?;
-    let viewport = egui::ViewportBuilder::default()
+    let viewport = desktop_viewport()
         .with_title("s-gw")
         .with_app_id("com.s-gw.sgw.desktop")
-        .with_inner_size([1280.0, 840.0])
-        .with_min_inner_size([900.0, 620.0])
         .with_visible(!settings.background || show_from_activation)
         .with_icon(icon);
     let options = native_options(viewport);
@@ -103,6 +101,20 @@ fn run() -> Result<(), String> {
     .map_err(|error| format!("The native window could not start: {error}"));
     drop(instance);
     result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn desktop_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 840.0])
+        .with_min_inner_size([980.0, 640.0])
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 840.0])
+        .with_min_inner_size([900.0, 620.0])
 }
 
 #[cfg(windows)]
