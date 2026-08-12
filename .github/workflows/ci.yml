@@ -146,14 +146,16 @@ jobs:
           cargo metadata --locked --format-version 1 \
             --manifest-path native/desktop-app/Cargo.toml > "$metadata_file"
           mapfile -t package_names < <(jq -r '.packages[].name' "$metadata_file")
+          package_list="$(printf '%s\n' "${package_names[@]}")"
           for required in eframe glow tray-icon; do
-            if ! printf '%s\n' "${package_names[@]}" | grep -Fxq "$required"; then
+            if ! grep -Fxq "$required" <<< "$package_list"; then
               printf 'Required native desktop dependency is missing: %s\n' "$required" >&2
               exit 1
             fi
           done
-          blocked="$(printf '%s\n' "${package_names[@]}" \
-            | grep -Ei '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)' || true)"
+          blocked="$(grep -Ei \
+            '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)' \
+            <<< "$package_list" || true)"
           if test -n "$blocked"; then
             printf 'Forbidden WebView dependency in desktop graph:\n%s\n' "$blocked" >&2
             exit 1
@@ -161,14 +163,14 @@ jobs:
           active_tree="$(cargo tree --locked --edges normal --target x86_64-unknown-linux-gnu \
             --manifest-path native/desktop-app/Cargo.toml)"
           for required_renderer in egui_glow glow glutin; do
-            if ! printf '%s\n' "$active_tree" \
-              | grep -Eq "(^|[[:space:]])${required_renderer} v[0-9]"; then
+            if ! grep -Eq "(^|[[:space:]])${required_renderer} v[0-9]" <<< "$active_tree"; then
               printf 'Required active renderer dependency is missing: %s\n' "$required_renderer" >&2
               exit 1
             fi
           done
-          blocked_renderer="$(printf '%s\n' "$active_tree" \
-            | grep -Ei '(egui-wgpu|gpu-allocator|wgpu(-[^[:space:]]*)?) v[0-9]' || true)"
+          blocked_renderer="$(grep -Ei \
+            '(egui-wgpu|gpu-allocator|wgpu(-[^[:space:]]*)?) v[0-9]' \
+            <<< "$active_tree" || true)"
           if test -n "$blocked_renderer"; then
             printf 'Unsupported desktop renderer dependency:\n%s\n' "$blocked_renderer" >&2
             exit 1

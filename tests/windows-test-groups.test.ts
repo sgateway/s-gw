@@ -100,6 +100,12 @@ describe("Windows test groups", () => {
       "cargo metadata --locked --format-version 1"
     );
     expect(workflow).toContain("for required in eframe glow tray-icon");
+    expect(workflow).toContain('grep -Fxq "$required" <<< "$package_list"');
+    expect(workflow).not.toContain('| grep -Fxq "$required"');
+    expect(workflow).toContain(
+      'grep -Eq "(^|[[:space:]])${required_renderer} v[0-9]" <<< "$active_tree"'
+    );
+    expect(workflow).not.toContain('| grep -Eq "(^|[[:space:]])${required_renderer} v[0-9]"');
     expect(workflow).toContain("foreach ($required in @('eframe', 'wgpu', 'tray-icon'))");
     expect(workflow).toContain("egui-wgpu|gpu-allocator|wgpu");
     expect(workflow).toContain("foreach ($requiredRenderer in @('egui-wgpu', 'wgpu', 'wgpu-core', 'wgpu-hal', 'gpu-allocator'))");
