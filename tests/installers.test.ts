@@ -206,8 +206,8 @@ describe("platform installers", () => {
     expect(assetJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(assetJob).toContain("path: .private/sgw-core");
     expect(assetJob).toContain("name: Pin release build npm");
-    expect(assetJob).toContain("npm install --global npm@10.9.8");
-    expect(assetJob).toContain('test "$(npm --version)" = 10.9.8');
+    expect(assetJob).toContain("npx --yes --package npm@10.9.8 npm ci --ignore-scripts");
+    expect(assetJob).toContain('test "$(npx --yes --package npm@10.9.8 npm --version)" = 10.9.8');
     expect(assetJob).toContain("npm run build");
     expect(assetJob).toContain("npm run check:rust");
     expect(assetJob).toContain("npx vitest run --testTimeout 15000");
@@ -274,15 +274,9 @@ describe("platform installers", () => {
     expect(npmJob).toContain("ref: ${{ inputs.release_tag }}");
     expect(npmJob).not.toContain("github.event.release");
     expect(npmJob).toContain("name: Pin release build npm");
-    expect(npmJob).toContain("npm install --global npm@10.9.8");
-    expect(npmJob).toContain('test "$(npm --version)" = 10.9.8');
-    expect(npmJob).toContain("name: Enable npm trusted publishing");
-    expect(npmJob).toContain("npm install --global npm@11.16.0");
-    expect(npmJob).toContain('test "$(npm --version)" = 11.16.0');
-    expect(npmJob.indexOf("npm install --global npm@10.9.8"))
-      .toBeLessThan(npmJob.indexOf("npm ci --ignore-scripts"));
-    expect(npmJob.indexOf("npm install --global npm@11.16.0"))
-      .toBeLessThan(npmJob.indexOf("name: Record local npm package integrity"));
+    expect(npmJob).toContain("npx --yes --package npm@10.9.8 npm ci --ignore-scripts");
+    expect(npmJob).toContain('test "$(npx --yes --package npm@10.9.8 npm --version)" = 10.9.8');
+    expect(npmJob).not.toContain("npm install --global npm@10.9.8");
     expect(npmJob).toContain("npm run validate:npm-package");
     expect(npmJob).toContain("Record local npm package integrity");
     expect(npmJob).toContain("SGW_NPM_PACKAGE_INTEGRITY");
