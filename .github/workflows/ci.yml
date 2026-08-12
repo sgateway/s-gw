@@ -185,7 +185,7 @@ jobs:
           }
           $metadata = $metadataJson | ConvertFrom-Json
           $packageNames = @($metadata.packages | ForEach-Object { $_.name })
-          foreach ($required in @('eframe', 'glow', 'tray-icon')) {
+          foreach ($required in @('eframe', 'wgpu', 'tray-icon')) {
             if ($required -cnotin $packageNames) {
               throw "Required native desktop dependency is missing: $required"
             }
@@ -201,14 +201,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read the active Windows desktop dependency tree."
           }
-          foreach ($requiredRenderer in @('egui_glow', 'glow', 'glutin')) {
+          foreach ($requiredRenderer in @('egui-wgpu', 'wgpu', 'wgpu-core', 'wgpu-hal', 'gpu-allocator')) {
             $rendererPattern = "\b$([regex]::Escape($requiredRenderer)) v\d"
             if ($activeTree -notmatch $rendererPattern) {
               throw "Required active renderer dependency is missing: $requiredRenderer"
             }
           }
-          if ($activeTree -match '(egui-wgpu|gpu-allocator|wgpu(?:-[^\s]+)?) v\d') {
+          if ($activeTree -match '(egui_glow|glow|glutin(?:-[^\s]+)?) v\d') {
             throw "Unsupported desktop renderer dependency: $($Matches[0])"
+          }
+          $windowsCrateVersions = @(
+            [regex]::Matches($activeTree, '\bwindows v(\d+\.\d+\.\d+)') |
+              ForEach-Object { $_.Groups[1].Value } |
+              Sort-Object -Unique
+          )
+          if ($windowsCrateVersions.Count -ne 1 -or $windowsCrateVersions[0] -notmatch '^0\.62\.') {
+            throw "wgpu and gpu-allocator must share windows 0.62.x bindings: $($windowsCrateVersions -join ', ')"
+          }
+          $featureTree = (& cargo tree --locked --edges features --target x86_64-pc-windows-msvc `
+            --manifest-path native/desktop-app/Cargo.toml | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the active Windows desktop feature tree."
+          }
+          foreach ($requiredFeature in @('dx12', 'std', 'wgsl')) {
+            if ($featureTree -notmatch "wgpu feature `"$requiredFeature`"") {
+              throw "Required Windows wgpu feature is missing: $requiredFeature"
+            }
+          }
+          if ($featureTree -match 'wgpu feature "(vulkan|gles|metal)"') {
+            throw "Unsupported Windows wgpu backend feature: $($Matches[1])"
           }
 
       - run: npm run check:desktop-app

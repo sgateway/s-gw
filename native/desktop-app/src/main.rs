@@ -84,10 +84,7 @@ fn run() -> Result<(), String> {
         .with_min_inner_size([900.0, 620.0])
         .with_visible(!settings.background || show_from_activation)
         .with_icon(icon);
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    let options = native_options(viewport);
     let settings_for_app = settings.clone();
     let activation_for_app = activation.clone();
     let result = eframe::run_native(
@@ -106,6 +103,31 @@ fn run() -> Result<(), String> {
     .map_err(|error| format!("The native window could not start: {error}"));
     drop(instance);
     result
+}
+
+#[cfg(windows)]
+fn native_options(viewport: egui::ViewportBuilder) -> eframe::NativeOptions {
+    let mut wgpu_options = eframe::WgpuConfiguration::default();
+    let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup else {
+        unreachable!("the default wgpu configuration creates a new instance")
+    };
+    setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+
+    eframe::NativeOptions {
+        viewport,
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
+        ..Default::default()
+    }
+}
+
+#[cfg(unix)]
+fn native_options(viewport: egui::ViewportBuilder) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport,
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    }
 }
 
 fn open_instance_lock(lock_name: &str) -> Result<SingleInstance, String> {

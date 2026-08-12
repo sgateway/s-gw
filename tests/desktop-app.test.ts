@@ -51,8 +51,15 @@ describe("Windows and Linux desktop app", () => {
     ).join("\n");
     const packageInfo = JSON.parse(packageRaw);
 
-    expect(cargoRaw).toContain('eframe = { version = "=0.36.1"');
-    expect(cargoRaw).toContain('features = ["accesskit", "default_fonts", "glow", "wayland", "x11"]');
+    expect(cargoRaw).toContain(
+      'eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }'
+    );
+    expect(cargoRaw).toContain(
+      'eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu_no_default_features"] }'
+    );
+    expect(cargoRaw).toContain(
+      'wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "dx12"] }'
+    );
     expect(cargoRaw).toContain('egui = "=0.36.1"');
     expect(cargoRaw).toContain('egui_extras = "=0.36.1"');
     expect(cargoRaw).toContain('tray-icon = "=0.24.2"');
@@ -66,6 +73,9 @@ describe("Windows and Linux desktop app", () => {
 
     expect(rustSource).toContain("eframe::run_native");
     expect(rustSource).toContain("impl eframe::App");
+    expect(rustSource).toContain("renderer: eframe::Renderer::Wgpu");
+    expect(rustSource).toContain("backends = eframe::wgpu::Backends::DX12");
+    expect(rustSource).toContain("renderer: eframe::Renderer::Glow");
     expect(rustSource).toContain("parse_health_response");
     expect(rustSource).toContain('"__desktop-instance-key"');
     expect(rustSource).toContain("current_windows_default_instance_key");
@@ -100,8 +110,10 @@ describe("Windows and Linux desktop app", () => {
     expect(workflowSource).toContain("$allowedInstallerHelper = Join-Path $unpacked '$PLUGINSDIR\\nsis_tauri_utils.dll'");
     expect(workflowSource).toContain("$_.FullName -cne $allowedInstallerHelper");
     expect(workflowSource).toContain("$_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)'");
-    expect(workflowSource).toContain("@('egui_glow', 'glow', 'glutin')");
     expect(workflowSource).toContain("for required_renderer in egui_glow glow glutin");
+    expect(workflowSource).toContain("@('egui-wgpu', 'wgpu', 'wgpu-core', 'wgpu-hal', 'gpu-allocator')");
+    expect(workflowSource).toContain("@('dx12', 'std', 'wgsl')");
+    expect(workflowSource).toContain("wgpu feature \"(vulkan|gles|metal)\"");
     expect(smokeSource).toContain("xauth");
     expect(smokeSource).toContain("xvfb-run");
     expect(smokeSource).toContain("timeout 8s");

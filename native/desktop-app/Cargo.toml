@@ -13,7 +13,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dependencies]
-eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui = "=0.36.1"
 egui_extras = "=0.36.1"
 image = { version = "=0.25.6", default-features = false, features = ["png"] }
@@ -27,6 +26,7 @@ url = "=2.5.7"
 zeroize = "=1.8.2"
 
 [target.'cfg(unix)'.dependencies]
+eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 libc = "=0.2.189"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -36,6 +36,8 @@ gtk = "=0.18.2"
 egui_kittest = "=0.36.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu_no_default_features"] }
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "dx12"] }
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",

@@ -100,8 +100,10 @@ describe("Windows test groups", () => {
       "cargo metadata --locked --format-version 1"
     );
     expect(workflow).toContain("for required in eframe glow tray-icon");
-    expect(workflow).toContain("foreach ($required in @('eframe', 'glow', 'tray-icon'))");
+    expect(workflow).toContain("foreach ($required in @('eframe', 'wgpu', 'tray-icon'))");
     expect(workflow).toContain("egui-wgpu|gpu-allocator|wgpu");
+    expect(workflow).toContain("foreach ($requiredRenderer in @('egui-wgpu', 'wgpu', 'wgpu-core', 'wgpu-hal', 'gpu-allocator'))");
+    expect(workflow).toContain("foreach ($requiredFeature in @('dx12', 'std', 'wgsl'))");
     expect(workflow).toContain(
       "__TAURI__|tauri://|tauri-runtime|tauri_runtime|tauri-plugin|webview2|webkit2gtk|javascriptcore|github\\.com/tauri-apps/wry|wry::"
     );
