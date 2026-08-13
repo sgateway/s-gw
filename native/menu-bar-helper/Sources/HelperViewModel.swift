@@ -87,21 +87,47 @@ final class DecisionController {
   }
 
   func approve(_ id: String, choice: ApprovalChoice = .oneTime) {
-    decide(id, approving: true, choice: choice)
+    decide(
+      id,
+      args: ["approve", id] + choice.cliArgs,
+      successTitle: "s-gw approved",
+      successBody: "Approved request \(id).",
+      failureTitle: "Approve failed"
+    )
+  }
+
+  func approvePolicy(_ id: String) {
+    decide(
+      id,
+      args: ["approve-policy", id],
+      successTitle: "s-gw policy added",
+      successBody: "Allowed this request scope and approved request \(id).",
+      failureTitle: "Allow policy failed"
+    )
   }
 
   func deny(_ id: String) {
-    decide(id, approving: false, choice: nil)
+    decide(
+      id,
+      args: ["deny", id],
+      successTitle: "s-gw denied",
+      successBody: "Denied request \(id).",
+      failureTitle: "Deny failed"
+    )
   }
 
-  private func decide(_ id: String, approving: Bool, choice: ApprovalChoice?) {
+  private func decide(
+    _ id: String,
+    args: [String],
+    successTitle: String,
+    successBody: String,
+    failureTitle: String
+  ) {
     guard !decidingRequestIds.contains(id) else { return }
     decidingRequestIds.insert(id)
     onInFlightChange(decidingRequestIds)
 
-    let verb = approving ? "approve" : "deny"
     let run = runCli
-    let args = [verb, id] + (approving ? (choice?.cliArgs ?? ApprovalChoice.oneTime.cliArgs) : [])
 
     Task {
       let result = await Task.detached { run(args) }.value
@@ -109,15 +135,14 @@ final class DecisionController {
       self.onInFlightChange(self.decidingRequestIds)
 
       if result.ok {
-        let label = approving ? "approved" : "denied"
         self.notify(DecisionOutcome(
-          title: "s-gw \(label)",
-          body: "\(approving ? "Approved" : "Denied") request \(id).",
+          title: successTitle,
+          body: successBody,
           succeeded: true
         ))
       } else {
         self.notify(DecisionOutcome(
-          title: approving ? "Approve failed" : "Deny failed",
+          title: failureTitle,
           body: Self.failureReason(result.stderr ?? result.stdout, id: id),
           succeeded: false
         ))

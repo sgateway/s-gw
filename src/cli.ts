@@ -5,6 +5,7 @@ import { stdin } from "node:process";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
+  mcpAuthorityEnvironment,
   refreshManagedAgentIntegrations,
   resolvePackagedMcpCommand,
   uninstallAgentIntegrations
@@ -24,29 +25,42 @@ import {
 import { guardStatus, prepareGuardedRun, runGuardedAgent } from "./guard.js";
 import {
   assertMacRuntimeForManagedSurfaces,
+  ensureWindowsConsole,
   getPackageLayout,
   installMacAppBundle,
   installConsoleLaunchAgent,
   installMenuBarLaunchAgent,
+  installSystemdUserService,
+  installWindowsLoginService,
   launchAgentStatus,
   normalizeMenuBarCountMode,
+  openDesktopApp,
   openMacApp,
   openMenuBarHelper,
-  openWindowsClient,
   openWindowsHelper,
   packageHealth,
   refreshMacRuntimeServices,
   restartWindowsSurfaces,
+  startInstalledWindowsLoginService,
   startInstalledLaunchAgent,
+  startInstalledSystemdUserService,
   stopInstalledLaunchAgent,
+  stopInstalledSystemdUserService,
+  stopInstalledWindowsLoginService,
   stopMacApp,
   stopWindowsSurfaces,
+  waitForConsoleAuthority,
   type WindowsStoppedSurfaces,
   uninstallConsoleLaunchAgent,
-  uninstallMenuBarLaunchAgent
+  uninstallMenuBarLaunchAgent,
+  uninstallSystemdUserService,
+  uninstallWindowsLoginService,
+  windowsLoginServiceStatus,
+  systemdUserServiceStatus
 } from "./install.js";
 import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "./onepassword.js";
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
+import { getSgwInstanceKey } from "./paths.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { normalizeCommandGrant, SecretStore } from "./store.js";
 import {
@@ -58,6 +72,7 @@ import {
   unlockStatus
 } from "./unlock.js";
 import { releaseChecker } from "./update-check.js";
+import { trustedWindowsSystemExecutableSync, windowsSystemEnvironment } from "./windows-system.js";
 import type {
   ApprovalAgentScope,
   ApprovalMode,
@@ -86,8 +101,28 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "setup" && (second === "-h" || hasFlag(parsed.flags, "help"))) {
+    printSetupHelp();
+    return;
+  }
+
   if (first === "mcp") {
     await import("./mcp-server.js");
+    return;
+  }
+
+  if (first === "__windows-login-start") {
+    if (process.platform !== "win32") {
+      throw new Error("Windows login startup is only available on Windows.");
+    }
+    const payload = getFlag(parsed.flags, "payload");
+    if (!payload) throw new Error("Windows login startup requires its managed payload.");
+    await startInstalledWindowsLoginService(payload);
+    return;
+  }
+
+  if (first === "__desktop-instance-key") {
+    printJson({ instanceKey: getSgwInstanceKey() });
     return;
   }
 
@@ -163,7 +198,7 @@ async function main(): Promise<void> {
     }
 
     if (!hasFlag(parsed.flags, "no-open")) {
-      openBrowser(running.url);
+      await openBrowser(running.url);
     }
 
     process.stdout.write(`s-gw console running at ${running.url}\n`);
@@ -311,7 +346,7 @@ async function main(): Promise<void> {
       type: secretType(getFlag(parsed.flags, "type") || "unknown"),
       value,
       service: getFlag(parsed.flags, "service"),
-      source: getFlag(parsed.flags, "source") || "macos-keychain",
+      source: getFlag(parsed.flags, "source"),
       policy: {
         injectEnv: getFlag(parsed.flags, "inject-env"),
         allowedCommands: getFlagList(parsed.flags, "allow-command"),
@@ -524,6 +559,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "approve-policy") {
+    if (!second) {
+      throw new Error("approve-policy requires a request id.");
+    }
+
+    printJson(await store.approveRequestWithScopedPolicy(second));
+    return;
+  }
+
   if (first === "deny") {
     if (!second) {
       throw new Error("deny requires a request id.");
@@ -644,6 +688,7 @@ const valueFlags = new Set([
   "name",
   "npm-prefix",
   "package",
+  "payload",
   "pending-ttl-ms",
   "port",
   "priority",
@@ -651,6 +696,7 @@ const valueFlags = new Set([
   "reason",
   "recover",
   "ref",
+  "resolved-command",
   "secret-handle",
   "service",
   "server-name",
@@ -700,7 +746,7 @@ async function readStdinValue(
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
 
-  return Buffer.concat(chunks).toString("utf8").replace(/\n$/, "");
+  return Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/, "");
 }
 
 function getFlag(flags: Record<string, string | boolean | string[]>, key: string): string | undefined {
@@ -980,9 +1026,13 @@ function parseDurationMs(input: string): number {
 function mcpSnippetOptions(flags: Record<string, string | boolean | string[]>) {
   const command = getFlag(flags, "command");
   const args = getFlagList(flags, "arg");
+  const explicitEnv = parseEnvFlags(getFlagList(flags, "env"));
+  const authorityEnv = mcpAuthorityEnvironment({
+    env: { ...process.env, ...explicitEnv }
+  });
   const env = {
-    ...(process.env.SGW_HOME ? { SGW_HOME: process.env.SGW_HOME } : {}),
-    ...parseEnvFlags(getFlagList(flags, "env"))
+    ...explicitEnv,
+    ...authorityEnv
   };
   if (process.platform === "darwin") {
     const layout = getPackageLayout();
@@ -1039,6 +1089,10 @@ async function handleSetupCommand(
   store: SecretStore,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  if (process.platform === "win32" && hasFlag(flags, "no-service") && !hasFlag(flags, "no-menubar")) {
+    throw new Error("--no-service requires --no-menubar on Windows because the tray helper requires its matching console.");
+  }
+
   if (process.platform === "darwin") {
     const layout = getPackageLayout();
     assertMacRuntimeForManagedSurfaces(layout);
@@ -1048,14 +1102,40 @@ async function handleSetupCommand(
   const keychainHelper = process.platform === "darwin" ? installPersistentKeychainHelper() : undefined;
   const keychainCompatibility = process.platform === "darwin" ? pinPackagedKeychainHelper() : undefined;
   const beforeUnlock = unlockStatus();
+  const backgroundRequested = !hasFlag(flags, "no-service")
+    || (process.platform === "darwin" && !hasFlag(flags, "no-menubar"));
+  if (backgroundRequested && beforeUnlock.envConfigured && process.platform === "win32") {
+    throw new Error(
+      "Windows background startup will not persist or inherit SGW_MASTER_PASSPHRASE. " +
+      "Unset it before setup, or use `s-gw setup --no-service --no-menubar` for a foreground-only installation."
+    );
+  }
+  if (backgroundRequested && beforeUnlock.envConfigured && process.platform === "darwin") {
+    throw new Error(
+      "macOS background startup will not persist or inherit SGW_MASTER_PASSPHRASE. " +
+      "Unset it before setup, or use `s-gw setup --no-service --no-menubar` for a foreground-only installation."
+    );
+  }
+  if (backgroundRequested && beforeUnlock.envConfigured && process.platform === "linux") {
+    throw new Error(
+      "Linux background startup will not persist or inherit SGW_MASTER_PASSPHRASE. " +
+      "Unset it before setup, or use `s-gw setup --no-service --no-menubar` for a foreground-only installation."
+    );
+  }
   const masterKeychainRepair = process.platform === "darwin" && beforeUnlock.keychain.configured
     ? repairKeychainPassphraseAccess()
     : undefined;
   let unlockAction = beforeUnlock.activeSource === "none" ? "not-configured" : `existing-${beforeUnlock.activeSource}`;
 
   if (beforeUnlock.activeSource === "none") {
-    if (process.platform !== "darwin" && process.platform !== "win32") {
-      throw new Error("s-gw setup currently needs a local OS credential store. On Linux, set SGW_MASTER_PASSPHRASE and run s-gw init.");
+    if (process.platform !== "darwin" && process.platform !== "linux" && process.platform !== "win32") {
+      throw new Error("s-gw setup needs a supported local OS credential store or SGW_MASTER_PASSPHRASE.");
+    }
+    if (beforeUnlock.keychain.state === "unavailable") {
+      throw new Error(
+        "s-gw setup cannot verify existing OS credential-store unlock material and will not generate or replace it. " +
+        (beforeUnlock.keychain.error || "Make the local credential store available, then retry.")
+      );
     }
 
     const passphrase = hasFlag(flags, "passphrase-stdin")
@@ -1070,13 +1150,31 @@ async function handleSetupCommand(
     ? await store.repairKeychainAccess()
     : undefined;
   const consoleUrl = `http://127.0.0.1:${port}/`;
-  let service = launchAgentStatus("console");
+  let service: unknown = process.platform === "linux"
+    ? systemdUserServiceStatus()
+    : launchAgentStatus("console");
   let menuBar = launchAgentStatus("menubar");
+  let windowsConsole: unknown;
   let windowsHelper: unknown;
   const appInstall = process.platform === "darwin" ? installMacAppBundle() : undefined;
 
   if (process.platform === "darwin" && !hasFlag(flags, "no-service")) {
     service = await installConsoleLaunchAgent({ port, start: true });
+  } else if (process.platform === "linux" && !hasFlag(flags, "no-service")) {
+    service = await installSystemdUserService({ port, start: true });
+  } else if (process.platform === "win32" && !hasFlag(flags, "no-service")) {
+    const windowsService = await installWindowsLoginService({
+      port,
+      start: true,
+      tray: !hasFlag(flags, "no-menubar")
+    });
+    service = windowsService;
+    windowsConsole = windowsService.active
+      ? { consoleUrl: windowsService.consoleUrl, pid: windowsService.consolePid }
+      : undefined;
+    windowsHelper = windowsService.helperActive
+      ? { consoleUrl: windowsService.consoleUrl }
+      : undefined;
   }
 
   if (process.platform === "darwin" && !hasFlag(flags, "no-menubar")) {
@@ -1086,11 +1184,11 @@ async function handleSetupCommand(
       notify: !hasFlag(flags, "no-notify"),
       countMode: normalizeMenuBarCountMode(getFlag(flags, "menubar-count"))
     });
-  } else if (process.platform === "win32" && !hasFlag(flags, "no-menubar")) {
-    windowsHelper = openWindowsHelper({ port, consoleUrl });
   }
 
-  const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+  const opened = shouldOpenUi(flags) && !(process.platform === "win32" && hasFlag(flags, "no-service"))
+    ? await openPreferredUi(port, consoleUrl)
+    : undefined;
   const agents = hasFlag(flags, "no-agents")
     ? { skipped: true, results: [] }
     : { skipped: false, results: installAgentIntegrations() };
@@ -1103,6 +1201,7 @@ async function handleSetupCommand(
     opened,
     service,
     menuBar,
+    windowsConsole,
     windowsHelper,
     keychainHelper,
     keychainCompatibility,
@@ -1124,9 +1223,27 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
   const port = numericFlag(flags, "port", 8718);
   const consoleUrl = `http://127.0.0.1:${port}/`;
   if (process.platform === "win32") {
-    const helper = openWindowsHelper({ port, consoleUrl });
-    const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
-    printJson({ ok: true, consoleUrl, opened, helper });
+    if (hasFlag(flags, "no-service") && !hasFlag(flags, "no-menubar")) {
+      throw new Error("--no-service requires --no-menubar on Windows because the tray helper requires its matching console.");
+    }
+    if (hasFlag(flags, "no-service")) {
+      printJson({ ok: true, consoleUrl, opened: undefined, service: undefined });
+      return;
+    }
+    const service = await installWindowsLoginService({
+      port,
+      start: true,
+      tray: !hasFlag(flags, "no-menubar")
+    });
+    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
+    printJson({ ok: true, consoleUrl, opened, service });
+    return;
+  }
+
+  if (process.platform === "linux") {
+    const service = await installSystemdUserService({ port, start: true });
+    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
+    printJson({ ok: true, consoleUrl, opened, service });
     return;
   }
 
@@ -1137,12 +1254,25 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
     ? startInstalledLaunchAgent("menubar")
     : await installMenuBarLaunchAgent({ port, start: true });
 
-  const opened = shouldOpenUi(flags) ? openPreferredUi(port, consoleUrl) : undefined;
+  const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
 
   printJson({ ok: true, consoleUrl, opened, service, menuBar });
 }
 
 async function handleStopCommand(): Promise<void> {
+  if (process.platform === "win32") {
+    const service = await windowsLoginServiceStatus();
+    if (service.installed && !service.managed) {
+      throw new Error(service.error || "The Windows login startup is not managed by s-gw.");
+    }
+    if (service.managed) {
+      const stoppedService = await stopInstalledWindowsLoginService();
+      printJson({ ok: true, windows: stoppedService.stopped, service: stoppedService });
+      return;
+    }
+    printJson({ ok: true, windows: stopWindowsSurfaces() });
+    return;
+  }
   const { service, menuBar } = stopBackgroundSurfaces();
   printJson({ ok: true, service, menuBar });
 }
@@ -1153,10 +1283,13 @@ function updateServiceLifecycle(keepAppRunning: boolean): {
 } {
   const serviceBefore = launchAgentStatus("console");
   const menuBarBefore = launchAgentStatus("menubar");
+  const systemdBefore = process.platform === "linux" ? systemdUserServiceStatus() : undefined;
   const serviceWasLoaded = process.platform === "darwin" && serviceBefore.installed && serviceBefore.loaded;
   const menuBarWasLoaded = process.platform === "darwin" && menuBarBefore.installed && menuBarBefore.loaded;
+  const systemdWasActive = Boolean(systemdBefore?.installed && systemdBefore.active);
   let macAppWasRunning = false;
   let windowsStopped: WindowsStoppedSurfaces | undefined;
+  let windowsServiceBefore: Awaited<ReturnType<typeof windowsLoginServiceStatus>> | undefined;
 
   return {
     stop: async () => {
@@ -1164,7 +1297,13 @@ function updateServiceLifecycle(keepAppRunning: boolean): {
       if (process.platform === "darwin" && !keepAppRunning) {
         macAppWasRunning = Boolean(stopMacApp());
       } else if (process.platform === "win32") {
-        windowsStopped = stopWindowsSurfaces();
+        windowsServiceBefore = await windowsLoginServiceStatus();
+        if (windowsServiceBefore.installed && !windowsServiceBefore.managed) {
+          throw new Error(windowsServiceBefore.error || "The Windows login startup is not managed by s-gw.");
+        }
+        windowsStopped = windowsServiceBefore.managed
+          ? (await stopInstalledWindowsLoginService()).stopped
+          : stopWindowsSurfaces();
       }
     },
     restart: async () => {
@@ -1182,9 +1321,23 @@ function updateServiceLifecycle(keepAppRunning: boolean): {
         }
       } else if (process.platform === "win32" && windowsStopped) {
         try {
-          await restartWindowsSurfaces(windowsStopped);
+          if (windowsServiceBefore?.managed && windowsServiceBefore.config) {
+            await installWindowsLoginService({
+              port: windowsServiceBefore.config.port,
+              start: windowsServiceBefore.active,
+              tray: windowsServiceBefore.config.tray
+            });
+          } else {
+            await restartWindowsSurfaces(windowsStopped);
+          }
         } catch (error) {
           failures.push(`Windows surfaces: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } else if (process.platform === "linux" && systemdWasActive) {
+        try {
+          startInstalledSystemdUserService();
+        } catch (error) {
+          failures.push(`systemd service: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 
@@ -1227,9 +1380,13 @@ function restartLaunchAgent(
 function stopBackgroundSurfaces() {
   const serviceBefore = launchAgentStatus("console");
   const menuBarBefore = launchAgentStatus("menubar");
-  const service = process.platform === "darwin" && serviceBefore.installed
-    ? stopInstalledLaunchAgent("console")
-    : serviceBefore;
+  let service: unknown = serviceBefore;
+  if (process.platform === "darwin" && serviceBefore.installed) {
+    service = stopInstalledLaunchAgent("console");
+  } else if (process.platform === "linux") {
+    const systemdBefore = systemdUserServiceStatus();
+    service = systemdBefore.installed ? stopInstalledSystemdUserService() : systemdBefore;
+  }
   const menuBar = process.platform === "darwin" && menuBarBefore.installed
     ? stopInstalledLaunchAgent("menubar")
     : menuBarBefore;
@@ -1240,6 +1397,61 @@ async function handleServiceCommand(
   action: string | undefined,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  if (process.platform === "win32") {
+    if (action === "install") {
+      printJson(await installWindowsLoginService({
+        port: numericFlag(flags, "port", 8718),
+        start: hasFlag(flags, "start"),
+        tray: hasFlag(flags, "menubar")
+      }));
+      return;
+    }
+    if (action === "start") {
+      printJson(await startInstalledWindowsLoginService());
+      return;
+    }
+    if (action === "stop") {
+      printJson(await stopInstalledWindowsLoginService());
+      return;
+    }
+    if (action === "status") {
+      printJson(await windowsLoginServiceStatus());
+      return;
+    }
+    if (action === "uninstall") {
+      printJson(await uninstallWindowsLoginService());
+      return;
+    }
+    throw new Error("service requires install, start, stop, status, or uninstall.");
+  }
+
+  if (process.platform === "linux") {
+    if (action === "install") {
+      printJson(await installSystemdUserService({
+        port: numericFlag(flags, "port", 8718),
+        start: hasFlag(flags, "start")
+      }));
+      return;
+    }
+    if (action === "start") {
+      printJson(startInstalledSystemdUserService());
+      return;
+    }
+    if (action === "stop") {
+      printJson(stopInstalledSystemdUserService());
+      return;
+    }
+    if (action === "status") {
+      printJson(systemdUserServiceStatus());
+      return;
+    }
+    if (action === "uninstall") {
+      printJson(await uninstallSystemdUserService());
+      return;
+    }
+    throw new Error("service requires install, start, stop, status, or uninstall.");
+  }
+
   if (action === "install") {
     printJson(
       await installConsoleLaunchAgent({
@@ -1286,7 +1498,7 @@ async function handleMenuBarCommand(
   if (action === "open") {
     if (process.platform === "win32") {
       printJson(
-        openWindowsHelper({
+        await openWindowsHelper({
           consoleUrl: getFlag(flags, "console-url"),
           port: numericFlag(flags, "port", 8718)
         })
@@ -1790,8 +2002,16 @@ function awsCommandLine(
 }
 
 function shellArg(value: string): string {
-  if (/^[A-Za-z0-9_./:=@%+-]+$/.test(value)) {
+  const safe = process.platform === "win32"
+    ? /^[A-Za-z0-9_./\\:=@+~-]+$/
+    : /^[A-Za-z0-9_./:=@%+-]+$/;
+  const specialPowerShellPrefix = process.platform === "win32"
+    && (value.startsWith("@") || value.startsWith("~"));
+  if (safe.test(value) && !specialPowerShellPrefix) {
     return value;
+  }
+  if (process.platform === "win32") {
+    return `'${value.replaceAll("'", "''")}'`;
   }
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -1854,6 +2074,7 @@ async function handleApprovalPolicyCommand(
   }
 
   if (action === "add") {
+    assertAnyCommandFlag(flags);
     const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
     printJson(
       await store.addApprovalPolicyRule({
@@ -1873,6 +2094,7 @@ async function handleApprovalPolicyCommand(
     if (!approvalPolicyUpdateFlags.some((flag) => hasFlag(flags, flag))) {
       throw new Error("approval policy update needs at least one change.");
     }
+    assertAnyCommandFlag(flags);
 
     const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
     const conditions = approvalPolicyConditionPatchFromFlags(flags);
@@ -1927,6 +2149,8 @@ const approvalPolicyUpdateFlags = [
   "agent",
   "action-kind",
   "command",
+  "resolved-command",
+  "any-command",
   "inject-env",
   "working-dir",
   "cwd",
@@ -1939,7 +2163,7 @@ const approvalPolicyUpdateFlags = [
 function approvalPolicyConditionsFromFlags(
   flags: Record<string, string | boolean | string[]>
 ): ApprovalPolicyConditions {
-  return {
+  const conditions: ApprovalPolicyConditions = {
     handles: getFlagList(flags, "handle"),
     envBindings: approvalPolicyEnvBindingsFromFlags(flags),
     secretTypes: getFlagList(flags, "type").map(approvalPolicySecretType),
@@ -1947,12 +2171,21 @@ function approvalPolicyConditionsFromFlags(
     minSeverity: optionalSecretSeverity(getFlag(flags, "min-severity")),
     agents: getFlagList(flags, "agent"),
     actionKinds: getFlagList(flags, "action-kind").map(approvalPolicyActionKind),
-    commands: getFlagList(flags, "command"),
     injectEnvs: getFlagList(flags, "inject-env"),
     workingDirs: getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd")),
     sshTargets: getFlagList(flags, "ssh-target").concat(getFlagList(flags, "target")),
     sshPorts: getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item))
   };
+
+  if (hasFlag(flags, "any-command")) {
+    conditions.commands = [];
+    conditions.resolvedCommands = [];
+  } else {
+    if (hasFlag(flags, "command")) conditions.commands = getFlagList(flags, "command");
+    if (hasFlag(flags, "resolved-command")) conditions.resolvedCommands = getFlagList(flags, "resolved-command");
+  }
+
+  return conditions;
 }
 
 function approvalPolicyConditionPatchFromFlags(
@@ -1967,6 +2200,8 @@ function approvalPolicyConditionPatchFromFlags(
     "agent",
     "action-kind",
     "command",
+    "resolved-command",
+    "any-command",
     "inject-env",
     "working-dir",
     "cwd",
@@ -1987,7 +2222,13 @@ function approvalPolicyConditionPatchFromFlags(
   if (hasFlag(flags, "min-severity")) patch.minSeverity = optionalSecretSeverity(getFlag(flags, "min-severity"));
   if (hasFlag(flags, "agent")) patch.agents = getFlagList(flags, "agent");
   if (hasFlag(flags, "action-kind")) patch.actionKinds = getFlagList(flags, "action-kind").map(approvalPolicyActionKind);
-  if (hasFlag(flags, "command")) patch.commands = getFlagList(flags, "command");
+  if (hasFlag(flags, "any-command")) {
+    patch.commands = [];
+    patch.resolvedCommands = [];
+  } else {
+    if (hasFlag(flags, "command")) patch.commands = getFlagList(flags, "command");
+    if (hasFlag(flags, "resolved-command")) patch.resolvedCommands = getFlagList(flags, "resolved-command");
+  }
   if (hasFlag(flags, "inject-env")) patch.injectEnvs = getFlagList(flags, "inject-env");
   if (hasFlag(flags, "working-dir") || hasFlag(flags, "cwd")) {
     patch.workingDirs = getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd"));
@@ -1999,6 +2240,15 @@ function approvalPolicyConditionPatchFromFlags(
     patch.sshPorts = getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item));
   }
   return patch;
+}
+
+function assertAnyCommandFlag(flags: Record<string, string | boolean | string[]>): void {
+  if (!hasFlag(flags, "any-command")) {
+    return;
+  }
+  if (hasFlag(flags, "command") || hasFlag(flags, "resolved-command")) {
+    throw new Error("--any-command cannot be combined with --command or --resolved-command.");
+  }
 }
 
 function approvalPolicyEnvBindingsFromFlags(
@@ -2029,7 +2279,8 @@ async function handleAppCommand(
 ): Promise<void> {
   if (action === "app-path") {
     const layout = getPackageLayout();
-    process.stdout.write(`${process.platform === "win32" ? layout.windowsClientLauncherPath : layout.macAppPath}\n`);
+    const appPath = process.platform === "darwin" ? layout.macAppPath : layout.desktopAppPath;
+    process.stdout.write(`${appPath}\n`);
     return;
   }
 
@@ -2066,26 +2317,53 @@ async function handleAppCommand(
   }
 
   if (action === "open") {
-    if (process.platform === "win32") {
-      printJson(
-        openWindowsClient({
-          consoleUrl: getFlag(flags, "console-url"),
-          port: numericFlag(flags, "port", 8718)
-        })
-      );
+    const { port, url: consoleUrl } = appConsoleEndpoint(flags);
+    if (hasFlag(flags, "browser")) {
+      const service = await ensureBrowserConsole(port);
+      await waitForConsoleAuthority(consoleUrl);
+      await openBrowser(consoleUrl);
+      printJson({ kind: "web-console", consoleUrl, service });
       return;
     }
 
-    printJson(
-      openMacApp({
-        consoleUrl: getFlag(flags, "console-url"),
-        port: numericFlag(flags, "port", 8718)
-      })
-    );
+    printJson(await openPreferredUi(port, consoleUrl));
     return;
   }
 
   throw new Error("app requires app-path, install, open, refresh-services, or refresh-agents.");
+}
+
+function appConsoleEndpoint(flags: Record<string, string | boolean | string[]>): { port: number; url: string } {
+  const configuredUrl = getFlag(flags, "console-url");
+  const configuredPort = hasFlag(flags, "port") ? numericFlag(flags, "port", 8718) : undefined;
+  if (!configuredUrl) {
+    const port = configuredPort ?? 8718;
+    return { port, url: `http://127.0.0.1:${port}/` };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(configuredUrl);
+  } catch {
+    throw new Error("--console-url must use http://127.0.0.1:<port>/.");
+  }
+  const port = Number(parsed.port);
+  if (parsed.protocol !== "http:"
+    || parsed.hostname !== "127.0.0.1"
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== "/"
+    || parsed.search
+    || parsed.hash
+    || !Number.isInteger(port)
+    || port < 1
+    || port > 65_535) {
+    throw new Error("--console-url must use http://127.0.0.1:<port>/.");
+  }
+  if (configuredPort !== undefined && configuredPort !== port) {
+    throw new Error("--port must match the explicit port in --console-url.");
+  }
+  return { port, url: parsed.toString() };
 }
 
 async function handleGuardCommand(
@@ -2139,31 +2417,83 @@ async function handleGuardRun(
   process.exitCode = code;
 }
 
-function openPreferredUi(port: number, consoleUrl: string) {
-  try {
-    if (process.platform === "win32") {
-      const opened = openWindowsClient({ port, consoleUrl });
-      return { kind: "windows-client", ...opened };
+async function openPreferredUi(port: number, consoleUrl: string) {
+  if (process.platform === "win32" || process.platform === "linux") {
+    try {
+      const opened = await openDesktopApp({ port, consoleUrl });
+      return { kind: "desktop-app", ...opened };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`${detail} To use the browser backup, run \`s-gw app open --browser\`.`);
     }
+  }
 
+  try {
     const opened = openMacApp({ port, consoleUrl });
     return { kind: "mac-app", ...opened };
   } catch {
-    openBrowser(consoleUrl);
-    return { kind: "web-console", consoleUrl };
+    const service = await ensureBrowserConsole(port);
+    await waitForConsoleAuthority(consoleUrl);
+    await openBrowser(consoleUrl);
+    return { kind: "web-console", consoleUrl, service };
   }
 }
 
-function shouldOpenUi(flags: Record<string, string | boolean | string[]>): boolean {
-  return !hasFlag(flags, "no-open-console") && !hasFlag(flags, "no-open-app");
+async function ensureBrowserConsole(port: number): Promise<unknown> {
+  if (process.platform === "win32") {
+    return installWindowsLoginService({ port, start: true, tray: true });
+  }
+  if (process.platform === "linux") {
+    return installSystemdUserService({ port, start: true });
+  }
+
+  return launchAgentStatus("console").installed
+    ? startInstalledLaunchAgent("console")
+    : installConsoleLaunchAgent({ port, start: true });
 }
 
-function openBrowser(url: string): void {
-  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+function shouldOpenUi(flags: Record<string, string | boolean | string[]>): boolean {
+  if (hasFlag(flags, "no-open-console") || hasFlag(flags, "no-open-app")) return false;
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return false;
+  return true;
+}
+
+async function openBrowser(url: string): Promise<void> {
+  const command = process.platform === "darwin"
+    ? "/usr/bin/open"
+    : process.platform === "win32"
+      ? trustedWindowsSystemExecutableSync("rundll32.exe")
+      : "/usr/bin/xdg-open";
+  const args = process.platform === "win32"
+    ? [`${trustedWindowsSystemExecutableSync("url.dll")},FileProtocolHandler`, url]
+    : [url];
   const child = spawn(command, args, {
     detached: true,
-    stdio: "ignore"
+    env: process.platform === "win32" ? windowsSystemEnvironment() : process.env,
+    stdio: "ignore",
+    shell: false
+  });
+  await new Promise<void>((resolve, reject) => {
+    let spawned = false;
+    const timer = setTimeout(() => {
+      if (!spawned) {
+        reject(new Error(`Timed out opening the browser for ${url}`));
+        return;
+      }
+      resolve();
+    }, 3_000);
+    child.once("spawn", () => {
+      spawned = true;
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`Browser launcher exited with status ${code ?? "unknown"} for ${url}`));
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(new Error(`Could not open the browser for ${url}: ${error.message}`));
+    });
   });
   child.unref();
 }
@@ -2198,7 +2528,7 @@ Commands:
   s-gw init
   s-gw setup [--port 8718] [--passphrase-stdin] [--menubar-count pending|credentials|none] [--no-open-app] [--no-service] [--no-menubar] [--no-agents]
   s-gw status
-  s-gw start [--port 8718] [--no-open-app]
+  s-gw start [--port 8718] [--no-open-app] [--no-service] [--no-menubar]
   s-gw stop
   s-gw doctor
   s-gw update check [--force]
@@ -2208,14 +2538,14 @@ Commands:
   s-gw console [--host 127.0.0.1] [--port 8718] [--no-open]
   s-gw app app-path
   s-gw app install
-  s-gw app open [--port 8718] [--console-url URL]
+  s-gw app open [--port 8718] [--console-url URL] [--browser]
   s-gw app refresh-services [--no-agents]
   s-gw app refresh-agents [--lock-timeout-ms 35000]
   s-gw guard status
   s-gw guard run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
-  s-gw service install [--port 8718] [--start]
+  s-gw service install [--port 8718] [--start] [--menubar]
   s-gw service start|stop|status|uninstall
   s-gw menubar app-path
   s-gw menubar open [--port 8718] [--console-url URL] [--count pending|credentials|none] [--show] [--no-notify]
@@ -2245,8 +2575,8 @@ Commands:
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m]
   s-gw approval grants
   s-gw approval policy list
-  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command /path/to/tool] [--action-kind env_command|ssh_session] [--duration 8h]
-  s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command /path/to/tool] [--clear-expiry]
+  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session] [--duration 8h]
+  s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--clear-expiry]
   s-gw approval policy arrange
   s-gw approval policy delete --id POLICY_ID
   s-gw approval policy enable|disable --id POLICY_ID
@@ -2267,8 +2597,26 @@ Commands:
   s-gw execute-next [--handle HANDLE] [--kind env_command|ssh_session] [--command CMD]
   s-gw store backups
   s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent]
+  s-gw approve-policy REQUEST_ID
   s-gw deny REQUEST_ID
   s-gw execute REQUEST_ID
+`);
+}
+
+function printSetupHelp(): void {
+  process.stdout.write(`Usage: s-gw setup [options]
+
+Initialize the local credential store and install the requested desktop integrations.
+
+Options:
+  --port PORT                         Console port (default: 8718)
+  --passphrase-stdin                  Read the unlock passphrase from stdin
+  --menubar-count MODE               pending, credentials, or none
+  --no-open-app                      Do not open the native app
+  --no-service                       Do not install or start the console service
+  --no-menubar                       Do not install or start the menu-bar helper
+  --no-agents                        Do not configure detected coding agents
+  -h, --help                         Show this help and exit
 `);
 }
 

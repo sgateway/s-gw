@@ -10,7 +10,7 @@ let tmpHome = "";
 let testEnv: NodeJS.ProcessEnv;
 
 const repoRoot = process.cwd();
-const tsxBin = path.join(repoRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
 
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-mcp-e2e-"));
@@ -33,8 +33,8 @@ afterEach(async () => {
 describe("MCP end-to-end flow", () => {
   it("starts through the primary CLI", async () => {
     const transport = new StdioClientTransport({
-      command: tsxBin,
-      args: ["src/cli.ts", "mcp"],
+      command: process.execPath,
+      args: [tsxCli, "src/cli.ts", "mcp"],
       cwd: repoRoot,
       env: testEnv as Record<string, string>,
       stderr: "pipe"
@@ -49,7 +49,7 @@ describe("MCP end-to-end flow", () => {
     } finally {
       await client.close();
     }
-  });
+  }, 20_000);
 
   it("denies execution before approval and returns sanitized output after approval", async () => {
     runCli(["init"]);
@@ -73,8 +73,8 @@ describe("MCP end-to-end flow", () => {
     );
 
     const transport = new StdioClientTransport({
-      command: tsxBin,
-      args: ["src/mcp-server.ts"],
+      command: process.execPath,
+      args: [tsxCli, "src/mcp-server.ts"],
       cwd: repoRoot,
       env: testEnv as Record<string, string>,
       stderr: "pipe"
@@ -131,11 +131,11 @@ describe("MCP end-to-end flow", () => {
     } finally {
       await client.close();
     }
-  });
+  }, 20_000);
 });
 
 function runCli(args: string[], input?: string): string {
-  return execFileSync(tsxBin, ["src/cli.ts", ...args], {
+  return execFileSync(process.execPath, [tsxCli, "src/cli.ts", ...args], {
     cwd: repoRoot,
     env: testEnv,
     input,

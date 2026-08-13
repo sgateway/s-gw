@@ -38,6 +38,7 @@ The recovery home is a local recovery vault, not a physical WORM guarantee: a pr
 ### Credential Backends
 
 - **macOS Keychain:** the preferred backend on macOS.
+- **Linux Secret Service:** the preferred backend on Linux desktop/user sessions, accessed through the fixed system `secret-tool` client.
 - **Windows Credential Manager:** the preview backend on Windows.
 - **Encrypted local value:** compatibility and test path.
 - **1Password reference:** optional source backed by the local `op` CLI, with an encrypted local cache for a bounded reusable approval.
@@ -58,7 +59,7 @@ The Rust runner clears the child environment, restores a small allowlist of ordi
 
 The runner is proprietary and maintained in the private `barryqy/s-gw-rust-core` repository. This public repository contains the protocol integration and TypeScript compatibility path, but not the Rust source. Maintainer builds locate a sibling checkout or use `SGW_RUST_CORE_DIR`; release automation requires the private checkout and packages only the compiled runner.
 
-Owned SSH sessions use the TypeScript execution path. Native runners live under `dist/native/<platform>-<architecture>/`, and automatic mode only selects the current target. The public npm package includes the macOS arm64 runner; Linux, Windows, and other architectures use the TypeScript compatibility path when their target directory is absent. Native Windows maintainer builds produce `dist/native/win32-x64/s-gw-core.exe`. `SGW_EXECUTION_ENGINE=rust` requires a compatible compiled runner, while `SGW_EXECUTION_ENGINE=typescript` selects the compatibility path explicitly.
+Owned SSH sessions use the TypeScript execution path. macOS and Linux reuse an s-gw-owned OpenSSH ControlMaster socket. Windows uses one hardened `ssh.exe` process per approved action because Win32 OpenSSH does not provide ControlMaster sockets. Windows accepts only SSH private-key metadata types, applies and verifies a current-user/SYSTEM-only ACL before writing the temporary key, and removes the key directory when the action finishes. Password and keyboard-interactive handles are rejected before value resolution. Native runners live under `dist/native/<platform>-<architecture>/`, and automatic mode only selects the current target. The public npm package includes the macOS arm64 runner; Linux, Windows, and other architectures use the TypeScript compatibility path when their target directory is absent. Native Windows maintainer builds produce `dist/native/win32-x64/s-gw-core.exe`. `SGW_EXECUTION_ENGINE=rust` requires a compatible compiled runner, while `SGW_EXECUTION_ENGINE=typescript` selects the compatibility path explicitly.
 
 ### User Interfaces
 
@@ -71,7 +72,8 @@ The React console is served on loopback and requires a per-session token for sta
 - New secrets and unlock values are accepted over stdin, not command-line arguments.
 - Approved environment-command credentials cross from the broker to `sgw-core` over a private stdin pipe, not process arguments or inherited environment variables.
 - Secret-backed commands run as child processes of the local s-gw process under the current operating system user.
-- s-gw-owned SSH sessions use private control sockets under the local s-gw home.
+- On macOS and Linux, s-gw-owned SSH sessions use private control sockets under the local s-gw home.
+- On Windows, approved SSH actions use an ACL-protected temporary private-key file and no persistent socket. Host enrollment uses OpenSSH `accept-new` trust on first use and should be checked out of band.
 
 See the [threat model](threat-model.md) for what these boundaries do and do not protect.
 

@@ -190,10 +190,15 @@ struct ApprovalPolicyConditions: Decodable, Hashable {
   var agents: [String]?
   var actionKinds: [String]?
   var commands: [String]?
+  var resolvedCommands: [String]?
   var injectEnvs: [String]?
   var workingDirs: [String]?
   var sshTargets: [String]?
   var sshPorts: [Int]?
+
+  var allowsAnyEnvironmentCommand: Bool {
+    commands?.isEmpty == true && resolvedCommands?.isEmpty == true
+  }
 
   var summary: String {
     var parts: [String] = []
@@ -203,6 +208,7 @@ struct ApprovalPolicyConditions: Decodable, Hashable {
     append("Agent", agents, to: &parts)
     append("Action", actionKinds, to: &parts)
     append("Command", commands, to: &parts)
+    append("Executable", resolvedCommands, to: &parts)
     append("Env", injectEnvs, to: &parts)
     append("SSH host", sshTargets, to: &parts)
     if let minSeverity {
@@ -243,6 +249,7 @@ struct ApprovalPolicyDraft: Hashable {
   var agent = "Codex"
   var actionKind = ""
   var command = ""
+  var resolvedCommand = ""
   var injectEnv = ""
   var sshTarget = ""
   var sshPort = 0
@@ -384,6 +391,7 @@ struct SshSessionSpec: Decodable, Hashable {
 struct CommandAction: Decodable, Hashable {
   var kind: String
   var command: String
+  var resolvedCommand: String?
   var args: [String]
   var injectEnv: String
   var workingDir: String?

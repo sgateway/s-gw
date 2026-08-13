@@ -57,6 +57,10 @@ export interface UpdateCheckResult {
   latestVersion: string | null;
   available: boolean;
   installerReady: boolean;
+  installerName: string | null;
+  installerUrl: string | null;
+  checksumName: string | null;
+  checksumUrl: string | null;
   releaseUrl: string | null;
   prerelease: boolean;
   publishedAt: string | null;
@@ -106,6 +110,7 @@ export interface RequestRecord {
   action: {
     kind: "env_command" | "ssh_session" | string;
     command: string;
+    resolvedCommand?: string;
     args: string[];
     injectEnv: string;
     workingDir?: string;
@@ -238,6 +243,7 @@ export interface ApprovalPolicyRuleRecord {
     agents?: string[];
     actionKinds?: string[];
     commands?: string[];
+    resolvedCommands?: string[];
     injectEnvs?: string[];
     workingDirs?: string[];
     sshTargets?: string[];

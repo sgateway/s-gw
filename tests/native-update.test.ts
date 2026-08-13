@@ -13,7 +13,7 @@ describe("native macOS update lifecycle", () => {
       readFile(path.join(root, "src/install.ts"), "utf8")
     ]);
 
-    expect(app).toContain("state.start()\n  }");
+    expect(app.replaceAll("\r\n", "\n")).toContain("state.start()\n  }");
     expect(app).not.toContain(".onAppear { appState.start() }");
     expect(state).not.toContain("private var updateTask");
     expect(helper).toContain("final class UpdateMonitor");
@@ -110,12 +110,26 @@ describe("native macOS update lifecycle", () => {
     expect(checker).toContain("static var bundledAppPath");
     expect(checker).toContain("for release in candidates");
     expect(checker).toContain("return nil");
-    expect(window).toContain(".disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)");
-    expect(settings).toContain(".disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)");
-    expect(window).toContain("release.isMacInstaller ? \"Download\" : \"Upgrade\"");
-    expect(settings).toContain("release.isMacInstaller ? \"Download Installer\" : \"Install Package\"");
+    expect(window).not.toContain(".disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)");
+    expect(settings).not.toContain(".disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)");
+    expect(window).toContain('if !release.hasVerifiedAsset { return "Open Release" }');
+    expect(settings).toContain('if !release.hasVerifiedAsset { return "Open Release" }');
+    expect(window.match(/\.disabled\(appState\.updateState\.isBusy\)/g)).toHaveLength(2);
+    expect(settings).toContain(".disabled(appState.updateState.isBusy)");
+    expect(state).toContain("await hydrateAvailableUpdateIfNeeded()");
+    expect(state).toContain("if availableUpdate?.hasVerifiedAsset == false");
     expect(runner).toContain("managedRuntimeEnvironment()");
     expect(runner).toContain('"com.s-gw.sgw.console", "com.s-gw.sgw.menubar"');
-    expect(runner).toContain('"SGW_HOME", "SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT"');
+    for (const key of [
+      "SGW_HOME",
+      "SGW_RECOVERY_HOME",
+      "SGW_KEYCHAIN_SERVICE",
+      "SGW_KEYCHAIN_ACCOUNT",
+      "SGW_SECRET_KEYCHAIN_SERVICE",
+      "SGW_SECRET_BACKEND",
+      "SGW_EXECUTION_ENGINE"
+    ]) {
+      expect(runner).toContain(`"${key}"`);
+    }
   });
 });

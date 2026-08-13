@@ -9,6 +9,7 @@ export interface PolicyConditionsLike {
   agents?: string[];
   actionKinds?: string[];
   commands?: string[];
+  resolvedCommands?: string[];
   injectEnvs?: string[];
   workingDirs?: string[];
   sshTargets?: string[];
@@ -28,7 +29,7 @@ export interface PolicyRuleLike {
 
 const arrayFields: Array<keyof Pick<
   PolicyConditionsLike,
-  "handles" | "secretTypes" | "providers" | "agents" | "actionKinds" | "commands" | "injectEnvs" | "workingDirs" | "sshTargets" | "sshPorts"
+  "handles" | "secretTypes" | "providers" | "agents" | "actionKinds" | "commands" | "resolvedCommands" | "injectEnvs" | "workingDirs" | "sshTargets" | "sshPorts"
 >> = [
   "handles",
   "secretTypes",
@@ -36,6 +37,7 @@ const arrayFields: Array<keyof Pick<
   "agents",
   "actionKinds",
   "commands",
+  "resolvedCommands",
   "injectEnvs",
   "workingDirs",
   "sshTargets",
@@ -69,6 +71,10 @@ export function approvalPolicyRuleCovers<T extends PolicyRuleLike>(broader: T, n
   if (!bindingSetCovers(broader.conditions.envBindings, narrower.conditions.envBindings)) {
     return false;
   }
+  if (broader.decision === "allow" && narrower.conditions.resolvedCommands?.length &&
+      !policyHasEffectiveEnvCommandScope(broader.conditions)) {
+    return false;
+  }
 
   for (const field of arrayFields) {
     if (!listCovers(broader.conditions[field], narrower.conditions[field])) {
@@ -83,6 +89,17 @@ export function approvalPolicyRuleCovers<T extends PolicyRuleLike>(broader: T, n
   }
 
   return true;
+}
+
+export function policyAllowsAnyEnvCommand(conditions: PolicyConditionsLike): boolean {
+  return Object.prototype.hasOwnProperty.call(conditions, "commands") &&
+    Object.prototype.hasOwnProperty.call(conditions, "resolvedCommands") &&
+    Array.isArray(conditions.commands) && conditions.commands.length === 0 &&
+    Array.isArray(conditions.resolvedCommands) && conditions.resolvedCommands.length === 0;
+}
+
+function policyHasEffectiveEnvCommandScope(conditions: PolicyConditionsLike): boolean {
+  return Boolean(conditions.resolvedCommands?.length) || policyAllowsAnyEnvCommand(conditions);
 }
 
 export function approvalPolicyRulesEquivalent<T extends PolicyRuleLike>(left: T, right: T): boolean {

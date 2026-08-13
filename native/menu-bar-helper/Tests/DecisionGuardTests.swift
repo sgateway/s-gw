@@ -45,8 +45,9 @@ private func helperUpdateResult(
   available: Bool = true,
   installerReady: Bool = true
 ) -> CliRunResult {
+  let installer = "s-gw-\(version)-macos.dmg"
   let json = """
-  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"installerReady":\(installerReady),"releaseUrl":"https://example.test/releases/v\(version)"}
+  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"installerReady":\(installerReady),"installerName":"\(installer)","installerUrl":"https://example.test/downloads/\(installer)","checksumName":"\(installer).sha256","checksumUrl":"https://example.test/downloads/\(installer).sha256","releaseUrl":"https://example.test/releases/v\(version)"}
   """
   return CliRunResult(ok: true, stdout: json, stderr: nil)
 }
@@ -68,14 +69,14 @@ fileprivate struct Scratch {
     gate = base.appendingPathComponent("gate.fifo")
     mkfifo(gate.path, 0o600)
 
-    // approve/deny block on the FIFO so the decision is genuinely in flight;
+    // approval actions block on the FIFO so the decision is genuinely in flight;
     // any other verb returns at once.
     let script = """
     #!/bin/zsh
     verb="$1"
     print -- "$verb" >> "\(invocationLog.path)"
     case "$verb" in
-      approve|deny)
+      approve|approve-policy|deny)
         read _line < "\(gate.path)"
         print -- '{"ok":true}'
         exit 0
@@ -156,13 +157,27 @@ struct DecisionGuardTests {
 
     await runInFlightGuardTest(scratch)
     await runGuardReleaseTest(scratch)
+    await runScopedPolicyApprovalTest(scratch)
     runFailureReasonTest()
     runRouteAndSizingTest()
     runApprovalFlowTest()
     runLaunchLockTest(scratch)
+    runRuntimeStatusScheduleTest()
     await runPersistentUpdateMonitorTest()
 
     print("ALL_MENUBAR_TESTS_OK")
+  }
+
+  static func runRuntimeStatusScheduleTest() {
+    let start = Date(timeIntervalSince1970: 1_800_000_000)
+    var schedule = HelperStatusRefreshSchedule(interval: 5 * 60)
+
+    check(schedule.isDue(at: start), "menu helper should read runtime status on launch")
+    schedule.markAttempt(at: start)
+    check(!schedule.isDue(at: start.addingTimeInterval(5 * 60 - 1)),
+          "four-second helper polls must reuse cached runtime status")
+    check(schedule.isDue(at: start.addingTimeInterval(5 * 60)),
+          "menu helper should refresh runtime status after five minutes")
   }
 
   // Test 1: a double-fire while a decision is in flight reaches the CLI exactly
@@ -229,6 +244,36 @@ struct DecisionGuardTests {
     check(done, "second decision should clear its in-flight id too")
   }
 
+  @MainActor
+  fileprivate static func runScopedPolicyApprovalTest(_ scratch: Scratch) async {
+    var outcomes: [DecisionOutcome] = []
+    let controller = DecisionController(
+      runCli: { args in runFakeCli(scratch.fakeCli.path, args) },
+      notify: { outcomes.append($0) },
+      afterDecision: {}
+    )
+    let id = "req-scoped-policy"
+    let before = scratch.verbs().filter { $0 == "approve-policy" }.count
+    let approveBefore = scratch.verbs().filter { $0 == "approve" }.count
+
+    controller.approvePolicy(id)
+    let started = await waitUntil(3.0) {
+      scratch.verbs().filter { $0 == "approve-policy" }.count == before + 1 && controller.isDeciding(id)
+    }
+    check(started, "scoped policy approval should invoke the approve-policy CLI command")
+
+    controller.approve(id)
+    try? await Task.sleep(for: .milliseconds(100))
+    check(scratch.verbs().filter { $0 == "approve" }.count == approveBefore,
+          "a second decision for the same request must be suppressed while approve-policy is running")
+
+    scratch.releaseOneInFlight()
+    let done = await waitUntil(3.0) { !controller.isDeciding(id) }
+    check(done, "scoped policy approval should release its in-flight request id")
+    check(outcomes.first?.title == "s-gw policy added" && outcomes.first?.succeeded == true,
+          "scoped policy approval should report an honest success")
+  }
+
   // Test 3: the honest-failure parser pulls a clean reason out of the CLI's real
   // error shapes (JSON {"error":...} and the "s-gw error: " stderr prefix), and
   // falls back sanely on empty output.
@@ -292,6 +337,11 @@ struct DecisionGuardTests {
     )
 
     await first.checkNow()
+    let firstNotice = UpdateNoticeStore(defaults: defaults, now: { now })
+      .available(installedVersion: "0.1.2")
+    check(firstNotice?.release.assetName == "s-gw-9.1.0-macos.dmg" &&
+          firstNotice?.release.checksumAssetName == "s-gw-9.1.0-macos.dmg.sha256",
+          "the helper should persist verified installer metadata with the update notice")
     await first.checkNow()
     check(notified == ["9.1.0"],
           "a queued alert should wait for its retry schedule instead of firing every helper poll")

@@ -1,12 +1,13 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { scanTextToOnePassword } from "../src/gateway.js";
-import { listOnePasswordSecretReferences, onePasswordStatus } from "../src/onepassword.js";
+import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "../src/onepassword.js";
 import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
+let originalNodeOptions: string | undefined;
 const fakeVault = "Example";
 
 function opRef(item: string, field: string): string {
@@ -18,6 +19,7 @@ function fakeOpenAiToken(): string {
 }
 
 beforeEach(async () => {
+  originalNodeOptions = process.env.NODE_OPTIONS;
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-op-test-"));
 });
 
@@ -27,6 +29,11 @@ afterEach(async () => {
   delete process.env.SGW_HOME;
   delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
+  if (originalNodeOptions === undefined) {
+    delete process.env.NODE_OPTIONS;
+  } else {
+    process.env.NODE_OPTIONS = originalNodeOptions;
+  }
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
     await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
@@ -41,8 +48,8 @@ describe("1Password metadata importer", () => {
     const status = onePasswordStatus();
 
     expect(status.available).toBe(true);
-    expect(status.command).toBe(fakeRealOp);
-    expect(status.version).toBe("2.32.0");
+    expect(status.command).toBe(await realpath(fakeRealOp));
+    expect(status.version).toBe(process.version);
   });
 
   it("discovers secret-like fields without returning field values", async () => {
@@ -50,7 +57,7 @@ describe("1Password metadata importer", () => {
 
     const status = onePasswordStatus();
     expect(status.available).toBe(true);
-    expect(status.version).toBe("2.32.0");
+    expect(status.version).toBe(process.version);
 
     const refs = await listOnePasswordSecretReferences(fakeVault);
     expect(refs).toHaveLength(2);
@@ -69,6 +76,46 @@ describe("1Password metadata importer", () => {
       })
     ]);
     expect(JSON.stringify(refs)).not.toContain("plain text note");
+  });
+
+  it.skipIf(process.platform === "win32")("passes only 1Password and process basics to the op child", async () => {
+    const fakeOp = path.join(tmpHome, "op-clean-env");
+    const capture = path.join(tmpHome, "op-env.json");
+    await writeFile(fakeOp, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.env));
+process.stdout.write("isolated-op-secret-value\\n");
+`, { mode: 0o700 });
+    await chmod(fakeOp, 0o700);
+
+    const previous = {
+      testMode: process.env.SGW_TEST_MODE,
+      aws: process.env.AWS_SECRET_ACCESS_KEY,
+      opToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
+      nodeOptions: process.env.NODE_OPTIONS
+    };
+    delete process.env.SGW_TEST_MODE;
+    process.env.SGW_OP_CLI = fakeOp;
+    process.env.SGW_MASTER_PASSPHRASE = "must-not-reach-op";
+    process.env.AWS_SECRET_ACCESS_KEY = "must-not-reach-op";
+    process.env.OP_SERVICE_ACCOUNT_TOKEN = "expected-op-token";
+    process.env.NODE_OPTIONS = "--require=/must-not-run.cjs";
+
+    try {
+      await expect(readOnePasswordReference(opRef("item", "field")))
+        .resolves.toBe("isolated-op-secret-value");
+      const childEnv = JSON.parse(await readFile(capture, "utf8"));
+      expect(childEnv.OP_SERVICE_ACCOUNT_TOKEN).toBe("expected-op-token");
+      expect(childEnv.SGW_MASTER_PASSPHRASE).toBeUndefined();
+      expect(childEnv.SGW_OP_CLI).toBeUndefined();
+      expect(childEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(childEnv.NODE_OPTIONS).toBeUndefined();
+    } finally {
+      restoreEnv("SGW_TEST_MODE", previous.testMode);
+      restoreEnv("AWS_SECRET_ACCESS_KEY", previous.aws);
+      restoreEnv("OP_SERVICE_ACCOUNT_TOKEN", previous.opToken);
+      restoreEnv("NODE_OPTIONS", previous.nodeOptions);
+    }
   });
 
   it("captures scanned text into a 1Password-backed handle without storing the raw value locally", async () => {
@@ -109,80 +156,84 @@ describe("1Password metadata importer", () => {
 });
 
 async function writeFakeOp(): Promise<string> {
-  const fakeOp = path.join(tmpHome, "op");
-  await writeFile(fakeOp, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  printf '2.32.0\\n'
-  exit 0
-fi
-if [ "$1" = "item" ] && [ "$2" = "list" ]; then
-  cat <<'JSON'
-[
-  {"id":"aws-dev","title":"AWS-dev","category":"API_CREDENTIAL"},
-  {"id":"github","title":"GitHub","category":"LOGIN"}
-]
-JSON
-  exit 0
-fi
-if [ "$1" = "item" ] && [ "$2" = "get" ] && [ "$3" = "aws-dev" ]; then
-  cat <<'JSON'
-{
-  "id":"aws-dev",
-  "title":"AWS-dev",
-  "category":"API_CREDENTIAL",
-  "fields":[
-    {"id":"username","label":"username","type":"STRING","purpose":"USERNAME","reference":"${opRef("aws-dev", "username")}"},
-    {"id":"credential","label":"credential","type":"CONCEALED","reference":"${opRef("aws-dev", "credential")}"}
-  ]
-}
-JSON
-  exit 0
-fi
-if [ "$1" = "item" ] && [ "$2" = "get" ] && [ "$3" = "github" ]; then
-  cat <<'JSON'
-{
-  "id":"github",
-  "title":"GitHub",
-  "category":"LOGIN",
-  "fields":[
-    {"id":"notesPlain","label":"notesPlain","type":"STRING","value":"plain text note"},
-    {"id":"password","label":"password","type":"CONCEALED","purpose":"PASSWORD","reference":"${opRef("github", "password")}"}
-  ]
-}
-JSON
-  exit 0
-fi
-if [ "$1" = "item" ] && [ "$2" = "create" ]; then
-  template=""
-  previous=""
-  for arg in "$@"; do
-    if [ "$previous" = "--template" ]; then
-      template="$arg"
-    fi
-    case "$arg" in
-      --template=*) template="\${arg#--template=}" ;;
-    esac
-    previous="$arg"
-  done
-  node - "$template" <<'NODE'
-const fs = require("node:fs");
-const template = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const fields = (template.fields || []).map((field) => ({
-  ...field,
-  reference: "op://${fakeVault}/created-item/" + field.id
-}));
-process.stdout.write(JSON.stringify({
-  id: "created-item",
-  title: template.title,
-  category: template.category,
-  fields
-}));
-NODE
-  exit 0
-fi
-printf 'unexpected op call: %s %s %s\\n' "$1" "$2" "$3" >&2
-exit 2
-`);
+  const fakeOp = path.join(tmpHome, process.platform === "win32" ? "op.exe" : "op");
+  const preload = path.join(tmpHome, "fake op preload.cjs");
+  if (process.platform === "win32") {
+    await copyFile(process.execPath, fakeOp);
+  } else {
+    try {
+      await link(process.execPath, fakeOp);
+    } catch {
+      await copyFile(process.execPath, fakeOp);
+    }
+  }
   await chmod(fakeOp, 0o755);
+  await writeFile(preload, `
+const fs = require("node:fs");
+const path = require("node:path");
+const fakeExecutable = ${JSON.stringify(fakeOp)};
+const actualExecutable = fs.realpathSync.native(process.execPath);
+const expectedExecutable = fs.realpathSync.native(fakeExecutable);
+const sameExecutable = process.platform === "win32"
+  ? actualExecutable.toLowerCase() === expectedExecutable.toLowerCase()
+  : actualExecutable === expectedExecutable;
+if (sameExecutable) {
+  const args = [path.basename(process.argv[1] || ""), ...process.argv.slice(2)];
+  let output;
+  if (args[0] === "item" && args[1] === "list") {
+    output = [
+      { id: "aws-dev", title: "AWS-dev", category: "API_CREDENTIAL" },
+      { id: "github", title: "GitHub", category: "LOGIN" }
+    ];
+  } else if (args[0] === "item" && args[1] === "get" && args[2] === "aws-dev") {
+    output = {
+      id: "aws-dev",
+      title: "AWS-dev",
+      category: "API_CREDENTIAL",
+      fields: [
+        { id: "username", label: "username", type: "STRING", purpose: "USERNAME", reference: ${JSON.stringify(opRef("aws-dev", "username"))} },
+        { id: "credential", label: "credential", type: "CONCEALED", reference: ${JSON.stringify(opRef("aws-dev", "credential"))} }
+      ]
+    };
+  } else if (args[0] === "item" && args[1] === "get" && args[2] === "github") {
+    output = {
+      id: "github",
+      title: "GitHub",
+      category: "LOGIN",
+      fields: [
+        { id: "notesPlain", label: "notesPlain", type: "STRING", value: "plain text note" },
+        { id: "password", label: "password", type: "CONCEALED", purpose: "PASSWORD", reference: ${JSON.stringify(opRef("github", "password"))} }
+      ]
+    };
+  } else if (args[0] === "item" && args[1] === "create") {
+    const direct = args.find((arg) => arg.startsWith("--template="));
+    const index = args.indexOf("--template");
+    const templatePath = direct ? direct.slice("--template=".length) : args[index + 1];
+    const template = JSON.parse(fs.readFileSync(templatePath, "utf8"));
+    output = {
+      id: "created-item",
+      title: template.title,
+      category: template.category,
+      fields: (template.fields || []).map((field) => ({
+        ...field,
+        reference: "op://${fakeVault}/created-item/" + field.id
+      }))
+    };
+  } else {
+    process.stderr.write("unexpected op call: " + args.join(" ") + "\\n");
+    process.exit(2);
+  }
+  process.stdout.write(JSON.stringify(output));
+  process.exit(0);
+}
+`);
+  const preloadPath = process.platform === "win32" ? preload.replaceAll("\\", "/") : preload;
+  const preloadOption = `--require="${preloadPath.replaceAll('"', '\\"')}"`;
+  process.env.NODE_OPTIONS = [originalNodeOptions, preloadOption].filter(Boolean).join(" ");
   return fakeOp;
+}
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
 }

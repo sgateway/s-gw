@@ -6,6 +6,7 @@ import { previewHandle, scanText } from "./scanner.js";
 import { buildSshSessionAction } from "./ssh.js";
 import type { CommandAction, CommandEnvBinding, ScanCandidate, ScanResult, SecretPolicy, SecretType } from "./types.js";
 import type { AddKeychainSecretInput, AddSecretInput } from "./store.js";
+import { keychainInfo } from "./unlock.js";
 
 export type LocalSecretBackend = "local" | "keychain";
 
@@ -73,7 +74,19 @@ export function preferredLocalSecretBackend(): LocalSecretBackend {
     return configured;
   }
 
-  if ((process.platform === "darwin" || process.platform === "win32") && process.env.SGW_DISABLE_KEYCHAIN !== "1") {
+  if (
+    process.platform === "linux"
+    && typeof process.env.SGW_MASTER_PASSPHRASE === "string"
+    && process.env.SGW_MASTER_PASSPHRASE.trim().length >= 8
+  ) {
+    return "local";
+  }
+
+  if (
+    (process.platform === "darwin" || process.platform === "linux" || process.platform === "win32")
+    && process.env.SGW_DISABLE_KEYCHAIN !== "1"
+    && keychainInfo().provider !== "none"
+  ) {
     return "keychain";
   }
 

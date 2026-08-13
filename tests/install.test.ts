@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  assertMacBackgroundUnlock,
   assertMacRuntimeForManagedSurfaces,
   buildConsoleLaunchAgentPlist,
   buildMenuBarLaunchAgentPlist,
@@ -10,7 +11,9 @@ import {
   getPackageLayout,
   macAppProcessRecordPath,
   menuBarLabel,
-  packageHealth
+  packageHealth,
+  windowsHelperOperationTimeoutMs,
+  windowsProcessInspectionTimeoutMs
 } from "../src/install.js";
 import { CURRENT_VERSION } from "../src/version.js";
 
@@ -18,6 +21,49 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 
 describe("customer package layout", () => {
+  it("allows a bounded Windows helper timeout only in isolated tests", () => {
+    const oldTestMode = process.env.SGW_TEST_MODE;
+    const oldTimeout = process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS;
+    try {
+      delete process.env.SGW_TEST_MODE;
+      process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS = "120000";
+      expect(windowsHelperOperationTimeoutMs()).toBe(15_000);
+      expect(windowsHelperOperationTimeoutMs(10_000)).toBe(10_000);
+
+      process.env.SGW_TEST_MODE = "1";
+      expect(windowsHelperOperationTimeoutMs()).toBe(120_000);
+      expect(windowsHelperOperationTimeoutMs(10_000)).toBe(120_000);
+      process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS = "120001";
+      expect(windowsHelperOperationTimeoutMs()).toBe(15_000);
+      expect(windowsHelperOperationTimeoutMs(10_000)).toBe(10_000);
+    } finally {
+      if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+      else process.env.SGW_TEST_MODE = oldTestMode;
+      if (oldTimeout === undefined) delete process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS;
+      else process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS = oldTimeout;
+    }
+  });
+
+  it("allows a bounded Windows process inspection timeout only in isolated tests", () => {
+    const oldTestMode = process.env.SGW_TEST_MODE;
+    const oldTimeout = process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS;
+    try {
+      delete process.env.SGW_TEST_MODE;
+      process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS = "120000";
+      expect(windowsProcessInspectionTimeoutMs()).toBe(15_000);
+
+      process.env.SGW_TEST_MODE = "1";
+      expect(windowsProcessInspectionTimeoutMs()).toBe(120_000);
+      process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS = "120001";
+      expect(windowsProcessInspectionTimeoutMs()).toBe(15_000);
+    } finally {
+      if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
+      else process.env.SGW_TEST_MODE = oldTestMode;
+      if (oldTimeout === undefined) delete process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS;
+      else process.env.SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS = oldTimeout;
+    }
+  });
+
   it("keeps managed surfaces inside one durable self-contained app", () => {
     expect(() => assertMacRuntimeForManagedSurfaces({
       isSelfContainedMacApp: true,
@@ -41,20 +87,33 @@ describe("customer package layout", () => {
   it("finds package artifacts from the runtime module location", () => {
     const layout = getPackageLayout();
 
-    expect(layout.cliPath).toMatch(/dist\/cli\.js$/);
-    expect(layout.mcpPath).toMatch(/dist\/mcp-server\.js$/);
+    expect(layout.cliPath).toBe(path.join(layout.packageRoot, "dist", "cli.js"));
+    expect(layout.mcpPath).toBe(path.join(layout.packageRoot, "dist", "mcp-server.js"));
     expect(layout.keychainHelperPath).toBe(
       path.join(layout.packageRoot, "dist", "native", `${process.platform}-${process.arch}`, "s-gw-keychain-helper")
     );
     expect(layout.packagedMacAppPath).toBe(path.join(layout.packageRoot, "dist", "s-gw.app"));
-    expect(layout.packagedMacAppBinaryPath).toContain("dist/s-gw.app/Contents/MacOS/s-gw");
-    expect(layout.installedMacAppPath).toMatch(/Applications\/s-gw\.app$/);
-    expect(layout.macAppPath).toContain("s-gw.app");
-    expect(layout.macAppBinaryPath).toContain("s-gw.app/Contents/MacOS/s-gw");
-    expect(layout.menuBarAppPath).toContain("s-gw Menu Bar.app");
-    expect(layout.windowsClientScriptPath).toMatch(/dist\/windows\/s-gw-client\.ps1$/);
-    expect(layout.windowsHelperScriptPath).toMatch(/dist\/windows\/s-gw-helper\.ps1$/);
-    expect(layout.windowsCredentialHelperPath).toMatch(/dist\/windows\/s-gw-credential\.ps1$/);
+    expect(layout.packagedMacAppBinaryPath).toBe(
+      path.join(layout.packagedMacAppPath, "Contents", "MacOS", "s-gw")
+    );
+    expect(path.basename(layout.installedMacAppPath)).toBe("s-gw.app");
+    expect(path.basename(path.dirname(layout.installedMacAppPath))).toBe("Applications");
+    expect(path.basename(layout.macAppPath)).toBe("s-gw.app");
+    expect(layout.macAppBinaryPath).toBe(path.join(layout.macAppPath, "Contents", "MacOS", "s-gw"));
+    expect(path.basename(layout.menuBarAppPath)).toBe("s-gw Menu Bar.app");
+    expect(path.basename(layout.desktopAppPath)).toMatch(/^s-gw-desktop(?:\.exe)?$/);
+    expect(layout.windowsClientScriptPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-client.ps1")
+    );
+    expect(layout.windowsHelperScriptPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-helper.ps1")
+    );
+    expect(layout.windowsHelperBootstrapPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-helper-bootstrap.ps1")
+    );
+    expect(layout.windowsCredentialHelperPath).toBe(
+      path.join(layout.packageRoot, "dist", "windows", "s-gw-credential.ps1")
+    );
   });
 
   it("routes app installation through the native app command", async () => {
@@ -77,7 +136,7 @@ describe("customer package layout", () => {
     expect(cliSource).toContain("assertMacRuntimeForManagedSurfaces(layout)");
   });
 
-  it("tracks a running native app so open focuses instead of relaunching", async () => {
+  it.skipIf(process.platform !== "darwin")("tracks a running native app so open focuses instead of relaunching", async () => {
     const [installSource, appSource] = await Promise.all([
       readFile(path.join(repoRoot, "src/install.ts"), "utf8"),
       readFile(path.join(repoRoot, "native/macos-app/Sources/SgwMac/App/SgwApp.swift"), "utf8")
@@ -116,6 +175,8 @@ describe("customer package layout", () => {
       expect(health).toContain("s-gw Menu Bar.app");
       expect(health).toContain("s-gw-client.ps1");
       expect(health).toContain("s-gw-helper.ps1");
+      expect(health).toContain("s-gw-helper-bootstrap.ps1");
+      expect(health).toContain("s-gw-desktop");
       expect(health).not.toContain("do not serialize this value");
       expect(packageHealth().version).toBe(CURRENT_VERSION);
     } finally {
@@ -129,6 +190,17 @@ describe("customer package layout", () => {
 });
 
 describe("install readiness", () => {
+  it.skipIf(process.platform !== "darwin")("refuses to put an environment passphrase in launchd", () => {
+    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
+    process.env.SGW_MASTER_PASSPHRASE = "foreground-only-mac-passphrase";
+    try {
+      expect(() => assertMacBackgroundUnlock()).toThrow(/will not persist or inherit SGW_MASTER_PASSPHRASE/i);
+    } finally {
+      if (oldPassphrase === undefined) delete process.env.SGW_MASTER_PASSPHRASE;
+      else process.env.SGW_MASTER_PASSPHRASE = oldPassphrase;
+    }
+  });
+
   it("reports ready when an unlock source is configured", () => {
     const oldValue = process.env.SGW_MASTER_PASSPHRASE;
     process.env.SGW_MASTER_PASSPHRASE = "configured-passphrase";
@@ -238,22 +310,50 @@ describe("launch-agent packaging", () => {
       const inherited = {
         PATH: "/custom/bin:/usr/bin:/bin",
         SGW_HOME: "/secure/s-gw-home",
+        SGW_RECOVERY_HOME: "/secure/s-gw-recovery",
         SGW_KEYCHAIN_SERVICE: "com.example.s-gw",
         SGW_KEYCHAIN_ACCOUNT: "primary",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+        SGW_SECRET_BACKEND: " KEYCHAIN ",
+        SGW_EXECUTION_ENGINE: " TYPESCRIPT ",
+        SGW_MASTER_PASSPHRASE: "must-not-persist",
         SGW_KEYCHAIN_HELPER: "/old/npm/s-gw-keychain-helper"
       };
       const console = buildConsoleLaunchAgentPlist(9123, "/secure/s-gw-home/logs", inherited);
       const menu = buildMenuBarLaunchAgentPlist({ port: 9123 }, "/secure/s-gw-home/logs", inherited);
 
-      for (const value of ["/custom/bin:/usr/bin:/bin", "/secure/s-gw-home", "com.example.s-gw", "primary"]) {
+      for (const value of [
+        "/custom/bin:/usr/bin:/bin",
+        path.resolve("/secure/s-gw-home"),
+        path.resolve("/secure/s-gw-recovery"),
+        "com.example.s-gw",
+        "com.example.s-gw.secret",
+        "primary",
+        "keychain",
+        "typescript"
+      ]) {
         expect(console).toContain(value);
         expect(menu).toContain(value);
       }
       expect(console).not.toContain("/old/npm/s-gw-keychain-helper");
       expect(menu).not.toContain("/old/npm/s-gw-keychain-helper");
+      expect(console).not.toContain("must-not-persist");
+      expect(menu).not.toContain("must-not-persist");
     } finally {
       if (oldHelper === undefined) delete process.env.SGW_KEYCHAIN_HELPER;
       else process.env.SGW_KEYCHAIN_HELPER = oldHelper;
     }
+  });
+
+  it.each([
+    ["SGW_SECRET_BACKEND", "windows-credential-manager"],
+    ["SGW_EXECUTION_ENGINE", "native"],
+    ["SGW_SECRET_BACKEND", "keychain\nmalformed"]
+  ])("rejects an invalid launchd authority value for %s", (key, value) => {
+    expect(() => buildConsoleLaunchAgentPlist(8718, "/tmp/s-gw logs", {
+      SGW_HOME: "/secure/s-gw-home",
+      SGW_RECOVERY_HOME: "/secure/s-gw-recovery",
+      [key]: value
+    })).toThrow(new RegExp(key));
   });
 });

@@ -21,3 +21,8 @@ website/
 *.tgz
 .build/
 target/
+native/desktop-app/runtime/*
+!native/desktop-app/runtime/.gitkeep
+native/desktop-app/gen/
+native/desktop-app/.runtime-staging-*
+native/desktop-app/.runtime-backup-*

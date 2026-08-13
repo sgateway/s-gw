@@ -3,7 +3,8 @@ import {
   approvalPolicyRuleCovers,
   arrangeApprovalPolicyRules,
   compareApprovalPolicyRules,
-  findShadowingPolicyRule
+  findShadowingPolicyRule,
+  policyAllowsAnyEnvCommand
 } from "../src/policy-order.js";
 import type { ApprovalPolicyRule } from "../src/types.js";
 
@@ -27,7 +28,7 @@ function rule(
 
 describe("approval policy ordering", () => {
   it("recognizes semantic containment without treating case-sensitive commands as equivalent", () => {
-    const broad = rule("broad", 10, { agents: ["codex"], minSeverity: "low" });
+    const broad = rule("broad", 10, { agents: ["codex"], minSeverity: "low" }, "ask");
     const narrow = rule("narrow", 20, { agents: ["codex"], commands: ["/usr/bin/aws"], minSeverity: "high" });
     const differentCommand = rule("different-command", 20, { agents: ["codex"], commands: ["/usr/bin/AWS"], minSeverity: "high" });
 
@@ -57,6 +58,36 @@ describe("approval policy ordering", () => {
     expect(approvalPolicyRuleCovers(broad, paired)).toBe(true);
     expect(approvalPolicyRuleCovers(paired, subset)).toBe(false);
     expect(approvalPolicyRuleCovers(paired, samePair)).toBe(true);
+  });
+
+  it("treats exact executable paths as part of policy containment", () => {
+    const broad = rule("broad", 10, { commands: ["aws"] });
+    const arm = rule("arm", 20, {
+      commands: ["aws"],
+      resolvedCommands: ["/opt/homebrew/bin/aws"]
+    });
+    const intel = rule("intel", 30, {
+      commands: ["aws"],
+      resolvedCommands: ["/usr/local/bin/aws"]
+    });
+
+    expect(approvalPolicyRuleCovers(broad, arm)).toBe(false);
+    expect(approvalPolicyRuleCovers(arm, broad)).toBe(false);
+    expect(approvalPolicyRuleCovers(arm, intel)).toBe(false);
+  });
+
+  it("distinguishes an explicit any-command allow from an unscoped legacy allow", () => {
+    const anyCommand = rule("any-command", 10, { commands: [], resolvedCommands: [] });
+    const legacy = rule("legacy", 20, {});
+    const pinned = rule("pinned", 30, {
+      commands: ["aws"],
+      resolvedCommands: ["/opt/homebrew/bin/aws"]
+    });
+
+    expect(policyAllowsAnyEnvCommand(anyCommand.conditions)).toBe(true);
+    expect(policyAllowsAnyEnvCommand(legacy.conditions)).toBe(false);
+    expect(approvalPolicyRuleCovers(anyCommand, pinned)).toBe(true);
+    expect(approvalPolicyRuleCovers(legacy, pinned)).toBe(false);
   });
 
   it("preserves the established last-updated-first order for equal priorities", () => {
@@ -97,7 +128,7 @@ describe("approval policy ordering", () => {
   });
 
   it("reports only an earlier live covering rule as shadowing", () => {
-    const broad = rule("broad", 10, { agents: ["codex"] });
+    const broad = rule("broad", 10, { agents: ["codex"] }, "ask");
     const narrow = rule("narrow", 20, { agents: ["codex"], commands: ["/usr/bin/aws"] });
     const expired = { ...broad, id: "expired", priority: 5, expiresAt: "2026-07-15T00:00:00Z" };
 

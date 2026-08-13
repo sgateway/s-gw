@@ -1,8 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, constants } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { resolveCommandExecutable } from "./command-path.js";
 import type { SecretType } from "./types.js";
 
 export interface OnePasswordStatus {
@@ -90,9 +90,24 @@ export function normalizeOnePasswordReference(reference: string): string {
 }
 
 export function onePasswordStatus(): OnePasswordStatus {
-  const command = resolveOpCommand();
+  let requested = process.env.SGW_OP_CLI?.trim() || process.env.SGW_REAL_OP_PATH?.trim() || "op";
+  let command: string;
+  try {
+    requested = requestedOpCommand();
+    command = resolveCommandExecutable(requested);
+  } catch (error) {
+    return {
+      available: false,
+      command: requested,
+      serviceAccountConfigured: Boolean(process.env.OP_SERVICE_ACCOUNT_TOKEN),
+      connectConfigured: Boolean(process.env.OP_CONNECT_HOST && process.env.OP_CONNECT_TOKEN),
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
   const result = spawnSync(command, ["--version"], {
     encoding: "utf8",
+    env: onePasswordEnvironment(),
+    shell: false,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -197,7 +212,7 @@ export async function readOnePasswordReference(reference: string): Promise<strin
   const timeoutMs = timeoutFromEnv();
 
   const child = spawn(command, ["read", normalized], {
-    env: process.env,
+    env: onePasswordEnvironment(),
     shell: false,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -261,7 +276,7 @@ async function runOp(args: string[], input?: string): Promise<string> {
   const command = resolveOpCommand();
   const timeoutMs = timeoutFromEnv();
   const child = spawn(command, args, {
-    env: process.env,
+    env: onePasswordEnvironment(),
     shell: false,
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"]
   });
@@ -313,17 +328,59 @@ async function runOp(args: string[], input?: string): Promise<string> {
 }
 
 function resolveOpCommand(): string {
-  if (process.env.SGW_OP_CLI) {
-    return process.env.SGW_OP_CLI;
-  }
+  return resolveCommandExecutable(requestedOpCommand());
+}
 
-  const realOp = process.env.SGW_REAL_OP_PATH || "/opt/homebrew/Caskroom/1password-cli/2.32.0/op.sgw-real";
-  try {
-    accessSync(realOp, constants.X_OK);
-    return realOp;
-  } catch {
-    return "op";
+function requestedOpCommand(): string {
+  const configured = process.env.SGW_OP_CLI?.trim();
+  if (configured) return configured;
+
+  const testCommand = process.env.SGW_REAL_OP_PATH?.trim();
+  if (testCommand) {
+    if (process.env.SGW_TEST_MODE !== "1") {
+      throw new Error("SGW_REAL_OP_PATH is restricted to isolated s-gw tests; use SGW_OP_CLI for a custom 1Password CLI path.");
+    }
+    return testCommand;
   }
+  return "op";
+}
+
+function onePasswordEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of [
+    "APPDATA",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LANG",
+    "LC_ALL",
+    "LOCALAPPDATA",
+    "NO_COLOR",
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR"
+  ]) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith("OP_") && value) env[key] = value;
+  }
+  if (process.env.SGW_TEST_MODE === "1" && process.env.NODE_OPTIONS) {
+    env.NODE_OPTIONS = process.env.NODE_OPTIONS;
+  }
+  return env;
 }
 
 function onePasswordTemplate(title: string, value: string, notes?: string) {

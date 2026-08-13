@@ -10,6 +10,7 @@ func validateTrustedApplication(
 
 let usage = """
 Usage:
+  sgw-keychain-inspector exists --service SERVICE --account ACCOUNT
   sgw-keychain-inspector trusted-helper --service SERVICE --account ACCOUNT --candidate PATH [...]
 """
 
@@ -57,6 +58,20 @@ func check(_ status: OSStatus) {
 
   let message = SecCopyErrorMessageString(status, nil) as String? ?? "Keychain inspection failed"
   fail("\(message) (\(status))")
+}
+
+func keychainItemExists(service: String, account: String) {
+  var query: [String: Any] = [
+    kSecClass as String: kSecClassGenericPassword,
+    kSecAttrService as String: service,
+    kSecAttrAccount as String: account,
+    kSecReturnAttributes as String: true,
+    kSecMatchLimit as String: kSecMatchLimitOne
+  ]
+  query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+
+  var attributes: CFTypeRef?
+  check(SecItemCopyMatching(query as CFDictionary, &attributes))
 }
 
 func copyTrustedApplications(item: SecKeychainItem) -> [SecTrustedApplication] {
@@ -123,6 +138,8 @@ let service = requireOption("--service")
 let account = requireOption("--account")
 
 switch command {
+case "exists":
+  keychainItemExists(service: service, account: account)
 case "trusted-helper":
   trustedHelper(service: service, account: account, candidates: options("--candidate"))
 default:

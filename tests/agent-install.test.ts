@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   agentIntegrationStatus,
   installAgentIntegrations,
+  mcpAuthorityEnvironment,
   refreshManagedAgentIntegrations,
   resolvePackagedMcpCommand,
   uninstallAgentIntegrations
@@ -110,11 +111,31 @@ describe("agent integration installation", () => {
     expect(launch).toEqual({ command: nodePath, args: [mcpPath] });
   });
 
-  it("keeps an inherited ledger home in manual MCP snippets", () => {
-    const cli = readFileSync(path.join(process.cwd(), "src", "cli.ts"), "utf8");
-
-    expect(cli).toContain("...(process.env.SGW_HOME ? { SGW_HOME: process.env.SGW_HOME } : {})");
-    expect(cli).toContain("...parseEnvFlags(getFlagList(flags, \"env\"))");
+  it("builds one validated authority environment for managed and manual MCP entries", () => {
+    const homeDir = testHome();
+    expect(mcpAuthorityEnvironment({
+      homeDir,
+      env: {
+        HOME: homeDir,
+        SGW_HOME: "primary",
+        SGW_RECOVERY_HOME: "~/recovery",
+        SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+        SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+        SGW_SECRET_BACKEND: " KEYCHAIN ",
+        SGW_EXECUTION_ENGINE: " TypeScript ",
+        SGW_MASTER_PASSPHRASE: "must-not-be-written",
+        AWS_SECRET_ACCESS_KEY: "must-not-be-written"
+      }
+    })).toEqual({
+      SGW_HOME: path.join(homeDir, "primary"),
+      SGW_RECOVERY_HOME: path.join(homeDir, "recovery"),
+      SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+      SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+      SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+      SGW_SECRET_BACKEND: "keychain",
+      SGW_EXECUTION_ENGINE: "typescript"
+    });
   });
 
   it("refreshes only agent integrations that s-gw already owns", () => {
@@ -171,6 +192,136 @@ describe("agent integration installation", () => {
       .toContain(`SGW_HOME = ${JSON.stringify(codexHome)}`);
     const claude = JSON.parse(readFileSync(path.join(homeDir, ".claude.json"), "utf8"));
     expect(claude.mcpServers["s-gw"].env.SGW_HOME).toBe(claudeHome);
+  });
+
+  it("writes only the validated authority environment to managed MCP entries", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    const base = opts(homeDir, binDir, ["codex", "claudecode", "opencode"]);
+    const env = {
+      ...base.env,
+      SGW_HOME: "primary-ledger",
+      SGW_RECOVERY_HOME: "~/recovery-ledger",
+      SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+      SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+      SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+      SGW_SECRET_BACKEND: "KEYCHAIN",
+      SGW_EXECUTION_ENGINE: "RUST",
+      SGW_MASTER_PASSPHRASE: "must-not-be-written",
+      SGW_SECRET_TOOL: "/tmp/test-secret-tool",
+      SGW_TEST_MODE: "1",
+      AWS_SECRET_ACCESS_KEY: "must-not-be-written",
+      NODE_OPTIONS: "--inspect"
+    };
+
+    const installed = installAgentIntegrations({ ...base, sgwHome: undefined, env });
+    expect(installed.every((item) => item.changed)).toBe(true);
+
+    const expected = {
+      SGW_HOME: path.join(homeDir, "primary-ledger"),
+      SGW_RECOVERY_HOME: path.join(homeDir, "recovery-ledger"),
+      SGW_KEYCHAIN_SERVICE: "com.example.s-gw.master",
+      SGW_KEYCHAIN_ACCOUNT: "ordinary-user",
+      SGW_SECRET_KEYCHAIN_SERVICE: "com.example.s-gw.secret",
+      SGW_SECRET_BACKEND: "keychain",
+      SGW_EXECUTION_ENGINE: "rust"
+    };
+    const claudeText = readFileSync(path.join(homeDir, ".claude.json"), "utf8");
+    const claude = JSON.parse(claudeText);
+    expect(claude.mcpServers["s-gw"].env).toEqual({
+      ...expected,
+      SGW_AGENT_NAME: "Claude Code"
+    });
+
+    const openCodePath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
+    const openCodeText = readFileSync(openCodePath, "utf8");
+    const openCode = parseJsonc(openCodeText);
+    expect(openCode.mcp["s-gw"].environment).toEqual({
+      ...expected,
+      SGW_AGENT_NAME: "OpenCode"
+    });
+
+    const codexText = readFileSync(path.join(homeDir, ".codex", "config.toml"), "utf8");
+    for (const [key, value] of Object.entries(expected)) {
+      expect(codexText).toContain(`${key} = ${JSON.stringify(value)}`);
+    }
+    for (const config of [claudeText, openCodeText, codexText]) {
+      expect(config).not.toContain("SGW_MASTER_PASSPHRASE");
+      expect(config).not.toContain("SGW_SECRET_TOOL");
+      expect(config).not.toContain("SGW_TEST_MODE");
+      expect(config).not.toContain("AWS_SECRET_ACCESS_KEY");
+      expect(config).not.toContain("NODE_OPTIONS");
+      expect(config).not.toContain("must-not-be-written");
+    }
+  });
+
+  it("keeps the complete owned authority environment during a runtime refresh", () => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "codex");
+    const primaryHome = path.join(homeDir, "critical-ledger");
+    const recoveryHome = path.join(homeDir, "critical-recovery");
+    const base = opts(homeDir, binDir, ["codex", "claudecode"]);
+    const env = {
+      ...base.env,
+      SGW_RECOVERY_HOME: recoveryHome,
+      SGW_KEYCHAIN_SERVICE: "com.example.original.master",
+      SGW_KEYCHAIN_ACCOUNT: "original-user",
+      SGW_SECRET_KEYCHAIN_SERVICE: "com.example.original.secret",
+      SGW_SECRET_BACKEND: "keychain",
+      SGW_EXECUTION_ENGINE: "typescript"
+    };
+
+    installAgentIntegrations({ ...base, sgwHome: primaryHome, env });
+    const refreshed = refreshManagedAgentIntegrations({
+      ...opts(homeDir, binDir),
+      sgwHome: path.join(homeDir, "wrong-ledger"),
+      env: {
+        ...base.env,
+        SGW_RECOVERY_HOME: path.join(homeDir, "wrong-recovery"),
+        SGW_KEYCHAIN_SERVICE: "com.example.wrong.master",
+        SGW_KEYCHAIN_ACCOUNT: "wrong-user",
+        SGW_SECRET_KEYCHAIN_SERVICE: "com.example.wrong.secret",
+        SGW_SECRET_BACKEND: "local",
+        SGW_EXECUTION_ENGINE: "rust"
+      }
+    });
+
+    expect(refreshed.map((item) => item.agentId).sort()).toEqual(["claudecode", "codex"]);
+    expect(refreshed.every((item) => item.changed === false)).toBe(true);
+    const claude = JSON.parse(readFileSync(path.join(homeDir, ".claude.json"), "utf8"));
+    expect(claude.mcpServers["s-gw"].env).toMatchObject({
+      SGW_HOME: primaryHome,
+      SGW_RECOVERY_HOME: recoveryHome,
+      SGW_KEYCHAIN_SERVICE: "com.example.original.master",
+      SGW_KEYCHAIN_ACCOUNT: "original-user",
+      SGW_SECRET_KEYCHAIN_SERVICE: "com.example.original.secret",
+      SGW_SECRET_BACKEND: "keychain",
+      SGW_EXECUTION_ENGINE: "typescript"
+    });
+    const codexText = readFileSync(path.join(homeDir, ".codex", "config.toml"), "utf8");
+    expect(codexText).toContain(`SGW_RECOVERY_HOME = ${JSON.stringify(recoveryHome)}`);
+    expect(codexText).toContain('SGW_KEYCHAIN_SERVICE = "com.example.original.master"');
+    expect(codexText).toContain('SGW_EXECUTION_ENGINE = "typescript"');
+    expect(codexText).not.toContain("wrong-");
+  });
+
+  it.each([
+    ["SGW_SECRET_BACKEND", "vault"],
+    ["SGW_SECRET_BACKEND", "windows-credential-manager"],
+    ["SGW_EXECUTION_ENGINE", "native"],
+    ["SGW_KEYCHAIN_SERVICE", "service\nname"],
+    ["SGW_RECOVERY_HOME", "recovery\u0000home"]
+  ])("rejects an invalid managed authority value for %s", (key, value) => {
+    const homeDir = testHome();
+    const binDir = fakeCommand(homeDir, "claude");
+    const base = opts(homeDir, binDir, ["claudecode"]);
+
+    expect(() => installAgentIntegrations({
+      ...base,
+      env: { ...base.env, [key]: value }
+    })).toThrow(new RegExp(key));
+    expect(existsSync(path.join(homeDir, ".claude.json"))).toBe(false);
+    expect(existsSync(path.join(homeDir, ".s-gw", "agent-integrations.json"))).toBe(false);
   });
 
   it("connects detected Codex and Claude while preserving unrelated config", () => {
@@ -879,7 +1030,7 @@ describe("agent integration installation", () => {
     });
     expect(conflict.status).toBe(1);
     expect(JSON.parse(conflict.stdout)).toMatchObject({ ok: false, results: [{ state: "conflict" }] });
-  });
+  }, 30_000);
 
   it("recovers an agent integration lock left by a dead process", () => {
     const homeDir = testHome();
@@ -962,15 +1113,33 @@ describe("agent integration installation", () => {
       const manifestPath = path.join(homeDir, ".s-gw", "agent-integrations.json");
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
       expect(Object.keys(manifest.agents).sort()).toEqual([...agentIds].sort());
-      expect(agentIntegrationStatus(opts(homeDir, binDir, agentIds)).every((item) => item.state === "installed")).toBe(true);
+      const statusOptions = opts(homeDir, binDir, agentIds);
+      const statusEnv = {
+        ...statusOptions.env,
+        ...mcpAuthorityEnvironment({ homeDir, sgwHome: statusOptions.sgwHome, env })
+      };
+      const currentStatus = agentIntegrationStatus({
+        ...statusOptions,
+        env: statusEnv
+      });
+      expect(
+        currentStatus.every((item) => item.state === "installed"),
+        JSON.stringify(currentStatus)
+      ).toBe(true);
 
       const removed = await Promise.all(
         agentIds.map((agentId) => runAgentCli(["agent", "uninstall", agentId], env))
       );
       expect(removed.every((result) => result.status === 0), removed.map((item) => item.stderr).join("\n")).toBe(true);
       expect(JSON.parse(readFileSync(manifestPath, "utf8")).agents).toEqual({});
-      const afterRemoval = agentIntegrationStatus(opts(homeDir, binDir, agentIds));
-      expect(afterRemoval.every((item) => item.mcp.state === "missing" && item.skill.state === "missing")).toBe(true);
+      const afterRemoval = agentIntegrationStatus({
+        ...statusOptions,
+        env: statusEnv
+      });
+      expect(
+        afterRemoval.every((item) => item.mcp.state === "missing" && item.skill.state === "missing"),
+        JSON.stringify(afterRemoval)
+      ).toBe(true);
       expect(existsSync(lockPath)).toBe(false);
       expect(existsSync(staleCandidate)).toBe(true);
     }

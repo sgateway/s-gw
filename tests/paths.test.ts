@@ -1,12 +1,20 @@
 import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ensureSgwHome, getSgwHome, getSgwRecoveryHome, getStorePath } from "../src/paths.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ensureSgwHome,
+  getSgwHome,
+  getSgwInstanceKey,
+  getSgwLoginSessionId,
+  getSgwRecoveryHome,
+  getStorePath
+} from "../src/paths.js";
 
 let testRoot = "";
 let outsideRoot = "";
 let previousEnv: NodeJS.ProcessEnv;
+const directoryLinkType = process.platform === "win32" ? "junction" : "dir";
 
 beforeEach(async () => {
   previousEnv = { ...process.env };
@@ -19,6 +27,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   process.env = previousEnv;
   await rm(testRoot, { recursive: true, force: true });
   await rm(outsideRoot, { recursive: true, force: true });
@@ -34,6 +43,76 @@ describe("test-mode s-gw paths", () => {
     expect(getStorePath()).toBe(path.join(home, "store.json"));
 
     await ensureSgwHome();
+  });
+
+  it("fingerprints stable credential authority settings without ephemeral unlock state", () => {
+    delete process.env.SGW_SECRET_BACKEND;
+    const first = getSgwInstanceKey();
+    process.env.USERDOMAIN = "first-domain";
+    process.env.SESSIONNAME = "RDP-Tcp#4";
+    process.env.SGW_MASTER_PASSPHRASE = "first secret value";
+    process.env.SGW_DISABLE_KEYCHAIN = "1";
+    process.env.SGW_KEYCHAIN_HELPER = path.join(testRoot, "helper-one");
+    process.env.SGW_WINDOWS_CREDENTIAL_HELPER = path.join(testRoot, "windows-helper-one");
+    process.env.SGW_LOGIN_SESSION_ID = "first-session";
+    expect(getSgwInstanceKey()).toBe(first);
+    process.env.SGW_MASTER_PASSPHRASE = "different secret value";
+    process.env.SGW_KEYCHAIN_HELPER = path.join(testRoot, "helper-two");
+    process.env.SGW_WINDOWS_CREDENTIAL_HELPER = path.join(testRoot, "windows-helper-two");
+    process.env.SGW_LOGIN_SESSION_ID = "second-session";
+    process.env.USERDOMAIN = "second-domain";
+    process.env.SESSIONNAME = "Console";
+    expect(getSgwInstanceKey()).toBe(first);
+
+    const beforeBackendChange = getSgwInstanceKey();
+    process.env.SGW_SECRET_BACKEND = "keychain";
+    expect(getSgwInstanceKey()).not.toBe(beforeBackendChange);
+  });
+
+  it("does not derive login-session grants from ambient temporary or SSH variables", () => {
+    delete process.env.SGW_LOGIN_SESSION_ID;
+    const first = getSgwLoginSessionId();
+    process.env.TMPDIR = path.join(testRoot, "different-tmp");
+    process.env.XDG_RUNTIME_DIR = path.join(testRoot, "different-runtime");
+    process.env.SSH_AUTH_SOCK = path.join(testRoot, "different-agent.sock");
+    expect(getSgwLoginSessionId()).toBe(first);
+  });
+
+  it("accepts a login-session override only in isolated test mode", () => {
+    process.env.SGW_LOGIN_SESSION_ID = "test-login-session";
+    expect(getSgwLoginSessionId()).toBe("test-login-session");
+
+    delete process.env.SGW_TEST_MODE;
+    expect(() => getSgwLoginSessionId()).toThrow(/restricted to isolated s-gw tests/i);
+  });
+
+  it("preserves raw credential namespace semantics", () => {
+    process.env.SGW_KEYCHAIN_SERVICE = "service-name";
+    const plain = getSgwInstanceKey();
+
+    process.env.SGW_KEYCHAIN_SERVICE = " service-name ";
+    expect(getSgwInstanceKey()).not.toBe(plain);
+  });
+
+  it("separates users even when they share configured ledger paths", () => {
+    const userInfo = vi.spyOn(os, "userInfo");
+    userInfo.mockReturnValue({
+      uid: 1001,
+      gid: 1001,
+      username: "first-user",
+      homedir: path.join(testRoot, "first-user"),
+      shell: "/bin/sh"
+    });
+    const first = getSgwInstanceKey();
+
+    userInfo.mockReturnValue({
+      uid: 1002,
+      gid: 1002,
+      username: "second-user",
+      homedir: path.join(testRoot, "second-user"),
+      shell: "/bin/sh"
+    });
+    expect(getSgwInstanceKey()).not.toBe(first);
   });
 
   it("requires both test homes to be explicit", () => {
@@ -65,8 +144,8 @@ describe("test-mode s-gw paths", () => {
     const recoveryLink = path.join(testRoot, "recovery-link");
     await mkdir(path.join(outsideRoot, "home"));
     await mkdir(path.join(outsideRoot, "recovery"));
-    await symlink(path.join(outsideRoot, "home"), homeLink);
-    await symlink(path.join(outsideRoot, "recovery"), recoveryLink);
+    await symlink(path.join(outsideRoot, "home"), homeLink, directoryLinkType);
+    await symlink(path.join(outsideRoot, "recovery"), recoveryLink, directoryLinkType);
 
     process.env.SGW_HOME = homeLink;
     expect(() => getSgwHome()).toThrow(/outside SGW_TEST_HOME_ROOT/i);
@@ -80,7 +159,7 @@ describe("test-mode s-gw paths", () => {
     const home = path.join(testRoot, "home");
     const recoveryLink = path.join(testRoot, "recovery-link");
     await mkdir(home);
-    await symlink(home, recoveryLink);
+    await symlink(home, recoveryLink, directoryLinkType);
 
     process.env.SGW_HOME = home;
     process.env.SGW_RECOVERY_HOME = recoveryLink;
@@ -100,7 +179,7 @@ describe("test-mode s-gw paths", () => {
 
   it("rejects a dangling home symlink before it can become a write target", async () => {
     const link = path.join(testRoot, "dangling-home-link");
-    await symlink(path.join(outsideRoot, "missing-home"), link);
+    await symlink(path.join(outsideRoot, "missing-home"), link, directoryLinkType);
 
     process.env.SGW_HOME = link;
     expect(() => getSgwHome()).toThrow(/symlinked s-gw test path/i);

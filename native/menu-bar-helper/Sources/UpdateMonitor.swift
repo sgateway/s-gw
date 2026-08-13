@@ -5,15 +5,19 @@ struct HelperUpdate: Sendable {
   let currentVersion: String
   let version: String
   let releaseURL: URL
+  let installerName: String
+  let installerURL: String
+  let checksumName: String
+  let checksumURL: String
 
   var noticeRelease: UpdateNoticeRelease {
     UpdateNoticeRelease(
       tag: "v\(version)",
       version: version,
-      assetName: "",
-      assetURL: "",
-      checksumAssetName: "",
-      checksumAssetURL: "",
+      assetName: installerName,
+      assetURL: installerURL,
+      checksumAssetName: checksumName,
+      checksumAssetURL: checksumURL,
       htmlURL: releaseURL.absoluteString,
       notes: ""
     )
@@ -112,6 +116,10 @@ private struct CliUpdateCheck: Decodable {
   let currentVersion: String
   let available: Bool
   let installerReady: Bool
+  let installerName: String?
+  let installerUrl: String?
+  let checksumName: String?
+  let checksumUrl: String?
   let latestVersion: String?
   let releaseUrl: String?
 
@@ -124,6 +132,14 @@ private struct CliUpdateCheck: Decodable {
           url.scheme == "https" || url.scheme == "http" else {
       return nil
     }
-    return HelperUpdate(currentVersion: currentVersion, version: version, releaseURL: url)
+    return HelperUpdate(
+      currentVersion: currentVersion,
+      version: version,
+      releaseURL: url,
+      installerName: installerName ?? "",
+      installerURL: installerUrl ?? "",
+      checksumName: checksumName ?? "",
+      checksumURL: checksumUrl ?? ""
+    )
   }
 }

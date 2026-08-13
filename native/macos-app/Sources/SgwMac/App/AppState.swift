@@ -3,6 +3,26 @@ import Observation
 import SgwUpdateState
 import SwiftUI
 
+struct RuntimeStatusRefreshSchedule {
+  static let fallbackInterval: TimeInterval = 5 * 60
+
+  let interval: TimeInterval
+  private(set) var lastAttempt: Date?
+
+  init(interval: TimeInterval = fallbackInterval) {
+    self.interval = interval
+  }
+
+  func isDue(at date: Date) -> Bool {
+    guard let lastAttempt else { return true }
+    return date.timeIntervalSince(lastAttempt) >= interval
+  }
+
+  mutating func markAttempt(at date: Date) {
+    lastAttempt = date
+  }
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -47,6 +67,10 @@ final class AppState {
   @ObservationIgnored private let defaults: UserDefaults
   @ObservationIgnored private let now: () -> Date
   @ObservationIgnored private let updateCheckInterval: TimeInterval
+  @ObservationIgnored private var runtimeStatusSchedule: RuntimeStatusRefreshSchedule
+  @ObservationIgnored private var runtimeStatusRefreshInProgress = false
+  @ObservationIgnored private var runtimeStatusError: String?
+  @ObservationIgnored private var updateMetadataVersionInFlight: String?
   @ObservationIgnored private var seenPendingRequestIds = Set<String>()
   @ObservationIgnored private var didAttemptServiceRecovery = false
 
@@ -54,13 +78,15 @@ final class AppState {
     updater: any UpdateChecking = UpdateChecker(),
     defaults: UserDefaults = .standard,
     now: @escaping () -> Date = Date.init,
-    updateCheckInterval: TimeInterval = 6 * 60 * 60
+    updateCheckInterval: TimeInterval = 6 * 60 * 60,
+    runtimeStatusRefreshInterval: TimeInterval = RuntimeStatusRefreshSchedule.fallbackInterval
   ) {
     self.updater = updater
     updateNotice = UpdateNoticeStore(defaults: defaults, now: now)
     self.defaults = defaults
     self.now = now
     self.updateCheckInterval = updateCheckInterval
+    runtimeStatusSchedule = RuntimeStatusRefreshSchedule(interval: runtimeStatusRefreshInterval)
     updateRepository = savedSgwUpdateRepository(defaults: defaults)
     restoreAvailableUpdate()
   }
@@ -153,7 +179,7 @@ final class AppState {
       await refreshInitialStatus()
       await refreshBundledRuntimeAfterReplacement(enabled: refreshBundledRuntime)
       await recoverInstalledServices()
-      await refresh()
+      await refresh(includeRuntimeStatus: false)
     }
     Task {
       await checkForUpdates()
@@ -172,18 +198,20 @@ final class AppState {
   }
 
   func refreshQuietly() async {
-    await refresh(showSpinner: false)
+    await refresh(
+      showSpinner: false,
+      includeRuntimeStatus: runtimeStatusSchedule.isDue(at: now())
+    )
+  }
+
+  func refreshLiveState(showSpinner: Bool = true) async {
+    await refresh(showSpinner: showSpinner, includeRuntimeStatus: false)
   }
 
   func refreshInitialStatus() async {
     defer { initialStatusResolved = true }
-    do {
-      status = try await cli.runJSON(StatusPayload.self, arguments: ["status"])
-      restoreAvailableUpdate()
-      lastError = nil
-    } catch {
-      lastError = error.localizedDescription
-    }
+    runtimeStatusError = await refreshRuntimeStatus()
+    lastError = runtimeStatusError
   }
 
   func recoverInstalledServices() async {
@@ -205,7 +233,7 @@ final class AppState {
     await refreshInitialStatus()
   }
 
-  func refresh(showSpinner: Bool = true) async {
+  func refresh(showSpinner: Bool = true, includeRuntimeStatus: Bool = true) async {
     if showSpinner {
       isRefreshing = true
     }
@@ -215,18 +243,19 @@ final class AppState {
       lastUpdated = Date()
     }
 
+    if includeRuntimeStatus {
+      runtimeStatusError = await refreshRuntimeStatus()
+    }
+
     do {
-      let newStatus = try await cli.runJSON(StatusPayload.self, arguments: ["status"])
       async let handleList = cli.runJSON([HandleSummary].self, arguments: ["secret", "list"])
       async let requestList = cli.runJSON([RequestRecord].self, arguments: ["requests"])
       async let agentList = cli.runJSON([AgentProfile].self, arguments: ["agent", "list"])
       async let approval = cli.runJSON(ApprovalSettings.self, arguments: ["approval", "settings"])
       async let grants = cli.runJSON([ApprovalGrantRecord].self, arguments: ["approval", "grants"])
       async let policies = cli.runJSON([ApprovalPolicyRuleRecord].self, arguments: ["approval", "policy", "list"])
-      async let auditList = store.auditEvents(storePath: newStatus.storePath)
+      async let auditList = store.auditEvents(storePath: status?.storePath)
 
-      status = newStatus
-      restoreAvailableUpdate()
       handles = try await handleList.sorted { $0.updatedAt > $1.updatedAt }
       requests = try await requestList.sorted { requestSortKey($0) > requestSortKey($1) }
       agents = (try? await agentList.sorted { $0.name < $1.name }) ?? []
@@ -235,9 +264,28 @@ final class AppState {
       approvalPolicyRules = (try? await policies.sorted { $0.priority < $1.priority }) ?? []
       audit = await auditList.sorted { $0.ts > $1.ts }
       routeToApprovalsIfNeeded()
-      lastError = nil
+      lastError = runtimeStatusError
     } catch {
       lastError = error.localizedDescription
+    }
+  }
+
+  private func refreshRuntimeStatus() async -> String? {
+    if runtimeStatusRefreshInProgress {
+      return nil
+    }
+
+    runtimeStatusRefreshInProgress = true
+    runtimeStatusSchedule.markAttempt(at: now())
+    defer { runtimeStatusRefreshInProgress = false }
+
+    do {
+      status = try await cli.runJSON(StatusPayload.self, arguments: ["status"])
+      restoreAvailableUpdate()
+      await hydrateAvailableUpdateIfNeeded()
+      return nil
+    } catch {
+      return error.localizedDescription
     }
   }
 
@@ -281,7 +329,7 @@ final class AppState {
         if selectedCredentialHandle == handle.handle {
           selectedCredentialHandle = nil
         }
-        await refresh()
+        await refreshLiveState()
       } else {
         operationMessage = result.output
       }
@@ -322,7 +370,7 @@ final class AppState {
       } else {
         operationMessage = result.output
       }
-      await refresh()
+      await refreshLiveState()
     }
   }
 
@@ -351,7 +399,7 @@ final class AppState {
         refreshAfter: false
       )
       operationMessage = result.succeeded ? "Approval settings updated" : result.output
-      await refresh()
+      await refreshLiveState()
     }
   }
 
@@ -365,7 +413,7 @@ final class AppState {
         refreshAfter: false
       )
       operationMessage = result.succeeded ? "Revoked reusable approval" : result.output
-      await refresh()
+      await refreshLiveState()
     }
   }
 
@@ -379,7 +427,7 @@ final class AppState {
         refreshAfter: false
       )
       operationMessage = result.succeeded ? "Revoked all reusable approvals" : result.output
-      await refresh()
+      await refreshLiveState()
     }
   }
 
@@ -401,6 +449,12 @@ final class AppState {
     }
     if !draft.command.isEmpty {
       args += ["--command", draft.command]
+    }
+    if !draft.resolvedCommand.isEmpty {
+      args += ["--resolved-command", draft.resolvedCommand]
+    }
+    if draft.decision == .allow && draft.command.isEmpty && draft.resolvedCommand.isEmpty && draft.actionKind != "ssh_session" {
+      args.append("--any-command")
     }
     if !draft.injectEnv.isEmpty {
       args += ["--inject-env", draft.injectEnv]
@@ -430,7 +484,7 @@ final class AppState {
     )
     if result.succeeded {
       operationMessage = "Policy rule added"
-      await refresh()
+      await refreshLiveState()
       return true
     }
     operationMessage = result.output
@@ -450,7 +504,7 @@ final class AppState {
         refreshAfter: false
       )
       operationMessage = result.succeeded ? "\(enabled ? "Enabled" : "Disabled") policy rule" : result.output
-      await refresh()
+      await refreshLiveState()
     }
   }
 
@@ -464,7 +518,7 @@ final class AppState {
         refreshAfter: false
       )
       operationMessage = result.succeeded ? "Deleted policy rule" : result.output
-      await refresh()
+      await refreshLiveState()
     }
   }
 
@@ -492,7 +546,7 @@ final class AppState {
     )
     if result.succeeded {
       operationMessage = "Secret added locally"
-      await refresh()
+      await refreshLiveState()
       return true
     }
     operationMessage = result.output
@@ -650,9 +704,19 @@ final class AppState {
     activity.finish(id: runID, result: result)
     operationMessage = result.succeeded ? "\(title) finished" : result.output
     if refreshAfter {
-      await refresh(showSpinner: false)
+      await refresh(
+        showSpinner: false,
+        includeRuntimeStatus: Self.commandRequiresRuntimeStatusRefresh(arguments)
+      )
     }
     return result
+  }
+
+  static func commandRequiresRuntimeStatusRefresh(_ arguments: [String]) -> Bool {
+    guard let command = arguments.first else { return false }
+    return [
+      "app", "doctor", "helper", "menubar", "service", "setup", "start", "status", "stop", "unlock", "update"
+    ].contains(command)
   }
 
   func cancelCommand(_ record: CommandActivityRecord) {
@@ -789,7 +853,8 @@ final class AppState {
     }
 
     guard release.hasVerifiedAsset else {
-      operationMessage = "The installer for s-gw \(release.version) is still being uploaded. Try again shortly."
+      openAvailableRelease()
+      operationMessage = "Choose a verified s-gw \(release.version) download from the release page."
       return
     }
 
@@ -860,6 +925,7 @@ final class AppState {
         ? "\(serviceMessage) Agent connections could not be refreshed yet."
         : "\(serviceMessage) Agent connections were not changed: \(detail)"
     }
+    await refreshInitialStatus()
   }
 
   static func needsBundledRuntimeRefresh(
@@ -872,6 +938,9 @@ final class AppState {
   }
 
   private func shouldCheckForUpdates() -> Bool {
+    if availableUpdate?.hasVerifiedAsset == false {
+      return true
+    }
     let lastCheck = defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey)
     if lastCheck <= 0 {
       return true
@@ -887,6 +956,18 @@ final class AppState {
     }
     availableUpdate = releaseInfo(from: snapshot.release)
     updateBannerDismissed = snapshot.acknowledgedAt != nil
+  }
+
+  private func hydrateAvailableUpdateIfNeeded() async {
+    guard let version = availableUpdate?.version,
+          availableUpdate?.hasVerifiedAsset == false,
+          updateMetadataVersionInFlight != version else {
+      return
+    }
+
+    updateMetadataVersionInFlight = version
+    defer { updateMetadataVersionInFlight = nil }
+    await checkForUpdates()
   }
 
 }

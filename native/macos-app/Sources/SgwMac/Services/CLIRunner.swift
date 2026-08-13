@@ -279,7 +279,15 @@ actor CLIRunner {
     let home = FileManager.default.homeDirectoryForCurrentUser
     let launchAgents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
     let labels = ["com.s-gw.sgw.console", "com.s-gw.sgw.menubar"]
-    let allowedKeys = ["SGW_HOME", "SGW_KEYCHAIN_SERVICE", "SGW_KEYCHAIN_ACCOUNT"]
+    let allowedKeys = [
+      "SGW_HOME",
+      "SGW_RECOVERY_HOME",
+      "SGW_KEYCHAIN_SERVICE",
+      "SGW_KEYCHAIN_ACCOUNT",
+      "SGW_SECRET_KEYCHAIN_SERVICE",
+      "SGW_SECRET_BACKEND",
+      "SGW_EXECUTION_ENGINE"
+    ]
     var values: [String: String] = [:]
 
     for label in labels {

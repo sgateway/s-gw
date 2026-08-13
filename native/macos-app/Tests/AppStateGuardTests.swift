@@ -151,7 +151,7 @@ fileprivate struct Scratch {
         exit 0
         ;;
       status)
-        print -- '{"version":"0.1.19","packageRoot":"/tmp/sgw","ready":true,"readiness":{"ok":true,"summary":"ready","blockers":[]},"cliPath":{"path":"/tmp/cli.js","exists":true},"mcpPath":{"path":"/tmp/mcp.js","exists":true},"keychainHelperPath":{"path":"/tmp/helper","exists":true},"menuBarAppPath":{"path":"/tmp/mb.app","exists":true},"menuBarBinaryPath":{"path":"/tmp/mb","exists":true},"storePath":"/tmp/store.json","consoleUrl":"http://127.0.0.1:8718/","unlock":{"activeSource":"env"},"launchAgents":{"console":{"label":"c","plistPath":"/tmp/c.plist","installed":true,"loaded":true},"menuBar":{"label":"m","plistPath":"/tmp/m.plist","installed":true,"loaded":true}}}'
+        print -- '{"version":"0.1.21","packageRoot":"/tmp/sgw","ready":true,"readiness":{"ok":true,"summary":"ready","blockers":[]},"cliPath":{"path":"/tmp/cli.js","exists":true},"mcpPath":{"path":"/tmp/mcp.js","exists":true},"keychainHelperPath":{"path":"/tmp/helper","exists":true},"menuBarAppPath":{"path":"/tmp/mb.app","exists":true},"menuBarBinaryPath":{"path":"/tmp/mb","exists":true},"storePath":"/tmp/store.json","consoleUrl":"http://127.0.0.1:8718/","unlock":{"activeSource":"env"},"launchAgents":{"console":{"label":"c","plistPath":"/tmp/c.plist","installed":true,"loaded":true},"menuBar":{"label":"m","plistPath":"/tmp/m.plist","installed":true,"loaded":true}}}'
         exit 0
         ;;
       app)
@@ -190,7 +190,7 @@ fileprivate struct Scratch {
   }
 
   // Count only decision verbs (approve/deny). After a decision completes the app
-  // calls refresh(), which fires benign read verbs (status/requests/...) — those
+  // refreshes live state, which fires benign read verbs (requests/secret/...) — those
   // must not be mistaken for a leaked second decision.
   func decisionCount() -> Int {
     verbs().filter { $0 == "approve" || $0 == "deny" }.count
@@ -262,6 +262,8 @@ struct AppStateGuardTests {
     // Point the real CLIRunner at the fake CLI via the documented override key.
     UserDefaults.standard.set(scratch.fakeCli.path, forKey: CLIRunner.binaryOverrideKey)
 
+    await runRuntimeStatusThrottleTest(scratch)
+    await runRuntimeStatusMutationClassificationTest()
     await runStartupOrderingTest(scratch)
     await runStoppedServiceRecoveryTest(scratch)
     await runInFlightGuardTest(scratch)
@@ -271,6 +273,7 @@ struct AppStateGuardTests {
     await runCommandOutputCaptureTest()
     await runUpdateRetryTest()
     await runIncompleteReleaseRetryTest()
+    await runHelperDiscoveredReleaseHydrationTest()
     await runUpdateAvailabilityPersistenceTest()
     await runUpdateAcknowledgementAndReminderTest()
     runUpdateStateClearAfterInstallTest()
@@ -281,6 +284,62 @@ struct AppStateGuardTests {
     runChecksumManifestTest()
 
     print("ALL_NATIVE_TESTS_OK")
+  }
+
+  @MainActor
+  fileprivate static func runRuntimeStatusThrottleTest(_ scratch: Scratch) async {
+    var currentTime = Date(timeIntervalSince1970: 1_800_000_000)
+    let app = AppState(
+      updater: FakeUpdateChecker([.release(nil)]),
+      defaults: isolatedDefaults("runtime-status-throttle"),
+      now: { currentTime },
+      runtimeStatusRefreshInterval: 5 * 60
+    )
+
+    let statusBefore = scratch.verbs().filter { $0 == "status" }.count
+    let requestsBefore = scratch.verbs().filter { $0 == "requests" }.count
+    await app.refreshInitialStatus()
+    check(scratch.verbs().filter { $0 == "status" }.count == statusBefore + 1,
+          "launch should read runtime and Keychain status once")
+
+    await app.refreshQuietly()
+    currentTime = currentTime.addingTimeInterval(5 * 60 - 1)
+    await app.refreshQuietly()
+    check(scratch.verbs().filter { $0 == "status" }.count == statusBefore + 1,
+          "four-second live refreshes must reuse runtime status before the five-minute fallback")
+    check(scratch.verbs().filter { $0 == "requests" }.count == requestsBefore + 2,
+          "approval requests must still refresh on every live polling pass")
+
+    currentTime = currentTime.addingTimeInterval(1)
+    await app.refreshQuietly()
+    check(scratch.verbs().filter { $0 == "status" }.count == statusBefore + 2,
+          "runtime status should refresh when the five-minute fallback becomes due")
+    check(scratch.verbs().filter { $0 == "requests" }.count == requestsBefore + 3,
+          "the fallback pass must continue refreshing approval requests")
+
+    await app.refresh()
+    check(scratch.verbs().filter { $0 == "status" }.count == statusBefore + 3,
+          "an explicit activation or user refresh should force current runtime status")
+  }
+
+  @MainActor
+  static func runRuntimeStatusMutationClassificationTest() {
+    check(AppState.commandRequiresRuntimeStatusRefresh(["setup", "--no-open-app"]),
+          "setup can change Keychain and package readiness")
+    check(AppState.commandRequiresRuntimeStatusRefresh(["unlock", "keychain", "delete"]),
+          "unlock mutations must invalidate cached runtime status")
+    check(AppState.commandRequiresRuntimeStatusRefresh(["service", "install", "--start"]),
+          "service mutations must invalidate cached package status")
+    check(AppState.commandRequiresRuntimeStatusRefresh(["status"]),
+          "the status command should refresh the app's runtime status model")
+    check(AppState.commandRequiresRuntimeStatusRefresh(["doctor"]),
+          "the doctor alias should refresh the app's runtime status model")
+    check(AppState.commandRequiresRuntimeStatusRefresh(["helper", "install"]),
+          "the helper alias can change menu helper launch state")
+    check(!AppState.commandRequiresRuntimeStatusRefresh(["approve", "req-1"]),
+          "approval decisions must not trigger a Keychain status probe")
+    check(!AppState.commandRequiresRuntimeStatusRefresh(["requests", "cleanup"]),
+          "request maintenance must stay on the live-state refresh path")
   }
 
   @MainActor
@@ -519,6 +578,57 @@ struct AppStateGuardTests {
     check(app.availableUpdate == complete, "the retry should pick up the completed release assets")
     check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == now.timeIntervalSince1970,
           "the completed release should start the successful-check interval")
+  }
+
+  @MainActor
+  static func runHelperDiscoveredReleaseHydrationTest() async {
+    let defaults = isolatedDefaults("helper-update-hydration")
+    let incomplete = makeRelease("9.0.2", installable: false)
+    let complete = makeRelease("9.0.2")
+    let checker = FakeUpdateChecker([.release(complete)])
+    let now = Date(timeIntervalSince1970: 1_800_000_150)
+    let helperNotice = UpdateNoticeStore(defaults: defaults, now: { now })
+    helperNotice.clear()
+    defer { helperNotice.clear() }
+
+    _ = helperNotice.observe(
+      storedRelease(incomplete),
+      installedVersion: UpdateChecker.currentVersion
+    )
+    defaults.set(now.timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
+
+    let restartedApp = AppState(
+      updater: checker,
+      defaults: defaults,
+      now: { now }
+    )
+    check(restartedApp.availableUpdate == incomplete,
+          "the app should restore the helper's release before fetching installer metadata")
+
+    await restartedApp.checkForUpdates()
+    check(await checker.checkCount() == 1,
+          "an incomplete helper notice must bypass a stale successful-check timestamp")
+    check(restartedApp.availableUpdate == complete,
+          "the app should hydrate a helper notice with verified installer metadata")
+
+    helperNotice.clear()
+    defaults.set(now.timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
+    let liveChecker = FakeUpdateChecker([.release(complete)])
+    let runningApp = AppState(
+      updater: liveChecker,
+      defaults: defaults,
+      now: { now }
+    )
+    _ = helperNotice.observe(
+      storedRelease(incomplete),
+      installedVersion: UpdateChecker.currentVersion
+    )
+
+    await runningApp.refreshInitialStatus()
+    check(await liveChecker.checkCount() == 1,
+          "a running app must hydrate an incomplete release discovered later by the helper")
+    check(runningApp.availableUpdate == complete,
+          "runtime refresh should replace the helper's metadata-only notice with an actionable release")
   }
 
   @MainActor

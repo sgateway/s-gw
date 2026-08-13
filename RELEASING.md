@@ -33,9 +33,26 @@ npm run build:installers
 
 Exercise the [quick-start trust loop](docs/quickstart.md) with a disposable store. Platform builds also require the relevant native tests and an install/uninstall smoke test on the target operating system.
 
+Build the Windows x64 or Linux x64 desktop preview on its target operating system:
+
+```bash
+npm ci
+npm run check:desktop-app
+npm run test:desktop-app
+npm run build:desktop-app
+```
+
+The desktop build stages the production npm package and a checksum-pinned Node runtime before building the native Rust UI and invoking the package builder. Cross-building these installers is not supported; build NSIS on Windows and the Debian package on Linux.
+
 ## Artifacts
 
 `npm run build:installers` writes release files and SHA-256 checksums under `dist/installers`.
+
+`npm run build:desktop-app` writes the platform-native preview under `native/desktop-app/target/release/bundle`: an NSIS installer under `nsis` on Windows or a Debian package under `deb` on Linux. These files are unsigned CI artifacts in the current release process. The publish workflow does not upload them to GitHub Releases, and they must not be described as supported public downloads.
+
+The installed desktop app bundles Node.js 24, the production s-gw package, and the explicit browser-backup assets. Users do not need a separate Node.js or npm installation. The primary Windows/Linux interface is native-rendered and has no WebView dependency. Windows uses a per-user NSIS install. The Linux x64 package declares its GTK 3, AppIndicator, `libxdo`, and `libsecret-tools` runtime dependencies and requires a graphical session with an unlocked Secret Service keyring.
+
+Building requires Node.js 20 or newer and the Rust toolchain. Windows builds need the MSVC Rust target and Visual Studio C++ build tools. Ubuntu/Debian build hosts need the ordinary compiler toolchain plus GTK 3, AppIndicator, X11/Wayland, XDO, and graphics development packages used by the native UI and tray.
 
 The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. The default `notarized` release mode requires Developer ID signing, hardened runtime, Apple notarization, stapling, and Gatekeeper assessment. The `release-assets` workflow fails closed unless these repository secrets are present:
 
@@ -45,7 +62,9 @@ The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. The 
 - `APPLE_NOTARY_KEY_ID`
 - `APPLE_NOTARY_ISSUER_ID`
 
-`unsigned` is the Apple-ID-free macOS mode. It produces the primary `s-gw.dmg` plus a versioned compatibility copy and uses the ordinary `vVERSION` tag, while the normal npm package remains the primary installation path. Its release notes and DMG README lead with `npm install -g @s-gw/s-gw` and explain the required Gatekeeper override for the desktop alternative. Local builds use ad-hoc signatures only. Do not describe the Windows package as a production download until it is signed and validated on supported Windows versions.
+`unsigned` is the Apple-ID-free macOS mode. It produces the primary `s-gw.dmg` plus a versioned compatibility copy and uses the ordinary `vVERSION` tag, while the normal npm package remains the primary installation path. Its release notes and DMG README lead with `npm install -g @s-gw/s-gw` and explain the required Gatekeeper override for the desktop alternative. Local builds use ad-hoc signatures only. Do not describe the Windows or Linux desktop package as a production download until it is signed and validated on supported target systems.
+
+Public Windows distribution requires an Authenticode-signed executable and installer plus clean-machine SmartScreen and install/uninstall testing. Public Linux distribution requires signed repository or release metadata, checksum publication, and install/uninstall testing on the supported distributions. Adding a CI artifact does not satisfy either release bar.
 
 ## Publish
 
@@ -56,9 +75,9 @@ The macOS DMG is a self-contained `s-gw.app` plus an Applications shortcut. The 
 5. It uploads every installer and checksum, confirms their GitHub asset state is `uploaded`, then verifies and publishes the scoped npm package from the immutable tag. This protected OIDC step is independent of macOS notarization.
 6. After npm verification succeeds, it publishes the draft. MCP Registry publication follows the successful npm publication and does not hold the GitHub release open.
 7. To inspect assets without notifying users, run the workflow with `publish_release=false` and `publish_npm_only=false`; the release remains a draft and npm is not changed. Re-run with `true` only after review.
-8. Verify checksums from a clean download and install the release on clean macOS and Windows test accounts.
+8. Verify checksums from a clean download and install the release on clean macOS and Windows test accounts. Validate Linux artifacts separately before adding them to any release.
 9. Confirm the update checker sees the release and opens the correct notes.
 
-When signing is unavailable, use `unsigned`. It creates a normal SemVer release so installed clients can discover it, and it still publishes the normal npm package before the GitHub release. The release notes must lead with the npm command and state the Gatekeeper override for the DMG. The Windows package may still be labeled as a preview artifact with its limitations stated in the release notes.
+When Apple signing is unavailable, use `unsigned`. It creates a normal SemVer release so installed clients can discover it, and it still publishes the normal npm package before the GitHub release. The release notes must lead with the npm command and state the Gatekeeper override for the DMG. Keep the Windows and Linux desktop builds as CI previews until their separate signing and target-system validation requirements are met.
 
 If an existing public GitHub release missed npm or MCP Registry publication, run **Publish release** with `release_tag=vX.Y.Z` and `publish_npm_only=true`. This verifies the immutable tag and matching private core, rejects current high-severity audit findings without letting a newly disclosed low-severity advisory make the immutable tag unrepairable, and clean-installs and exercises an existing npm artifact instead of comparing it with a non-reproducible native rebuild. If the npm version is absent, the workflow publishes it and requires the registry integrity to match the local package. It then publishes the same version to the MCP Registry without rebuilding assets or altering the GitHub release.

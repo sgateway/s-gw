@@ -148,7 +148,7 @@ server.registerTool(
   "sgw_request_ssh_session",
   {
     title: "Request s-gw-Owned SSH Session",
-    description: "Create a local approval request for an SSH command that s-gw will run over its own persistent ControlMaster session.",
+    description: "Create a local approval request for an SSH command. Unix-like systems use an s-gw-owned ControlMaster; Windows uses a hardened one-shot ssh.exe command with an SSH private key.",
     inputSchema: {
       handle: z.string().min(1),
       target: z.string().min(1),

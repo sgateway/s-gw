@@ -145,6 +145,10 @@ struct PoliciesView: View {
         EmptyPanel(title: "No requests to test", message: "Policy matching can be previewed after an agent creates a local authorization request.", systemImage: "target")
       } else {
         VStack(alignment: .leading, spacing: 12) {
+          Text("Rules evaluate from lowest priority to highest. Only the first matching rule applies.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
           Picker("Request", selection: Binding(
             get: { selectedPolicyRequestId },
             set: { selectedRequestId = $0 }
@@ -172,7 +176,7 @@ struct PoliciesView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             } else {
-              ForEach(matches) { rule in
+              ForEach(Array(matches.enumerated()), id: \.element.id) { index, rule in
                 HStack(spacing: 10) {
                   Image(systemName: icon(rule.decision))
                     .foregroundStyle(color(rule.decision))
@@ -185,9 +189,14 @@ struct PoliciesView: View {
                       .lineLimit(2)
                   }
                   Spacer()
-                  Text(rule.decision.label)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(color(rule.decision))
+                  VStack(alignment: .trailing, spacing: 2) {
+                    Text(index == 0 ? "First match · wins" : "Not reached")
+                      .font(.caption2.weight(.semibold))
+                      .foregroundStyle(index == 0 ? color(rule.decision) : .secondary)
+                    Text(rule.decision.label)
+                      .font(.caption.weight(.semibold))
+                      .foregroundStyle(color(rule.decision))
+                  }
                 }
               }
             }
@@ -266,7 +275,7 @@ struct PoliciesView: View {
       PolicyTemplate(
         id: "allow-codex-selected",
         title: "Allow selected for Codex",
-        summary: "Let Codex use one selected handle without interrupting you.",
+        summary: "Let Codex run any command already permitted by one selected credential without interrupting you.",
         icon: "checkmark.shield",
         decision: .allow,
         requiresHandle: true
@@ -278,7 +287,7 @@ struct PoliciesView: View {
           decision: .allow,
           handle: handle,
           agent: "Codex",
-          actionKind: "",
+          actionKind: "env_command",
           command: "",
           injectEnv: "",
           sshTarget: "",
@@ -327,7 +336,11 @@ struct PoliciesView: View {
   private func matchingRules(for request: RequestRecord) -> [ApprovalPolicyRuleRecord] {
     appState.approvalPolicyRules
       .filter { $0.enabled && matches($0, request: request) }
-      .sorted { $0.priority < $1.priority }
+      .sorted {
+        if $0.priority != $1.priority { return $0.priority < $1.priority }
+        if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+        return $0.id < $1.id
+      }
   }
 
   private func matches(_ rule: ApprovalPolicyRuleRecord, request: RequestRecord) -> Bool {
@@ -339,6 +352,16 @@ struct PoliciesView: View {
     if !matchesString(conditions.agents, request.agentName) { return false }
     if !matchesString(conditions.actionKinds, request.action.kind) { return false }
     if !matchesString(conditions.commands, request.action.command) { return false }
+    if request.action.kind == "env_command" {
+      if rule.decision == .allow && (conditions.resolvedCommands?.isEmpty != false) && !conditions.allowsAnyEnvironmentCommand {
+        return false
+      }
+      if let executables = conditions.resolvedCommands, !executables.isEmpty {
+        guard let resolved = request.action.resolvedCommand, executables.contains(resolved) else { return false }
+      }
+    } else if conditions.resolvedCommands?.isEmpty == false {
+      return false
+    }
     if !matchesString(conditions.injectEnvs, request.action.injectEnv) { return false }
     if !matchesString(conditions.workingDirs, request.action.workingDir ?? "") { return false }
     if !matchesString(conditions.sshTargets, request.action.ssh?.target ?? "") { return false }

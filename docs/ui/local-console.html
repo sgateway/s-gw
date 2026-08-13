@@ -2609,6 +2609,8 @@
         if (statusItems[1]) {
           var unlock = state.status && state.status.unlock ? state.status.unlock : {};
           var label = unlock.activeSource === "macos-keychain" ? "macOS Keychain unlocked" :
+            unlock.activeSource === "linux-secret-service" ? "Linux Secret Service unlocked" :
+            unlock.activeSource === "windows-credential-manager" ? "Windows Credential Manager unlocked" :
             unlock.activeSource === "env" ? "Env unlock active" : "Unlock required";
           statusItems[1].innerHTML = '<span class="dot"></span>' + escapeHtml(label) + ' <svg><use href="#i-key"></use></svg>';
         }
@@ -4249,7 +4251,7 @@
         if (provider === "ssh") {
           return '<span class="provider-icon"><svg><use href="#i-terminal"></use></svg></span>';
         }
-        if (provider === "macos-keychain" || provider === "keychain") {
+        if (provider === "macos-keychain" || provider === "linux-secret-service" || provider === "keychain") {
           return '<span class="provider-icon"><svg><use href="#i-key"></use></svg></span>';
         }
 
@@ -4263,6 +4265,9 @@
         }
         if (value === "keychain" || value === "macos-keychain") {
           return "macOS Keychain";
+        }
+        if (value === "linux-secret-service") {
+          return "Linux Secret Service";
         }
         if (value === "api-token") {
           return "API token";

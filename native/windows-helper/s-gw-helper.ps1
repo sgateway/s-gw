@@ -1,10 +1,58 @@
 [CmdletBinding()]
 param(
   [int]$Port = 8718,
-  [string]$ConsoleUrl = ""
+  [string]$ConsoleUrl = "",
+  [string]$InstanceKey = "",
+  [string]$LaunchNonce = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+function Quote-Arg([string]$Value) {
+  if ($Value.Length -eq 0) {
+    return '""'
+  }
+  return '"' + $Value.Replace('"', '\"') + '"'
+}
+
+$providedInstanceKey = $InstanceKey.Trim()
+if ($providedInstanceKey -notmatch '^[a-fA-F0-9]{64}$') {
+  throw 'Launch the helper through s-gw-helper.cmd or s-gw menubar open.'
+}
+$script:InstanceKey = $providedInstanceKey.ToLowerInvariant()
+$providedLaunchNonce = $LaunchNonce.Trim()
+if ($providedLaunchNonce -and $providedLaunchNonce -notmatch '^[a-fA-F0-9]{64}$') {
+  throw 'Launch the helper through s-gw-helper.cmd or s-gw menubar open.'
+}
+
+function Get-Sha256Hex([string]$Value) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $digest = $sha256.ComputeHash($bytes)
+  } finally {
+    $sha256.Dispose()
+  }
+  return -join ($digest | ForEach-Object { $_.ToString("x2") })
+}
+
+function New-HelperMutexName {
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $key = Get-Sha256Hex "$sid|$Port"
+  return "Local\s-gw-helper-$key"
+}
+
+$script:HelperMutex = [System.Threading.Mutex]::new($false, (New-HelperMutexName))
+$script:HelperMutexOwned = $false
+try {
+  $script:HelperMutexOwned = $script:HelperMutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+  $script:HelperMutexOwned = $true
+}
+if (-not $script:HelperMutexOwned) {
+  $script:HelperMutex.Dispose()
+  exit 0
+}
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -37,13 +85,6 @@ function New-ConsoleUrl {
   return "http://127.0.0.1:$Port/"
 }
 
-function Quote-Arg([string]$Value) {
-  if ($Value.Length -eq 0) {
-    return '""'
-  }
-  return '"' + $Value.Replace('"', '\"') + '"'
-}
-
 function Invoke-CliJson([string[]]$Args) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $script:NodePath
@@ -68,14 +109,17 @@ function Invoke-CliJson([string[]]$Args) {
 }
 
 function Start-Client([string]$Path = "") {
-  $clientScript = Join-Path $PSScriptRoot "s-gw-client.ps1"
   $url = $script:BaseConsoleUrl
   if ($Path) {
     $url = $script:BaseConsoleUrl.TrimEnd("/") + "/" + $Path.TrimStart("/")
   }
-  Start-Process `
-    -FilePath "powershell.exe" `
-    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $clientScript, "-Port", [string]$Port, "-ConsoleUrl", $url) | Out-Null
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $script:NodePath
+  $args = @($script:CliPath, "app", "open", "--port", [string]$Port, "--console-url", $url)
+  $psi.Arguments = ($args | ForEach-Object { Quote-Arg ([string]$_) }) -join " "
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  [System.Diagnostics.Process]::Start($psi) | Out-Null
 }
 
 function Get-PendingRequests {
@@ -213,4 +257,11 @@ $script:Timer.Add_Tick({ Update-Menu })
 
 Update-Menu
 $script:Timer.Start()
-[System.Windows.Forms.Application]::Run()
+try {
+  [System.Windows.Forms.Application]::Run()
+} finally {
+  if ($script:HelperMutexOwned) {
+    $script:HelperMutex.ReleaseMutex()
+  }
+  $script:HelperMutex.Dispose()
+}

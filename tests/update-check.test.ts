@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -38,7 +38,18 @@ describe("release update checks", () => {
     });
 
     const first = await checker.check();
-    expect(first).toMatchObject({ checked: true, available: true, installerReady: true, latestVersion: "0.1.1", prerelease: false });
+    const firstInstaller = installerName("v0.1.1");
+    expect(first).toMatchObject({
+      checked: true,
+      available: true,
+      installerReady: true,
+      installerName: firstInstaller,
+      installerUrl: `https://github.com/sgateway/s-gw/releases/download/v0.1.1/${firstInstaller}`,
+      checksumName: `${firstInstaller}.sha256`,
+      checksumUrl: `https://github.com/sgateway/s-gw/releases/download/v0.1.1/${firstInstaller}.sha256`,
+      latestVersion: "0.1.1",
+      prerelease: false
+    });
     expect(calls).toBe(1);
 
     const cached = await checker.check();
@@ -72,6 +83,46 @@ describe("release update checks", () => {
     });
   });
 
+  it("normalizes update caches written before installer metadata was persisted", async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-old-cache-"));
+    const now = Date.parse("2026-07-03T12:00:00.000Z");
+    const cachePath = path.join(tmpDir, "update.json");
+    await writeFile(cachePath, JSON.stringify({
+      result: {
+        checked: true,
+        currentVersion: "0.1.0",
+        latestVersion: "0.1.1",
+        available: true,
+        installerReady: true,
+        releaseUrl: "https://github.com/sgateway/s-gw/releases/tag/v0.1.1",
+        prerelease: false,
+        publishedAt: "2026-07-03T11:00:00.000Z",
+        checkedAt: new Date(now).toISOString()
+      }
+    }));
+    let calls = 0;
+    const checker = new ReleaseChecker({
+      cachePath,
+      currentVersion: "0.1.0",
+      enabled: true,
+      now: () => now,
+      fetcher: async () => {
+        calls += 1;
+        throw new Error("the fresh cache should be used");
+      }
+    });
+
+    await expect(checker.check()).resolves.toMatchObject({
+      available: true,
+      installerReady: true,
+      installerName: null,
+      installerUrl: null,
+      checksumName: null,
+      checksumUrl: null
+    });
+    expect(calls).toBe(0);
+  });
+
   it("falls back to the public Atom feed when the GitHub API is rate-limited", async () => {
     tmpDir = await mkdtemp(path.join(os.tmpdir(), "sgw-update-atom-"));
     const calls: string[] = [];
@@ -100,6 +151,7 @@ describe("release update checks", () => {
     });
 
     const result = await checker.check(true);
+    const asset = installerName("v0.1.2");
     expect(result.error).toBeUndefined();
     expect(result).toMatchObject({
       checked: true,
@@ -107,10 +159,13 @@ describe("release update checks", () => {
       latestVersion: "0.1.2",
       available: true,
       installerReady: true,
+      installerName: asset,
+      installerUrl: `https://github.com/sgateway/s-gw/releases/download/v0.1.2/${asset}`,
+      checksumName: `${asset}.sha256`,
+      checksumUrl: `https://github.com/sgateway/s-gw/releases/download/v0.1.2/${asset}.sha256`,
       releaseUrl: "https://github.com/sgateway/s-gw/releases/tag/v0.1.2",
       publishedAt: "2026-07-11T12:00:00Z"
     });
-    const asset = installerName("v0.1.2");
     expect(calls).toEqual([
       api,
       atom,

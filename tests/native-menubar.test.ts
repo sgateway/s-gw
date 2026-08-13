@@ -88,6 +88,9 @@ describe("menu-bar helper approval surface contract", () => {
     expect(source).not.toContain(".frame(width: 448, height: 510)");
     expect(source).toContain('Button("Allow 8 hours")');
     expect(source).toContain('Button("Once")');
+    expect(source).toContain('Button("Always allow this request scope")');
+    expect(source).toContain("actions.approvePolicy(request.id)");
+    expect(source).toContain("let approvePolicy: (String) -> Void");
     expect(source).toContain("confirmUnlimitedForAll = true");
     expect(source).toContain("Allow every agent without an expiry?");
   });
@@ -143,6 +146,17 @@ describe("menu-bar helper approval surface contract", () => {
     expect(source).toContain("flock(fd, LOCK_EX | LOCK_NB)");
     expect(source).toContain("com.s-gw.sgw.showMenuHelper");
     expect(source).not.toContain("popoverNeedsRefreshOnClose");
+  });
+
+  it("keeps approval polling fast without probing runtime status every cycle", () => {
+    const source = helperSource();
+
+    expect(source).toContain("Timer.scheduledTimer(withTimeInterval: 4");
+    expect(source).toContain("let requests = readRequests()");
+    expect(source).toContain("HelperStatusRefreshSchedule");
+    expect(source).toContain("static let fallbackInterval: TimeInterval = 5 * 60");
+    expect(source).toContain("refreshState(includeRuntimeStatus: true)");
+    expect(source).not.toContain("readUnlockSource()");
   });
 
   it("routes deep helper actions into the native app", () => {

@@ -43,7 +43,7 @@ jobs:
       - run: npm run check
       - run: npm run build
       - run: npm test
-      - run: npm audit --audit-level=high
+      - run: npm run audit:release
       - run: npm run package:dry-run
 
   macos-native:
@@ -57,13 +57,376 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run build:native
-      - run: npx vitest run tests/install-macos.test.ts tests/native-appstate.test.ts tests/native-menubar.test.ts tests/native-command-surface.test.ts tests/native-readiness-ui.test.ts
+      - run: npm run build
+      - run: npm test -- --no-file-parallelism
 
-  windows-preview:
-    name: Windows preview client
+  desktop-apps:
+    name: Desktop app (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 NSIS
+            runner: windows-latest
+            runtime_target: win32-x64
+            artifact_name: s-gw-windows-x64-nsis
+            artifact_path: native/desktop-app/target/release/bundle/nsis/*.exe
+          - name: Ubuntu 22.04 x64 deb
+            runner: ubuntu-22.04
+            runtime_target: linux-x64
+            artifact_name: s-gw-linux-x64-deb
+            artifact_path: native/desktop-app/target/release/bundle/deb/*.deb
+    env:
+      SGW_DESKTOP_TARGET: ${{ matrix.runtime_target }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      # npm 11 rejects an unpublished optional packager binary before platform filtering.
+      - name: Pin desktop npm
+        run: npm install --global npm@10.9.8
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libsecret-tools \
+            libssl-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            patchelf \
+            pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+          rustup default 1.96.1
+
+      - name: Verify Windows MSVC host
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hostTriple = (rustc -vV | Where-Object { $_ -match '^host:' }) -replace '^host:\s*', ''
+          if ($hostTriple -ne 'x86_64-pc-windows-msvc') {
+            throw "Expected the MSVC Rust host, got $hostTriple."
+          }
+
+      - name: Audit Rust dependencies
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file native/desktop-app/Cargo.lock
+
+      - run: npm ci --ignore-scripts
+
+      - name: Verify native Rust dependency graph (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata_file="$RUNNER_TEMP/desktop-cargo-metadata.json"
+          cargo metadata --locked --format-version 1 \
+            --manifest-path native/desktop-app/Cargo.toml > "$metadata_file"
+          mapfile -t package_names < <(jq -r '.packages[].name' "$metadata_file")
+          package_list="$(printf '%s\n' "${package_names[@]}")"
+          for required in eframe glow tray-icon; do
+            if ! grep -Fxq "$required" <<< "$package_list"; then
+              printf 'Required native desktop dependency is missing: %s\n' "$required" >&2
+              exit 1
+            fi
+          done
+          blocked="$(grep -Ei \
+            '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)' \
+            <<< "$package_list" || true)"
+          if test -n "$blocked"; then
+            printf 'Forbidden WebView dependency in desktop graph:\n%s\n' "$blocked" >&2
+            exit 1
+          fi
+          active_tree="$(cargo tree --locked --edges normal --target x86_64-unknown-linux-gnu \
+            --manifest-path native/desktop-app/Cargo.toml)"
+          for required_renderer in egui_glow glow glutin; do
+            if ! grep -Eq "(^|[[:space:]])${required_renderer} v[0-9]" <<< "$active_tree"; then
+              printf 'Required active renderer dependency is missing: %s\n' "$required_renderer" >&2
+              exit 1
+            fi
+          done
+          blocked_renderer="$(grep -Ei \
+            '(egui-wgpu|gpu-allocator|wgpu(-[^[:space:]]*)?) v[0-9]' \
+            <<< "$active_tree" || true)"
+          if test -n "$blocked_renderer"; then
+            printf 'Unsupported desktop renderer dependency:\n%s\n' "$blocked_renderer" >&2
+            exit 1
+          fi
+
+      - name: Verify native Rust dependency graph (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $metadataJson = (& cargo metadata --locked --format-version 1 `
+            --manifest-path native/desktop-app/Cargo.toml | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the native desktop dependency graph."
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $packageNames = @($metadata.packages | ForEach-Object { $_.name })
+          foreach ($required in @('eframe', 'wgpu', 'tray-icon')) {
+            if ($required -cnotin $packageNames) {
+              throw "Required native desktop dependency is missing: $required"
+            }
+          }
+          $blocked = @($packageNames | Where-Object {
+            $_ -match '^(tauri($|-)|wry($|-)|webview2|webkit|javascriptcore)'
+          })
+          if ($blocked.Count -gt 0) {
+            throw "Forbidden WebView dependency in desktop graph: $($blocked -join ', ')"
+          }
+          $activeTree = (& cargo tree --locked --edges normal --target x86_64-pc-windows-msvc `
+            --manifest-path native/desktop-app/Cargo.toml | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the active Windows desktop dependency tree."
+          }
+          foreach ($requiredRenderer in @('egui-wgpu', 'wgpu', 'wgpu-core', 'wgpu-hal', 'gpu-allocator')) {
+            $rendererPattern = "\b$([regex]::Escape($requiredRenderer)) v\d"
+            if ($activeTree -notmatch $rendererPattern) {
+              throw "Required active renderer dependency is missing: $requiredRenderer"
+            }
+          }
+          if ($activeTree -match '(egui_glow|glow|glutin(?:-[^\s]+)?) v\d') {
+            throw "Unsupported desktop renderer dependency: $($Matches[0])"
+          }
+          $windowsCrateVersions = @(
+            [regex]::Matches($activeTree, '\bwindows v(\d+\.\d+\.\d+)') |
+              ForEach-Object { $_.Groups[1].Value } |
+              Sort-Object -Unique
+          )
+          if ($windowsCrateVersions.Count -ne 1 -or $windowsCrateVersions[0] -notmatch '^0\.62\.') {
+            throw "wgpu and gpu-allocator must share windows 0.62.x bindings: $($windowsCrateVersions -join ', ')"
+          }
+          $featureTree = (& cargo tree --locked --edges features --target x86_64-pc-windows-msvc `
+            --manifest-path native/desktop-app/Cargo.toml | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the active Windows desktop feature tree."
+          }
+          foreach ($requiredFeature in @('dx12', 'std', 'wgsl')) {
+            if ($featureTree -notmatch "wgpu feature `"$requiredFeature`"") {
+              throw "Required Windows wgpu feature is missing: $requiredFeature"
+            }
+          }
+          if ($featureTree -match 'wgpu feature "(vulkan|gles|metal)"') {
+            throw "Unsupported Windows wgpu backend feature: $($Matches[1])"
+          }
+
+      - run: npm run check:desktop-app
+      - run: npm run test:desktop-app
+      - run: npm run build:desktop-app
+
+      - name: Verify deb package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(native/desktop-app/target/release/bundle/deb/*.deb)
+          test "${#installers[@]}" -eq 1
+          version="$(jq -r .version package.json)"
+          test "$(basename "${installers[0]}")" = "s-gw_${version}_amd64.deb"
+          test "$(dpkg-deb -f "${installers[0]}" Package)" = "s-gw"
+          test "$(dpkg-deb -f "${installers[0]}" Version)" = "$version"
+          test "$(dpkg-deb -f "${installers[0]}" Architecture)" = "amd64"
+          depends="$(dpkg-deb -f "${installers[0]}" Depends)"
+          for dependency in \
+            libayatana-appindicator3-1 \
+            libgl1 \
+            libgtk-3-0 \
+            libsecret-tools \
+            libxdo3 \
+            libxkbcommon-x11-0; do
+            printf '%s\n' "$depends" | grep -Fq "$dependency"
+          done
+          if printf '%s\n' "$depends" | grep -Eiq '(webview2|webkit|javascriptcore)'; then
+            printf 'Forbidden WebView dependency in deb metadata: %s\n' "$depends" >&2
+            exit 1
+          fi
+          dpkg-deb --info "${installers[0]}" >/dev/null
+          unpacked="$(mktemp -d)"
+          dpkg-deb --extract "${installers[0]}" "$unpacked"
+          node_path="$(find "$unpacked" -type f -path '*/runtime/node/bin/node' -print -quit)"
+          cli_path="$(find "$unpacked" -type f -path '*/runtime/package/dist/cli.js' -print -quit)"
+          package_path="$(find "$unpacked" -type f -path '*/runtime/package/package.json' -print -quit)"
+          test -n "$node_path"
+          test -n "$cli_path"
+          test -n "$package_path"
+          test -x "$unpacked/usr/bin/s-gw-desktop"
+          test -f "$unpacked/usr/share/applications/s-gw.desktop"
+          test -f "$(dirname "$cli_path")/console-ui/index.html"
+          blocked_files="$(find "$unpacked" -type f \( \
+            -iname '*tauri*' -o -iname '*wry*' -o -iname '*webview2*' -o \
+            -iname '*webkit*' -o -iname '*javascriptcore*' \) -print)"
+          if test -n "$blocked_files"; then
+            printf 'Forbidden WebView files in deb payload:\n%s\n' "$blocked_files" >&2
+            exit 1
+          fi
+          desktop_imports="$(ldd "$unpacked/usr/bin/s-gw-desktop")"
+          if printf '%s\n' "$desktop_imports" | grep -Eiq '(webview2|webkit|javascriptcore)'; then
+            printf 'Forbidden WebView library linked by desktop executable:\n%s\n' "$desktop_imports" >&2
+            exit 1
+          fi
+          binary_markers="$(strings "$unpacked/usr/bin/s-gw-desktop" \
+            | grep -Ei '(__TAURI__|tauri://|tauri-runtime|tauri_runtime|tauri-plugin|webview2|webkit2gtk|javascriptcore|github\.com/tauri-apps/wry|wry::)' || true)"
+          if test -n "$binary_markers"; then
+            printf 'Forbidden WebView marker in desktop executable:\n%s\n' "$binary_markers" >&2
+            exit 1
+          fi
+          test "$(jq -r .name "$package_path")" = "@s-gw/s-gw"
+          test "$(jq -r .version "$package_path")" = "$version"
+          test "$("$node_path" --version)" = "v24.18.0"
+          "$node_path" "$cli_path" help >/dev/null
+          sha256sum "${installers[0]}"
+
+      - name: Clean-install and launch deb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(native/desktop-app/target/release/bundle/deb/*.deb)
+          test "${#installers[@]}" -eq 1
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            ubuntu:22.04 \
+            bash /workspace/scripts/verify-desktop-deb.sh "/workspace/${installers[0]}"
+
+      - name: Verify NSIS installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "native/desktop-app/target/release/bundle/nsis" -Filter "*.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected one NSIS installer, found $($installers.Count)."
+          }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $expectedName = "s-gw_${version}_x64-setup.exe"
+          if ($installers[0].Name -cne $expectedName) {
+            throw "Expected $expectedName, got $($installers[0].Name)."
+          }
+          if ($installers[0].Length -lt 1MB) {
+            throw "NSIS installer is unexpectedly small."
+          }
+          $unpacked = Join-Path $env:RUNNER_TEMP "s-gw-nsis"
+          New-Item -ItemType Directory -Force $unpacked | Out-Null
+          & 7z x $installers[0].FullName "-o$unpacked" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not unpack the NSIS installer."
+          }
+          $node = Get-ChildItem $unpacked -Recurse -File -Filter "node.exe" |
+            Where-Object { $_.FullName -match '[\\/]runtime[\\/]node[\\/]node\.exe$' } |
+            Select-Object -First 1
+          $cli = Get-ChildItem $unpacked -Recurse -File -Filter "cli.js" |
+            Where-Object { $_.FullName -match '[\\/]runtime[\\/]package[\\/]dist[\\/]cli\.js$' } |
+            Select-Object -First 1
+          $desktop = Get-ChildItem $unpacked -Recurse -File -Filter "s-gw-desktop.exe" |
+            Select-Object -First 1
+          $package = Get-ChildItem $unpacked -Recurse -File -Filter "package.json" |
+            Where-Object { $_.FullName -match '[\\/]runtime[\\/]package[\\/]package\.json$' } |
+            Select-Object -First 1
+          $console = Get-ChildItem $unpacked -Recurse -File -Filter "index.html" |
+            Where-Object { $_.FullName -match '[\\/]runtime[\\/]package[\\/]dist[\\/]console-ui[\\/]index\.html$' } |
+            Select-Object -First 1
+          if (-not $node -or -not $cli -or -not $desktop -or -not $package -or -not $console) {
+            throw "NSIS installer is missing the desktop executable or embedded runtime."
+          }
+          $allowedInstallerHelper = Join-Path $unpacked '$PLUGINSDIR\nsis_tauri_utils.dll'
+          $blockedFiles = @(Get-ChildItem $unpacked -Recurse -File | Where-Object {
+            ($_.Name -match '(tauri|wry|webview2|webkit|javascriptcore)') -and
+              ($_.FullName -cne $allowedInstallerHelper)
+          })
+          if ($blockedFiles.Count -gt 0) {
+            throw "Forbidden WebView files in NSIS payload: $($blockedFiles.FullName -join ', ')"
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $visualStudio = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $visualStudio) {
+            throw "Could not locate the Visual Studio C++ tools."
+          }
+          $visualStudio = $visualStudio.Trim()
+          $dumpbin = Get-ChildItem (Join-Path $visualStudio 'VC\Tools\MSVC') `
+            -Recurse -File -Filter 'dumpbin.exe' |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]Hostx64[\\/]x64[\\/]dumpbin\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            throw "Could not locate dumpbin.exe."
+          }
+          $desktopImports = (& $dumpbin.FullName /dependents $desktop.FullName | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect the desktop executable imports."
+          }
+          if ($desktopImports -match '(webview2|webkit|javascriptcore)') {
+            throw "Forbidden WebView library linked by desktop executable: $($Matches[0])"
+          }
+          $desktopBytes = [IO.File]::ReadAllBytes($desktop.FullName)
+          $desktopText = [Text.Encoding]::ASCII.GetString($desktopBytes)
+          if ($desktopText -match '(__TAURI__|tauri://|tauri-runtime|tauri_runtime|tauri-plugin|webview2|webkit2gtk|javascriptcore|github\.com/tauri-apps/wry|wry::)') {
+            throw "Forbidden WebView marker in desktop executable: $($Matches[0])"
+          }
+          $packageInfo = Get-Content $package.FullName -Raw | ConvertFrom-Json
+          if ($packageInfo.name -cne '@s-gw/s-gw' -or $packageInfo.version -cne $version) {
+            throw "Embedded package identity mismatch: $($packageInfo.name)@$($packageInfo.version)"
+          }
+          $nodeVersion = (& $node.FullName --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne "v24.18.0") {
+            throw "Embedded Node smoke check failed: $nodeVersion"
+          }
+          & $node.FullName $cli.FullName help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Embedded s-gw CLI smoke check failed."
+          }
+          Get-FileHash $installers[0].FullName -Algorithm SHA256 | Format-List
+
+      - name: Upload desktop installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  windows_shards:
+    name: Windows tests (${{ matrix.group }})
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, store, client-package, client-session, client-startup, credential, acl]
+    env:
+      SGW_WINDOWS_ACL_OPERATION_TIMEOUT_MS: ${{ matrix.group == 'acl' && '120000' || '' }}
+      SGW_WINDOWS_CREDENTIAL_HELPER_TIMEOUT_MS: 120000
+      SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS: ${{ startsWith(matrix.group, 'client-') && '120000' || '' }}
+      SGW_WINDOWS_PROCESS_INSPECTION_TIMEOUT_MS: 120000
+      SGW_WINDOWS_STARTUP_OPERATION_TIMEOUT_MS: 120000
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -72,6 +435,17 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm run build:windows-client
-      - run: npx tsc -p tsconfig.json
-      - run: npx vitest run tests/windows-client.test.ts tests/installers.test.ts tests/agents.test.ts tests/agent-install.test.ts tests/agent-install-windows.test.ts
+      - run: npm run build
+      - run: npm run test:windows -- --group ${{ matrix.group }}
+
+  windows-preview:
+    name: Windows preview client
+    runs-on: ubuntu-latest
+    needs: windows_shards
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Verify Windows test shards
+        env:
+          WINDOWS_RESULT: ${{ needs.windows_shards.result }}
+        run: test "$WINDOWS_RESULT" = success

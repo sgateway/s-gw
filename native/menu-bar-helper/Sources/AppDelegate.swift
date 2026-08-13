@@ -86,6 +86,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   private var outsideClickMonitor: Any?
   private var deferredStatusTitle: String?
   private var refreshQueued = false
+  private var runtimeStatusRefreshQueued = false
+  private var refreshIncludesRuntimeStatus = false
+  private var runtimeStatusSchedule = HelperStatusRefreshSchedule()
+  private var cachedStatus: StatusPayload?
   private var notifiedRequestIds = Set<String>()
   private var hostingController: NSHostingController<HelperMenuDashboard>?
 
@@ -188,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     installOutsideClickMonitor()
     installDistributedObservers()
     requestNotificationPermission()
-    refreshState()
+    refreshState(includeRuntimeStatus: true)
     updateMonitor.start()
 
     timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
@@ -198,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     if showOnLaunch {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-        self?.showStatusPopover()
+        self?.showStatusPopover(refreshRuntimeStatus: false)
       }
     }
   }
@@ -269,29 +273,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     updateMonitor.requestReminder(version: version)
   }
 
-  private func refreshState() {
+  private func refreshState(includeRuntimeStatus: Bool = false) {
+    let shouldRefreshRuntimeStatus = includeRuntimeStatus || runtimeStatusSchedule.isDue(at: Date())
     if model.isRefreshing {
       refreshQueued = true
+      if shouldRefreshRuntimeStatus && !refreshIncludesRuntimeStatus {
+        runtimeStatusRefreshQueued = true
+      }
       return
     }
 
     model.beginRefresh()
+    if shouldRefreshRuntimeStatus {
+      runtimeStatusSchedule.markAttempt(at: Date())
+    }
+    refreshIncludesRuntimeStatus = shouldRefreshRuntimeStatus
     let loader = snapshotLoader
+    let previousStatus = cachedStatus
 
     Task { [weak self] in
-      let snapshot = await Task.detached(priority: .utility) {
-        loader.load()
+      let result = await Task.detached(priority: .utility) {
+        loader.load(
+          cachedStatus: previousStatus,
+          refreshRuntimeStatus: shouldRefreshRuntimeStatus
+        )
       }.value
 
       guard let self else { return }
-      self.model.apply(snapshot)
+      self.cachedStatus = result.status
+      self.model.apply(result.state)
       self.updateStatusTitle()
       self.updatePopoverSize()
-      self.notifyForNewPendingRequests(snapshot.pending)
+      self.notifyForNewPendingRequests(result.state.pending)
+      self.refreshIncludesRuntimeStatus = false
 
       if self.refreshQueued {
+        let refreshRuntimeStatus = self.runtimeStatusRefreshQueued
         self.refreshQueued = false
-        self.refreshState()
+        self.runtimeStatusRefreshQueued = false
+        self.refreshState(includeRuntimeStatus: refreshRuntimeStatus)
       }
     }
   }
@@ -312,7 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       }
     }
 
-    showStatusPopover()
+    showStatusPopover(refreshRuntimeStatus: false)
   }
 
   private func updateStatusTitle() {
@@ -347,11 +367,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
   private func helperActions() -> HelperMenuActions {
     HelperMenuActions(
-      refresh: { [weak self] in self?.refreshState() },
+      refresh: { [weak self] in self?.refreshState(includeRuntimeStatus: true) },
       openApp: { [weak self] route in self?.openAppAction(route) },
       openConsole: { [weak self] in self?.openConsoleAction() },
       testNotification: { [weak self] in self?.showTestNotificationAction() },
       approve: { [weak self] id, choice in self?.decisions.approve(id, choice: choice) },
+      approvePolicy: { [weak self] id in self?.decisions.approvePolicy(id) },
       deny: { [weak self] id in self?.decisions.deny(id) },
       setCountMode: { [weak self] mode in self?.setCountMode(mode) },
       quit: { NSApp.terminate(nil) }
@@ -424,9 +445,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func showStatusPopover() {
+    showStatusPopover(refreshRuntimeStatus: true)
+  }
+
+  private func showStatusPopover(refreshRuntimeStatus: Bool) {
     guard let button = statusItem.button else { return }
     updatePopoverSize()
-    refreshState()
+    refreshState(includeRuntimeStatus: refreshRuntimeStatus)
 
     if !popover.isShown {
       popover.show(relativeTo: popoverAnchorRect(in: button), of: button, preferredEdge: .minY)
