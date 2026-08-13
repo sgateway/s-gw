@@ -64,9 +64,7 @@ struct MainWindow: View {
         Text("Installed \(appState.installedVersion)")
           .font(.caption)
           .foregroundStyle(.secondary)
-        Text(release.isMacInstaller
-          ? "Download the installer, quit s-gw, replace the app in Applications, then reopen it."
-          : "This update stays available here until you dismiss it or install it.")
+        Text(updateDescription(release))
           .font(.caption)
           .foregroundStyle(.secondary)
       }
@@ -74,10 +72,10 @@ struct MainWindow: View {
       Button("Release Notes") {
         releaseNotesOpen = true
       }
-      Button(appState.updateState.isBusy ? appState.updateState.label : (release.isMacInstaller ? "Download" : "Upgrade")) {
+      Button(appState.updateState.isBusy ? appState.updateState.label : updateActionLabel(release)) {
         appState.installAvailableUpdate()
       }
-      .disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)
+      .disabled(appState.updateState.isBusy)
       Button {
         appState.dismissUpdateBanner()
       } label: {
@@ -90,6 +88,19 @@ struct MainWindow: View {
     .background(SGWTheme.raised, in: RoundedRectangle(cornerRadius: 8))
     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(SGWTheme.teal.opacity(0.45)))
     .padding(.horizontal)
+  }
+
+  private func updateActionLabel(_ release: ReleaseInfo) -> String {
+    if !release.hasVerifiedAsset { return "Open Release" }
+    return release.isMacInstaller ? "Download" : "Upgrade"
+  }
+
+  private func updateDescription(_ release: ReleaseInfo) -> String {
+    if !release.hasVerifiedAsset { return "Installer details are loading. You can open the release now." }
+    if release.isMacInstaller {
+      return "Download the installer, quit s-gw, replace the app in Applications, then reopen it."
+    }
+    return "This update stays available here until you dismiss it or install it."
   }
 
   private func banner(_ text: String, systemImage: String, tint: Color) -> some View {
@@ -186,15 +197,20 @@ private struct UpdateReleaseSheet: View {
           appState.dismissUpdateBanner()
           dismiss()
         }
-        Button(appState.updateState.isBusy ? appState.updateState.label : (release.isMacInstaller ? "Download" : "Upgrade")) {
+        Button(appState.updateState.isBusy ? appState.updateState.label : updateActionLabel(release)) {
           dismiss()
           appState.installAvailableUpdate()
         }
         .keyboardShortcut(.defaultAction)
-        .disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)
+        .disabled(appState.updateState.isBusy)
       }
     }
     .padding(24)
     .frame(width: 560, height: 460)
+  }
+
+  private func updateActionLabel(_ release: ReleaseInfo) -> String {
+    if !release.hasVerifiedAsset { return "Open Release" }
+    return release.isMacInstaller ? "Download" : "Upgrade"
   }
 }

@@ -12,6 +12,10 @@ export interface UpdateCheckResult {
   latestVersion: string | null;
   available: boolean;
   installerReady: boolean;
+  installerName: string | null;
+  installerUrl: string | null;
+  checksumName: string | null;
+  checksumUrl: string | null;
   releaseUrl: string | null;
   prerelease: boolean;
   publishedAt: string | null;
@@ -31,6 +35,7 @@ interface GitHubRelease {
 interface GitHubReleaseAsset {
   name: string;
   state?: string;
+  browser_download_url?: string;
 }
 
 interface UpdateCache {
@@ -110,12 +115,17 @@ export class ReleaseChecker {
     try {
       const release = await this.fetchLatestRelease();
       const checkedAt = new Date(this.now()).toISOString();
+      const assets = release ? verifiedInstallerAssets(release) : null;
       const result: UpdateCheckResult = release ? {
         checked: true,
         currentVersion: this.currentVersion,
         latestVersion: cleanVersion(release.tag_name),
-        available: isNewerVersion(release.tag_name, this.currentVersion) && releaseHasVerifiedInstaller(release),
-        installerReady: releaseHasVerifiedInstaller(release),
+        available: isNewerVersion(release.tag_name, this.currentVersion) && assets !== null,
+        installerReady: assets !== null,
+        installerName: assets?.installer.name ?? null,
+        installerUrl: assets ? releaseAssetUrl(release, assets.installer) : null,
+        checksumName: assets?.checksum.name ?? null,
+        checksumUrl: assets ? releaseAssetUrl(release, assets.checksum) : null,
         releaseUrl: release.html_url,
         prerelease: release.prerelease,
         publishedAt: release.published_at ?? null,
@@ -182,7 +192,13 @@ export class ReleaseChecker {
       if (!validResult(parsed.result) || parsed.result.currentVersion !== this.currentVersion) {
         return null;
       }
-      return parsed.result;
+      return {
+        ...parsed.result,
+        installerName: parsed.result.installerName ?? null,
+        installerUrl: parsed.result.installerUrl ?? null,
+        checksumName: parsed.result.checksumName ?? null,
+        checksumUrl: parsed.result.checksumUrl ?? null
+      };
     } catch {
       return null;
     }
@@ -262,8 +278,8 @@ async function atomReleaseAssets(
   });
   if (checksumResponse.ok) {
     return [
-      { name: installer, state: "uploaded" },
-      { name: `${installer}.sha256`, state: "uploaded" }
+      { name: installer, state: "uploaded", browser_download_url: installerUrl },
+      { name: `${installer}.sha256`, state: "uploaded", browser_download_url: checksumUrl }
     ];
   }
 
@@ -273,7 +289,10 @@ async function atomReleaseAssets(
     signal: AbortSignal.timeout(5_000)
   });
   return manifestResponse.ok
-    ? [{ name: installer, state: "uploaded" }, { name: "SHA256SUMS.txt", state: "uploaded" }]
+    ? [
+      { name: installer, state: "uploaded", browser_download_url: installerUrl },
+      { name: "SHA256SUMS.txt", state: "uploaded", browser_download_url: manifestUrl }
+    ]
     : null;
 }
 
@@ -293,6 +312,10 @@ function emptyResult(currentVersion: string): UpdateCheckResult {
     latestVersion: null,
     available: false,
     installerReady: false,
+    installerName: null,
+    installerUrl: null,
+    checksumName: null,
+    checksumUrl: null,
     releaseUrl: null,
     prerelease: false,
     publishedAt: null,
@@ -374,23 +397,45 @@ function validResult(value: unknown): value is UpdateCheckResult {
   return typeof result.currentVersion === "string" &&
     typeof result.available === "boolean" &&
     typeof result.installerReady === "boolean" &&
+    optionalString(result.installerName) &&
+    optionalString(result.installerUrl) &&
+    optionalString(result.checksumName) &&
+    optionalString(result.checksumUrl) &&
     (result.latestVersion === null || typeof result.latestVersion === "string") &&
     (result.releaseUrl === null || typeof result.releaseUrl === "string") &&
     (result.checkedAt === null || typeof result.checkedAt === "string");
 }
 
+function optionalString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
+}
+
 function releaseHasVerifiedInstaller(release: GitHubRelease): boolean {
+  return verifiedInstallerAssets(release) !== null;
+}
+
+function verifiedInstallerAssets(
+  release: GitHubRelease
+): { installer: GitHubReleaseAsset; checksum: GitHubReleaseAsset } | null {
   const expected = expectedInstallerName(release.tag_name);
   const uploaded = (release.assets || []).filter((asset) => asset.state?.toLowerCase() === "uploaded");
   const installer = uploaded.find((asset) => asset.name.toLowerCase() === expected.toLowerCase());
-  if (!installer) return false;
+  if (!installer) return null;
 
   const lower = installer.name.toLowerCase();
   const base = lower.replace(/\.[^.]+$/, "");
-  return uploaded.some((asset) => {
+  const checksum = uploaded.find((asset) => {
     const name = asset.name.toLowerCase();
     return name === `${lower}.sha256` || name === `${base}.sha256` || name === "sha256sums.txt" || name === "sha256sums";
   });
+  return checksum ? { installer, checksum } : null;
+}
+
+function releaseAssetUrl(release: GitHubRelease, asset: GitHubReleaseAsset): string {
+  if (asset.browser_download_url) return asset.browser_download_url;
+  const tag = encodeURIComponent(release.tag_name);
+  const name = encodeURIComponent(asset.name);
+  return `https://github.com/${UPDATE_REPOSITORY}/releases/download/${tag}/${name}`;
 }
 
 function expectedInstallerName(version: string): string {

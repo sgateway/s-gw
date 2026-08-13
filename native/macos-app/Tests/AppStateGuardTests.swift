@@ -273,6 +273,7 @@ struct AppStateGuardTests {
     await runCommandOutputCaptureTest()
     await runUpdateRetryTest()
     await runIncompleteReleaseRetryTest()
+    await runHelperDiscoveredReleaseHydrationTest()
     await runUpdateAvailabilityPersistenceTest()
     await runUpdateAcknowledgementAndReminderTest()
     runUpdateStateClearAfterInstallTest()
@@ -577,6 +578,57 @@ struct AppStateGuardTests {
     check(app.availableUpdate == complete, "the retry should pick up the completed release assets")
     check(defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey) == now.timeIntervalSince1970,
           "the completed release should start the successful-check interval")
+  }
+
+  @MainActor
+  static func runHelperDiscoveredReleaseHydrationTest() async {
+    let defaults = isolatedDefaults("helper-update-hydration")
+    let incomplete = makeRelease("9.0.2", installable: false)
+    let complete = makeRelease("9.0.2")
+    let checker = FakeUpdateChecker([.release(complete)])
+    let now = Date(timeIntervalSince1970: 1_800_000_150)
+    let helperNotice = UpdateNoticeStore(defaults: defaults, now: { now })
+    helperNotice.clear()
+    defer { helperNotice.clear() }
+
+    _ = helperNotice.observe(
+      storedRelease(incomplete),
+      installedVersion: UpdateChecker.currentVersion
+    )
+    defaults.set(now.timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
+
+    let restartedApp = AppState(
+      updater: checker,
+      defaults: defaults,
+      now: { now }
+    )
+    check(restartedApp.availableUpdate == incomplete,
+          "the app should restore the helper's release before fetching installer metadata")
+
+    await restartedApp.checkForUpdates()
+    check(await checker.checkCount() == 1,
+          "an incomplete helper notice must bypass a stale successful-check timestamp")
+    check(restartedApp.availableUpdate == complete,
+          "the app should hydrate a helper notice with verified installer metadata")
+
+    helperNotice.clear()
+    defaults.set(now.timeIntervalSince1970, forKey: UpdateChecker.lastCheckDefaultsKey)
+    let liveChecker = FakeUpdateChecker([.release(complete)])
+    let runningApp = AppState(
+      updater: liveChecker,
+      defaults: defaults,
+      now: { now }
+    )
+    _ = helperNotice.observe(
+      storedRelease(incomplete),
+      installedVersion: UpdateChecker.currentVersion
+    )
+
+    await runningApp.refreshInitialStatus()
+    check(await liveChecker.checkCount() == 1,
+          "a running app must hydrate an incomplete release discovered later by the helper")
+    check(runningApp.availableUpdate == complete,
+          "runtime refresh should replace the helper's metadata-only notice with an actionable release")
   }
 
   @MainActor

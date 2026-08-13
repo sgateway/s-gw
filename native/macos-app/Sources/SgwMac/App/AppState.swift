@@ -70,6 +70,7 @@ final class AppState {
   @ObservationIgnored private var runtimeStatusSchedule: RuntimeStatusRefreshSchedule
   @ObservationIgnored private var runtimeStatusRefreshInProgress = false
   @ObservationIgnored private var runtimeStatusError: String?
+  @ObservationIgnored private var updateMetadataVersionInFlight: String?
   @ObservationIgnored private var seenPendingRequestIds = Set<String>()
   @ObservationIgnored private var didAttemptServiceRecovery = false
 
@@ -281,6 +282,7 @@ final class AppState {
     do {
       status = try await cli.runJSON(StatusPayload.self, arguments: ["status"])
       restoreAvailableUpdate()
+      await hydrateAvailableUpdateIfNeeded()
       return nil
     } catch {
       return error.localizedDescription
@@ -848,7 +850,8 @@ final class AppState {
     }
 
     guard release.hasVerifiedAsset else {
-      operationMessage = "The installer for s-gw \(release.version) is still being uploaded. Try again shortly."
+      openAvailableRelease()
+      operationMessage = "Choose a verified s-gw \(release.version) download from the release page."
       return
     }
 
@@ -932,6 +935,9 @@ final class AppState {
   }
 
   private func shouldCheckForUpdates() -> Bool {
+    if availableUpdate?.hasVerifiedAsset == false {
+      return true
+    }
     let lastCheck = defaults.double(forKey: UpdateChecker.lastCheckDefaultsKey)
     if lastCheck <= 0 {
       return true
@@ -947,6 +953,18 @@ final class AppState {
     }
     availableUpdate = releaseInfo(from: snapshot.release)
     updateBannerDismissed = snapshot.acknowledgedAt != nil
+  }
+
+  private func hydrateAvailableUpdateIfNeeded() async {
+    guard let version = availableUpdate?.version,
+          availableUpdate?.hasVerifiedAsset == false,
+          updateMetadataVersionInFlight != version else {
+      return
+    }
+
+    updateMetadataVersionInFlight = version
+    defer { updateMetadataVersionInFlight = nil }
+    await checkForUpdates()
   }
 
 }

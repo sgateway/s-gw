@@ -192,17 +192,15 @@ struct SettingsView: View {
             Button("Notify Again") {
               appState.requestUpdateReminder()
             }
-            Button(appState.updateState.isBusy ? appState.updateState.label : (release.isMacInstaller ? "Download Installer" : "Install Package")) {
+            Button(appState.updateState.isBusy ? appState.updateState.label : updateActionLabel(release)) {
               appState.installAvailableUpdate()
             }
-            .disabled(!release.hasVerifiedAsset || appState.updateState.isBusy)
+            .disabled(appState.updateState.isBusy)
           }
         }
 
         if let release = appState.availableUpdate {
-          Text(release.isMacInstaller
-            ? "Available: \(release.version) · download the installer to update this app"
-            : "Available: \(release.version)\(release.canInstallPackage ? "" : " · checksum required for automatic install")")
+          Text(updateDescription(release))
             .font(.caption)
             .foregroundStyle(release.hasVerifiedAsset ? SGWTheme.teal : SGWTheme.orange)
         } else {
@@ -218,6 +216,17 @@ struct SettingsView: View {
         }
       }
     }
+  }
+
+  private func updateActionLabel(_ release: ReleaseInfo) -> String {
+    if !release.hasVerifiedAsset { return "Open Release" }
+    return release.isMacInstaller ? "Download Installer" : "Install Package"
+  }
+
+  private func updateDescription(_ release: ReleaseInfo) -> String {
+    if !release.hasVerifiedAsset { return "Available: \(release.version) · installer details are loading" }
+    if release.isMacInstaller { return "Available: \(release.version) · download the installer to update this app" }
+    return "Available: \(release.version)\(release.canInstallPackage ? "" : " · checksum required for automatic install")"
   }
 
   private var connectionTab: some View {

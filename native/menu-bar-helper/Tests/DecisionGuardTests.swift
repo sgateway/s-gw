@@ -45,8 +45,9 @@ private func helperUpdateResult(
   available: Bool = true,
   installerReady: Bool = true
 ) -> CliRunResult {
+  let installer = "s-gw-\(version)-macos.dmg"
   let json = """
-  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"installerReady":\(installerReady),"releaseUrl":"https://example.test/releases/v\(version)"}
+  {"checked":true,"currentVersion":"0.1.2","latestVersion":"\(version)","available":\(available),"installerReady":\(installerReady),"installerName":"\(installer)","installerUrl":"https://example.test/downloads/\(installer)","checksumName":"\(installer).sha256","checksumUrl":"https://example.test/downloads/\(installer).sha256","releaseUrl":"https://example.test/releases/v\(version)"}
   """
   return CliRunResult(ok: true, stdout: json, stderr: nil)
 }
@@ -305,6 +306,11 @@ struct DecisionGuardTests {
     )
 
     await first.checkNow()
+    let firstNotice = UpdateNoticeStore(defaults: defaults, now: { now })
+      .available(installedVersion: "0.1.2")
+    check(firstNotice?.release.assetName == "s-gw-9.1.0-macos.dmg" &&
+          firstNotice?.release.checksumAssetName == "s-gw-9.1.0-macos.dmg.sha256",
+          "the helper should persist verified installer metadata with the update notice")
     await first.checkNow()
     check(notified == ["9.1.0"],
           "a queued alert should wait for its retry schedule instead of firing every helper poll")
