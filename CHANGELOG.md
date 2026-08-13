@@ -4,6 +4,10 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Fixed
+
+- macOS update notices now carry verified installer metadata from the menu helper, enrich older partial notices automatically, and keep an enabled release-page fallback instead of showing a disabled Upgrade button.
+
 ## 0.1.20 - 2026-08-12
 
 ### Added
