@@ -1866,7 +1866,7 @@ mod tests {
     fn fixture() -> DesktopSnapshot {
         DesktopSnapshot {
             status: StatusSnapshot {
-                version: Some("0.1.20".into()),
+                version: Some("0.1.21".into()),
                 ready: Some(true),
                 readiness: Readiness {
                     summary: "Ready for local credential requests.".into(),
