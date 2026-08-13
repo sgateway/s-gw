@@ -97,14 +97,27 @@ describe("native command and policy surface", () => {
   });
 
   it("keeps policy templates and request matching visible in the native app", async () => {
-    const policies = await source("Views/PoliciesView.swift");
+    const [policies, settings, models] = await Promise.all([
+      source("Views/PoliciesView.swift"),
+      source("Views/SettingsView.swift"),
+      source("Models/Models.swift")
+    ]);
 
     expect(policies).toContain("policyTemplatesPanel");
     expect(policies).toContain("policyTestPanel");
     expect(policies).toContain("Always ask for high-risk credentials");
     expect(policies).toContain("Always ask for SSH sessions");
     expect(policies).toContain("Allow Codex for selected credential");
+    expect(policies).toContain('actionKind: "env_command"');
+    expect(policies).toContain("any command already permitted by one selected credential");
     expect(policies).toContain("matchingRules(for request");
     expect(policies).toContain("matchesString");
+    expect(policies).toContain("First match · wins");
+    expect(policies).toContain("Only the first matching rule applies");
+    expect(policies).toContain("conditions.allowsAnyEnvironmentCommand");
+    expect(settings).toContain("Leave both fields empty to match any command already permitted by the credential");
+    expect(settings).toContain("A named command without a pinned executable never runs automatically");
+    expect(models).toContain("var allowsAnyEnvironmentCommand: Bool");
+    expect(await source("App/AppState.swift")).toContain('args.append("--any-command")');
   });
 });

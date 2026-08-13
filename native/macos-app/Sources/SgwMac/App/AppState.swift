@@ -453,6 +453,9 @@ final class AppState {
     if !draft.resolvedCommand.isEmpty {
       args += ["--resolved-command", draft.resolvedCommand]
     }
+    if draft.decision == .allow && draft.command.isEmpty && draft.resolvedCommand.isEmpty && draft.actionKind != "ssh_session" {
+      args.append("--any-command")
+    }
     if !draft.injectEnv.isEmpty {
       args += ["--inject-env", draft.injectEnv]
     }

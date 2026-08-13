@@ -372,6 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       openConsole: { [weak self] in self?.openConsoleAction() },
       testNotification: { [weak self] in self?.showTestNotificationAction() },
       approve: { [weak self] id, choice in self?.decisions.approve(id, choice: choice) },
+      approvePolicy: { [weak self] id in self?.decisions.approvePolicy(id) },
       deny: { [weak self] id in self?.decisions.deny(id) },
       setCountMode: { [weak self] mode in self?.setCountMode(mode) },
       quit: { NSApp.terminate(nil) }

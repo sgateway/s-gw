@@ -6,7 +6,11 @@ import { decryptSecret, encryptSecret, fingerprintSecret, shortId } from "./cryp
 import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
 import { isAbsoluteCommand, resolveCommandExecutable, verifyPinnedCommand } from "./command-path.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
-import { arrangeApprovalPolicyRules as arrangePolicyRules, compareApprovalPolicyRules } from "./policy-order.js";
+import {
+  arrangeApprovalPolicyRules as arrangePolicyRules,
+  compareApprovalPolicyRules,
+  policyAllowsAnyEnvCommand
+} from "./policy-order.js";
 import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, sshSessionIdentity } from "./ssh.js";
 import { ensureSgwHome, getSgwHome, getSgwLoginSessionId, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
@@ -3503,7 +3507,8 @@ function approvalPolicyMatches(
   }
   if (action.kind === "env_command") {
     const resolved = action.resolvedCommand;
-    if (rule.decision === "allow" && !conditions.resolvedCommands?.length) {
+    if (rule.decision === "allow" && !conditions.resolvedCommands?.length &&
+        !policyAllowsAnyEnvCommand(rule.conditions)) {
       return false;
     }
     if (conditions.resolvedCommands?.length &&
@@ -3708,7 +3713,7 @@ function normalizeApprovalPolicyConditions(
   const resolvedCommands = policyStringValues(input?.resolvedCommands, "resolvedCommands", strict);
   const minSeverity = normalizePolicySeverity(input?.minSeverity, strict);
 
-  return {
+  const normalized: ApprovalPolicyConditions = {
     handles: policyStringValues(input?.handles, "handles", strict),
     envBindings: normalizePolicyEnvBindings(input?.envBindings, strict),
     secretTypes: normalizePolicySecretTypes(secretTypes, strict),
@@ -3716,17 +3721,24 @@ function normalizeApprovalPolicyConditions(
     minSeverity,
     agents: policyStringValues(input?.agents, "agents", strict).map((agent) => agent.toLowerCase()),
     actionKinds: normalizePolicyActionKinds(actionKinds, strict),
-    commands: strict
-      ? commands.map((command) => normalizeCommandGrant(command))
-      : commands.map((command) => safeNormalizeCommandGrant(command)).filter(Boolean) as string[],
-    resolvedCommands: strict
-      ? resolvedCommands.map(normalizeResolvedPolicyCommand)
-      : resolvedCommands.map(safeNormalizeResolvedPolicyCommand).filter(Boolean) as string[],
     injectEnvs: policyStringValues(input?.injectEnvs, "injectEnvs", strict),
     workingDirs: policyStringValues(input?.workingDirs, "workingDirs", strict).map((dir) => path.resolve(dir)),
     sshTargets: policyStringValues(input?.sshTargets, "sshTargets", strict).map((target) => normalizeSshTarget(target)),
     sshPorts: normalizePolicyPorts(input?.sshPorts, strict)
   };
+
+  if (input && hasOwn(input, "commands")) {
+    normalized.commands = strict
+      ? commands.map((command) => normalizeCommandGrant(command))
+      : commands.map((command) => safeNormalizeCommandGrant(command)).filter(Boolean) as string[];
+  }
+  if (input && hasOwn(input, "resolvedCommands")) {
+    normalized.resolvedCommands = strict
+      ? resolvedCommands.map(normalizeResolvedPolicyCommand)
+      : resolvedCommands.map(safeNormalizeResolvedPolicyCommand).filter(Boolean) as string[];
+  }
+
+  return normalized;
 }
 
 function mergeApprovalPolicyConditions(

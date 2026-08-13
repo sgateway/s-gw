@@ -540,6 +540,36 @@ describe("local console server", () => {
     expect(policies).toHaveLength(0);
   });
 
+  it("preserves omitted command scope and accepts an explicit Any command scope", async () => {
+    running = await startConsoleServer({ port: 0 });
+
+    const incomplete = await fetchJson("api/approval/policies", {
+      method: "POST",
+      body: {
+        name: "Legacy-style incomplete allow",
+        decision: "allow",
+        agents: ["Codex"],
+        actionKinds: ["env_command"]
+      }
+    });
+    expect(incomplete.conditions).not.toHaveProperty("commands");
+    expect(incomplete.conditions).not.toHaveProperty("resolvedCommands");
+
+    const anyCommand = await fetchJson("api/approval/policies", {
+      method: "POST",
+      body: {
+        name: "Codex Any command",
+        decision: "allow",
+        agents: ["Codex"],
+        actionKinds: ["env_command"],
+        commands: [],
+        resolvedCommands: []
+      }
+    });
+    expect(anyCommand.conditions.commands).toEqual([]);
+    expect(anyCommand.conditions.resolvedCommands).toEqual([]);
+  });
+
   it("rejects malformed policy constraints without widening an existing rule", async () => {
     running = await startConsoleServer({ port: 0 });
     const created = await fetchJson("api/approval/policies", {

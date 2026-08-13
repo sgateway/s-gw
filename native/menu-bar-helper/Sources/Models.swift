@@ -279,6 +279,7 @@ struct HelperMenuActions {
   let openConsole: () -> Void
   let testNotification: () -> Void
   let approve: (String, ApprovalChoice) -> Void
+  let approvePolicy: (String) -> Void
   let deny: (String) -> Void
   let setCountMode: (StatusCountMode) -> Void
   let quit: () -> Void

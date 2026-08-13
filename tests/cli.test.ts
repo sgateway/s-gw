@@ -201,6 +201,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       SGW_HOME: home,
       SGW_RECOVERY_HOME: recoveryHome,
       CARGO_TARGET_DIR: cargoTarget,
+      SGW_AGENT_NAME: "Codex",
       SGW_MASTER_PASSPHRASE: "cli-policy-test-passphrase",
       SGW_DISABLE_KEYCHAIN: "1",
       SGW_DISABLE_ONEPASSWORD_BACKUP: "1"
@@ -281,6 +282,36 @@ describe("CLI unknown-command behavior (end to end)", () => {
       });
       expect(updated.expiresAt).toBeUndefined();
 
+      const anyCommand = JSON.parse(run([
+        "approval",
+        "policy",
+        "update",
+        "--id",
+        specific.id,
+        "--decision",
+        "allow",
+        "--any-command"
+      ]));
+      expect(anyCommand.conditions.commands).toEqual([]);
+      expect(anyCommand.conditions.resolvedCommands).toEqual([]);
+
+      let conflictingScopeError: { stderr?: string } | undefined;
+      try {
+        run([
+          "approval",
+          "policy",
+          "update",
+          "--id",
+          specific.id,
+          "--any-command",
+          "--command",
+          "aws"
+        ]);
+      } catch (error) {
+        conflictingScopeError = error as { stderr?: string };
+      }
+      expect(conflictingScopeError?.stderr).toContain("cannot be combined");
+
       const arranged = JSON.parse(run(["approval", "policy", "arrange"]));
       expect(arranged.reordered).toBeGreaterThan(0);
       expect(arranged.rules.map((rule: { id: string }) => rule.id)).toEqual([specific.id, broad.id]);
@@ -292,10 +323,152 @@ describe("CLI unknown-command behavior (end to end)", () => {
       expect(help).toContain("s-gw approval policy update --id POLICY_ID");
       expect(help).toContain("s-gw approval policy arrange");
       expect(help).toContain("--resolved-command /path/to/tool");
+      expect(help).toContain("--any-command");
+      expect(help).toContain("s-gw approve-policy REQUEST_ID");
+
+      const secret = JSON.parse(runCliSync([
+        "src/cli.ts",
+        "secret",
+        "add",
+        "--name",
+        "scoped CLI policy",
+        "--type",
+        "api-token",
+        "--value-stdin",
+        "--inject-env",
+        "SGW_CLI_SCOPED_POLICY",
+        "--allow-command",
+        process.execPath
+      ], {
+        cwd: repoRoot,
+        env,
+        input: "scoped-cli-policy-secret-value-123456789",
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"]
+      }));
+      const request = JSON.parse(run([
+        "request",
+        "env-command",
+        secret.handle,
+        "--command",
+        process.execPath,
+        "--inject-env",
+        "SGW_CLI_SCOPED_POLICY",
+        "--arg",
+        "--version"
+      ]));
+      expect(request.state).toBe("pending");
+
+      const policyApproval = JSON.parse(run(["approve-policy", request.id]));
+      expect(policyApproval.created).toBe(true);
+      expect(policyApproval.request).toMatchObject({
+        id: request.id,
+        state: "approved",
+        approvalSource: "policy"
+      });
+      expect(policyApproval.rule).toMatchObject({
+        decision: "allow",
+        conditions: {
+          handles: [secret.handle],
+          agents: ["codex"],
+          commands: [process.execPath],
+          resolvedCommands: [realpathSync.native(process.execPath)]
+        }
+      });
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(recoveryHome, { recursive: true, force: true });
       await rm(cargoTarget, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("keeps CLI add without --any-command fail-closed while explicit --any-command approves", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-any-command-"));
+    const recoveryHome = `${home}-recovery`;
+    const env = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: recoveryHome,
+      SGW_AGENT_NAME: "Codex",
+      SGW_MASTER_PASSPHRASE: "cli any-command test passphrase",
+      SGW_DISABLE_KEYCHAIN: "1",
+      SGW_DISABLE_ONEPASSWORD_BACKUP: "1"
+    };
+    const run = (args: string[], input?: string) => runCliSync(["src/cli.ts", ...args], {
+      cwd: repoRoot,
+      env,
+      input,
+      encoding: "utf8",
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"]
+    });
+
+    try {
+      const secret = JSON.parse(run([
+        "secret",
+        "add",
+        "--name",
+        "CLI any-command scope",
+        "--type",
+        "api-token",
+        "--value-stdin",
+        "--inject-env",
+        "SGW_CLI_ANY_COMMAND",
+        "--allow-command",
+        process.execPath
+      ], "cli-any-command-secret-value-123456789"));
+      const policyArgs = [
+        "--decision",
+        "allow",
+        "--handle",
+        secret.handle,
+        "--agent",
+        "Codex",
+        "--action-kind",
+        "env_command"
+      ];
+      const incomplete = JSON.parse(run([
+        "approval",
+        "policy",
+        "add",
+        "--name",
+        "Incomplete command scope",
+        ...policyArgs
+      ]));
+      expect(incomplete.conditions).not.toHaveProperty("commands");
+      expect(incomplete.conditions).not.toHaveProperty("resolvedCommands");
+
+      const requestArgs = [
+        "request",
+        "env-command",
+        secret.handle,
+        "--command",
+        process.execPath,
+        "--inject-env",
+        "SGW_CLI_ANY_COMMAND",
+        "--arg",
+        "--version"
+      ];
+      expect(JSON.parse(run(requestArgs)).state).toBe("pending");
+
+      run(["approval", "policy", "disable", "--id", incomplete.id]);
+      const explicit = JSON.parse(run([
+        "approval",
+        "policy",
+        "add",
+        "--name",
+        "Explicit any command",
+        ...policyArgs,
+        "--any-command"
+      ]));
+      expect(explicit.conditions.commands).toEqual([]);
+      expect(explicit.conditions.resolvedCommands).toEqual([]);
+      expect(JSON.parse(run(requestArgs))).toMatchObject({
+        state: "approved",
+        approvalSource: "policy"
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(recoveryHome, { recursive: true, force: true });
     }
   }, 15_000);
 

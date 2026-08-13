@@ -71,8 +71,8 @@ export function approvalPolicyRuleCovers<T extends PolicyRuleLike>(broader: T, n
   if (!bindingSetCovers(broader.conditions.envBindings, narrower.conditions.envBindings)) {
     return false;
   }
-  if (broader.decision === "allow" && !broader.conditions.resolvedCommands?.length &&
-      narrower.conditions.resolvedCommands?.length) {
+  if (broader.decision === "allow" && narrower.conditions.resolvedCommands?.length &&
+      !policyHasEffectiveEnvCommandScope(broader.conditions)) {
     return false;
   }
 
@@ -89,6 +89,17 @@ export function approvalPolicyRuleCovers<T extends PolicyRuleLike>(broader: T, n
   }
 
   return true;
+}
+
+export function policyAllowsAnyEnvCommand(conditions: PolicyConditionsLike): boolean {
+  return Object.prototype.hasOwnProperty.call(conditions, "commands") &&
+    Object.prototype.hasOwnProperty.call(conditions, "resolvedCommands") &&
+    Array.isArray(conditions.commands) && conditions.commands.length === 0 &&
+    Array.isArray(conditions.resolvedCommands) && conditions.resolvedCommands.length === 0;
+}
+
+function policyHasEffectiveEnvCommandScope(conditions: PolicyConditionsLike): boolean {
+  return Boolean(conditions.resolvedCommands?.length) || policyAllowsAnyEnvCommand(conditions);
 }
 
 export function approvalPolicyRulesEquivalent<T extends PolicyRuleLike>(left: T, right: T): boolean {

@@ -7,6 +7,9 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 ### Fixed
 
 - macOS update notices now carry verified installer metadata from the menu helper, enrich older partial notices automatically, and keep an enabled release-page fallback instead of showing a disabled Upgrade button.
+- Explicit Any command allow policies now authorize credential-permitted environment commands, while incomplete legacy rules remain fail-closed until they are deliberately converted. Policy previews identify the earlier winning rule and its priority.
+- The macOS approval helper can create a persistent request-scoped allow policy directly from the popup, alongside one-time and session-based grants.
+- The macOS app can be moved by dragging blank native title chrome without stealing clicks from buttons and other interactive controls.
 
 ## 0.1.20 - 2026-08-12
 
@@ -23,6 +26,7 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ### Fixed
 
+- Timed and login-session approvals now stay bound to the requesting login session when the native helper approves them from a separate process.
 - The macOS app now restarts installed-but-unloaded local services when it opens, and LaunchAgent setup no longer issues a redundant blocking `kickstart` after loading a `RunAtLoad` job.
 - Windows agent integration updates now retry transient filesystem contention while another process releases the integration lock.
 - Windows desktop refreshes now hide packaged Node.js and credential-helper consoles instead of flashing command windows during background polling.

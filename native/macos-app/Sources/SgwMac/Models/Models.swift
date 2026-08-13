@@ -196,6 +196,10 @@ struct ApprovalPolicyConditions: Decodable, Hashable {
   var sshTargets: [String]?
   var sshPorts: [Int]?
 
+  var allowsAnyEnvironmentCommand: Bool {
+    commands?.isEmpty == true && resolvedCommands?.isEmpty == true
+  }
+
   var summary: String {
     var parts: [String] = []
     append("Handle", handles, to: &parts)

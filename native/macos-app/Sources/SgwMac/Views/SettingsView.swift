@@ -452,9 +452,14 @@ struct PolicyRuleEditor: View {
 
           TextField("Command", text: $draft.command)
           TextField("Resolved executable", text: $draft.resolvedCommand)
-          Text("Allow command policies require an exact executable path.")
+          Text("Leave both fields empty to match any command already permitted by the credential. If Command is set, Resolved executable must pin it to an exact path.")
             .font(.caption)
             .foregroundStyle(.secondary)
+          if draft.decision == .allow && !draft.command.isEmpty && draft.resolvedCommand.isEmpty {
+            Label("A named command without a pinned executable never runs automatically.", systemImage: "exclamationmark.triangle.fill")
+              .font(.caption)
+              .foregroundStyle(.orange)
+          }
           TextField("Environment name", text: $draft.injectEnv)
 
           HStack {
@@ -496,7 +501,8 @@ struct PolicyRuleEditor: View {
           save()
         }
         .keyboardShortcut(.defaultAction)
-        .disabled(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .disabled(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+          (draft.decision == .allow && !draft.command.isEmpty && draft.resolvedCommand.isEmpty))
       }
     }
     .padding(20)

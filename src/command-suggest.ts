@@ -67,6 +67,7 @@ export const KNOWN_COMMANDS = [
   "requests cleanup",
   "store backups",
   "approve",
+  "approve-policy",
   "deny",
   "execute",
   "execute-next"

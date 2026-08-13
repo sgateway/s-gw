@@ -88,6 +88,9 @@ describe("menu-bar helper approval surface contract", () => {
     expect(source).not.toContain(".frame(width: 448, height: 510)");
     expect(source).toContain('Button("Allow 8 hours")');
     expect(source).toContain('Button("Once")');
+    expect(source).toContain('Button("Always allow this request scope")');
+    expect(source).toContain("actions.approvePolicy(request.id)");
+    expect(source).toContain("let approvePolicy: (String) -> Void");
     expect(source).toContain("confirmUnlimitedForAll = true");
     expect(source).toContain("Allow every agent without an expiry?");
   });
