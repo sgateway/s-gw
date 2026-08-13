@@ -181,6 +181,20 @@ describe("React console source contracts", () => {
     expect(store).toContain("exactBindingsWouldConflict");
   });
 
+  it("makes Any command policy scope explicit and identifies earlier winning rules", async () => {
+    const app = await readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8");
+
+    expect(app).toContain("empty Commands and Resolved executables means any command already permitted by the credential");
+    expect(app).toContain("Any credential-permitted command");
+    expect(app).toContain("This legacy rule is not an Any command rule yet");
+    expect(app).toContain("confirmAnyCommandConversion");
+    expect(app).toContain("commands: form.commands");
+    expect(app).toContain("resolvedCommands: form.resolvedCommands");
+    expect(app).toContain("First matching rule:");
+    expect(app).toContain("data-policy-first-match");
+    expect(app).toContain("named command without a pinned executable never runs automatically");
+  });
+
   it("shows policy details without replacing hardened policy evaluation", async () => {
     const [app, policyOrder] = await Promise.all([
       readFile(path.join(repoRoot, "src/console-ui/src/App.tsx"), "utf8"),

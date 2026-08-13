@@ -69,14 +69,14 @@ fileprivate struct Scratch {
     gate = base.appendingPathComponent("gate.fifo")
     mkfifo(gate.path, 0o600)
 
-    // approve/deny block on the FIFO so the decision is genuinely in flight;
+    // approval actions block on the FIFO so the decision is genuinely in flight;
     // any other verb returns at once.
     let script = """
     #!/bin/zsh
     verb="$1"
     print -- "$verb" >> "\(invocationLog.path)"
     case "$verb" in
-      approve|deny)
+      approve|approve-policy|deny)
         read _line < "\(gate.path)"
         print -- '{"ok":true}'
         exit 0
@@ -157,6 +157,7 @@ struct DecisionGuardTests {
 
     await runInFlightGuardTest(scratch)
     await runGuardReleaseTest(scratch)
+    await runScopedPolicyApprovalTest(scratch)
     runFailureReasonTest()
     runRouteAndSizingTest()
     runApprovalFlowTest()
@@ -241,6 +242,36 @@ struct DecisionGuardTests {
     scratch.releaseOneInFlight()
     let done = await waitUntil(3.0) { !controller.isDeciding(id) }
     check(done, "second decision should clear its in-flight id too")
+  }
+
+  @MainActor
+  fileprivate static func runScopedPolicyApprovalTest(_ scratch: Scratch) async {
+    var outcomes: [DecisionOutcome] = []
+    let controller = DecisionController(
+      runCli: { args in runFakeCli(scratch.fakeCli.path, args) },
+      notify: { outcomes.append($0) },
+      afterDecision: {}
+    )
+    let id = "req-scoped-policy"
+    let before = scratch.verbs().filter { $0 == "approve-policy" }.count
+    let approveBefore = scratch.verbs().filter { $0 == "approve" }.count
+
+    controller.approvePolicy(id)
+    let started = await waitUntil(3.0) {
+      scratch.verbs().filter { $0 == "approve-policy" }.count == before + 1 && controller.isDeciding(id)
+    }
+    check(started, "scoped policy approval should invoke the approve-policy CLI command")
+
+    controller.approve(id)
+    try? await Task.sleep(for: .milliseconds(100))
+    check(scratch.verbs().filter { $0 == "approve" }.count == approveBefore,
+          "a second decision for the same request must be suppressed while approve-policy is running")
+
+    scratch.releaseOneInFlight()
+    let done = await waitUntil(3.0) { !controller.isDeciding(id) }
+    check(done, "scoped policy approval should release its in-flight request id")
+    check(outcomes.first?.title == "s-gw policy added" && outcomes.first?.succeeded == true,
+          "scoped policy approval should report an honest success")
   }
 
   // Test 3: the honest-failure parser pulls a clean reason out of the CLI's real

@@ -609,6 +609,12 @@ struct ApprovalPromptCard: View {
           }
         }
       }
+
+      Section("Policy") {
+        Button("Always allow this request scope") {
+          actions.approvePolicy(request.id)
+        }
+      }
     }
   }
 

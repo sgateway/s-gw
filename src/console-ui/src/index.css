@@ -194,6 +194,19 @@
   backdrop-filter: none;
 }
 
+.sgw-native-drag-surface {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 40;
+  height: 3.3rem;
+}
+
+.sgw-native-actions {
+  pointer-events: auto;
+}
+
 .sgw-native-actions [data-slot="button"],
 .sgw-native-actions [data-slot="badge"] {
   box-shadow: none;

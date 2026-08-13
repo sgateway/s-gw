@@ -165,7 +165,7 @@ import {
 } from "@/lib/layout";
 import { credentialBackendLabel, credentialProviderPresentation } from "@/lib/credential-presentation";
 import { addDemoData, DEMO_DATA_STORAGE_KEY } from "@/lib/demo-data";
-import { findShadowingPolicyRule } from "../../policy-order";
+import { findShadowingPolicyRule, policyAllowsAnyEnvCommand } from "../../policy-order";
 import {
   commandName,
   durationLabel,
@@ -404,18 +404,21 @@ function ConsoleShell({ ctx, theme, setTheme }: { ctx: ConsoleContext; theme: st
 
       <SidebarInset className="sgw-console-main min-w-0 bg-transparent">
         {nativeShell ? (
-          <NativeWindowActions
-            ctx={displayCtx}
-            state={state}
-            theme={theme}
-            setTheme={setTheme}
-            setView={setView}
-            view={view}
-            onResetLayout={resetOverviewLayout}
-            setCommandOpen={setCommandOpen}
-            demoEnabled={demoEnabled}
-            onToggleDemoData={toggleDemoData}
-          />
+          <>
+            <div className="sgw-native-drag-surface" data-sgw-window-drag aria-hidden="true" />
+            <NativeWindowActions
+              ctx={displayCtx}
+              state={state}
+              theme={theme}
+              setTheme={setTheme}
+              setView={setView}
+              view={view}
+              onResetLayout={resetOverviewLayout}
+              setCommandOpen={setCommandOpen}
+              demoEnabled={demoEnabled}
+              onToggleDemoData={toggleDemoData}
+            />
+          </>
         ) : (
           <ConsoleTopbar
             ctx={displayCtx}
@@ -627,7 +630,7 @@ function ConsoleSidebar({
   return (
     <Sidebar collapsible="icon" className="border-r border-sidebar-border/80">
       <SidebarHeader className="sgw-sidebar-header h-14 justify-center px-3 group-data-[collapsible=icon]:px-2">
-        <div className="sgw-sidebar-titlebar flex w-full items-center justify-end gap-2 group-data-[collapsible=icon]:justify-center">
+        <div className="sgw-sidebar-titlebar flex w-full items-center justify-end gap-2 group-data-[collapsible=icon]:justify-center" data-sgw-window-drag>
           <Tooltip>
             <TooltipTrigger asChild>
               <SidebarTrigger className="sgw-sidebar-titlebar-trigger h-8 w-8 shrink-0 rounded-md text-sidebar-foreground hover:bg-sidebar-accent group-data-[collapsible=icon]:hidden" />
@@ -1453,6 +1456,9 @@ function PolicyConditionsCell({ conditions }: { conditions: ApprovalPolicyRuleRe
           {titleCase(agent)}
         </span>
       ))}
+      {policyAllowsAnyEnvCommand(conditions) ? (
+        <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs">Any credential-permitted command</span>
+      ) : null}
       {hasRest ? <span className="truncate text-sm text-muted-foreground">{restSummary}</span> : null}
     </div>
   );
@@ -1679,7 +1685,7 @@ function PolicyDetailPanel({
 
   return (
     <div className="space-y-5 px-4 py-5 lg:px-6" data-policy-detail={rule.id}>
-      <PolicyFlowPreview form={policyFormFromRule(rule)} state={state} />
+      <PolicyFlowPreview form={policyFormFromRule(rule)} state={state} rule={rule} />
       {shadowedBy ? (
         <Alert variant={coveredBySameDecision ? "default" : "destructive"}>
           <EyeOff className="h-4 w-4" />
@@ -1704,7 +1710,7 @@ function PolicyDetailPanel({
           ["Agents", policyDetailValue(conditions.agents)],
           ["Credentials", bindings.length > 0 ? bindings.join(", ") : policyDetailValue(conditions.handles, (handle) => state.handles.find((item) => item.handle === handle)?.name || shortHandle(handle))],
           ["Action", policyDetailValue([...(conditions.actionKinds || []), ...(conditions.commands || [])])],
-          ["Executables", policyDetailValue(conditions.resolvedCommands)],
+          ["Executables", policyAllowsAnyEnvCommand(conditions) ? "Any executable permitted by the credential" : policyDetailValue(conditions.resolvedCommands)],
           ["Scope", policyDetailValue([...(conditions.providers || []), ...(conditions.secretTypes || []), conditions.minSeverity ? `${conditions.minSeverity} and above` : ""])],
           ["Environment", policyDetailValue([...(conditions.injectEnvs || []), ...(conditions.workingDirs || [])])],
           ["SSH", policyDetailValue([...(conditions.sshTargets || []), ...(conditions.sshPorts || []).map(String)])],
@@ -3439,14 +3445,24 @@ function PolicyEditorDialog({
   const [form, setForm] = React.useState<PolicyFormState>(emptyPolicyForm);
   const [advanced, setAdvanced] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [confirmAnyCommandConversion, setConfirmAnyCommandConversion] = React.useState(false);
   const sources = React.useMemo(() => buildPolicyOptionSources(state), [state]);
   const editing = Boolean(rule);
   const bindingsLocked = Boolean(rule?.conditions.envBindings?.length);
+  const namedCommandNeedsExecutable = form.decision === "allow" && form.commands.length > 0 && form.resolvedCommands.length === 0;
+  const includesEnvCommand = form.actionKinds.length === 0 || form.actionKinds.includes("env_command");
+  const convertsLegacyCommandScope = Boolean(
+    rule && form.decision === "allow" && includesEnvCommand &&
+    form.commands.length === 0 && form.resolvedCommands.length === 0 &&
+    !policyAllowsAnyEnvCommand(rule.conditions)
+  );
+  const saveBlocked = namedCommandNeedsExecutable || (convertsLegacyCommandScope && !confirmAnyCommandConversion);
 
   React.useEffect(() => {
     if (!open) return;
     setForm(rule ? policyFormFromRule(rule) : emptyPolicyForm());
     setAdvanced(Boolean(rule));
+    setConfirmAnyCommandConversion(false);
   }, [open, rule]);
 
   const update = <K extends keyof PolicyFormState>(field: K, value: PolicyFormState[K]) => {
@@ -3454,7 +3470,7 @@ function PolicyEditorDialog({
   };
 
   async function save() {
-    if (busy || !form.name.trim()) return;
+    if (busy || !form.name.trim() || saveBlocked) return;
     setBusy(true);
     try {
       const body = policyFormToInput(form, rule?.enabled ?? true, bindingsLocked);
@@ -3480,7 +3496,7 @@ function PolicyEditorDialog({
         <DialogHeader>
           <DialogTitle>{editing ? "Edit policy rule" : "Add policy rule"}</DialogTitle>
           <DialogDescription>
-            Leave a condition empty to match anything. The preview shows the request shape this rule will affect.
+            Empty conditions are wildcards. In an allow rule, empty Commands and Resolved executables means any command already permitted by the credential. Lower priority numbers run first.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-5">
@@ -3500,7 +3516,32 @@ function PolicyEditorDialog({
               </AlertDescription>
             </Alert>
           ) : null}
-          <PolicyFlowPreview form={form} state={state} />
+          <PolicyFlowPreview form={form} state={state} rule={rule || undefined} />
+          {namedCommandNeedsExecutable ? (
+            <Alert variant="destructive" data-policy-command-pin-warning>
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Pin the named command</AlertTitle>
+              <AlertDescription>Add at least one exact Resolved executable path. A named command without a pinned executable never runs automatically.</AlertDescription>
+            </Alert>
+          ) : null}
+          {convertsLegacyCommandScope ? (
+            <Alert data-policy-any-command-conversion>
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>This legacy rule is not an Any command rule yet</AlertTitle>
+              <AlertDescription>
+                <p>Its saved command scope is incomplete, so it does not currently auto-authorize environment commands. Saving both fields empty will deliberately convert it to Any credential-permitted command.</p>
+                <label className="mt-3 flex cursor-pointer items-start gap-2 text-foreground">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4"
+                    checked={confirmAnyCommandConversion}
+                    onChange={(event) => setConfirmAnyCommandConversion(event.target.checked)}
+                  />
+                  <span>I understand this rule will allow any command already permitted by the selected credential.</span>
+                </label>
+              </AlertDescription>
+            </Alert>
+          ) : null}
           <PolicyFormFields
             form={form}
             update={update}
@@ -3512,7 +3553,7 @@ function PolicyEditorDialog({
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>Cancel</Button>
-          <Button onClick={() => void save()} disabled={busy || !form.name.trim()}>
+          <Button onClick={() => void save()} disabled={busy || !form.name.trim() || saveBlocked}>
             {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             {editing ? "Save changes" : "Add rule"}
           </Button>
@@ -3558,10 +3599,10 @@ function PolicyFormFields({
       <PolicyField label={bindingsLocked ? "Credentials (fixed)" : "Credentials"} hint={bindingsLocked ? "Fixed by the exact binding set above." : undefined}>
         <MultiSelectField values={form.handles} onChange={(value) => update("handles", value)} options={sources.handles} disabled={bindingsLocked} aria-label="Policy credentials" />
       </PolicyField>
-      <PolicyField label="Commands">
+      <PolicyField label="Commands" hint="Leave this and Resolved executables empty to allow any command already permitted by the selected credential.">
         <MultiSelectField values={form.commands} onChange={(value) => update("commands", value)} options={sources.commands} aria-label="Policy commands" />
       </PolicyField>
-      <PolicyField label="Resolved executables" hint="Allow rules use exact executable paths; old unpinned allow rules do not authorize command execution.">
+      <PolicyField label="Resolved executables" hint="Pins named commands to exact executable paths. If Commands is not empty, an allow rule needs at least one path here.">
         <MultiSelectField values={form.resolvedCommands} onChange={(value) => update("resolvedCommands", value)} options={sources.resolvedCommands} aria-label="Policy resolved executables" />
       </PolicyField>
       <PolicyField label="Action kinds">
@@ -3624,18 +3665,92 @@ function PolicyField({ label, hint, className, children }: { label: string; hint
   );
 }
 
-function PolicyFlowPreview({ form, state }: { form: PolicyFormState; state: ConsoleState }) {
+function PolicyFlowPreview({
+  form,
+  state,
+  rule
+}: {
+  form: PolicyFormState;
+  state: ConsoleState;
+  rule?: ApprovalPolicyRuleRecord;
+}) {
   const handleLabels = form.handles.map((handle) => state.handles.find((item) => item.handle === handle)?.name || shortHandle(handle));
   const decisionCopy = form.decision === "allow" ? "Runs automatically" : form.decision === "deny" ? "Blocked automatically" : "Requires approval";
   const DecisionIcon = form.decision === "allow" ? ShieldCheck : form.decision === "deny" ? Ban : Clock3;
+  const candidate = policyPreviewCandidate(form, state, rule);
+  const rules = rule
+    ? state.approvalPolicyRules.map((item) => item.id === rule.id ? candidate : item)
+    : [...state.approvalPolicyRules, candidate];
+  const firstMatch = findShadowingPolicyRule(rules, candidate);
   return (
     <div className="grid gap-2 rounded-lg border bg-muted/30 p-3 text-sm sm:grid-cols-4" data-policy-flow-preview>
       <PolicyFlowCell label="Agent" value={summarizePolicyValues(form.agents, "Any agent")} icon={<UsersRound className="h-4 w-4" />} />
-      <PolicyFlowCell label="Action" value={summarizePolicyValues(form.commands, form.actionKinds.includes("ssh_session") ? "SSH session" : "Any command")} icon={<CommandIcon className="h-4 w-4" />} />
+      <PolicyFlowCell label="Action" value={policyActionPreview(form)} icon={<CommandIcon className="h-4 w-4" />} />
       <PolicyFlowCell label="Credential" value={summarizePolicyValues(handleLabels, "Any credential")} icon={<KeyRound className="h-4 w-4" />} />
       <PolicyFlowCell label="Decision" value={decisionCopy} icon={<DecisionIcon className="h-4 w-4" />} />
+      {firstMatch ? (
+        <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 sm:col-span-4 dark:text-amber-300" data-policy-first-match>
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          First matching rule: “{firstMatch.name}” at priority {firstMatch.priority} ({firstMatch.decision}). This rule is not reached for the full previewed scope.
+        </div>
+      ) : (
+        <div className="text-xs text-muted-foreground sm:col-span-4" data-policy-first-match>
+          No earlier rule covers this entire preview scope. A narrower earlier rule can still win for requests it matches.
+        </div>
+      )}
     </div>
   );
+}
+
+function policyPreviewCandidate(
+  form: PolicyFormState,
+  state: ConsoleState,
+  rule?: ApprovalPolicyRuleRecord
+): ApprovalPolicyRuleRecord {
+  const now = new Date().toISOString();
+  const fallbackPriority = state.approvalPolicyRules.length
+    ? Math.max(...state.approvalPolicyRules.map((item) => item.priority)) + 10
+    : 100;
+  return {
+    id: rule?.id || "policy_preview",
+    name: form.name.trim() || "This rule",
+    enabled: rule?.enabled ?? true,
+    priority: form.priority.trim() ? Number(form.priority) : fallbackPriority,
+    decision: form.decision,
+    conditions: {
+      handles: form.handles,
+      envBindings: rule?.conditions.envBindings,
+      providers: form.providers,
+      secretTypes: form.secretTypes,
+      minSeverity: form.minSeverity ? form.minSeverity as SecretSeverity : undefined,
+      agents: form.agents,
+      actionKinds: form.actionKinds,
+      commands: form.commands,
+      resolvedCommands: form.resolvedCommands,
+      injectEnvs: form.injectEnvs,
+      workingDirs: form.workingDirs,
+      sshTargets: form.sshTargets,
+      sshPorts: form.sshPorts.map(Number)
+    },
+    expiresAt: rule?.expiresAt,
+    createdAt: rule?.createdAt || now,
+    updatedAt: rule?.updatedAt || now
+  };
+}
+
+function policyActionPreview(form: PolicyFormState): string {
+  if (form.actionKinds.length === 1 && form.actionKinds[0] === "ssh_session") {
+    return "SSH session";
+  }
+  if (form.commands.length > 0) {
+    return summarizePolicyValues(form.commands, "Any command");
+  }
+  if (form.resolvedCommands.length > 0) {
+    return summarizePolicyValues(form.resolvedCommands, "Any executable");
+  }
+  return form.actionKinds.includes("ssh_session")
+    ? "Any permitted command or SSH"
+    : "Any credential-permitted command";
 }
 
 function PolicyFlowCell({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {

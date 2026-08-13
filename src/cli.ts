@@ -559,6 +559,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "approve-policy") {
+    if (!second) {
+      throw new Error("approve-policy requires a request id.");
+    }
+
+    printJson(await store.approveRequestWithScopedPolicy(second));
+    return;
+  }
+
   if (first === "deny") {
     if (!second) {
       throw new Error("deny requires a request id.");
@@ -2065,6 +2074,7 @@ async function handleApprovalPolicyCommand(
   }
 
   if (action === "add") {
+    assertAnyCommandFlag(flags);
     const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
     printJson(
       await store.addApprovalPolicyRule({
@@ -2084,6 +2094,7 @@ async function handleApprovalPolicyCommand(
     if (!approvalPolicyUpdateFlags.some((flag) => hasFlag(flags, flag))) {
       throw new Error("approval policy update needs at least one change.");
     }
+    assertAnyCommandFlag(flags);
 
     const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
     const conditions = approvalPolicyConditionPatchFromFlags(flags);
@@ -2139,6 +2150,7 @@ const approvalPolicyUpdateFlags = [
   "action-kind",
   "command",
   "resolved-command",
+  "any-command",
   "inject-env",
   "working-dir",
   "cwd",
@@ -2151,7 +2163,7 @@ const approvalPolicyUpdateFlags = [
 function approvalPolicyConditionsFromFlags(
   flags: Record<string, string | boolean | string[]>
 ): ApprovalPolicyConditions {
-  return {
+  const conditions: ApprovalPolicyConditions = {
     handles: getFlagList(flags, "handle"),
     envBindings: approvalPolicyEnvBindingsFromFlags(flags),
     secretTypes: getFlagList(flags, "type").map(approvalPolicySecretType),
@@ -2159,13 +2171,21 @@ function approvalPolicyConditionsFromFlags(
     minSeverity: optionalSecretSeverity(getFlag(flags, "min-severity")),
     agents: getFlagList(flags, "agent"),
     actionKinds: getFlagList(flags, "action-kind").map(approvalPolicyActionKind),
-    commands: getFlagList(flags, "command"),
-    resolvedCommands: getFlagList(flags, "resolved-command"),
     injectEnvs: getFlagList(flags, "inject-env"),
     workingDirs: getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd")),
     sshTargets: getFlagList(flags, "ssh-target").concat(getFlagList(flags, "target")),
     sshPorts: getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item))
   };
+
+  if (hasFlag(flags, "any-command")) {
+    conditions.commands = [];
+    conditions.resolvedCommands = [];
+  } else {
+    if (hasFlag(flags, "command")) conditions.commands = getFlagList(flags, "command");
+    if (hasFlag(flags, "resolved-command")) conditions.resolvedCommands = getFlagList(flags, "resolved-command");
+  }
+
+  return conditions;
 }
 
 function approvalPolicyConditionPatchFromFlags(
@@ -2181,6 +2201,7 @@ function approvalPolicyConditionPatchFromFlags(
     "action-kind",
     "command",
     "resolved-command",
+    "any-command",
     "inject-env",
     "working-dir",
     "cwd",
@@ -2201,8 +2222,13 @@ function approvalPolicyConditionPatchFromFlags(
   if (hasFlag(flags, "min-severity")) patch.minSeverity = optionalSecretSeverity(getFlag(flags, "min-severity"));
   if (hasFlag(flags, "agent")) patch.agents = getFlagList(flags, "agent");
   if (hasFlag(flags, "action-kind")) patch.actionKinds = getFlagList(flags, "action-kind").map(approvalPolicyActionKind);
-  if (hasFlag(flags, "command")) patch.commands = getFlagList(flags, "command");
-  if (hasFlag(flags, "resolved-command")) patch.resolvedCommands = getFlagList(flags, "resolved-command");
+  if (hasFlag(flags, "any-command")) {
+    patch.commands = [];
+    patch.resolvedCommands = [];
+  } else {
+    if (hasFlag(flags, "command")) patch.commands = getFlagList(flags, "command");
+    if (hasFlag(flags, "resolved-command")) patch.resolvedCommands = getFlagList(flags, "resolved-command");
+  }
   if (hasFlag(flags, "inject-env")) patch.injectEnvs = getFlagList(flags, "inject-env");
   if (hasFlag(flags, "working-dir") || hasFlag(flags, "cwd")) {
     patch.workingDirs = getFlagList(flags, "working-dir").concat(getFlagList(flags, "cwd"));
@@ -2214,6 +2240,15 @@ function approvalPolicyConditionPatchFromFlags(
     patch.sshPorts = getFlagList(flags, "ssh-port").concat(getFlagList(flags, "port")).map((item) => Number(item));
   }
   return patch;
+}
+
+function assertAnyCommandFlag(flags: Record<string, string | boolean | string[]>): void {
+  if (!hasFlag(flags, "any-command")) {
+    return;
+  }
+  if (hasFlag(flags, "command") || hasFlag(flags, "resolved-command")) {
+    throw new Error("--any-command cannot be combined with --command or --resolved-command.");
+  }
 }
 
 function approvalPolicyEnvBindingsFromFlags(
@@ -2540,8 +2575,8 @@ Commands:
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m]
   s-gw approval grants
   s-gw approval policy list
-  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--action-kind env_command|ssh_session] [--duration 8h]
-  s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--clear-expiry]
+  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session] [--duration 8h]
+  s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--clear-expiry]
   s-gw approval policy arrange
   s-gw approval policy delete --id POLICY_ID
   s-gw approval policy enable|disable --id POLICY_ID
@@ -2562,6 +2597,7 @@ Commands:
   s-gw execute-next [--handle HANDLE] [--kind env_command|ssh_session] [--command CMD]
   s-gw store backups
   s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent]
+  s-gw approve-policy REQUEST_ID
   s-gw deny REQUEST_ID
   s-gw execute REQUEST_ID
 `);

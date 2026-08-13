@@ -217,6 +217,75 @@ describe("SecretStore", () => {
     expect(request.state).toBe("pending");
   });
 
+  it("treats explicit empty command conditions as an allow wildcard", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "any command policy token",
+      type: "api-token",
+      value: fakeOpenAiToken("any_command_policy"),
+      policy: {
+        injectEnv: "ANY_COMMAND_POLICY_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Allow Codex any credential-permitted command",
+      decision: "allow",
+      conditions: {
+        handles: [record.handle],
+        agents: ["Codex"],
+        actionKinds: ["env_command"],
+        commands: [],
+        resolvedCommands: []
+      }
+    });
+
+    const request = await store.createRequest(record.handle, buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "ANY_COMMAND_POLICY_TOKEN"
+    }), "Codex any command policy request");
+
+    expect(rule.conditions.commands).toEqual([]);
+    expect(rule.conditions.resolvedCommands).toEqual([]);
+    expect(request.state).toBe("approved");
+    expect(request.approvalPolicyRuleId).toBe(rule.id);
+  });
+
+  it("does not broaden an allow rule that omits its command scope", async () => {
+    const store = new SecretStore();
+    const record = await store.addSecret({
+      name: "omitted command scope token",
+      type: "api-token",
+      value: fakeOpenAiToken("omitted_command_scope"),
+      policy: {
+        injectEnv: "OMITTED_COMMAND_SCOPE_TOKEN",
+        allowedCommands: [process.execPath]
+      }
+    });
+    const rule = await store.addApprovalPolicyRule({
+      name: "Legacy allow without a command scope",
+      decision: "allow",
+      conditions: {
+        handles: [record.handle],
+        agents: ["Codex"],
+        actionKinds: ["env_command"]
+      }
+    });
+    await store.updateApprovalPolicyRule(rule.id, { name: "Renamed legacy allow" });
+
+    const saved = (await store.listApprovalPolicyRules()).find((item) => item.id === rule.id);
+    expect(saved?.conditions).not.toHaveProperty("commands");
+    expect(saved?.conditions).not.toHaveProperty("resolvedCommands");
+
+    const request = await store.createRequest(record.handle, buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "OMITTED_COMMAND_SCOPE_TOKEN"
+    }), "Codex omitted command scope request");
+    expect(request.state).toBe("pending");
+  });
+
   it("does not reuse a pinned allow policy after a bare command resolves elsewhere", async () => {
     const firstBin = path.join(tmpHome, "first-bin");
     const secondBin = path.join(tmpHome, "second-bin");

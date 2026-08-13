@@ -1293,7 +1293,7 @@ function policyRuleUpdateInput(body: Record<string, unknown>): UpdateApprovalPol
 }
 
 function policyConditionsFromBody(body: Record<string, unknown>): ApprovalPolicyConditions {
-  return {
+  const conditions: ApprovalPolicyConditions = {
     handles: policyStringArray(body, "handles"),
     envBindings: policyEnvBindings(body.envBindings),
     secretTypes: policyStringArray(body, "secretTypes").map(policySecretType),
@@ -1301,13 +1301,14 @@ function policyConditionsFromBody(body: Record<string, unknown>): ApprovalPolicy
     minSeverity: optionalSecretSeverity(body.minSeverity),
     agents: policyStringArray(body, "agents"),
     actionKinds: policyStringArray(body, "actionKinds").map(approvalPolicyActionKind),
-    commands: policyStringArray(body, "commands"),
-    resolvedCommands: policyStringArray(body, "resolvedCommands"),
     injectEnvs: policyStringArray(body, "injectEnvs"),
     workingDirs: policyStringArray(body, "workingDirs"),
     sshTargets: policyStringArray(body, "sshTargets"),
     sshPorts: policyNumberArray(body, "sshPorts")
   };
+  if (hasBodyField(body, "commands")) conditions.commands = policyStringArray(body, "commands");
+  if (hasBodyField(body, "resolvedCommands")) conditions.resolvedCommands = policyStringArray(body, "resolvedCommands");
+  return conditions;
 }
 
 function policyConditionPatchFromBody(body: Record<string, unknown>): Partial<ApprovalPolicyConditions> | undefined {
