@@ -23,7 +23,7 @@ sha2 = "=0.10.9"
 single-instance = "=0.3.3"
 tray-icon = "=0.24.2"
 url = "=2.5.8"
-zeroize = "=1.8.2"
+zeroize = "=1.9.0"
 
 [target.'cfg(unix)'.dependencies]
 eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
