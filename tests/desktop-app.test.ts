@@ -65,7 +65,7 @@ describe("Windows and Linux desktop app", () => {
     expect(cargoRaw).toContain('tray-icon = "=0.24.2"');
     expect(cargoRaw).toContain('gtk = "=0.18.2"');
     expect(cargoRaw).toContain('single-instance = "=0.3.3"');
-    expect(cargoRaw).toContain('open = "=5.4.1"');
+    expect(cargoRaw).toContain('open = "=5.4.2"');
     expect(cargoRaw).not.toMatch(/\btauri\b/iu);
     expect(cargoRaw).not.toMatch(/\bwry\b/iu);
     expect(packageInfo.devDependencies["@crabnebula/packager"]).toBe("0.11.2");
