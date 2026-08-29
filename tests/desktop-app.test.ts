@@ -58,7 +58,7 @@ describe("Windows and Linux desktop app", () => {
       'eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu_no_default_features"] }'
     );
     expect(cargoRaw).toContain(
-      'wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "dx12"] }'
+      'wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "dx12"] }'
     );
     expect(cargoRaw).toContain('egui = "=0.36.1"');
     expect(cargoRaw).toContain('egui_extras = "=0.36.1"');
