@@ -12,6 +12,16 @@ import {
   policyAllowsAnyEnvCommand
 } from "./policy-order.js";
 import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, sshSessionIdentity } from "./ssh.js";
+import {
+  compareRuntimeVersions,
+  isHistoryFreeLedger,
+  isRuntimeVersion,
+  ledgerHistoryStats,
+  mergeLedgerHistory,
+  type LedgerHistorySource
+} from "./ledger-recovery.js";
+import { appendLedgerJournal, hasLedgerJournal, readLedgerJournal } from "./ledger-journal.js";
+import { CURRENT_VERSION } from "./version.js";
 import { ensureSgwHome, getSgwHome, getSgwLoginSessionId, getSgwRecoveryHome, getStorePath } from "./paths.js";
 import {
   defaultSecretKeychainService,
@@ -65,6 +75,11 @@ const emptyStoreLockStaleMs = 1_000;
 // so we reap it back to a terminal failed state instead of bricking it forever.
 const staleExecutionMs = 10 * 60 * 1000;
 const maxStoreBackups = 20;
+/**
+ * Retained files inspected when rebuilding request/audit history after a history-free recovery.
+ * Bounded so recovery stays fast on a home with a large backup directory.
+ */
+const maxLedgerHistoryDonors = 40;
 const requestBackupIntervalMs = 5 * 60 * 1000;
 const storeMarkerName = ".store-initialized";
 const controlStateName = ".store-control.json";
@@ -246,6 +261,12 @@ interface StoreControlState {
   recoveryCheckpoint?: string;
   recoveryVaultId?: string;
   recoveryNamespace?: string;
+  /**
+   * s-gw runtime that last wrote this home. A client older than the recorded writer refuses
+   * to touch the live ledger, so a stale CLI, MCP server, or app cannot rewrite a home that a
+   * newer runtime owns and drop fields it does not understand.
+   */
+  writerVersion?: string;
 }
 
 interface PendingStoreControlState {
@@ -1216,7 +1237,9 @@ export class SecretStore {
     await lock.assertOwned();
     await assertStoreRevision(this.home, this.storePath, expectedRevision);
 
-    await assertRecoveryVaultMatches(this.home, await readControlState(this.home));
+    const manifest = await readControlState(this.home);
+    await assertRecoveryVaultMatches(this.home, manifest);
+    await assertWriterRuntimeIsCurrent(this.home, manifest);
 
     const previous = expectedRevision.storeText
       ? parseStoreFile(expectedRevision.storeText, this.storePath)
@@ -1267,6 +1290,11 @@ export class SecretStore {
       await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
     }
     await ensureStoreMarker(this.home);
+
+    // History durability, after the commit has landed. The journal is a recovery aid, so a
+    // failure here must never fail a write the operator already asked for and that already
+    // succeeded; recovery simply falls back to retained full backups.
+    await appendLedgerJournal(this.home, store, previous).catch(() => undefined);
   }
 
   private async mutate<T>(updater: (store: StoreFile) => T | Promise<T>): Promise<T> {
@@ -1286,6 +1314,7 @@ export class SecretStore {
   private async loadOrRecoverUnlocked(lock: StoreLock): Promise<StoreFile> {
     const manifest = await readControlState(this.home);
     await assertRecoveryVaultMatches(this.home, manifest);
+    await assertWriterRuntimeIsCurrent(this.home, manifest);
     if (!(await this.exists())) {
       if (manifest?.recoverySealed && !(await latestSealedExternalControlPlaneCheckpoint(this.home))) {
         const legacy = await latestSealedControlPlaneCheckpoint(legacyExternalControlPlaneBackupDir(this.home));
@@ -1716,8 +1745,31 @@ function controlStateFor(
     recoverySealed: true,
     recoveryCheckpoint: checkpoint ? path.basename(checkpoint.path) : undefined,
     recoveryVaultId: recoveryVaultId(home),
-    recoveryNamespace: recoveryNamespace(home)
+    recoveryNamespace: recoveryNamespace(home),
+    writerVersion: CURRENT_VERSION
   };
+}
+
+/**
+ * Refuse to write a home that a newer s-gw runtime owns.
+ *
+ * Mixed-runtime homes are how the ledger was lost: a current app and a much older CLI/MCP
+ * client wrote the same home, and the older writer did not understand the newer on-disk
+ * shape. This guard makes the newer format authoritative going forward. It cannot retrofit
+ * itself onto clients that predate it, so it is one layer of the defense, not the whole of it.
+ */
+async function assertWriterRuntimeIsCurrent(home: string, manifest?: StoreControlState): Promise<void> {
+  const recorded = manifest?.writerVersion ?? (await readControlState(home))?.writerVersion;
+  if (!recorded || !isRuntimeVersion(recorded) || !isRuntimeVersion(CURRENT_VERSION)) {
+    return;
+  }
+  if (compareRuntimeVersions(recorded, CURRENT_VERSION) > 0) {
+    throw new Error(
+      `This s-gw home was last written by version ${recorded}, but this client is version ${CURRENT_VERSION}. `
+      + "Refusing to write the live ledger with an older runtime. Upgrade this client, or stop the older "
+      + "CLI, MCP server, or app that is sharing this home."
+    );
+  }
 }
 
 async function controlStateMatches(home: string, store: StoreFile): Promise<boolean> {
@@ -1785,7 +1837,8 @@ function parseControlState(raw: string): StoreControlState | undefined {
       !sealedRecoveryIsComplete ||
       (value.recoveryCheckpoint !== undefined && !isSealedCheckpointName(value.recoveryCheckpoint)) ||
       (value.recoveryVaultId !== undefined && !/^[a-f0-9]{64}$/.test(value.recoveryVaultId)) ||
-      (value.recoveryNamespace !== undefined && !/^[a-f0-9]{24}$/.test(value.recoveryNamespace))
+      (value.recoveryNamespace !== undefined && !/^[a-f0-9]{24}$/.test(value.recoveryNamespace)) ||
+      (value.writerVersion !== undefined && !isRuntimeVersion(value.writerVersion))
     ) {
       return undefined;
     }
@@ -2145,8 +2198,22 @@ async function hasStoreMarker(home: string): Promise<boolean> {
   return fileExists(storeMarkerPath(home));
 }
 
+/**
+ * Any sign that this home has held a ledger before. Used to fail closed rather than quietly
+ * initializing an empty ledger over history that is still on disk. Preserved stores under
+ * `recovery/automatic` count as evidence even though they are never restoration candidates
+ * themselves: they were set aside because they were invalid or foreign, and their existence
+ * still proves this home is not new.
+ */
 async function hasRecoveryEvidence(home: string): Promise<boolean> {
-  return (await listRecoveryCandidates(home)).length > 0;
+  if ((await listRecoveryCandidates(home)).length > 0) {
+    return true;
+  }
+  if (await hasLedgerJournal(home)) {
+    return true;
+  }
+  const preserved = await readdir(path.join(home, "recovery", "automatic")).catch(() => []);
+  return preserved.some((entry) => entry.endsWith(".json"));
 }
 
 async function hasRecoveryCandidateFingerprint(home: string, requiredFingerprint: string): Promise<boolean> {
@@ -2238,9 +2305,44 @@ async function restoreRecoveryCandidate(
   }
   const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
   const fingerprint = controlPlaneFingerprint(store);
+  const source = path.basename(candidate.path);
+
+  // A sealed control-plane checkpoint anchors secrets, grants, settings, and policy rules, and
+  // carries no request or audit history by design. Restoring one as-is is what emptied Usage
+  // Flow: the ledger came back with every credential intact and no history at all. Keep the
+  // checkpoint authoritative for the control plane, then rebuild history from retained full
+  // backups of this same home. Merged rows are history only and carry no authority.
+  const sourceStats = ledgerHistoryStats(store);
+  const sourceKind = isHistoryFreeLedger(store)
+    ? "That source carried no request or audit history."
+    : `That source carried ${sourceStats.requests} request(s) and ${sourceStats.audit} audit event(s).`;
+
+  // Always reconcile against the journal and retained backups, not just when the source is
+  // completely empty. A backup taken between two requests is partial in exactly the same way a
+  // checkpoint is total: both silently shorten Usage Flow unless the rest is merged back in.
+  const donors = await collectLedgerHistorySources(home, candidate.path);
+  let historyNote = ` ${sourceKind}`;
+  if (donors.length > 0) {
+    const merged = mergeLedgerHistory(store, donors);
+    store.requests = merged.requests;
+    store.audit = merged.audit;
+    historyNote += merged.addedRequests > 0 || merged.addedAudit > 0
+      ? ` Recovery restored a further ${merged.addedRequests} request(s) and ${merged.addedAudit} audit event(s)`
+        + ` from ${merged.sources.join(", ")}, for a total of ${merged.requests.length} request(s)`
+        + ` and ${merged.audit.length} audit event(s).`
+        + (merged.neutralizedRequests > 0
+          ? ` ${merged.neutralizedRequests} restored request(s) that were still open were closed as failed and`
+          + " stripped of approval, so recovery re-authorized nothing."
+          : "")
+      : " No additional history was available beyond that source.";
+  } else if (isHistoryFreeLedger(store)) {
+    historyNote += " No ledger journal or retained full backup of this home could supply any,"
+      + " so the restored ledger starts with an empty history.";
+  }
+
   store.audit.push(audit(
     "store.recovered",
-    `Recovered the s-gw ledger from ${path.basename(candidate.path)} after the primary store became unavailable.`
+    `Recovered the s-gw ledger from ${source} after the primary store became unavailable.${historyNote}`
   ));
   await lock.assertOwned();
   await writeAtomicFile(storePath, serializeStore(store));
@@ -2250,6 +2352,74 @@ async function restoreRecoveryCandidate(
   await unlink(pendingControlStatePath(home)).catch(() => undefined);
   await ensureStoreMarker(home);
   return store;
+}
+
+/**
+ * Collect request/audit history donors for a recovery that produced a history-free ledger.
+ *
+ * Only files inside this home's own 0700 backup and preserved-store directories are eligible,
+ * so the donor set is bounded by the vault itself. Nothing from a donor is trusted as
+ * authority: `mergeLedgerHistory` takes requests and audit events only, never secrets, grants,
+ * settings, or policy rules, and it closes out any request that was still live.
+ */
+async function collectLedgerHistorySources(home: string, excludePath: string): Promise<LedgerHistorySource[]> {
+  const sources: LedgerHistorySource[] = [];
+
+  // The append-only journal comes first. It is the only history source that is written on every
+  // commit, so it is the one that survives a crash between backups.
+  const journal = await readLedgerJournal(home).catch(() => undefined);
+  if (journal && (journal.requests.length > 0 || journal.audit.length > 0)) {
+    sources.push({
+      label: journal.damagedLines > 0
+        ? `the append-only ledger journal (${journal.damagedLines} damaged line(s) skipped)`
+        : "the append-only ledger journal",
+      store: {
+        ...emptyStore(),
+        requests: journal.requests,
+        audit: journal.audit
+      }
+    });
+  }
+
+  const dirs = [
+    path.join(home, "backups"),
+    path.join(home, "backups", "manual"),
+    path.join(home, "recovery", "automatic")
+  ];
+
+  const candidates: RecoveryCandidate[] = [];
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    const entries = await readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) {
+        continue;
+      }
+      const candidatePath = path.join(dir, entry);
+      if (candidatePath === excludePath || seen.has(candidatePath)) {
+        continue;
+      }
+      const info = await regularFileInfo(candidatePath);
+      if (info) {
+        seen.add(candidatePath);
+        candidates.push({ path: candidatePath, modifiedAtMs: info.mtimeMs });
+      }
+    }
+  }
+
+  candidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+
+  for (const candidate of candidates.slice(0, maxLedgerHistoryDonors)) {
+    try {
+      const store = parseStoreFile(await readFile(candidate.path, "utf8"), candidate.path);
+      if (!isHistoryFreeLedger(store)) {
+        sources.push({ label: path.basename(candidate.path), store });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return sources;
 }
 
 async function preserveUnavailableStore(
