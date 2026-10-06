@@ -96,7 +96,7 @@
   "author": "Barry Yuan",
   "license": "Apache-2.0",
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "0.0.50",
+    "@anthropic-ai/sandbox-runtime": "0.0.78",
     "@fontsource-variable/geist": "^5.2.9",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "class-variance-authority": "^0.7.1",
