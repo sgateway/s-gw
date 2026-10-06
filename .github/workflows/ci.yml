@@ -42,7 +42,7 @@ jobs:
       - name: Install Linux sandbox dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap socat
+          sudo apt-get install -y bubblewrap socat ripgrep
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
@@ -467,7 +467,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap socat
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
       - run: npm ci --ignore-scripts
       - run: npm run build
       - name: Run installed package with delegated cgroup isolation

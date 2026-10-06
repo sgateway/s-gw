@@ -8,7 +8,7 @@ s-gw run codex --sandbox anthropic --cwd /path/to/project -- exec "your task"
 s-gw run claude-code --sandbox anthropic --cwd /path/to/project
 ```
 
-The existing builtin guard is still the default. macOS and Linux use Anthropic sandbox-runtime 0.0.50. Linux needs bubblewrap, socat, and a writable delegated cgroup v2. The pinned runtime has no native Windows backend; the existing Windows app, CLI, SSH, and integrations remain supported.
+The existing builtin guard is still the default. macOS and Linux use Anthropic sandbox-runtime 0.0.50. Linux needs bubblewrap, socat, ripgrep, and a writable delegated cgroup v2. The pinned runtime has no native Windows backend; the existing Windows app, CLI, SSH, and integrations remain supported.
 
 ## Credential-backed actions
 
