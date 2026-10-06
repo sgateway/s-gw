@@ -34,19 +34,6 @@ struct ApprovalsView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(executable)
-              if let transfer = request.action.ssh?.transfer {
-                DisclosureGroup("SSH upload details") {
-                  Text(transfer.approvalDetails).font(.caption.monospaced()).textSelection(.enabled)
-                }
-              }
-              if let http = request.action.http {
-                DisclosureGroup("HTTPS operation details") {
-                  ScrollView {
-                    Text(http.approvalDetails + "\nTimeout: \(request.action.timeoutMs) ms")
-                      .font(.caption.monospaced()).textSelection(.enabled)
-                  }.frame(maxHeight: 180)
-                }
-              }
             }
           }
           TableColumn("Handle") { request in
@@ -114,9 +101,32 @@ struct RequestRow: View {
 
 struct ApprovalMenu: View {
   @Environment(AppState.self) private var appState
+  @State private var showingOperation = false
   let request: RequestRecord
 
   var body: some View {
+    HStack {
+      if request.action.http != nil || request.action.ssh?.transfer != nil || request.action.owned == true {
+        Button("Details") { showingOperation = true }
+          .sheet(isPresented: $showingOperation) {
+            VStack(alignment: .leading, spacing: 12) {
+              Text("Approved operation").font(.headline)
+              Text(request.handle).font(.caption.monospaced())
+              ScrollView {
+                Text(request.action.http?.approvalDetails ?? request.action.ssh?.transfer?.approvalDetails ?? "SSH target: \(request.action.ssh?.target ?? ""):\(request.action.ssh?.port ?? 22)\nRemote arguments: \(String(data: (try? JSONSerialization.data(withJSONObject: request.action.args, options: .prettyPrinted)) ?? Data(), encoding: .utf8) ?? "")")
+                  .font(.body.monospaced()).textSelection(.enabled)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+              }
+              Text("Timeout: \(request.action.timeoutMs) ms")
+              Button("Close") { showingOperation = false }
+            }.padding(20).frame(width: 680, height: 440)
+          }
+      }
+      approvalChoices
+    }
+  }
+
+  private var approvalChoices: some View {
     Menu {
       Button("One time") {
         appState.approve(request, choice: .oneTime)

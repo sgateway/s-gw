@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from "node:fs/promises";
 import { createServer, connect } from "node:net";
 import { createServer as createHttpsServer } from "node:https";
 import { execFileSync, spawn } from "node:child_process";
@@ -145,10 +145,10 @@ describe("Anthropic sandbox", () => {
     await writeFile(loginFile, "synthetic database"); await writeFile(sibling, "synthetic unrelated database");
     vi.spyOn(os, "homedir").mockReturnValue(userHome);
     const probe = path.join(workspace, "keychain-probe.mjs");
-    await writeFile(probe, `import assert from 'node:assert/strict'; import {readFileSync,writeFileSync} from 'node:fs'; const file=${JSON.stringify(loginFile)}; if(process.env.SGW_EXPECT_KEYCHAIN_READ==='1') assert.equal(readFileSync(file,'utf8'),'synthetic database'); else assert.throws(()=>readFileSync(file)); assert.throws(()=>readFileSync(${JSON.stringify(sibling)})); assert.throws(()=>writeFileSync(file,'changed')); assert.throws(()=>writeFileSync(${JSON.stringify(path.join(keychains, 'created'))},'changed'));`);
+    await copyFile(path.join(process.cwd(), "tests/fixtures/keychain-policy-agent.mjs"), probe);
     for (const sandboxOptions of [{}, { allowAgentKeychain: true }, { allowAgentKeychain: true, denyAgentAuth: true }, { allowAgentKeychain: true, denyRead: [loginFile] }, { allowAgentKeychain: true, denyRead: [keychains] }]) {
       const visible = Boolean(macAgentKeychainReadPath(workspace, sandboxOptions));
-      const prepared = await prepareGuardedRun(store, { agent: "claude-code", command: process.execPath, args: [probe], cwd: workspace, env: { PATH: process.env.PATH, SGW_EXPECT_KEYCHAIN_READ: visible ? "1" : "0" }, sandbox: "anthropic", sandboxOptions });
+      const prepared = await prepareGuardedRun(store, { agent: "claude-code", command: process.execPath, args: [probe], cwd: workspace, env: { PATH: process.env.PATH, SGW_EXPECT_KEYCHAIN_READ: visible ? "1" : "0", SGW_TEST_LOGIN_FILE: loginFile, SGW_TEST_SIBLING_FILE: sibling, SGW_TEST_CREATED_FILE: path.join(keychains, "created") }, sandbox: "anthropic", sandboxOptions });
       expect(prepared.plan.sandbox.policy?.allowRead).toEqual(visible ? [loginFile] : []);
       expect(await runAnthropicSandbox(prepared, store.home, sandboxOptions)).toBe(0);
     }

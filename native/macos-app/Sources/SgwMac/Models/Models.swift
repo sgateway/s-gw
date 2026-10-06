@@ -426,6 +426,7 @@ struct CommandAction: Decodable, Hashable {
   var workingDir: String?
   var timeoutMs: Int
   var ssh: SshSessionSpec?
+  var owned: Bool? = nil
   var http: HttpRequestSpec? = nil
 }
 

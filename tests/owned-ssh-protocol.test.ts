@@ -151,3 +151,23 @@ it.skipIf(process.platform === "win32")("rejects a wrong real SSH host key befor
     expect(f.authentications()).toBe(1);
   } finally { await f.close(); }
 });
+
+it("binds owned SSH grants and persistent allow policies to the exact command", async () => {
+  root = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-owned-scope-")));
+  process.env.SGW_HOME = path.join(root, "store"); process.env.SGW_MASTER_PASSPHRASE = randomUUID();
+  process.env.SGW_DISABLE_PROCESS_AGENT_DETECTION = "1";
+  const store = new SecretStore();
+  const handle = await store.addSecret({ name: "scope fixture", type: "password", value: randomUUID(), policy: { allowedCommands: ["s-gw:ssh-session"] } });
+  const action = buildSshSessionAction({ target: "fixture@example.test", args: ["hostname"] });
+  action.owned = true;
+  const request = await store.createRequest(handle.handle, action, "Codex owned scope");
+  await store.approveRequest(request.id, { mode: "timed-session", durationMs: 60000, agentScope: "same-agent" });
+  expect((await store.createRequest(handle.handle, action, "Codex same scope")).state).toBe("approved");
+  const changed = await store.createRequest(handle.handle, { ...action, args: ["uptime"] }, "Codex changed scope");
+  expect(changed.state).toBe("pending");
+  await store.approveRequestWithScopedPolicy(changed.id);
+  const fresh = new SecretStore();
+  expect((await fresh.createRequest(handle.handle, changed.action, "Codex same permanent scope")).state).toBe("approved");
+  expect((await fresh.createRequest(handle.handle, { ...changed.action, args: ["id"] }, "Codex changed permanent command")).state).toBe("pending");
+  expect((await fresh.createRequest(handle.handle, { ...changed.action, timeoutMs: action.timeoutMs + 1000 }, "Codex changed timeout")).state).toBe("pending");
+});

@@ -3069,6 +3069,9 @@ function ApprovalSheet({
                 ["Policy", "User approval required"]
               ]}
             />
+            {request.action.owned && request.action.ssh ? (
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded border p-2">{JSON.stringify(request.action.args, null, 2)}</pre>
+            ) : null}
             {request.action.ssh?.transfer ? (
               <div className="space-y-2 text-sm break-all">
                 <div>Upload source: {request.action.ssh.transfer.sourcePath}</div>

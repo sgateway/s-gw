@@ -183,6 +183,7 @@ pub struct CommandAction {
     pub inject_env: String,
     pub working_dir: Option<String>,
     pub ssh: Option<SshSession>,
+    pub owned: bool,
     pub http: Option<serde_json::Value>,
     pub timeout_ms: Option<u64>,
 }
@@ -191,6 +192,7 @@ pub struct CommandAction {
 #[serde(default)]
 pub struct SshSession {
     pub target: String,
+    pub port: Option<u16>,
     pub transfer: Option<serde_json::Value>,
 }
 

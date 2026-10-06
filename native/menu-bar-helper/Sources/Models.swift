@@ -42,6 +42,7 @@ struct CommandAction: Decodable, Hashable, Sendable {
   let args: [String]
   let injectEnv: String
   let ssh: SshSessionSpec?
+  var owned: Bool? = nil
   var http: HttpRequestSpec? = nil
   var timeoutMs: Int? = nil
 }

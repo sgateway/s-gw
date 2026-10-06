@@ -45,7 +45,9 @@ export async function startSandboxBroker(cwd: string, home: string, denyRead: st
       delete env.SGW_SANDBOX_PROXY_URL;
       delete env.SGW_SANDBOX_MCP_CONFIG;
       const entry = ownedModuleCommand("mcp-server");
-      const child = spawnIsolated(entry.command, entry.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+      let child: ReturnType<typeof spawnIsolated>;
+      try { child = spawnIsolated(entry.command, entry.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] }); }
+      catch { socket.destroy(); return; }
       children.add(child);
       child.once("error", () => socket.destroy());
       child.stdin?.on("error", () => socket.destroy());

@@ -49,7 +49,11 @@ async function jsonFile(name) {
   catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
 async function api(route, body, method) {
-  const response = await fetch(new URL(route, consoleServer.url), {
+  const target = new URL(consoleServer.url);
+  assert.equal(target.hostname, '127.0.0.1');
+  assert.match(route, /^api\/[a-zA-Z0-9_/-]+$/);
+  target.pathname = '/' + route;
+  const response = await fetch(target, {
     method: method || (body === undefined ? 'GET' : 'POST'),
     headers: { 'Content-Type': 'application/json', 'X-SGW-Console-Token': consoleServer.token },
     body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10000)
@@ -202,10 +206,17 @@ try {
     const completion = new Promise((resolve, reject) => {
       child.once('error', reject); child.once('close', code => { children.delete(child); resolve({ code, output }); });
     });
-    return { child, completion };
+    return { child, completion, output: () => output };
   }
   const first = launch();
-  const pending = await waitFor(() => jsonFile('pending.json'), 'MCP requests');
+  const pending = await Promise.race([
+    waitFor(() => jsonFile('pending.json'), 'MCP requests').catch(error => {
+      let output = first.output();
+      for (const value of values) output = output.replaceAll(value, '[synthetic credential]');
+      throw new Error(error.message + '\nSandbox output:\n' + output);
+    }),
+    first.completion.then(result => { throw new Error('Sandbox exited before requests: ' + result.code + '\n' + result.output); })
+  ]);
   assert.equal(httpHits, 0); assert.equal(sshAuthentications, 0);
   const state = await api('api/state'); assert.equal(state.pendingRequests.length, 3);
   await api(`api/requests/${pending.changed}/deny`, {});

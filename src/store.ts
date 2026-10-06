@@ -3887,7 +3887,7 @@ function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddAppro
       workingDirs: action.workingDir ? [action.workingDir] : [],
       sshTargets: action.ssh?.target ? [action.ssh.target] : [],
       sshPorts: action.ssh?.port ? [action.ssh.port] : [],
-      ...(action.kind === "http_request" ? { actionKeys: [approvalActionKey(request.handle, action)] } : {})
+      ...(action.kind === "http_request" || action.owned ? { actionKeys: [approvalActionKey(request.handle, action)] } : {})
     }
   };
 }

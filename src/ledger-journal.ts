@@ -80,15 +80,11 @@ async function activeSegment(home: string): Promise<string> {
 }
 
 async function endsWithNewline(filePath: string): Promise<boolean> {
-  const info = await stat(filePath).catch(() => undefined);
-  if (!info || info.size === 0) {
-    return true;
-  }
   const handle = await open(filePath, "r").catch(() => undefined);
-  if (!handle) {
-    return true;
-  }
+  if (!handle) return true;
   try {
+    const info = await handle.stat();
+    if (info.size === 0) return true;
     const buffer = Buffer.alloc(1);
     await handle.read(buffer, 0, 1, info.size - 1);
     return buffer[0] === 0x0a;

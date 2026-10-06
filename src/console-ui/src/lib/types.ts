@@ -109,6 +109,7 @@ export interface RequestRecord {
   agentName?: string;
   action: {
     kind: "env_command" | "ssh_session" | "http_request" | string;
+    owned?: boolean;
     http?: { url: string; method: string; headers: Record<string, string>; body?: string; auth: { kind: string; username?: string; name?: string } };
     command: string;
     resolvedCommand?: string;

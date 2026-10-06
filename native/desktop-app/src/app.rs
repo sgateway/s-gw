@@ -1750,6 +1750,30 @@ fn request_card(
                 .small()
                 .color(MUTED),
         );
+        if request.action.owned {
+            ui.collapsing("Owned SSH command", |ui| {
+                ui.label(format!(
+                    "Target: {}:{}",
+                    request
+                        .action
+                        .ssh
+                        .as_ref()
+                        .map(|ssh| ssh.target.as_str())
+                        .unwrap_or(""),
+                    request
+                        .action
+                        .ssh
+                        .as_ref()
+                        .and_then(|ssh| ssh.port)
+                        .unwrap_or(22)
+                ));
+                ui.label(serde_json::to_string_pretty(&request.action.args).unwrap_or_default());
+                ui.label(format!(
+                    "Timeout: {} ms",
+                    request.action.timeout_ms.unwrap_or(30000)
+                ));
+            });
+        }
         if let Some(operation) = request.action.http.as_ref().or_else(|| {
             request
                 .action
