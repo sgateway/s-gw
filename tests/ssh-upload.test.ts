@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { hashUpload, openApprovedUpload, prepareUpload, uploadCommand } from "../src/ssh-upload.js";
+import { approvedPipeStream, hashUpload, openApprovedUpload, prepareUpload, uploadCommand } from "../src/ssh-upload.js";
 let root = "";
 const saved = process.env.SGW_SANDBOX_DENY_READ;
 beforeEach(async () => { root = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-upload-"))); delete process.env.SGW_SANDBOX_DENY_READ; });
@@ -28,7 +28,7 @@ it("approves and snapshots files without imposing an upload size limit", async (
   await expect(openApprovedUpload(transfer, home)).rejects.toThrow("changed after approval");
 });
 
-it("denies credential paths, explicit parents, root, globs, and symbolic links", async () => {
+it("denies credential paths, explicit parents, root, globs, and credential symbolic links", async () => {
   const home = path.join(root, "store"); await mkdir(home);
   const source = path.join(root, "payload"); await writeFile(source, "public input");
   const sensitive = path.join(home, "credential"); await writeFile(sensitive, "synthetic credential");
@@ -40,7 +40,13 @@ it("denies credential paths, explicit parents, root, globs, and symbolic links",
   delete process.env.SGW_SANDBOX_DENY_READ;
   if (process.platform !== "win32") {
     const alias = path.join(root, "alias"); await symlink(source, alias);
-    await expect(prepareUpload(alias, "/tmp/output", home)).rejects.toThrow("regular file");
+    expect((await prepareUpload(alias, "/tmp/output", home)).sourcePath).toBe(source);
+    const directoryAlias = path.join(root, "directory-alias"); await symlink(root, directoryAlias);
+    process.env.SGW_SANDBOX_DENY_READ = JSON.stringify([path.join(directoryAlias, "pay*")]);
+    await expect(prepareUpload(source, "/tmp/output", home)).rejects.toThrow("denied");
+    delete process.env.SGW_SANDBOX_DENY_READ;
+    const credentialAlias = path.join(root, "credential-alias"); await symlink(sensitive, credentialAlias);
+    await expect(prepareUpload(credentialAlias, "/tmp/output", home)).rejects.toThrow("denied");
   }
 });
 
@@ -57,4 +63,15 @@ it.skipIf(process.platform === "win32")("preserves named pipe uploads and quotes
   execFileSync("sh", ["-c", uploadCommand(destination)], { cwd: root, input: "exact bytes" });
   expect(await readFile(destination, "utf8")).toBe("exact bytes");
   expect(await readdir(root)).not.toContain("injected");
+});
+
+it.skipIf(process.platform === "win32")("rejects a named pipe replaced by a regular file before its descriptor opens", async () => {
+  const source = path.join(root, "replaced.pipe"), home = path.join(root, "store");
+  execFileSync("mkfifo", [source]);
+  await prepareUpload(source, "/tmp/output", home);
+  const stream = approvedPipeStream(source);
+  rmSync(source); writeFileSync(source, "must not upload");
+  try {
+    await expect((async () => { for await (const _chunk of stream) {} })()).rejects.toThrow("named pipe changed");
+  } finally { stream.destroy(); }
 });
