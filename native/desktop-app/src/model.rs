@@ -127,6 +127,13 @@ impl RequestRecord {
     }
 
     pub fn action_label(&self) -> String {
+        if let Some(http) = &self.action.http {
+            return format!(
+                "{} {}",
+                http["method"].as_str().unwrap_or("HTTPS"),
+                http["url"].as_str().unwrap_or("")
+            );
+        }
         if self.action.kind == "ssh_session" {
             let host = self
                 .action
@@ -176,12 +183,15 @@ pub struct CommandAction {
     pub inject_env: String,
     pub working_dir: Option<String>,
     pub ssh: Option<SshSession>,
+    pub http: Option<serde_json::Value>,
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct SshSession {
     pub target: String,
+    pub transfer: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

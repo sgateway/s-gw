@@ -68,7 +68,8 @@ describe("Windows and Linux desktop app", () => {
     expect(cargoRaw).toContain('open = "=5.4.1"');
     expect(cargoRaw).not.toMatch(/\btauri\b/iu);
     expect(cargoRaw).not.toMatch(/\bwry\b/iu);
-    expect(packageInfo.devDependencies["@crabnebula/packager"]).toBe("0.11.2");
+    expect(packageInfo.devDependencies["@s-gw/desktop-packager"]).toBe("file:tools/desktop-packager");
+    expect(packageInfo.devDependencies["@crabnebula/packager"]).toBeUndefined();
     expect(packageInfo.devDependencies["@tauri-apps/cli"]).toBeUndefined();
 
     expect(rustSource).toContain("eframe::run_native");

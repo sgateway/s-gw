@@ -248,6 +248,7 @@ Read the [threat model](docs/threat-model.md) before relying on s-gw for sensiti
 
 - [Documentation index](docs/README.md)
 - [Quick start and trust-loop demo](docs/quickstart.md)
+- [Anthropic sandbox and owned connections](docs/anthropic-sandbox.md)
 - [Architecture](docs/architecture.md)
 - [Threat model](docs/threat-model.md)
 - [Agent integrations](docs/integrations.md)

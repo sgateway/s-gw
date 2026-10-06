@@ -1,6 +1,7 @@
 import type { ApprovalPolicyDecision, SecretSeverity } from "./types.js";
 
 export interface PolicyConditionsLike {
+  actionKeys?: string[];
   handles?: string[];
   envBindings?: Array<{ handle: string; injectEnv: string }>;
   secretTypes?: string[];
@@ -29,8 +30,9 @@ export interface PolicyRuleLike {
 
 const arrayFields: Array<keyof Pick<
   PolicyConditionsLike,
-  "handles" | "secretTypes" | "providers" | "agents" | "actionKinds" | "commands" | "resolvedCommands" | "injectEnvs" | "workingDirs" | "sshTargets" | "sshPorts"
+  "actionKeys" | "handles" | "secretTypes" | "providers" | "agents" | "actionKinds" | "commands" | "resolvedCommands" | "injectEnvs" | "workingDirs" | "sshTargets" | "sshPorts"
 >> = [
+  "actionKeys",
   "handles",
   "secretTypes",
   "providers",

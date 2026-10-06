@@ -22,3 +22,5 @@
 - [Third-party notices](ui/THIRD_PARTY_NOTICES.md): bundled code, artwork, and licenses.
 
 The native app and local console expose the same local store and CLI behavior. Documentation should describe supported behavior rather than a specific UI layout unless the distinction matters.
+
+- [Anthropic sandbox and owned connections](anthropic-sandbox.md)

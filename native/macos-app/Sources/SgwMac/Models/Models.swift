@@ -383,9 +383,38 @@ struct HandleSummary: Decodable, Identifiable, Hashable {
   var providerLabel: String { (provider?.isEmpty == false ? provider! : type).uppercased() }
 }
 
+struct SshTransferSpec: Decodable, Hashable, Sendable {
+  let sourcePath: String
+  let destinationPath: String
+  let sha256: String?
+  var approvalDetails: String {
+    "Source: \(sourcePath)\nDestination: \(destinationPath)\nSHA-256: \(sha256 ?? "Named pipe: content supplied while executing")"
+  }
+}
+
 struct SshSessionSpec: Decodable, Hashable {
   var target: String
   var port: Int?
+  var transfer: SshTransferSpec? = nil
+}
+
+struct HttpAuthSpec: Decodable, Hashable, Sendable {
+  let kind: String
+  let name: String?
+  let username: String?
+}
+
+struct HttpRequestSpec: Decodable, Hashable, Sendable {
+  let url: String
+  let method: String
+  let headers: [String: String]
+  let body: String?
+  let auth: HttpAuthSpec
+
+  var approvalDetails: String {
+    let headerLines = headers.keys.sorted().map { "\($0): \(headers[$0]!)" }.joined(separator: "\n")
+    return "\(method) \(url)\nAuthentication: \(auth.kind) \(auth.name ?? auth.username ?? "")\nHeaders:\n\(headerLines)\nBody:\n\(body ?? "(none)")"
+  }
 }
 
 struct CommandAction: Decodable, Hashable {
@@ -397,6 +426,7 @@ struct CommandAction: Decodable, Hashable {
   var workingDir: String?
   var timeoutMs: Int
   var ssh: SshSessionSpec?
+  var http: HttpRequestSpec? = nil
 }
 
 struct RequestRecord: Decodable, Identifiable, Hashable {

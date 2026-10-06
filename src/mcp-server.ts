@@ -8,7 +8,15 @@ import { SecretStore } from "./store.js";
 import { defaultSshInjectEnv } from "./ssh.js";
 import { CURRENT_VERSION } from "./version.js";
 
+import { prepareUpload } from "./ssh-upload.js";
+import { buildHttpRequestAction } from "./http-action.js";
+import { runSandboxMcpBridge } from "./sandbox-broker.js";
+
+if (process.env.SGW_SANDBOX_BROKER_PORT) {
+  await runSandboxMcpBridge();
+} else {
 const store = new SecretStore();
+const operationsOnly = process.env.SGW_SANDBOX_OPERATIONS_ONLY === "1";
 const server = new McpServer({
   name: "s-gw",
   version: CURRENT_VERSION
@@ -18,6 +26,7 @@ function mcpAgentContext() {
   return { mcpClientName: server.server.getClientVersion()?.name };
 }
 
+if (!operationsOnly) {
 server.registerTool(
   "sgw_scan_file",
   {
@@ -30,7 +39,10 @@ server.registerTool(
   },
   async ({ path, persist }) => asText(await scanLocalFile(store, path, { persist: persist ?? true }))
 );
+}
 
+
+if (!operationsOnly) {
 server.registerTool(
   "sgw_scan_text",
   {
@@ -44,6 +56,8 @@ server.registerTool(
   },
   async ({ text, persist, source }) => asText(await scanLocalText(store, text, { persist: persist === true, source }))
 );
+}
+
 
 server.registerTool(
   "sgw_list_handles",
@@ -67,6 +81,7 @@ server.registerTool(
   async ({ handle }) => asText(await store.getHandle(handle) ?? { error: "unknown_handle", handle })
 );
 
+if (!operationsOnly) {
 server.registerTool(
   "sgw_request_execution",
   {
@@ -101,7 +116,10 @@ server.registerTool(
     });
   }
 );
+}
 
+
+if (!operationsOnly) {
 server.registerTool(
   "sgw_run_execution",
   {
@@ -143,6 +161,8 @@ server.registerTool(
     });
   }
 );
+}
+
 
 server.registerTool(
   "sgw_request_ssh_session",
@@ -170,6 +190,7 @@ server.registerTool(
       workingDir,
       timeoutMs
     });
+    if (operationsOnly) action.owned = true;
     const request = await store.createRequest(
       handle,
       action,
@@ -185,6 +206,48 @@ server.registerTool(
 );
 
 server.registerTool(
+  "sgw_request_ssh_transfer",
+  {
+    title: "Request s-gw-Owned SSH Upload",
+    description: "Request an SSH upload from the agent workspace. Approval binds the source contents and remote destination.",
+    inputSchema: { handle: z.string(), target: z.string(), port: z.number().int().positive().optional(),
+      sourcePath: z.string(), destinationPath: z.string(), timeoutMs: z.number().int().positive().optional(), reason: z.string().optional() }
+  },
+  async ({ handle, target, port, sourcePath, destinationPath, timeoutMs, reason }) => {
+    const transfer = await prepareUpload(sourcePath, destinationPath, store.home);
+    const secret = await store.getSecretRecord(handle);
+    const action = buildSshSessionAction({ target, port, timeoutMs, injectEnv: defaultSshInjectEnv(secret) });
+    action.owned = true;
+    action.ssh!.transfer = transfer;
+    const request = await store.createRequest(handle, action, reason || "Agent requested an SSH upload.", mcpAgentContext());
+    return asText({ approvalRequired: request.state !== "approved", request });
+  }
+);
+
+server.registerTool(
+  "sgw_request_http",
+  {
+    title: "Request s-gw-Owned HTTPS Operation",
+    description: "Request an approved HTTPS operation executed by s-gw. Credentials remain outside the agent.",
+    inputSchema: {
+      handle: z.string().min(1), url: z.string().url(),
+      method: z.enum(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
+      headers: z.record(z.string(), z.string()).optional(), body: z.string().optional(),
+      auth: z.discriminatedUnion("kind", [z.object({ kind: z.literal("bearer") }),
+        z.object({ kind: z.literal("header"), name: z.string() }),
+        z.object({ kind: z.literal("basic"), username: z.string() })]),
+      timeoutMs: z.number().int().positive().optional(), reason: z.string().optional()
+    }
+  },
+  async ({ handle, url, method, headers, body, auth, timeoutMs, reason }) => {
+    const secret = await store.getSecretRecord(handle);
+    const action = buildHttpRequestAction({ url, method, headers: headers || {}, body, auth }, timeoutMs, secret.policy.injectEnv);
+    const request = await store.createRequest(handle, action, reason || "Agent requested an owned HTTPS operation.", mcpAgentContext());
+    return asText({ approvalRequired: request.state !== "approved", request });
+  }
+);
+
+server.registerTool(
   "sgw_execute_request",
   {
     title: "Execute Approved Request",
@@ -193,7 +256,7 @@ server.registerTool(
       requestId: z.string().min(1)
     }
   },
-  async ({ requestId }) => asText(await executeApprovedRequest(store, requestId))
+  async ({ requestId }) => asText(await executeApprovedRequest(store, requestId, { operationsOnly }))
 );
 
 function asText(value: unknown) {
@@ -208,3 +271,5 @@ function asText(value: unknown) {
 }
 
 await server.connect(new StdioServerTransport());
+
+}

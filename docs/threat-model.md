@@ -102,3 +102,13 @@ Output sanitization is a last line of defense, not a data-loss-prevention guaran
 ## Reporting
 
 Report suspected boundary failures through the private process in [SECURITY.md](../SECURITY.md). Do not test with credentials or systems you do not own or have permission to use.
+
+## Opt-in Anthropic mode
+
+The agent process is confined by Anthropic sandbox-runtime. Its MCP client reaches an authenticated loopback broker that owns approved SSH and HTTPS operations outside confinement. Credentials are resolved only by s-gw. HTTPS uses destination TLS directly; no interception certificate or TLS credential replacement is added.
+
+Approvals for owned operations bind their complete operation scope. The executor rechecks active authorization and monitors revocation. Regular SSH uploads use a digest-verified copy in the denied store directory before connecting. Named pipe approvals bind the path and destination; the producer controls the streamed content. Explicit read denies are also applied to the upload broker. Ordinary execution and SSH session semantics are unchanged.
+
+Saved agent login credentials remain readable by default so existing logins work. Operators can deny known authentication paths explicitly or use `--deny-agent-auth`. The macOS `--allow-agent-keychain` exception exposes the encrypted login database, including other applications' encrypted entries, while leaving native item authorization in place. It is opt-in and explicit denies override it. This is a separate trust boundary from service credentials held by s-gw.
+
+The pinned backend supports macOS and Linux. Native Windows Anthropic confinement is unavailable; existing Windows features remain supported. Linux requires delegated cgroup v2 for process-tree cleanup and fails before launching without it. Tests can explicitly exercise a fallback without cgroups; that fallback is not a production readiness claim.

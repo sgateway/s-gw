@@ -1,3 +1,4 @@
+import { runOwnedHttpRequest, type OwnedHttpOptions } from "./http-executor.js";
 import { createHash } from "node:crypto";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -16,6 +17,8 @@ import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 export interface ExecutionOptions {
   engine?: "auto" | "rust" | "typescript";
   coreBinary?: string;
+  http?: OwnedHttpOptions;
+  operationsOnly?: boolean;
 }
 
 export async function executeApprovedRequest(
@@ -23,6 +26,10 @@ export async function executeApprovedRequest(
   requestId: string,
   options: ExecutionOptions = {}
 ): Promise<ExecutionSummary> {
+  if (options.operationsOnly) {
+    const pending = await store.getRequest(requestId);
+    if (!["http_request", "ssh_session"].includes(pending.action.kind)) throw new Error("Sandbox execution supports owned SSH and HTTPS operations only.");
+  }
   const request = await store.claimApprovedRequest(requestId);
   try {
     const summary = await executeRequest(store, request, options);
@@ -101,8 +108,12 @@ async function executeRequest(
   const secretValue = await store.revealSecretForLocalUse(request.handle, request, {
     cache: executionOptions.cacheOnePassword !== false
   });
+  if (request.action.kind === "http_request") {
+    return runOwnedHttpRequest(store, request, secretRecord, secretValue, options.http);
+  }
   if (request.action.kind === "ssh_session") {
-    return runOwnedSshSession(request, secretRecord, secretValue, store.home);
+    if (options.operationsOnly) await store.assertOwnedRequestAuthorized(request.id);
+    return runOwnedSshSession(request, secretRecord, secretValue, store.home, options.operationsOnly || request.action.owned ? () => store.assertOwnedRequestAuthorized(request.id) : undefined);
   }
   const extraSecrets = await resolveExtraSecrets(store, request, executionOptions);
   return runEnvCommand(request, command!, secretRecord, secretValue, extraSecrets, options);

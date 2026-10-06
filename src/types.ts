@@ -15,7 +15,7 @@ export type RequestApprovalSource = "manual" | "grant" | "policy";
 export type ApprovalMode = "per-transaction" | "timed-session" | "login-session" | "always";
 export type ApprovalAgentScope = "same-agent" | "any-agent";
 export type ApprovalPolicyDecision = "ask" | "allow" | "deny";
-export type ApprovalPolicyActionKind = "env_command" | "ssh_session";
+export type ApprovalPolicyActionKind = "env_command" | "ssh_session" | "http_request";
 export type AgentIdentitySource = "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
 
 export interface ApprovalSettings {
@@ -51,6 +51,7 @@ export interface ApprovalPolicyConditions {
   workingDirs?: string[];
   sshTargets?: string[];
   sshPorts?: number[];
+  actionKeys?: string[];
 }
 
 export interface ApprovalPolicyRule {
@@ -77,6 +78,7 @@ export interface EncryptedBox {
 export interface SecretPolicy {
   injectEnv?: string;
   allowedCommands: string[];
+  allowedDestinations?: string[];
   maxOutputBytes: number;
 }
 
@@ -131,6 +133,14 @@ export interface HandleSummary {
 export interface SshSessionSpec {
   target: string;
   port: number;
+  transfer?: SshTransferSpec;
+}
+
+export interface SshTransferSpec {
+  direction: "upload";
+  sourcePath: string;
+  destinationPath: string;
+  sha256?: string;
 }
 
 export interface CommandEnvBinding {
@@ -139,7 +149,7 @@ export interface CommandEnvBinding {
 }
 
 export interface CommandAction {
-  kind: "env_command" | "ssh_session";
+  kind: ApprovalPolicyActionKind;
   command: string;
   resolvedCommand?: string;
   args: string[];
@@ -148,6 +158,16 @@ export interface CommandAction {
   workingDir?: string;
   timeoutMs: number;
   ssh?: SshSessionSpec;
+  http?: HttpRequestSpec;
+  owned?: boolean;
+}
+
+export interface HttpRequestSpec {
+  url: string;
+  method: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
+  headers: Record<string, string>;
+  body?: string;
+  auth: { kind: "bearer" } | { kind: "header"; name: string } | { kind: "basic"; username: string };
 }
 
 export interface ExecutionSummary {

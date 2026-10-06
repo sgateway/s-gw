@@ -1713,6 +1713,7 @@ function PolicyDetailPanel({
           ["Executables", policyAllowsAnyEnvCommand(conditions) ? "Any executable permitted by the credential" : policyDetailValue(conditions.resolvedCommands)],
           ["Scope", policyDetailValue([...(conditions.providers || []), ...(conditions.secretTypes || []), conditions.minSeverity ? `${conditions.minSeverity} and above` : ""])],
           ["Environment", policyDetailValue([...(conditions.injectEnvs || []), ...(conditions.workingDirs || [])])],
+          ["Exact operation keys", policyDetailValue(conditions.actionKeys)],
           ["SSH", policyDetailValue([...(conditions.sshTargets || []), ...(conditions.sshPorts || []).map(String)])],
           ["Expires", rule.expiresAt ? new Date(rule.expiresAt).toLocaleString() : "Never"],
           ["Updated", relativeTime(rule.updatedAt)]
@@ -3068,6 +3069,24 @@ function ApprovalSheet({
                 ["Policy", "User approval required"]
               ]}
             />
+            {request.action.ssh?.transfer ? (
+              <div className="space-y-2 text-sm break-all">
+                <div>Upload source: {request.action.ssh.transfer.sourcePath}</div>
+                <div>Destination: {request.action.ssh.transfer.destinationPath}</div>
+                <div>SHA-256: {request.action.ssh.transfer.sha256 ?? "Named pipe: content supplied while executing"}</div>
+                <div>Timeout: {request.action.timeoutMs} ms</div>
+              </div>
+            ) : null}
+            {request.action.http ? (
+              <div className="space-y-2 text-sm">
+                <div>Authentication: {request.action.http.auth.kind}{request.action.http.auth.username ? ` (${request.action.http.auth.username})` : ""}{request.action.http.auth.name ? ` (${request.action.http.auth.name})` : ""}</div>
+                <div>Timeout: {request.action.timeoutMs} ms</div>
+                <div>Approved headers</div>
+                <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded border p-2">{JSON.stringify(request.action.http.headers, null, 2)}</pre>
+                <div>Approved body</div>
+                <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded border p-2">{request.action.http.body ?? "(none)"}</pre>
+              </div>
+            ) : null}
             <Textarea placeholder="Optional note for this decision..." />
           </div>
         ) : null}
@@ -3279,7 +3298,8 @@ const policySecretTypeOptions: MultiSelectOption[] = [
 
 const policyActionKindOptions: MultiSelectOption[] = [
   { value: "env_command", label: "Command" },
-  { value: "ssh_session", label: "SSH session" }
+  { value: "ssh_session", label: "SSH session" },
+  { value: "http_request", label: "HTTPS operation" }
 ];
 
 type PolicyOptionSources = {

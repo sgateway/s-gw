@@ -22,6 +22,8 @@ import {
   scanTextToOnePassword,
   type LocalSecretBackend
 } from "./gateway.js";
+import { anthropicSandboxReadiness } from "./anthropic-sandbox.js";
+import type { GuardRunOptions } from "./guard.js";
 import { guardStatus, prepareGuardedRun, runGuardedAgent } from "./guard.js";
 import {
   assertMacRuntimeForManagedSurfaces,
@@ -326,6 +328,7 @@ async function main(): Promise<void> {
       policy: {
         injectEnv: getFlag(parsed.flags, "inject-env"),
         allowedCommands: getFlagList(parsed.flags, "allow-command"),
+        allowedDestinations: getFlagList(parsed.flags, "allow-destination"),
         maxOutputBytes: numericFlag(parsed.flags, "max-output-bytes", 16_384)
       }
     });
@@ -350,6 +353,7 @@ async function main(): Promise<void> {
       policy: {
         injectEnv: getFlag(parsed.flags, "inject-env"),
         allowedCommands: getFlagList(parsed.flags, "allow-command"),
+        allowedDestinations: getFlagList(parsed.flags, "allow-destination"),
         maxOutputBytes: numericFlag(parsed.flags, "max-output-bytes", 16_384)
       }
     });
@@ -378,6 +382,7 @@ async function main(): Promise<void> {
       policy: {
         injectEnv: getFlag(parsed.flags, "inject-env"),
         allowedCommands: getFlagList(parsed.flags, "allow-command"),
+        allowedDestinations: getFlagList(parsed.flags, "allow-destination"),
         maxOutputBytes: numericFlag(parsed.flags, "max-output-bytes", 16_384)
       }
     });
@@ -411,6 +416,14 @@ async function main(): Promise<void> {
   if (first === "secret" && (second === "delete" || second === "remove")) {
     const handle = third || requireFlag(parsed.flags, "handle");
     printJson(await store.deleteSecret(handle));
+    return;
+  }
+
+  if (first === "secret" && second === "allow-destination") {
+    if (!third) throw new Error("Secret handle is required.");
+    const destination = getFlag(parsed.flags, "destination");
+    if (!destination) throw new Error("Exact HTTPS destination host[:port] is required.");
+    printJson(await store.allowDestination(third, destination));
     return;
   }
 
@@ -662,6 +675,11 @@ const valueFlags = new Set([
   "access-handle",
   "agent",
   "allow-command",
+  "allow-host",
+  "allow-write",
+  "deny-read",
+  "allow-destination",
+  "destination",
   "action-kind",
   "approved-ttl-ms",
   "arg",
@@ -2377,6 +2395,11 @@ async function handleGuardCommand(
     return;
   }
 
+  if (action === "doctor") {
+    printJson(anthropicSandboxReadiness());
+    return;
+  }
+
   if (action === "run") {
     await handleGuardRun(store, agent || getFlag(flags, "agent"), flags);
     return;
@@ -2394,14 +2417,23 @@ async function handleGuardRun(
     throw new Error("guard run requires an agent name.");
   }
 
-  const options = {
+  const options: GuardRunOptions = {
     agent,
     command: getFlag(flags, "command"),
     args: getFlagList(flags, "--"),
     cwd: getFlag(flags, "cwd") || process.cwd(),
     extraEnv: parseEnvFlags(getFlagList(flags, "env")),
     scrubEnv: !hasFlag(flags, "no-scrub-env"),
-    allowedCommands: getFlagList(flags, "allow-command")
+    allowedCommands: getFlagList(flags, "allow-command"),
+    sandbox: (getFlag(flags, "sandbox") || "builtin") as GuardRunOptions["sandbox"],
+    sandboxOptions: {
+      allowHosts: getFlagList(flags, "allow-host"),
+      allowWrite: getFlagList(flags, "allow-write"),
+      denyRead: getFlagList(flags, "deny-read"),
+      strictEgress: hasFlag(flags, "strict-egress"),
+      denyAgentAuth: hasFlag(flags, "deny-agent-auth"),
+      allowAgentKeychain: hasFlag(flags, "allow-agent-keychain")
+    }
   };
 
   if (hasFlag(flags, "dry-run")) {
@@ -2541,8 +2573,9 @@ Commands:
   s-gw app open [--port 8718] [--console-url URL] [--browser]
   s-gw app refresh-services [--no-agents]
   s-gw app refresh-agents [--lock-timeout-ms 35000]
+  s-gw guard doctor
   s-gw guard status
-  s-gw guard run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--deny-agent-auth] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
   s-gw service install [--port 8718] [--start] [--menubar]
@@ -2562,6 +2595,7 @@ Commands:
   s-gw secret list
   s-gw secret delete HANDLE
   s-gw secret allow-command HANDLE [--command s-gw:ssh-session]
+  s-gw secret allow-destination HANDLE --destination HOST[:PORT]
   s-gw secret set-inject-env HANDLE --inject-env ENV
   s-gw onepassword status
   s-gw onepassword import [--vault Dev] [--dry-run] [--include-companions] [--allow-command CMD]
@@ -2575,7 +2609,7 @@ Commands:
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m]
   s-gw approval grants
   s-gw approval policy list
-  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session] [--duration 8h]
+  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session|http_request] [--duration 8h]
   s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--clear-expiry]
   s-gw approval policy arrange
   s-gw approval policy delete --id POLICY_ID

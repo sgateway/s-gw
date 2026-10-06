@@ -1,12 +1,16 @@
+import { sanitizeCapturedOutput, captureHeadroomBytes } from "./output-redaction.js";
+import { spawnIsolated, killProcessTree } from "./process-tree.js";
+import { createReadStream, type ReadStream } from "node:fs";
+import { openApprovedUpload, uploadCommand } from "./ssh-upload.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, chmod, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, realpath, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { getSgwHome } from "./paths.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
-import type { CommandAction, ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
+import type { CommandAction, ExecutionSummary, RequestRecord, SecretRecord, SshTransferSpec } from "./types.js";
 import {
   createPrivateWindowsSshDirectory,
   trustedWindowsSystemExecutable,
@@ -79,6 +83,15 @@ export function normalizeSshPort(port?: number): number {
   return value;
 }
 
+export function normalizeSshTransfer(transfer?: SshTransferSpec): SshTransferSpec | undefined {
+  if (!transfer) return;
+  if (transfer.direction !== "upload" || !path.isAbsolute(transfer.sourcePath) ||
+      !transfer.destinationPath || /[\x00\r\n]/.test(transfer.destinationPath) ||
+      (transfer.sha256 !== undefined && !/^[a-f0-9]{64}$/.test(transfer.sha256))) throw new Error("Invalid approved SSH upload.");
+  return { direction: "upload", sourcePath: transfer.sourcePath,
+    destinationPath: transfer.destinationPath, sha256: transfer.sha256 };
+}
+
 export function sshSessionIdentity(action: CommandAction): string {
   const target = action.ssh?.target ? normalizeSshTarget(action.ssh.target) : "";
   const port = normalizeSshPort(action.ssh?.port);
@@ -89,7 +102,8 @@ export async function runOwnedSshSession(
   request: RequestRecord,
   secretRecord: SecretRecord,
   secretValue: string,
-  home = getSgwHome()
+  home = getSgwHome(),
+  assertAuthorized?: () => Promise<void>
 ): Promise<ExecutionSummary> {
   if (request.action.kind !== "ssh_session") {
     throw new Error("runOwnedSshSession requires an ssh_session action.");
@@ -101,15 +115,35 @@ export async function runOwnedSshSession(
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
   const captureCap = maxOutput + Math.max(secretValue.length, 0);
   let auth: PreparedSshAuth | undefined;
+  let upload: Awaited<ReturnType<typeof openApprovedUpload>> | undefined;
 
   try {
     assertSshCredentialSupported(secretRecord);
-    if (process.platform === "win32") {
-      auth = await prepareSshAuth(secretRecord, secretValue);
-      return await runWindowsSshCommand(request, sshPath, target, port, auth, secretValue, maxOutput, captureCap);
-    }
-
     auth = await prepareSshAuth(secretRecord, secretValue);
+    if (assertAuthorized) {
+      await assertAuthorized();
+      const transfer = normalizeSshTransfer(request.action.ssh?.transfer);
+      if (transfer) upload = await openApprovedUpload(transfer, home);
+      await assertAuthorized();
+    }
+    if (process.platform === "win32") {
+      return await runWindowsSshCommand(request, sshPath, target, port, auth, secretValue, maxOutput, captureCap, assertAuthorized, upload?.stream);
+    }
+    if (assertAuthorized) {
+      await assertAuthorized();
+      const transfer = request.action.ssh?.transfer;
+      const remoteArgs = transfer ? [uploadCommand(transfer.destinationPath)] : (request.action.args.length ? request.action.args : ["true"]);
+      const result = await runProcess(sshPath, [
+        "-o", "ControlMaster=no", "-o", "ControlPath=none",
+        "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=no",
+        "-p", String(port), ...auth.args, target,
+        ...remoteArgs
+      ], { timeoutMs: request.action.timeoutMs, env: auth.env,
+        maxOutputBytes: maxOutput + captureHeadroomBytes([secretValue, Buffer.from(secretValue).toString("base64")]),
+        rejectOnNonZero: false, assertAuthorized, stdin: upload?.stream });
+      await assertAuthorized();
+      return sshSummary(request, result, secretValue, maxOutput);
+    }
     const socketPath = await controlSocketPath(home, request.handle, target, port);
     if (!(await controlMasterIsActive(sshPath, socketPath, target, port, request.action.timeoutMs, captureCap))) {
       await openControlMaster(
@@ -149,6 +183,8 @@ export async function runOwnedSshSession(
   } catch (error) {
     throw sanitizedSshError(error, request.handle, secretValue, maxOutput);
   } finally {
+    upload?.stream.destroy();
+    await upload?.cleanup();
     await auth?.cleanup();
   }
 }
@@ -193,9 +229,11 @@ async function runWindowsSshCommand(
   auth: PreparedSshAuth,
   secretValue: string,
   maxOutput: number,
-  captureCap: number
+  captureCap: number,
+  assertAuthorized?: () => Promise<void>,
+  stdin?: ReadStream
 ): Promise<ExecutionSummary> {
-  const remoteArgs = request.action.args.length > 0 ? request.action.args : ["true"];
+  const remoteArgs = request.action.ssh?.transfer ? [uploadCommand(request.action.ssh.transfer.destinationPath)] : request.action.args.length > 0 ? request.action.args : ["true"];
   const sshArgs = [
     "-T",
     "-F", "none",
@@ -220,6 +258,7 @@ async function runWindowsSshCommand(
     throw new Error("The Windows SSH private key has no pre-spawn validation.");
   }
   await auth.validateBeforeSpawn();
+  await assertAuthorized?.();
   const result = await runProcess(
     sshPath,
     sshArgs,
@@ -227,9 +266,10 @@ async function runWindowsSshCommand(
       timeoutMs: request.action.timeoutMs,
       env: auth.env,
       maxOutputBytes: captureCap,
-      rejectOnNonZero: false
+      rejectOnNonZero: false, assertAuthorized, stdin
     }
   );
+  await assertAuthorized?.();
   return sshSummary(request, result, secretValue, maxOutput);
 }
 
@@ -466,15 +506,35 @@ async function runProcess(
     env: NodeJS.ProcessEnv;
     maxOutputBytes: number;
     rejectOnNonZero?: boolean;
+    assertAuthorized?: () => Promise<void>;
+    stdin?: ReadStream;
   }
 ): Promise<ProcessResult> {
   const started = Date.now();
-  const child = spawn(command, args, {
+  const child = options.assertAuthorized
+    ? spawnIsolated(command, args, { env: options.env, stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"] })
+    : spawn(command, args, {
     env: options.env,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
+  if (!child.stdout || !child.stderr) { killProcessTree(child, "SIGKILL"); throw new Error("SSH capture pipes unavailable."); }
+  if (options.stdin) {
+    if (!child.stdin) { killProcessTree(child, "SIGKILL"); throw new Error("SSH input pipe unavailable."); }
+    child.stdin.on("error", () => {});
+    options.stdin.on("error", error => { child.stdin?.destroy(error); killProcessTree(child, "SIGKILL"); });
+    options.stdin.pipe(child.stdin);
+  }
+  let authorizationError: Error | undefined;
+  let checking = false;
+  const authorizationMonitor = options.assertAuthorized ? setInterval(async () => {
+    if (checking) return;
+    checking = true;
+    try { await options.assertAuthorized!(); }
+    catch (error) { authorizationError = error instanceof Error ? error : new Error("SSH authorization revoked."); killProcessTree(child, "SIGKILL"); }
+    finally { checking = false; }
+  }, 250) : undefined;
   let stdout = "";
   let stderr = "";
   let timedOut = false;
@@ -482,8 +542,8 @@ async function runProcess(
   const timeout = options.timeoutMs > 0
     ? setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), 1_500);
+      if (options.assertAuthorized) killProcessTree(child, "SIGTERM"); else child.kill("SIGTERM");
+      killTimer = setTimeout(() => { if (options.assertAuthorized) killProcessTree(child, "SIGKILL"); else child.kill("SIGKILL"); }, 1_500);
     }, options.timeoutMs)
     : undefined;
 
@@ -501,6 +561,8 @@ async function runProcess(
       child.on("close", (code, signal) => resolve({ code, signal }));
     });
   } finally {
+    options.stdin?.destroy();
+    if (authorizationMonitor) clearInterval(authorizationMonitor);
     if (timeout) {
       clearTimeout(timeout);
     }
@@ -509,6 +571,7 @@ async function runProcess(
     }
   }
 
+  if (authorizationError) throw authorizationError;
   const result = {
     exitCode: timedOut ? 124 : status.code,
     signal: status.signal,
@@ -546,9 +609,10 @@ function sshSummary(
   secretValue: string,
   maxOutput: number
 ): ExecutionSummary {
-  const known = [{ handle: request.handle, value: secretValue }];
-  const sanitizedStdout = sanitizeKnownSecrets(result.stdout, known);
-  const sanitizedStderr = sanitizeKnownSecrets(result.stderr, known);
+  const known = [{ handle: request.handle, value: secretValue },
+    { handle: request.handle, value: Buffer.from(secretValue).toString("base64") }];
+  const sanitizedStdout = sanitizeCapturedOutput(result.stdout, known, maxOutput, { rawTruncated: result.stdout.endsWith("<<SGW_OUTPUT_TRUNCATED>>") }).text;
+  const sanitizedStderr = sanitizeCapturedOutput(result.stderr, known, maxOutput, { rawTruncated: result.stderr.endsWith("<<SGW_OUTPUT_TRUNCATED>>") }).text;
   const cleanStdout = capBytes(sanitizedStdout, maxOutput);
   const cleanStderr = capBytes(sanitizedStderr, maxOutput);
   return {

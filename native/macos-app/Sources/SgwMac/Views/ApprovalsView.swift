@@ -34,6 +34,19 @@ struct ApprovalsView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(executable)
+              if let transfer = request.action.ssh?.transfer {
+                DisclosureGroup("SSH upload details") {
+                  Text(transfer.approvalDetails).font(.caption.monospaced()).textSelection(.enabled)
+                }
+              }
+              if let http = request.action.http {
+                DisclosureGroup("HTTPS operation details") {
+                  ScrollView {
+                    Text(http.approvalDetails + "\nTimeout: \(request.action.timeoutMs) ms")
+                      .font(.caption.monospaced()).textSelection(.enabled)
+                  }.frame(maxHeight: 180)
+                }
+              }
             }
           }
           TableColumn("Handle") { request in
