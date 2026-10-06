@@ -60,7 +60,7 @@ describe("Windows and Linux desktop app", () => {
     expect(cargoRaw).toContain(
       'wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "dx12"] }'
     );
-    expect(cargoRaw).toContain('egui = "=0.36.1"');
+    expect(cargoRaw).toContain('egui = "=0.36.2"');
     expect(cargoRaw).toContain('egui_extras = "=0.36.1"');
     expect(cargoRaw).toContain('tray-icon = "=0.24.2"');
     expect(cargoRaw).toContain('gtk = "=0.18.2"');
