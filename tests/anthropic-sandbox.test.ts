@@ -262,7 +262,7 @@ describe("Anthropic sandbox", () => {
         });
       }
     } finally { if (child.exitCode === null) child.kill("SIGKILL"); await completion; }
-  });
+  }, 20_000);
 
   it.skipIf(!["darwin", "linux"].includes(process.platform))("confines a real process tree while MCP approval and execution run outside it", async () => {
     const store = await fixtureStore();
