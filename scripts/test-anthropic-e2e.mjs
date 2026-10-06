@@ -25,7 +25,7 @@ const clients = new Set();
 let consoleServer, https, ssh;
 const env = {
   PATH: oldEnv.PATH, HOME: home, TMPDIR: os.tmpdir(), LANG: 'en_US.UTF-8',
-  SGW_TEST_MODE: "1", SGW_TEST_HOME_ROOT: root, SGW_RECOVERY_HOME: path.join(root, "recovery"),
+  SGW_TEST_MODE: "1", SGW_TEST_HOME_ROOT: root, SGW_LOGIN_SESSION_ID: "package-e2e-" + randomUUID(), SGW_RECOVERY_HOME: path.join(root, "recovery"),
   SGW_HOME: storeHome, SGW_MASTER_PASSPHRASE: randomUUID(), SGW_DISABLE_KEYCHAIN: '1',
   SGW_DISABLE_ONEPASSWORD_BACKUP: '1', SGW_DISABLE_UPDATE_CHECK: '1', SGW_ALLOW_TOKEN_FILE: '1',
   SGW_ALLOW_NO_CGROUP: process.argv.includes('--require-cgroup') ? undefined : '1',
