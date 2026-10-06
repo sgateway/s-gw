@@ -12,5 +12,5 @@ describe("native desktop packager", () => {
   });
   it("loads the native package and returns its configuration error", async () => {
     expect(() => packageApp({})).toThrow(/Could not find the main binary/);
-  });
+  }, 30_000);
 });

@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmdirSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import { posix as path } from "node:path";
 
 const attachments = new Map<number, string>();
 
