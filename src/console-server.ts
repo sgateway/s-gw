@@ -1180,7 +1180,8 @@ function approvalPolicyActionKind(input: string): ApprovalPolicyActionKind {
     return "ssh_session";
   }
 
-  throw new HttpError(400, "actionKinds must contain env_command or ssh_session.");
+  if (input === "http_request") return "http_request";
+  throw new HttpError(400, "actionKinds must contain env_command, ssh_session or http_request.");
 }
 
 function optionalApprovalMode(input: unknown): ApprovalMode | undefined {

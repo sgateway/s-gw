@@ -2,9 +2,38 @@ import AppKit
 import Foundation
 import SwiftUI
 
+struct SshTransferSpec: Decodable, Hashable, Sendable {
+  let sourcePath: String
+  let destinationPath: String
+  let sha256: String?
+  var approvalDetails: String {
+    "Source: \(sourcePath)\nDestination: \(destinationPath)\nSHA-256: \(sha256 ?? "Named pipe: content supplied while executing")"
+  }
+}
+
 struct SshSessionSpec: Decodable, Hashable, Sendable {
   let target: String
   let port: Int?
+  var transfer: SshTransferSpec? = nil
+}
+
+struct HttpAuthSpec: Decodable, Hashable, Sendable {
+  let kind: String
+  let name: String?
+  let username: String?
+}
+
+struct HttpRequestSpec: Decodable, Hashable, Sendable {
+  let url: String
+  let method: String
+  let headers: [String: String]
+  let body: String?
+  let auth: HttpAuthSpec
+
+  var approvalDetails: String {
+    let headerLines = headers.keys.sorted().map { "\($0): \(headers[$0]!)" }.joined(separator: "\n")
+    return "\(method) \(url)\nAuthentication: \(auth.kind) \(auth.name ?? auth.username ?? "")\nHeaders:\n\(headerLines)\nBody:\n\(body ?? "(none)")"
+  }
 }
 
 struct CommandAction: Decodable, Hashable, Sendable {
@@ -13,6 +42,9 @@ struct CommandAction: Decodable, Hashable, Sendable {
   let args: [String]
   let injectEnv: String
   let ssh: SshSessionSpec?
+  var owned: Bool? = nil
+  var http: HttpRequestSpec? = nil
+  var timeoutMs: Int? = nil
 }
 
 struct RequestRecord: Decodable, Identifiable, Hashable, Sendable {

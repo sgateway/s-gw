@@ -528,6 +528,28 @@ struct ApprovalPromptCard: View {
       VStack(alignment: .leading, spacing: 6) {
         requestLine("Command", commandPreview, monospaced: true)
         requestLine("Handle", helperShortHandle(request.handle), monospaced: true)
+        if request.action.owned == true, let ssh = request.action.ssh {
+          DisclosureGroup("Owned SSH operation details") {
+            ScrollView {
+              Text("Target: \(ssh.target):\(ssh.port ?? 22)\nRemote arguments: \(String(data: (try? JSONSerialization.data(withJSONObject: request.action.args, options: .prettyPrinted)) ?? Data(), encoding: .utf8) ?? "")\nTimeout: \(request.action.timeoutMs ?? 30000) ms")
+                .font(.caption.monospaced()).textSelection(.enabled)
+            }.frame(maxHeight: 180)
+          }
+        }
+        if let transfer = request.action.ssh?.transfer {
+          DisclosureGroup("SSH upload details") {
+            Text(transfer.approvalDetails).font(.caption.monospaced()).textSelection(.enabled)
+          }
+        }
+        if let http = request.action.http {
+          DisclosureGroup("HTTPS operation details") {
+            ScrollView {
+              Text(http.approvalDetails + "\nTimeout: \(request.action.timeoutMs ?? 30000) ms")
+                .font(.system(size: 11, design: .monospaced))
+                .textSelection(.enabled)
+            }.frame(maxHeight: 180)
+          }
+        }
         requestLine("Reason", request.reason, monospaced: false)
       }
 

@@ -7,6 +7,7 @@ import { addLocalSecret, preferredLocalSecretBackend } from "./gateway.js";
 import { previewHandle, scanText } from "./scanner.js";
 import { SecretStore } from "./store.js";
 import type { ScanCandidate } from "./types.js";
+import { anthropicSandboxConfig, anthropicSandboxReadiness, macAgentKeychainReadPath, runAnthropicSandbox, type AnthropicSandboxOptions } from "./anthropic-sandbox.js";
 
 export interface GuardRunOptions {
   agent: string;
@@ -18,6 +19,8 @@ export interface GuardRunOptions {
   scrubEnv?: boolean;
   persist?: boolean;
   allowedCommands?: string[];
+  sandbox?: "builtin" | "anthropic";
+  sandboxOptions?: AnthropicSandboxOptions;
 }
 
 export interface GuardEnvFinding {
@@ -49,6 +52,11 @@ export interface GuardRunPlan {
   instructions: string;
   dryRun: boolean;
   warnings: string[];
+  sandbox: {
+    provider: "builtin" | "anthropic";
+    tlsInterception: false;
+    policy?: { denyRead: string[]; allowRead: string[]; allowWrite: string[]; denyWrite: string[]; allowedDomains: string[]; credentialOperations: Array<"ssh" | "https"> };
+  };
 }
 
 export interface GuardRunPreparation {
@@ -111,6 +119,14 @@ export function guardStatus() {
 
 export async function prepareGuardedRun(store: SecretStore, options: GuardRunOptions): Promise<GuardRunPreparation> {
   const profile = resolveAgentProfile(options.agent);
+  if (options.sandbox && !["builtin", "anthropic"].includes(options.sandbox)) throw new Error("Unknown sandbox provider. Use builtin or anthropic.");
+  if (options.sandbox === "anthropic" && options.scrubEnv === false) throw new Error("Anthropic sandbox mode requires credential environment scrubbing.");
+  if (options.sandbox === "anthropic" && options.persist === true && !["darwin", "linux"].includes(process.platform)) {
+    throw new Error("The Anthropic s-gw launcher currently supports macOS and Linux. Native Windows integration is pending validation.");
+  }
+  if (options.sandbox !== "anthropic" && Object.values(options.sandboxOptions || {}).some(value => Array.isArray(value) ? value.length > 0 : value === true)) {
+    throw new Error("Sandbox path and host options require --sandbox anthropic.");
+  }
   const command = options.command || defaultAgentCommands[profile.id];
   if (!command) {
     throw new Error(`Guard run for ${profile.displayName} needs --command because it has no safe default CLI launcher yet.`);
@@ -120,6 +136,12 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   const baseEnv = normalizeEnv(options.env || process.env);
   for (const [key, value] of Object.entries(options.extraEnv || {})) {
     baseEnv[key] = value;
+  }
+  const sandboxConfig = options.sandbox === "anthropic" ? anthropicSandboxConfig(cwd, store.home, options.sandboxOptions, baseEnv) : undefined;
+  const loginKeychain = sandboxConfig ? macAgentKeychainReadPath(cwd, options.sandboxOptions) : undefined;
+  if (options.sandbox === "anthropic" && options.persist === true) {
+    const readiness = anthropicSandboxReadiness();
+    if (!readiness.ready) throw new Error(`Anthropic sandbox dependencies are unavailable: ${readiness.dependencies.errors.join("; ")}`);
   }
 
   const scrubbedEnv: GuardEnvFinding[] = [];
@@ -157,6 +179,14 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   if (profile.mcp.status !== "supported") {
     warnings.push(`${profile.displayName} MCP setup is marked ${profile.mcp.status}; install/config may need manual review.`);
   }
+  if (options.sandbox === "anthropic") {
+    warnings.push("Experimental Anthropic sandbox: credential operations use external owned SSH and HTTPS executors. Database and service-specific connectors are pending.");
+    if (!options.sandboxOptions?.denyAgentAuth) warnings.push("Saved agent authentication files remain readable. macOS login Keychain reads require --allow-agent-keychain. Use --deny-agent-auth to block known login files and Keychain IPC.");
+    if (loginKeychain) warnings.push("--allow-agent-keychain permits this process tree to read the encrypted login Keychain database, which contains credentials beyond the agent's login. Remove the flag to restore the block.");
+    else if (options.sandboxOptions?.allowAgentKeychain) warnings.push("--allow-agent-keychain is inactive on this platform or overridden by an explicit credential deny.");
+    if (!options.sandboxOptions?.strictEgress) warnings.push("Default agent destinations are permitted. Use --strict-egress with explicit --allow-host entries to constrain that list.");
+    guardedEnv.SGW_GUARD_INSTRUCTIONS = `s-gw Anthropic sandbox is active for ${profile.displayName}. Use s-gw MCP to request approved SSH or HTTPS operations through the external trusted executor. Raw credentials remain outside this sandbox. Generic credential-bearing commands and file scans are unavailable in this mode.`;
+  }
 
   return {
     env: guardedEnv,
@@ -176,9 +206,20 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
         serverName: "s-gw",
         command: "s-gw-mcp"
       },
-      instructions,
+      instructions: guardedEnv.SGW_GUARD_INSTRUCTIONS,
       dryRun: options.persist !== true,
-      warnings
+      warnings,
+      sandbox: {
+        provider: options.sandbox || "builtin", tlsInterception: false,
+        ...(sandboxConfig ? { policy: {
+          denyRead: sandboxConfig.filesystem.denyRead,
+          allowRead: loginKeychain ? [loginKeychain] : [],
+          allowWrite: sandboxConfig.filesystem.allowWrite,
+          denyWrite: sandboxConfig.filesystem.denyWrite,
+          allowedDomains: sandboxConfig.network.allowedDomains,
+          credentialOperations: ["ssh", "https"]
+        } } : {})
+      }
     }
   };
 }
@@ -193,6 +234,10 @@ export async function runGuardedAgent(store: SecretStore, options: GuardRunOptio
     `s-gw guard mode: launching ${prepared.plan.agent.displayName}; tokenized ${prepared.plan.scrubbedEnvCount} environment credential(s).\n`
   );
 
+  if (options.sandbox === "anthropic") {
+    process.stderr.write("Experimental Anthropic sandbox: external s-gw credential operations support SSH and HTTPS.\n");
+    return runAnthropicSandbox(prepared, store.home, options.sandboxOptions);
+  }
   const launcher = resolveGuardLauncher(prepared.plan.command, prepared.plan.args, {
     cwd: prepared.plan.cwd,
     env: prepared.env

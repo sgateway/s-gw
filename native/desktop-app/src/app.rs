@@ -1525,6 +1525,9 @@ fn auth_type_label(handle: Option<&HandleSummary>) -> String {
 }
 
 fn target_type_label(request: &RequestRecord) -> &'static str {
+    if request.action.http.is_some() {
+        return "HTTPS API";
+    }
     if request.action.kind == "ssh_session" || request.action.ssh.is_some() {
         return "SSH server";
     }
@@ -1747,6 +1750,49 @@ fn request_card(
                 .small()
                 .color(MUTED),
         );
+        if request.action.owned {
+            ui.collapsing("Owned SSH command", |ui| {
+                ui.label(format!(
+                    "Target: {}:{}",
+                    request
+                        .action
+                        .ssh
+                        .as_ref()
+                        .map(|ssh| ssh.target.as_str())
+                        .unwrap_or(""),
+                    request
+                        .action
+                        .ssh
+                        .as_ref()
+                        .and_then(|ssh| ssh.port)
+                        .unwrap_or(22)
+                ));
+                ui.label(serde_json::to_string_pretty(&request.action.args).unwrap_or_default());
+                ui.label(format!(
+                    "Timeout: {} ms",
+                    request.action.timeout_ms.unwrap_or(30000)
+                ));
+            });
+        }
+        if let Some(operation) = request.action.http.as_ref().or_else(|| {
+            request
+                .action
+                .ssh
+                .as_ref()
+                .and_then(|ssh| ssh.transfer.as_ref())
+        }) {
+            ui.collapsing("Operation details", |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.label(serde_json::to_string_pretty(operation).unwrap_or_default());
+                        ui.label(format!(
+                            "Timeout: {} ms",
+                            request.action.timeout_ms.unwrap_or(30000)
+                        ));
+                    });
+            });
+        }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.button("Approve once").clicked() {

@@ -4,6 +4,26 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+## 0.1.22 - 2026-10-05
+
+### Added
+
+- Opt-in Anthropic sandbox mode on macOS and Linux, with explicit host, file-read, and file-write controls. The existing builtin mode remains the default.
+- Approved HTTPS operations and SSH commands/uploads run outside the agent sandbox. Credentials remain with s-gw, and sanitized results return through MCP. HTTPS connects directly to the destination without TLS interception.
+- HTTP approvals bind the method, full URL, headers, body, authentication mode, and timeout. Owned SSH approvals bind the command or upload destination and file digest. Regular uploads use a verified snapshot; named pipes retain streaming support.
+- Native and browser approval dialogs show HTTPS and upload scope. Existing installers, updater, integrations, and ordinary MCP tools remain available.
+
+### Fixed
+
+- Crash recovery preserves the full request and audit history without restoring execution authority from recovered history.
+- Dependency updates remove the current npm audit findings. Desktop packaging calls the same native packager without loading its unused Electron extraction dependency.
+
+### Authentication and platform scope
+
+- Saved agent authentication remains available by default. `--deny-agent-auth` and explicit `--deny-read` controls can restrict it.
+- macOS `--allow-agent-keychain` is an explicit opt-in to read the encrypted login Keychain database, which can contain credentials for other applications. Native Keychain item access still requires its usual authorization. Explicit read denies and `--deny-agent-auth` override the flag.
+- The pinned Anthropic runtime has no native Windows backend. Existing Windows functionality is preserved. Linux production isolation requires a writable delegated cgroup v2; doctor reports readiness without creating or starting a VM.
+
 ## 0.1.21 - 2026-08-12
 
 ### Fixed

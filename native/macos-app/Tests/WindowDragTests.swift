@@ -17,7 +17,7 @@ private func waitForDocument(_ webView: WKWebView) -> Bool {
   while Date() < deadline {
     var complete = false
     var ready = false
-    webView.evaluateJavaScript("document.getElementById('blank') !== null") { value, _ in
+    webView.evaluateJavaScript("document.getElementById('blank') !== null && document.elementFromPoint(300, 20) !== null") { value, _ in
       ready = value as? Bool == true
       complete = true
     }
@@ -55,6 +55,11 @@ struct WindowDragTests {
       frame: NSRect(x: 0, y: 0, width: 400, height: 200),
       configuration: configuration
     )
+    // WebKit can defer layout until its view has a real window.
+    let window = NSWindow(contentRect: webView.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = webView
+    window.orderBack(nil)
+    defer { window.orderOut(nil) }
     webView.loadHTMLString(
       """
       <!doctype html>

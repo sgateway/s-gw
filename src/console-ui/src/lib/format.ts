@@ -6,6 +6,7 @@ export function shortHandle(value: string): string {
 }
 
 export function commandName(request: RequestRecord): string {
+  if (request.action.kind === "http_request") return request.action.http?.method || "HTTPS";
   if (request.action.kind === "ssh_session") return "ssh";
   const parts = String(request.action.command || "").replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] || request.action.command || "command";
@@ -16,6 +17,7 @@ export function requestTarget(request: RequestRecord): string {
     const port = request.action.ssh.port;
     return port && port !== 22 ? `${request.action.ssh.target}:${port}` : request.action.ssh.target;
   }
+  if (request.action.kind === "http_request") return request.action.http?.url || "HTTPS operation";
   if (request.action.workingDir) return request.action.workingDir;
   if (request.action.args[0] === "-e") return `${commandName(request)} inline script`;
   for (const arg of request.action.args) {

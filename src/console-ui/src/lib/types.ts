@@ -108,7 +108,9 @@ export interface RequestRecord {
   reason: string;
   agentName?: string;
   action: {
-    kind: "env_command" | "ssh_session" | string;
+    kind: "env_command" | "ssh_session" | "http_request" | string;
+    owned?: boolean;
+    http?: { url: string; method: string; headers: Record<string, string>; body?: string; auth: { kind: string; username?: string; name?: string } };
     command: string;
     resolvedCommand?: string;
     args: string[];
@@ -118,6 +120,7 @@ export interface RequestRecord {
     ssh?: {
       target: string;
       port?: number;
+      transfer?: { direction: string; sourcePath: string; destinationPath: string; sha256?: string };
     };
   };
   state: RequestState;
@@ -242,6 +245,7 @@ export interface ApprovalPolicyRuleRecord {
     minSeverity?: SecretSeverity;
     agents?: string[];
     actionKinds?: string[];
+    actionKeys?: string[];
     commands?: string[];
     resolvedCommands?: string[];
     injectEnvs?: string[];

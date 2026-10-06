@@ -36,10 +36,11 @@ function allowedReport() {
 }
 
 describe("release dependency audit", () => {
-  it("allows only the pinned build-only Electron extractor advisory", () => {
-    expect(validateAudit(allowedReport(), packageInfo, lock)).toEqual({
-      allowedBuildOnlyAdvisory: true
-    });
+  it("accepts a clean graph and rejects the removed Electron exception", () => {
+    expect(validateAudit({ metadata: { vulnerabilities: { high: 0, critical: 0 } }, vulnerabilities: {} }, packageInfo, lock)).toEqual({ allowedBuildOnlyAdvisory: false });
+    expect(packageInfo.devDependencies["@crabnebula/packager"]).toBeUndefined();
+    expect(lock.packages["node_modules/extract-zip"]).toBeUndefined();
+    expect(() => validateAudit(allowedReport(), packageInfo, lock)).toThrow("build-only audit exception");
   });
 
   it("fails when another high-severity advisory appears", () => {
