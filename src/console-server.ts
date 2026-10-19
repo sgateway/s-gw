@@ -47,6 +47,24 @@ import type {
 
 const version = CURRENT_VERSION;
 const maxBodyBytes = 1024 * 1024;
+const operatorCodeLifetimeMs = 5 * 60 * 1000;
+const operatorSessionLifetimeMs = 15 * 60 * 1000;
+const operatorCookieName = "sgw_operator";
+
+interface OperatorSession {
+  id: string;
+  proof: string;
+  expiresAt: number;
+}
+
+interface OperatorAuthState {
+  code?: string;
+  codeExpiresAt: number;
+  attempts: number;
+  attemptsResetAt: number;
+  session?: OperatorSession;
+  origin: string;
+}
 
 export interface ConsoleServerOptions {
   host?: string;
@@ -58,6 +76,7 @@ export interface ConsoleServerOptions {
   agentHomeDir?: string;
   agentPathEnv?: string;
   agentSkillSourcePath?: string;
+  operatorAuth?: { displayCode: (code: string) => void };
 }
 
 export interface RunningConsoleServer {
@@ -140,8 +159,18 @@ interface UsageFlow {
 
 export async function startConsoleServer(options: ConsoleServerOptions = {}): Promise<RunningConsoleServer> {
   const host = options.host || "127.0.0.1";
+  if (options.operatorAuth && host !== "127.0.0.1") {
+    throw new Error("Protected operator console requires 127.0.0.1.");
+  }
   const port = options.port ?? 8718;
-  const token = options.token || randomBytes(24).toString("base64url");
+  const token = options.operatorAuth ? "" : options.token || randomBytes(24).toString("base64url");
+  const operatorAuth: OperatorAuthState | undefined = options.operatorAuth ? {
+    code: randomBytes(24).toString("base64url"),
+    codeExpiresAt: Date.now() + operatorCodeLifetimeMs,
+    attempts: 0,
+    attemptsResetAt: 0,
+    origin: ""
+  } : undefined;
   const store = options.store || new SecretStore();
   const uiDir = options.uiDir || defaultUiDir();
   const updateChecker = options.updateChecker || new ReleaseChecker();
@@ -159,7 +188,7 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   updateTimer.unref();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey).catch((error) => {
+    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth).catch((error) => {
       sendError(res, error);
     });
   });
@@ -168,9 +197,23 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     server.once("error", reject);
     server.listen(port, host, () => {
       server.off("error", reject);
+      if (operatorAuth) {
+        const boundAddress = server.address() as AddressInfo;
+        operatorAuth.origin = `http://127.0.0.1:${boundAddress.port}`;
+      }
       resolve();
     });
   });
+
+  if (options.operatorAuth && operatorAuth?.code) {
+    try {
+      options.operatorAuth.displayCode(operatorAuth.code);
+    } catch (error) {
+      clearInterval(updateTimer);
+      await closeServer(server);
+      throw error;
+    }
+  }
 
   const address = server.address() as AddressInfo;
   const shownHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
@@ -205,9 +248,15 @@ async function handleRequest(
   uiDir: string,
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
   agentOptions: AgentIntegrationOptions,
-  instanceKey: string
+  instanceKey: string,
+  operatorAuth?: OperatorAuthState
 ): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
+  if (operatorAuth) {
+    await handleProtectedRequest(req, res, url, store, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth);
+    return;
+  }
+
   if (url.pathname.startsWith("/api/")) {
     if (url.pathname !== "/api/health" && !validConsoleToken(req, token)) {
       throw new HttpError(403, "Missing or invalid local console token.");
@@ -224,6 +273,232 @@ async function handleRequest(
   }
 
   await serveUi(req, res, url.pathname, uiDir, token);
+}
+
+async function handleProtectedRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  store: SecretStore,
+  uiDir: string,
+  updateChecker: Pick<ReleaseChecker, "check" | "current">,
+  agentOptions: AgentIntegrationOptions,
+  instanceKey: string,
+  auth: OperatorAuthState
+): Promise<void> {
+  if (req.headers.host !== auth.origin.slice("http://".length)) {
+    throw new HttpError(403, "Invalid local console host.");
+  }
+
+  const origin = req.headers.origin;
+  const unsafe = req.method !== "GET" && req.method !== "HEAD";
+  if (Array.isArray(origin) || (origin && origin !== auth.origin) || (unsafe && origin !== auth.origin)) {
+    throw new HttpError(403, "Invalid local console origin.");
+  }
+
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+
+  if (url.pathname === "/auth/enroll") {
+    if (req.method !== "POST" || url.search) {
+      throw new HttpError(405, "Invalid operator enrollment request.");
+    }
+    await enrollOperator(req, res, auth);
+    return;
+  }
+
+  const session = operatorSession(req, auth);
+  if (!session) {
+    if ((req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html")) {
+      serveOperatorLogin(req, res);
+      return;
+    }
+    throw new HttpError(401, "Operator sign-in required.");
+  }
+
+  if (url.pathname === "/auth/app") {
+    await serveUi(req, res, "/", uiDir, "", true);
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/")) {
+    if (!validConsoleToken(req, session.proof)) {
+      throw new HttpError(403, "Invalid operator request token.");
+    }
+    await handleApi(req, res, url, store, updateChecker, agentOptions, instanceKey);
+    return;
+  }
+
+  if ((req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html" || shouldServeSpaFallback(url.pathname, uiDir))) {
+    serveOperatorLogin(req, res);
+    return;
+  }
+
+  if (unsafe && !validConsoleToken(req, session.proof)) {
+    throw new HttpError(403, "Invalid operator request token.");
+  }
+
+  if (url.pathname === "/favicon.ico") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  await serveUi(req, res, url.pathname, uiDir, "", true);
+}
+
+async function enrollOperator(req: IncomingMessage, res: ServerResponse, auth: OperatorAuthState): Promise<void> {
+  const now = Date.now();
+  if (now >= auth.attemptsResetAt) {
+    auth.attempts = 0;
+    auth.attemptsResetAt = now + 60_000;
+  }
+  if (auth.attempts >= 5) {
+    throw new HttpError(429, "Operator sign-in temporarily unavailable.");
+  }
+  auth.attempts += 1;
+
+  const submitted = await readOperatorCode(req);
+  if (!auth.code || Date.now() >= auth.codeExpiresAt || !sameSecret(submitted, auth.code)) {
+    throw new HttpError(401, "Invalid or expired operator code.");
+  }
+
+  auth.code = undefined;
+  auth.session = {
+    id: randomBytes(32).toString("base64url"),
+    proof: randomBytes(24).toString("base64url"),
+    expiresAt: Date.now() + operatorSessionLifetimeMs
+  };
+  res.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Set-Cookie": `${operatorCookieName}=${auth.session.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${operatorSessionLifetimeMs / 1000}`
+  });
+  res.end(JSON.stringify({ proof: auth.session.proof }));
+}
+
+async function readOperatorCode(req: IncomingMessage): Promise<string> {
+  if (!/^application\/json(?:\s*;|$)/iu.test(req.headers["content-type"] || "")) {
+    throw new HttpError(415, "Operator sign-in requires JSON.");
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += data.length;
+    if (size > 1024) throw new HttpError(413, "Operator sign-in request is too large.");
+    chunks.push(data);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new HttpError(400, "Invalid operator sign-in request.");
+  }
+  const code = (parsed as { code?: unknown } | null)?.code;
+  if (typeof code !== "string" || !/^[A-Za-z0-9_-]{32}$/u.test(code)) {
+    throw new HttpError(400, "Invalid operator sign-in request.");
+  }
+  return code;
+}
+
+function operatorSession(req: IncomingMessage, auth: OperatorAuthState): OperatorSession | undefined {
+  const session = auth.session;
+  if (!session) return undefined;
+  if (Date.now() >= session.expiresAt) {
+    auth.session = undefined;
+    return undefined;
+  }
+
+  const cookie = req.headers.cookie || "";
+  const matches = cookie.split(";").map((part) => part.trim()).filter((part) => part.startsWith(`${operatorCookieName}=`));
+  if (matches.length !== 1) return undefined;
+  const value = matches[0].slice(operatorCookieName.length + 1);
+  return sameSecret(value, session.id) ? session : undefined;
+}
+
+function sameSecret(value: string, expected: string): boolean {
+  const actual = Buffer.from(value);
+  const wanted = Buffer.from(expected);
+  if (actual.length !== wanted.length) return false;
+  return timingSafeEqual(actual, wanted);
+}
+
+function serveOperatorLogin(req: IncomingMessage, res: ServerResponse): void {
+  const nonce = randomBytes(18).toString("base64");
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s-gw operator sign-in</title>
+<style>body{font:16px system-ui,sans-serif;max-width:32rem;margin:12vh auto;padding:1.5rem;background:#111827;color:#f9fafb}input,button{font:inherit;padding:.7rem;width:100%;box-sizing:border-box;margin:.5rem 0}input{background:#1f2937;border:1px solid #6b7280;color:inherit}button{background:#2563eb;border:0;color:white;cursor:pointer}p{line-height:1.5}</style></head>
+<body><main><h1>s-gw operator sign-in</h1><p>Enter the one-time code shown in the foreground s-gw terminal. It expires after five minutes.</p>
+<form id="login"><label for="code">One-time code</label><input id="code" type="password" autocomplete="off" required autofocus><button type="submit">Sign in</button></form><p id="error" role="alert"></p></main>
+<script nonce="${nonce}">
+(function () {
+  const pageNonce = document.currentScript.nonce;
+  document.getElementById("login").addEventListener("submit", async function (event) {
+    event.preventDefault();
+    const code = document.getElementById("code");
+    const error = document.getElementById("error");
+    error.textContent = "";
+
+    try {
+      const response = await fetch("/auth/enroll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: code.value })
+      });
+      code.value = "";
+      if (!response.ok) {
+        error.textContent = "Sign-in failed. Check the code in the terminal.";
+        return;
+      }
+
+      const body = await response.json();
+      if (!body.proof) throw new Error("Missing operator proof.");
+      const app = await fetch("/auth/app");
+      if (!app.ok) throw new Error("Console unavailable.");
+
+      const parsed = new DOMParser().parseFromString(await app.text(), "text/html");
+      const scripts = [...parsed.querySelectorAll("script")];
+      window.SGW_CONSOLE_TOKEN = body.proof;
+      window.SGW_CONSOLE_LIVE = true;
+      window.SGW_CONSOLE_OPERATOR_AUTH = true;
+
+      // Keep the proof in this document; browser storage can persist to disk.
+      document.head.replaceChildren(...[...parsed.head.childNodes]
+        .filter((node) => node.nodeName !== "SCRIPT")
+        .map((node) => document.importNode(node, true)));
+      document.body.replaceChildren(...[...parsed.body.childNodes]
+        .filter((node) => node.nodeName !== "SCRIPT")
+        .map((node) => document.importNode(node, true)));
+
+      for (const old of scripts) {
+        const script = document.createElement("script");
+        script.nonce = pageNonce;
+        if (old.src) script.src = old.src;
+        if (old.type) script.type = old.type;
+        if (old.crossOrigin) script.crossOrigin = old.crossOrigin;
+        if (!old.src) script.textContent = old.textContent;
+        script.async = false;
+        (old.parentElement === parsed.head ? document.head : document.body).appendChild(script);
+      }
+    } catch {
+      code.value = "";
+      error.textContent = "Sign-in failed. Restart the console and try again.";
+    }
+  });
+})();
+</script></body></html>`;
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Security-Policy": consoleContentSecurityPolicy(nonce),
+    "Cache-Control": "no-store"
+  });
+  res.end(req.method === "HEAD" ? undefined : html);
 }
 
 async function handleApi(
@@ -957,7 +1232,8 @@ async function serveUi(
   res: ServerResponse,
   pathname: string,
   uiDir: string,
-  token: string
+  token: string,
+  operatorAuth = false
 ): Promise<void> {
   if (req.method !== "GET" && req.method !== "HEAD") {
     throw new HttpError(405, "Only GET is supported for local console assets.");
@@ -978,7 +1254,7 @@ async function serveUi(
   let body = await readFile(target);
   const scriptNonce = randomBytes(18).toString("base64");
   if (path.basename(target) === "local-console.html" || path.basename(target) === "index.html") {
-    body = Buffer.from(injectConsoleToken(body.toString("utf8"), token, scriptNonce));
+    body = Buffer.from(injectConsoleToken(body.toString("utf8"), token, scriptNonce, operatorAuth));
   }
 
   res.writeHead(200, {
@@ -1021,9 +1297,12 @@ function shouldServeSpaFallback(pathname: string, uiDir: string): boolean {
   return ext === "";
 }
 
-function injectConsoleToken(html: string, token: string, nonce: string): string {
+function injectConsoleToken(html: string, token: string, nonce: string, operatorAuth: boolean): string {
   const withNonces = html.replace(/<script(?![^>]*\bnonce=)/giu, `<script nonce="${nonce}"`);
-  const script = `<script nonce="${nonce}">window.SGW_CONSOLE_TOKEN=${JSON.stringify(token)};window.SGW_CONSOLE_LIVE=true;</script>`;
+  const credential = operatorAuth
+    ? 'window.SGW_CONSOLE_TOKEN||""'
+    : JSON.stringify(token);
+  const script = `<script nonce="${nonce}">window.SGW_CONSOLE_TOKEN=${credential};window.SGW_CONSOLE_LIVE=true;window.SGW_CONSOLE_OPERATOR_AUTH=${operatorAuth};</script>`;
   return withNonces.includes("</head>")
     ? withNonces.replace("</head>", `${script}\n</head>`)
     : `${script}\n${withNonces}`;
@@ -1075,11 +1354,7 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 function validConsoleToken(req: IncomingMessage, expected: string): boolean {
   const header = req.headers["x-sgw-console-token"];
   const token = Array.isArray(header) ? header[0] : header;
-  if (!token || token.length !== expected.length) {
-    return false;
-  }
-
-  return timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+  return Boolean(token && sameSecret(token, expected));
 }
 
 function stringValue(value: unknown, name: string): string {

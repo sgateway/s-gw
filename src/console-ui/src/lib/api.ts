@@ -163,3 +163,23 @@ export function uninstallAgentIntegration(agentId: string) {
 export function auditCsvUrl(): string {
   return "/api/audit.csv";
 }
+
+export function isProtectedConsole(): boolean {
+  return window.SGW_CONSOLE_OPERATOR_AUTH === true;
+}
+
+export async function downloadAuditCsv(): Promise<void> {
+  const response = await fetch(auditCsvUrl(), {
+    headers: { "X-SGW-Console-Token": consoleToken() }
+  });
+  if (!response.ok) throw new Error("Audit CSV download failed.");
+
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = "s-gw-audit.csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}

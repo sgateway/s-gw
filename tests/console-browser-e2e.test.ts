@@ -56,6 +56,47 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it("opens the protected console only after operator sign-in", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "protected-browser-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    let code = "";
+    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const launched = await launchChrome(running.url);
+    cdp = launched.cdp;
+
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "operator sign-in page");
+    expect(await cdp.eval<string>("document.body.innerText")).toContain("one-time code");
+    expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe("");
+    await cdp.eval(`(() => {
+      document.querySelector('#code').value = ${JSON.stringify(code)};
+      document.querySelector('#login').requestSubmit();
+      return true;
+    })()`);
+
+    await waitFor(() => cdp!.eval<boolean>("Boolean(window.SGW_CONSOLE_TOKEN)"), "signed-in console");
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#root')?.children.length)"), "protected React console");
+    expect(await cdp.eval<string>("sessionStorage.getItem('sgw_operator_proof') || ''")).toBe("");
+    expect(await cdp.eval<string>("localStorage.getItem('sgw_operator_proof') || ''")).toBe("");
+    const result = await cdp.eval<{ read: number; write: number; csvWithoutProof: number; csvWithProof: number }>(`(async () => {
+      const read = await fetch('/api/state');
+      const csvWithoutProof = await fetch('/api/audit.csv');
+      const csvWithProof = await fetch('/api/audit.csv', {
+        headers: { 'X-SGW-Console-Token': window.SGW_CONSOLE_TOKEN }
+      });
+      const write = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-SGW-Console-Token': window.SGW_CONSOLE_TOKEN },
+        body: JSON.stringify({ text: 'no secret', persist: false })
+      });
+      return { read: read.status, write: write.status, csvWithoutProof: csvWithoutProof.status, csvWithProof: csvWithProof.status };
+    })()`);
+    expect(result).toEqual({ read: 403, write: 200, csvWithoutProof: 403, csvWithProof: 200 });
+
+    await cdp.eval("window.location.reload()");
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "sign-in after reload");
+    expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe("");
+  }, 30_000);
+
   it("shows the canonical managed SSH route and pinned host key before approval", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "managed-route-browser-fixture";
     process.env.SGW_SECRET_BACKEND = "local";

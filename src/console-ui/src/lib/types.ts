@@ -331,5 +331,6 @@ declare global {
   interface Window {
     SGW_CONSOLE_TOKEN?: string;
     SGW_CONSOLE_LIVE?: boolean;
+    SGW_CONSOLE_OPERATOR_AUTH?: boolean;
   }
 }

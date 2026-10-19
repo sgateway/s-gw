@@ -183,12 +183,25 @@ async function main(): Promise<void> {
   if (first === "console") {
     const host = getFlag(parsed.flags, "host") || "127.0.0.1";
     const port = numericFlag(parsed.flags, "port", 8718);
+    const protectedOperator = hasFlag(parsed.flags, "operator-auth");
+    if (protectedOperator && (!process.stdin.isTTY || !process.stderr.isTTY)) {
+      throw new Error("--operator-auth requires a trusted foreground terminal.");
+    }
+    const operatorAuth = protectedOperator ? {
+      displayCode: (code: string) => {
+        process.stderr.write(`s-gw one-time operator code: ${code}\n`);
+        process.stderr.write("The code expires in five minutes. Restart the console to get a new code.\n");
+      }
+    } : undefined;
 
     let running;
     try {
-      running = await startConsoleServer({ host, port, store });
+      running = await startConsoleServer({ host, port, store, operatorAuth });
     } catch (error) {
       if (isAddressInUse(error)) {
+        if (protectedOperator) {
+          throw new Error(`Port ${port} on ${host} is already in use. Stop the existing console service before using --operator-auth.`);
+        }
         // Very common first-run snag: `s-gw setup`/`s-gw start` already left a
         // console daemon on this port, so the foreground `s-gw console` can't
         // bind it. Don't dump a raw Node listen error — say what's going on.
@@ -2635,7 +2648,7 @@ Commands:
   s-gw update plan [--package PATH_OR_SPEC]
   s-gw update install [--package PATH_OR_SPEC] [--dry-run]
   s-gw mcp
-  s-gw console [--host 127.0.0.1] [--port 8718] [--no-open]
+  s-gw console [--host 127.0.0.1] [--port 8718] [--no-open] [--operator-auth]
   s-gw app app-path
   s-gw app install
   s-gw app open [--port 8718] [--console-url URL] [--browser]

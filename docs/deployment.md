@@ -267,6 +267,8 @@ s-gw console
 
 The console binds to `127.0.0.1`, serves the UI from the installed package, and injects a per-session token into the page. That token is required for local API writes such as approving or denying requests, so another browser origin cannot silently drive the credential API with a plain form post. `s-gw app open --browser` is the simpler choice when the background service is already running.
 
+For a foreground console with operator sign-in, run `s-gw console --operator-auth` from a trusted terminal. Stop the ordinary console service before relying on this mode: another URL-only console would still have approval authority, even on a different port. The terminal displays a one-use code that expires in five minutes. Enter it in the browser sign-in page; the browser receives a fifteen-minute, HttpOnly, SameSite=Strict session cookie. The protected console requires the session for UI assets and a second proof kept only in the enrolled browser tab's memory for API calls. The proof is never injected into served HTML or browser storage. It checks the exact loopback Host and Origin, and requires the proof for both API reads and writes. This also keeps a cookie copied from another loopback port from authorizing API calls. Reloading or closing the tab loses the proof; restart the foreground console to get a new code. The code is never placed in a URL, environment variable, or on disk. This mode is opt-in; existing browser backup and background service behavior remain available. It protects the console listener only when the agent cannot read the trusted terminal or browser session. OS-level agent isolation is still required for that boundary.
+
 For a background setup, install the per-user console service:
 
 ```bash

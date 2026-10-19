@@ -1,9 +1,10 @@
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createHash, generateKeyPairSync } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { getSgwInstanceKey } from "../src/paths.js";
 import { buildSshSessionAction } from "../src/ssh.js";
@@ -73,6 +74,149 @@ describe("local console server", () => {
       body: JSON.stringify({ name: "blocked", value: "nope" })
     });
     expect(rejected.status).toBe(403);
+  });
+
+  it("keeps the protected console private until one-time operator enrollment", async () => {
+    let code = "";
+    running = await startConsoleServer({
+      port: 0,
+      operatorAuth: { displayCode: (value) => { code = value; } }
+    });
+    expect(running.token).toBe("");
+    expect(code).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+
+    const before = await fetch(running.url);
+    const signInPage = await before.text();
+    expect(before.status).toBe(200);
+    expect(signInPage).toContain("operator sign-in");
+    expect(signInPage).not.toContain(code);
+    expect(before.headers.get("cache-control")).toBe("no-store");
+    expect(before.headers.get("x-frame-options")).toBe("DENY");
+    expect((await fetch(`${running.url}api/health`)).status).toBe(401);
+    expect((await fetch(`${running.url}api/state`, {
+      headers: { "X-SGW-Console-Token": "guessed" }
+    })).status).toBe(401);
+    expect((await fetch(`${running.url}assets/whatever.js`)).status).toBe(401);
+
+    const enroll = (attempt: string, headers: Record<string, string> = {}) => fetch(`${running!.url}auth/enroll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: new URL(running!.url).origin, ...headers },
+      body: JSON.stringify({ code: attempt })
+    });
+    expect((await enroll(code, { Origin: "http://malicious.example" })).status).toBe(403);
+    const wrongHost = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest(`${running!.url}auth/enroll`, {
+        method: "POST",
+        headers: { Host: "malicious.example", Origin: new URL(running!.url).origin, "Content-Type": "application/json" }
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode || 0));
+      });
+      req.on("error", reject);
+      req.end(JSON.stringify({ code }));
+    });
+    expect(wrongHost).toBe(403);
+    expect((await enroll("x".repeat(32))).status).toBe(401);
+
+    const signedIn = await enroll(code);
+    expect(signedIn.status).toBe(200);
+    const proof = (await signedIn.json() as { proof: string }).proof;
+    expect(proof).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+    const cookie = signedIn.headers.get("set-cookie") || "";
+    expect(cookie).toMatch(/^sgw_operator=[A-Za-z0-9_-]{43};/u);
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Strict");
+    expect(cookie).toContain("Max-Age=900");
+    expect(cookie).not.toContain(code);
+    expect((await enroll(code)).status).toBe(401);
+
+    const sessionCookie = cookie.split(";")[0];
+    const signedInPage = await fetch(`${running.url}auth/app`, { headers: { Cookie: sessionCookie } });
+    const html = await signedInPage.text();
+    expect(html).toContain('window.SGW_CONSOLE_TOKEN||""');
+    expect(html).not.toContain(code);
+    expect(html).not.toContain(proof);
+    expect(html).not.toContain(sessionCookie);
+    expect((await fetch(running.url, { headers: { Cookie: sessionCookie } })).status).toBe(200);
+    expect((await fetch(`${running.url}api/health`, { headers: { Cookie: sessionCookie } })).status).toBe(403);
+    expect((await fetch(`${running.url}api/health`, { headers: { Cookie: sessionCookie, "X-SGW-Console-Token": "é".repeat(32) } })).status).toBe(403);
+    expect((await fetch(`${running.url}api/health`, { headers: { Cookie: sessionCookie, "X-SGW-Console-Token": proof } })).status).toBe(200);
+
+    const action = (headers: Record<string, string>) => fetch(`${running!.url}api/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ text: "no secret", persist: false })
+    });
+    expect((await action({ Cookie: sessionCookie, Origin: new URL(running.url).origin })).status).toBe(403);
+    expect((await action({ Cookie: sessionCookie, "X-SGW-Console-Token": proof })).status).toBe(403);
+    expect((await action({ Cookie: sessionCookie, Origin: "http://malicious.example", "X-SGW-Console-Token": proof })).status).toBe(403);
+    expect((await action({ Origin: new URL(running.url).origin, "X-SGW-Console-Token": proof })).status).toBe(401);
+    expect((await action({ Cookie: sessionCookie, Origin: new URL(running.url).origin, "X-SGW-Console-Token": proof })).status).toBe(200);
+  });
+
+  it("limits operator code guesses and requires loopback binding", async () => {
+    await expect(startConsoleServer({
+      host: "0.0.0.0",
+      port: 0,
+      operatorAuth: { displayCode: () => {} }
+    })).rejects.toThrow("requires 127.0.0.1");
+
+    let code = "";
+    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const origin = new URL(running.url).origin;
+    for (let index = 0; index < 5; index += 1) {
+      const response = await fetch(`${running.url}auth/enroll`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ code: "x".repeat(32) })
+      });
+      expect(response.status).toBe(401);
+    }
+    const blocked = await fetch(`${running.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code })
+    });
+    expect(blocked.status).toBe(429);
+  });
+
+  it("expires the one-time code and operator session", async () => {
+    let code = "";
+    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const origin = new URL(running.url).origin;
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(startedAt + 5 * 60_000 + 1);
+      const expiredCode = await fetch(`${running.url}auth/enroll`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ code })
+      });
+      expect(expiredCode.status).toBe(401);
+    } finally {
+      clock.mockRestore();
+    }
+
+    await running.close();
+    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const newOrigin = new URL(running.url).origin;
+    const signedIn = await fetch(`${running.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: newOrigin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code })
+    });
+    expect(signedIn.status).toBe(200);
+    const cookie = (signedIn.headers.get("set-cookie") || "").split(";")[0];
+    const sessionStartedAt = Date.now();
+    const sessionClock = vi.spyOn(Date, "now");
+    try {
+      sessionClock.mockReturnValue(sessionStartedAt + 15 * 60_000 + 1);
+      const expiredSession = await fetch(`${running.url}api/state`, { headers: { Cookie: cookie } });
+      expect(expiredSession.status).toBe(401);
+    } finally {
+      sessionClock.mockRestore();
+    }
   });
 
   it("does not report favicon requests as server errors", async () => {

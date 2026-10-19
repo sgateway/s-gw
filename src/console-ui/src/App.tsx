@@ -145,8 +145,10 @@ import {
   deletePolicy,
   deleteSecret,
   denyRequest,
+  downloadAuditCsv,
   fetchConsoleState,
   installAgentIntegration,
+  isProtectedConsole,
   saveApprovalSettings,
   setPolicyEnabled,
   updatePolicy,
@@ -2294,14 +2296,19 @@ function EventLogTable({
           </SelectContent>
         </Select>
         <div className="sgw-event-count">{countLabel}</div>
-        {mode === "audit" ? (
+        {mode === "audit" ? (isProtectedConsole() ? (
+          <Button variant="outline" size="sm" className="sgw-event-export" onClick={() => void downloadAuditCsv().catch((error) => toast.error(String(error)))}>
+            <Download className="h-4 w-4" />
+            Export CSV
+          </Button>
+        ) : (
           <Button asChild variant="outline" size="sm" className="sgw-event-export">
             <a href={auditCsvUrl()} download>
               <Download className="h-4 w-4" />
               Export CSV
             </a>
           </Button>
-        ) : null}
+        )) : null}
       </div>
 
       {filtersOpen ? (
@@ -3843,7 +3850,10 @@ function CommandPalette({
               Review pending approvals
               <CommandShortcut>{state?.metrics.pendingApprovals || 0}</CommandShortcut>
             </CommandItem>
-            <CommandItem onSelect={() => window.open(auditCsvUrl(), "_blank")}>
+            <CommandItem onSelect={() => {
+              if (isProtectedConsole()) void downloadAuditCsv().catch((error) => toast.error(String(error)));
+              else window.open(auditCsvUrl(), "_blank");
+            }}>
               <Download className="h-4 w-4" />
               Download audit CSV
             </CommandItem>
