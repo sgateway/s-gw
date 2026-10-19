@@ -18,13 +18,14 @@ export interface AnthropicSandboxOptions {
   denyRead?: string[];
   strictEgress?: boolean;
   denyAgentAuth?: boolean;
+  denyKeychain?: boolean;
   allowAgentKeychain?: boolean;
   isolatedAuth?: boolean;
   strictBrokerEnv?: boolean;
 }
 
 export function macAgentKeychainReadPath(cwd: string, options: AnthropicSandboxOptions = {}, platform = process.platform): string | undefined {
-  if (platform !== "darwin" || !options.allowAgentKeychain || options.denyAgentAuth || options.isolatedAuth) return;
+  if (platform !== "darwin" || !options.allowAgentKeychain || options.denyAgentAuth || options.denyKeychain || options.isolatedAuth) return;
   const loginFile = normalizePathForSandbox(path.join(os.homedir(), "Library", "Keychains", "login.keychain-db"));
   for (const file of options.denyRead || []) {
     let denied = normalizePathForSandbox(path.resolve(cwd, file));
@@ -273,7 +274,9 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     let wrapped = await SandboxManager.wrapWithSandbox(fixedCommand, "/bin/bash");
     const loginFile = macAgentKeychainReadPath(prepared.plan.cwd, options);
     if (loginFile) wrapped = allowMacAgentKeychainRead(wrapped, loginFile);
-    if ((options.denyAgentAuth || options.isolatedAuth) && process.platform === "darwin") wrapped = restrictMacCredentialIpc(wrapped, options.isolatedAuth);
+    if ((options.denyAgentAuth || options.denyKeychain || options.isolatedAuth) && process.platform === "darwin") {
+      wrapped = restrictMacCredentialIpc(wrapped, Boolean(options.denyKeychain || options.isolatedAuth));
+    }
     const env: NodeJS.ProcessEnv = options.isolatedAuth
       ? isolatedAgentEnvironment(prepared.env, capabilityEnv, agentTmp, mcpConfig)
       : { ...prepared.env, ...capabilityEnv, SGW_SANDBOX_MCP_CONFIG: mcpConfig };

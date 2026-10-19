@@ -86,6 +86,8 @@ describe("Anthropic sandbox", () => {
     expect(JSON.parse(cli).sandbox.provider).toBe("anthropic");
     const keychainPlan = execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "run", "claude-code", "--sandbox", "anthropic", "--dry-run", "--command", process.execPath, "--allow-agent-keychain", "--", "-v"], { encoding: "utf8", env: process.env });
     expect(JSON.parse(keychainPlan).sandbox.policy.allowRead).toEqual(process.platform === "darwin" ? [path.join(os.homedir(), "Library", "Keychains", "login.keychain-db")] : []);
+    const deniedKeychainPlan = execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "run", "claude-code", "--sandbox", "anthropic", "--dry-run", "--command", process.execPath, "--allow-agent-keychain", "--deny-keychain", "--", "-v"], { encoding: "utf8", env: process.env });
+    expect(JSON.parse(deniedKeychainPlan).sandbox.policy.allowRead).toEqual([]);
   });
 
   it("adds stricter egress and authentication-file protection only when selected", () => {
@@ -260,6 +262,8 @@ writeFileSync('session-isolation-result.json', JSON.stringify({ siblingRead, own
     const wrapped = "env NO_PROXY=localhost,*.local /usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/bash -c 'fixed command'";
     const restricted = restrictMacCredentialIpc(wrapped);
     expect(restricted).toContain('com.apple.securityd.xpc');
+    expect(restricted).not.toContain('com.apple.SecurityServer');
+    expect(restrictMacCredentialIpc(wrapped, true)).toContain('com.apple.SecurityServer');
     expect(restricted).toContain('/bin/bash');
     for (const command of ["echo unsafe", wrapped + "; echo unsafe", wrapped.replace("(version 1)", "unexpected")]) {
       expect(() => restrictMacCredentialIpc(command)).toThrow("wrapper");
@@ -286,6 +290,7 @@ writeFileSync('session-isolation-result.json', JSON.stringify({ siblingRead, own
     expect(macAgentKeychainReadPath(cwd, allowed, "darwin")).toBe(loginFile);
     for (const platform of ["linux", "win32"]) expect(macAgentKeychainReadPath(cwd, allowed, platform)).toBeUndefined();
     expect(macAgentKeychainReadPath(cwd, { ...allowed, denyAgentAuth: true }, "darwin")).toBeUndefined();
+    expect(macAgentKeychainReadPath(cwd, { ...allowed, denyKeychain: true }, "darwin")).toBeUndefined();
     for (const deny of [loginFile, keychains, path.dirname(keychains), "/", path.join(keychains, "*.keychain-db"), path.join(keychains, "**"), alias, path.join(alias, "*.keychain-db"), path.relative(cwd, keychains)]) {
       expect(macAgentKeychainReadPath(cwd, { ...allowed, denyRead: [deny] }, "darwin"), deny).toBeUndefined();
     }
@@ -334,7 +339,7 @@ import { writeFileSync } from 'node:fs';
 const result = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-a', process.env.SGW_TEST_ACCOUNT, '-s', process.env.SGW_TEST_SERVICE, process.env.SGW_TEST_KEYCHAIN], { encoding: 'utf8', timeout: 10000 });
 writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0, timedOut: result.error?.code === 'ETIMEDOUT' }));
 `);
-      const launch = async (sandboxOptions: { denyAgentAuth?: boolean; denyRead?: string[] }) => {
+      const launch = async (sandboxOptions: { denyAgentAuth?: boolean; denyKeychain?: boolean; denyRead?: string[] }) => {
         const prepared = await prepareGuardedRun(store, {
           agent: "claude-code", command: process.execPath, args: [probe], cwd: workspace,
           env: { PATH: process.env.PATH, SGW_TEST_ACCOUNT: account, SGW_TEST_SERVICE: service, SGW_TEST_KEYCHAIN: keychain },
@@ -344,6 +349,8 @@ writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0
         return JSON.parse(await readFile(path.join(workspace, "keychain-result.json"), "utf8"));
       };
       expect(await launch({})).toEqual({ read: true, timedOut: false });
+      expect(await launch({ denyAgentAuth: true })).toEqual({ read: true, timedOut: false });
+      expect(await launch({ denyKeychain: true })).toEqual({ read: false, timedOut: false });
       const sandboxOptions = { denyAgentAuth: true, denyRead: [keychain] };
       expect(await launch(sandboxOptions)).toEqual({ read: false, timedOut: false });
     } finally {

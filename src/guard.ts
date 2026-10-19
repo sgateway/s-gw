@@ -184,12 +184,13 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   }
   if (options.sandbox === "anthropic") {
     warnings.push("Experimental Anthropic sandbox: credential operations use external owned SSH and HTTPS executors. Database and service-specific connectors are pending.");
-    if (!options.sandboxOptions?.denyAgentAuth && !options.sandboxOptions?.isolatedAuth) warnings.push("Saved agent authentication files remain readable. macOS login Keychain reads require --allow-agent-keychain. Use --deny-agent-auth to block known login files and Keychain IPC.");
+    if (!options.sandboxOptions?.denyAgentAuth && !options.sandboxOptions?.isolatedAuth) warnings.push("Saved agent authentication files remain readable. Use --deny-agent-auth to block known login files.");
+    if (process.platform === "darwin" && !options.sandboxOptions?.denyKeychain && !options.sandboxOptions?.isolatedAuth) warnings.push("Native Keychain item retrieval may still work, including with --deny-agent-auth. Use --deny-keychain to block the known Keychain IPC endpoints.");
     if (options.sandboxOptions?.isolatedAuth) warnings.push("Isolated authentication uses a temporary agent home and blocks reads from the original home. Files in the allowed workspace remain readable, including any credentials stored there.");
     if (loginKeychain) warnings.push("--allow-agent-keychain permits this process tree to read the encrypted login Keychain database, which contains credentials beyond the agent's login. Remove the flag to restore the block.");
     else if (options.sandboxOptions?.allowAgentKeychain) warnings.push("--allow-agent-keychain is inactive on this platform or overridden by an explicit credential deny.");
     if (!options.sandboxOptions?.strictEgress && !options.sandboxOptions?.isolatedAuth) warnings.push("Default agent destinations are permitted. Use --strict-egress with explicit --allow-host entries to constrain that list.");
-    guardedEnv.SGW_GUARD_INSTRUCTIONS = `s-gw Anthropic sandbox is active for ${profile.displayName}. Use s-gw MCP to request approved SSH or HTTPS operations through the external trusted executor. Raw credentials remain outside this sandbox. Generic credential-bearing commands and file scans are unavailable in this mode.`;
+    guardedEnv.SGW_GUARD_INSTRUCTIONS = `s-gw Anthropic sandbox is active for ${profile.displayName}. Use s-gw MCP to request approved SSH or HTTPS operations through the external trusted executor. Credentials enrolled in s-gw remain outside this sandbox. Generic credential-bearing commands and file scans are unavailable in this mode.`;
   }
 
   return {
