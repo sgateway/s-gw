@@ -1,5 +1,5 @@
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
-import { realpathSync, statSync } from "node:fs";
+import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -145,6 +145,41 @@ export function isolatedAgentEnvironment(parentEnv: NodeJS.ProcessEnv, capabilit
   return env;
 }
 
+export function sandboxSessionRoot(platform = process.platform, uid = process.getuid?.()): string {
+  if ((platform !== "darwin" && platform !== "linux") || uid === undefined) {
+    throw new Error("A native user identity is required for sandbox session storage.");
+  }
+  return path.join(platform === "darwin" ? "/private/tmp" : "/tmp", `s-gw-agent-sessions-${uid}`);
+}
+
+async function createSandboxSession(config: SandboxRuntimeConfig): Promise<string> {
+  const root = sandboxSessionRoot();
+  try { await mkdir(root, { mode: 0o700 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const info = lstatSync(root);
+  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) {
+    throw new Error("Sandbox session storage is not private to the current OS user.");
+  }
+  const resolvedRoot = realpathSync(root);
+  const overlapsRoot = (file: string) => {
+    let allowed = path.resolve(file);
+    try { allowed = realpathSync(allowed); } catch { /* A missing path may still be a future allowance. */ }
+    return resolvedRoot === allowed || resolvedRoot.startsWith(allowed + path.sep) || allowed.startsWith(resolvedRoot + path.sep);
+  };
+  const readOverlap = (config.filesystem.allowRead || []).some(overlapsRoot);
+  const writeOverlap = config.filesystem.allowWrite.some(overlapsRoot);
+  if (readOverlap || writeOverlap) {
+    process.stderr.write("s-gw warning: an agent file allowance overlaps sandbox session storage; cross-session capability isolation cannot be guaranteed for this workspace.\n");
+  }
+  const sessionDir = await mkdtemp(path.join(resolvedRoot, "session-"));
+  config.filesystem.denyRead.push(resolvedRoot);
+  config.filesystem.allowRead = [...(config.filesystem.allowRead || []), sessionDir];
+  if (!writeOverlap) config.filesystem.denyWrite.push(resolvedRoot);
+  return sessionDir;
+}
+
 let running = false;
 
 function macSandboxProfileArgs(wrapped: string): { args: string[]; at: number } {
@@ -210,7 +245,7 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
   let agentTmp: string | undefined;
   let broker: Awaited<ReturnType<typeof startSandboxBroker>> | undefined;
   try {
-    sessionDir = await mkdtemp(path.join(os.tmpdir(), "sgw-sandbox-"));
+    sessionDir = await createSandboxSession(config);
     agentTmp = await mkdtemp(path.join(prepared.plan.cwd, ".sgw-tmp-"));
     const manifestPath = path.join(sessionDir, "launch.json");
     config.filesystem.denyWrite.push(sessionDir);

@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { anthropicSandboxConfig, isolatedAgentEnvironment, runAnthropicSandbox, sandboxAgentArguments } from "../src/anthropic-sandbox.js";
+import { anthropicSandboxConfig, isolatedAgentEnvironment, runAnthropicSandbox, sandboxAgentArguments, sandboxSessionRoot } from "../src/anthropic-sandbox.js";
 import { prepareGuardedRun, runGuardedAgent } from "../src/guard.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { SecretStore } from "../src/store.js";
@@ -183,6 +183,77 @@ try {
       args: [probe], cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic", sandboxOptions: opts });
     expect(await runAnthropicSandbox(prepared, store.home, opts)).toBe(0);
     expect(JSON.parse(await readFile(path.join(workspace, "strict-broker-result.json"), "utf8"))).toEqual({ http: true, scan: false });
+  });
+
+  it.skipIf(!["darwin", "linux"].includes(process.platform))("hides another live session capability while keeping own MCP and allowed localhost access", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const siblingWorkspace = path.join(root, "sibling-workspace");
+    await mkdir(siblingWorkspace);
+    const sessionRoot = sandboxSessionRoot();
+    await mkdir(sessionRoot, { recursive: true, mode: 0o700 });
+    const siblingDir = await mkdtemp(path.join(sessionRoot, "session-"));
+    const siblingBroker = await startSandboxBroker(siblingWorkspace, store.home, "Claude Code", [],
+      { strictEnv: true, agentWritablePaths: [siblingWorkspace] });
+    const local = createServer(socket => socket.end("synthetic localhost fixture"));
+    await new Promise<void>(resolve => local.listen(0, "127.0.0.1", resolve));
+    try {
+      const siblingConfig = path.join(siblingDir, "mcp.json");
+      await writeFile(siblingConfig, JSON.stringify({ mcpServers: { "s-gw": { env: {
+        SGW_SANDBOX_BROKER_PORT: String(siblingBroker.port), SGW_SANDBOX_BROKER_TOKEN: siblingBroker.token
+      } } } }), { mode: 0o600 });
+      await writeFile(path.join(workspace, "fixture.json"), JSON.stringify({ siblingConfig,
+        localPort: (local.address() as { port: number }).port }));
+      const sdkRoot = path.resolve("node_modules/@modelcontextprotocol/sdk/dist/esm");
+      const probe = path.join(workspace, "session-isolation-probe.mjs");
+      await writeFile(probe, `import { readFileSync, writeFileSync } from 'node:fs';
+import { connect } from 'node:net';
+import { request } from 'node:http';
+import { Client } from ${JSON.stringify(new URL(`file://${path.join(sdkRoot, "client/index.js")}`).href)};
+import { StdioClientTransport } from ${JSON.stringify(new URL(`file://${path.join(sdkRoot, "client/stdio.js")}`).href)};
+const fixture = JSON.parse(readFileSync('fixture.json', 'utf8'));
+let siblingRead = false;
+try { readFileSync(fixture.siblingConfig); siblingRead = true; } catch {}
+const own = JSON.parse(readFileSync(process.env.SGW_SANDBOX_MCP_CONFIG, 'utf8')).mcpServers['s-gw'];
+const client = new Client({ name: 'synthetic agent', version: '1' });
+let ownMcp = false;
+try {
+  await client.connect(new StdioClientTransport({ ...own, stderr: 'pipe' }));
+  ownMcp = (await client.listTools()).tools.some(tool => tool.name === 'sgw_request_http');
+} finally { await client.close(); }
+const direct = await new Promise(resolve => {
+  const socket = connect(fixture.localPort, '127.0.0.1');
+  socket.once('connect', () => { socket.destroy(); resolve(true); });
+  socket.once('error', () => resolve(false));
+  socket.setTimeout(2000, () => { socket.destroy(); resolve(false); });
+});
+const proxy = new URL(process.env.SGW_SANDBOX_PROXY_URL);
+const viaProxy = await new Promise(resolve => {
+  const req = request({ hostname: proxy.hostname, port: Number(proxy.port), method: 'CONNECT',
+    path: '127.0.0.1:' + fixture.localPort });
+  req.once('connect', (response, socket) => {
+    if (response.statusCode !== 200) { socket.destroy(); resolve(false); return; }
+    socket.once('data', chunk => { socket.destroy(); resolve(chunk.toString() === 'synthetic localhost fixture'); });
+    socket.once('error', () => resolve(false));
+    socket.setTimeout(2000, () => { socket.destroy(); resolve(false); });
+  });
+  req.once('error', () => resolve(false));
+  req.end();
+});
+writeFileSync('session-isolation-result.json', JSON.stringify({ siblingRead, ownMcp, direct, viaProxy }));
+`);
+      const opts = { isolatedAuth: true, allowHosts: ["127.0.0.1"] };
+      const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+        args: [probe], cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic", sandboxOptions: opts });
+      expect(await runAnthropicSandbox(prepared, store.home, opts)).toBe(0);
+      expect(JSON.parse(await readFile(path.join(workspace, "session-isolation-result.json"), "utf8"))).toEqual({
+        siblingRead: false, ownMcp: true, direct: false, viaProxy: true
+      });
+    } finally {
+      await siblingBroker.close();
+      await new Promise<void>(resolve => local.close(() => resolve()));
+      await rm(siblingDir, { recursive: true, force: true });
+    }
   });
 
   it("adds the Keychain IPC denial to the existing trusted macOS profile", () => {

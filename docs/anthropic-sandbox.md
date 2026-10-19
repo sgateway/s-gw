@@ -40,6 +40,8 @@ The mode cannot protect credentials already embedded in prompts or returned by u
 
 The current launcher and broker run under the same OS user, and the agent can read its broker capability. Neither the default profile nor `--isolated-auth` establishes a kernel-verifiable agent principal. The cross-platform design and rollout gates are in [OS identity for confined agents](agent-os-identity.md).
 
+Sandbox launch manifests and MCP configuration now live in a private per-user session root. A confined process can read its own session directory, while the sandbox denies the shared root used by other updated sessions. If a workspace or runtime allowance overlaps that root, the launcher warns that cross-session capability isolation cannot be guaranteed. This file rule does not protect against other unrestricted processes running as the same OS user.
+
 ## Validation
 
 `npm run test:anthropic-e2e` installs a fresh packed package into a disposable home and exercises ordinary MCP compatibility, confinement, approval, HTTPS authentication, SSH authentication, output sanitization, and cleanup. `--real-agent codex` uses a native Codex session. Synthetic credentials and test homes are isolated from the live store.
