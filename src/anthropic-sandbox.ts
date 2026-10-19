@@ -215,7 +215,8 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     const manifestPath = path.join(sessionDir, "launch.json");
     config.filesystem.denyWrite.push(sessionDir);
     broker = await startSandboxBroker(prepared.plan.cwd, home, prepared.plan.agent.displayName, config.filesystem.denyRead,
-      { strictEnv: options.strictBrokerEnv || options.isolatedAuth, agentWritablePaths: config.filesystem.allowWrite });
+      { strictEnv: options.strictBrokerEnv || options.isolatedAuth, agentWritablePaths: config.filesystem.allowWrite,
+        ...(options.isolatedAuth ? { uploadWorkspace: prepared.plan.cwd } : {}) });
     const brokerPort = broker.port;
     await SandboxManager.initialize(config, async ({ host, port }) => host === "127.0.0.1" && port === brokerPort);
     const proxyPort = process.platform === "linux" ? 3128 : SandboxManager.getProxyPort();

@@ -21,6 +21,7 @@ export interface BrokerEnvironmentOptions {
   strictEnv?: boolean;
   inheritedEnv?: NodeJS.ProcessEnv;
   agentWritablePaths?: string[];
+  uploadWorkspace?: string;
 }
 
 export async function startSandboxBroker(
@@ -105,6 +106,12 @@ export function brokerChildEnvironment(
   env.SGW_HOME = home;
   env.SGW_SANDBOX_OPERATIONS_ONLY = "1";
   env.SGW_SANDBOX_DENY_READ = JSON.stringify(denyRead);
+  delete env.SGW_SANDBOX_UPLOAD_WORKSPACE;
+  if (options.uploadWorkspace) {
+    const workspace = path.resolve(cwd);
+    if (path.resolve(options.uploadWorkspace) !== workspace) throw new Error("The upload workspace must match the confined agent workspace.");
+    env.SGW_SANDBOX_UPLOAD_WORKSPACE = workspace;
+  }
   env.SGW_SANDBOX_AGENT_NAME = agentName;
   env.TSX_DISABLE_CACHE = "1";
   if (options.strictEnv) return env;

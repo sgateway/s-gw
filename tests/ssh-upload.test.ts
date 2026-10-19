@@ -8,8 +8,13 @@ import { afterEach, beforeEach, expect, it } from "vitest";
 import { approvedPipeStream, hashUpload, openApprovedUpload, prepareUpload, uploadCommand } from "../src/ssh-upload.js";
 let root = "";
 const saved = process.env.SGW_SANDBOX_DENY_READ;
-beforeEach(async () => { root = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-upload-"))); delete process.env.SGW_SANDBOX_DENY_READ; });
-afterEach(async () => { if (saved === undefined) delete process.env.SGW_SANDBOX_DENY_READ; else process.env.SGW_SANDBOX_DENY_READ = saved; await rm(root, { recursive: true, force: true }); });
+const savedWorkspace = process.env.SGW_SANDBOX_UPLOAD_WORKSPACE;
+beforeEach(async () => { root = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-upload-"))); delete process.env.SGW_SANDBOX_DENY_READ; delete process.env.SGW_SANDBOX_UPLOAD_WORKSPACE; });
+afterEach(async () => {
+  if (saved === undefined) delete process.env.SGW_SANDBOX_DENY_READ; else process.env.SGW_SANDBOX_DENY_READ = saved;
+  if (savedWorkspace === undefined) delete process.env.SGW_SANDBOX_UPLOAD_WORKSPACE; else process.env.SGW_SANDBOX_UPLOAD_WORKSPACE = savedWorkspace;
+  await rm(root, { recursive: true, force: true });
+});
 
 it("approves and snapshots files without imposing an upload size limit", async () => {
   const source = path.join(root, "input.bin"), home = path.join(root, "store");
@@ -48,6 +53,26 @@ it("denies credential paths, explicit parents, root, globs, and credential symbo
     const credentialAlias = path.join(root, "credential-alias"); await symlink(sensitive, credentialAlias);
     await expect(prepareUpload(credentialAlias, "/tmp/output", home)).rejects.toThrow("denied");
   }
+});
+
+it("allows an isolated workspace beneath a denied home without exposing siblings or protected paths", async () => {
+  const workspace = path.join(root, "workspace"), home = path.join(workspace, "store");
+  await mkdir(workspace); await mkdir(home);
+  const source = path.join(workspace, "payload"); await writeFile(source, "approved workspace bytes");
+  const sibling = path.join(root, "private"); await writeFile(sibling, "must remain private");
+  const protectedSource = path.join(home, "credential"); await writeFile(protectedSource, "must remain private");
+  process.env.SGW_SANDBOX_DENY_READ = JSON.stringify([root]);
+  await expect(prepareUpload(source, "/tmp/output", home)).rejects.toThrow("denied");
+
+  process.env.SGW_SANDBOX_UPLOAD_WORKSPACE = workspace;
+  expect((await prepareUpload(source, "/tmp/output", home)).sourcePath).toBe(source);
+  await expect(prepareUpload(sibling, "/tmp/output", home)).rejects.toThrow("denied");
+  await expect(prepareUpload(protectedSource, "/tmp/output", home)).rejects.toThrow("denied");
+
+  process.env.SGW_SANDBOX_DENY_READ = JSON.stringify([root, source]);
+  await expect(prepareUpload(source, "/tmp/output", home)).rejects.toThrow("denied");
+  process.env.SGW_SANDBOX_DENY_READ = JSON.stringify([root, path.join(workspace, "pay*")]);
+  await expect(prepareUpload(source, "/tmp/output", home)).rejects.toThrow("denied");
 });
 
 it.skipIf(process.platform === "win32")("preserves named pipe uploads and quotes a remote destination safely", async () => {

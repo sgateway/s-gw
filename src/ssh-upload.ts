@@ -18,7 +18,10 @@ export async function prepareUpload(sourcePath: string, destinationPath: string,
   if (!path.isAbsolute(sourcePath) || !destinationPath || /[\x00\r\n]/.test(destinationPath)) throw new Error("SSH upload paths are required.");
   const source = normalizePathForSandbox(await realpath(sourcePath));
   const explicit: string[] = JSON.parse(process.env.SGW_SANDBOX_DENY_READ || "[]");
-  for (const file of [...sensitiveChildPaths(home), ...explicit]) {
+  const protectedPaths = sensitiveChildPaths(home);
+  const uploadWorkspace = process.env.SGW_SANDBOX_UPLOAD_WORKSPACE
+    ? normalizePathForSandbox(await realpath(process.env.SGW_SANDBOX_UPLOAD_WORKSPACE)) : "";
+  for (const [index, file] of [...protectedPaths, ...explicit].entries()) {
     let denied = normalizePathForSandbox(path.resolve(file));
     if (containsGlobChars(denied)) {
       const prefix = denied.split(/[*?[\]]/)[0];
@@ -29,7 +32,11 @@ export async function prepareUpload(sourcePath: string, destinationPath: string,
     } else {
       try { denied = normalizePathForSandbox(await realpath(denied)); }
       catch (error) { if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code || "")) throw error; }
-      if (source === denied || source.startsWith(denied.endsWith(path.sep) ? denied : denied + path.sep)) throw new Error("SSH upload source is denied by the credential read policy.");
+      if (source !== denied && !source.startsWith(denied.endsWith(path.sep) ? denied : denied + path.sep)) continue;
+      if (index >= protectedPaths.length && uploadWorkspace &&
+          uploadWorkspace.startsWith(denied.endsWith(path.sep) ? denied : denied + path.sep) &&
+          (source === uploadWorkspace || source.startsWith(uploadWorkspace + path.sep))) continue;
+      throw new Error("SSH upload source is denied by the credential read policy.");
     }
   }
   const info = await lstat(source);
