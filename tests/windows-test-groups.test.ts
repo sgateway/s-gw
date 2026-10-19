@@ -124,6 +124,7 @@ describe("Windows test groups", () => {
   it("allows enough time to create the private Windows test root", async () => {
     const runner = await readFile(path.resolve("scripts/run-windows-tests.mjs"), "utf8");
     expect(runner).toContain("timeout: 60_000");
+    expect(runner).toContain('"--testTimeout", "30000"');
   });
 
   it("assigns every Windows client test to one shard", async () => {
