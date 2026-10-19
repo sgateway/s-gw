@@ -12,6 +12,7 @@ import {
 } from "./store.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
 import { assertSshCredentialSupported, runOwnedSshSession } from "./ssh.js";
+import type { AgentIdentityContext } from "./agent-context.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 
 export interface ExecutionOptions {
@@ -19,6 +20,7 @@ export interface ExecutionOptions {
   coreBinary?: string;
   http?: OwnedHttpOptions;
   operationsOnly?: boolean;
+  caller?: AgentIdentityContext;
 }
 
 export async function executeApprovedRequest(
@@ -30,7 +32,7 @@ export async function executeApprovedRequest(
     const pending = await store.getRequest(requestId);
     if (!["http_request", "ssh_session"].includes(pending.action.kind)) throw new Error("Sandbox execution supports owned SSH and HTTPS operations only.");
   }
-  const request = await store.claimApprovedRequest(requestId);
+  const request = await store.claimApprovedRequest(requestId, options.caller);
   try {
     const summary = await executeRequest(store, request, options);
     await store.markExecuted(requestId, summary);
@@ -47,7 +49,7 @@ export async function executeReusablePermit(
   permit: ReusableExecutionPermit,
   options: ExecutionOptions = {}
 ): Promise<ExecutionSummary> {
-  const initialRequest = await store.validateReusableExecutionPermit(permit);
+  const initialRequest = await store.validateReusableExecutionPermit(permit, options.caller);
   if (initialRequest.action.kind !== "env_command") {
     throw new Error("Reusable execution permits only support environment-command actions.");
   }
@@ -66,7 +68,7 @@ export async function executeReusablePermit(
       );
       nativeLaunch = launch.nativeLaunch;
       return launch;
-    });
+    }, options.caller);
   } catch (error) {
     if (!nativeLaunch || executionEngine(options.engine) !== "auto" || !isNativeLaunchError(error)) {
       throw error;
@@ -80,7 +82,7 @@ export async function executeReusablePermit(
         prepared.secretValue,
         prepared.extraSecrets
       );
-    });
+    }, options.caller);
   }
 }
 

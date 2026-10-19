@@ -33,6 +33,7 @@ export interface ApprovalGrant {
   agentScope?: ApprovalAgentScope;
   agentName?: string;
   principalId?: string;
+  agentSessionId?: string;
   loginSessionId: string;
   createdAt: string;
   updatedAt: string;
@@ -203,6 +204,7 @@ export interface RequestRecord {
   agentName?: string;
   agentSource?: AgentIdentitySource;
   principalId?: string;
+  agentSessionId?: string;
   loginSessionId?: string;
   action: CommandAction;
   state: RequestState;

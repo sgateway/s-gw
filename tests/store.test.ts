@@ -3493,13 +3493,15 @@ describe("SecretStore", () => {
     const action = buildEnvCommandAction({
       command: process.execPath, args: ["-e", "process.stdout.write('managed')"], injectEnv: "TOKEN"
     });
-    const managed = { managedPrincipal: principalForVerifiedPeer("local:codex", "Codex"), env: {} };
+    const managed = { managedPrincipal: principalForVerifiedPeer("local:codex", "Codex", "session-1"), env: {} };
     const first = await store.createRequest(secret.handle, action, "managed grant", managed);
     const approved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
     const same = await store.prepareOneShotExecution(secret.handle, action, "managed repeat", managed);
     expect(same.kind).toBe("reusable");
     if (same.kind !== "reusable") throw new Error("Expected managed permit.");
     expect(same.permit.principalId).toBe("local:codex");
+    expect(same.permit.agentSessionId).toBe("session-1");
+    expect((await store.listApprovalGrants())[0].agentSessionId).toBe("session-1");
 
     expect((await store.prepareOneShotExecution(secret.handle, action, "name spoof", {
       mcpClientName: "Codex", env: {}
@@ -3507,11 +3509,87 @@ describe("SecretStore", () => {
     expect((await store.prepareOneShotExecution(secret.handle, action, "other managed", {
       managedPrincipal: principalForVerifiedPeer("local:other", "Codex"), env: {}
     })).kind).toBe("request");
-    const result = await executeReusablePermit(store, same.permit, { engine: "typescript" });
+    expect((await store.prepareOneShotExecution(secret.handle, action, "later session", {
+      managedPrincipal: principalForVerifiedPeer("local:codex", "Codex", "session-2"), env: {}
+    })).kind).toBe("request");
+    const result = await executeReusablePermit(store, same.permit, { engine: "typescript", caller: managed });
     expect(result.stdout).toBe("managed");
     await store.revokeApprovalGrant(approved.approvalGrantId!);
     await expect(executeReusablePermit(store, same.permit, { engine: "typescript" }))
       .rejects.toThrow(/authorization changed|approval grant.*valid/i);
+  });
+
+  it("checks the verified peer and session when claiming an approved request", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "managed claim token", type: "api-token", value: fakeOpenAiToken("managed_claim"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "process.stdout.write('claimed')"], injectEnv: "TOKEN"
+    });
+    const peer = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
+    const otherSession = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-2"), env: {} };
+    const otherAgent = { managedPrincipal: principalForVerifiedPeer("linux:claude", "Codex", "session-1"), env: {} };
+    const ordinary = { mcpClientName: "Codex", env: {} };
+    const request = await store.createRequest(secret.handle, action, "managed claim", peer);
+    expect(request.agentSessionId).toBe("session-1");
+    await store.approveRequest(request.id);
+
+    for (const caller of [ordinary, otherSession, otherAgent]) {
+      await expect(executeApprovedRequest(store, request.id, { caller, engine: "typescript" }))
+        .rejects.toThrow(/different verified agent or session/);
+      expect((await store.getRequest(request.id)).state).toBe("approved");
+    }
+    await expect(executeApprovedRequest(store, request.id, {
+      caller: { managedPrincipal: { id: "linux:codex", name: "Codex", sessionId: "session-1" }, env: {} },
+      engine: "typescript"
+    })).rejects.toThrow(/not verified/);
+    expect((await store.getRequest(request.id)).state).toBe("approved");
+
+    const result = await executeApprovedRequest(store, request.id, { caller: peer, engine: "typescript" });
+    expect(result.stdout).toBe("claimed");
+
+    const legacy = await store.createRequest(secret.handle, action, "legacy claim", ordinary);
+    await store.approveRequest(legacy.id);
+    await expect(executeApprovedRequest(store, legacy.id, { caller: peer, engine: "typescript" }))
+      .rejects.toThrow(/different verified agent or session/);
+    expect((await executeApprovedRequest(store, legacy.id, { caller: ordinary, engine: "typescript" })).stdout).toBe("claimed");
+
+    const operatorRequest = await store.createRequest(secret.handle, action, "operator claim", peer);
+    await store.approveRequest(operatorRequest.id);
+    expect((await executeApprovedRequest(store, operatorRequest.id, { engine: "typescript" })).stdout).toBe("claimed");
+  });
+
+  it("rechecks a managed reusable permit against the peer before launch", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "managed permit token", type: "api-token", value: fakeOpenAiToken("managed_permit"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "process.stdout.write('permit')"], injectEnv: "TOKEN"
+    });
+    const peer = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
+    await store.addApprovalPolicyRule({ decision: "allow", conditions: {
+      handles: [secret.handle], principalIds: ["linux:codex"], commands: [process.execPath],
+      resolvedCommands: [resolvedNodeExecutable]
+    } });
+    const admission = await store.prepareOneShotExecution(secret.handle, action, "managed permit", peer);
+    expect(admission.kind).toBe("reusable");
+    if (admission.kind !== "reusable") throw new Error("Expected managed permit.");
+    expect(admission.permit.agentSessionId).toBe("session-1");
+
+    const wrong = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-2"), env: {} };
+    await expect(executeReusablePermit(store, admission.permit, { caller: wrong, engine: "typescript" }))
+      .rejects.toThrow(/different verified agent or session/);
+    let launched = false;
+    await expect(store.launchReusableExecution(admission.permit, () => {
+      launched = true;
+      return { completion: Promise.resolve("unexpected") };
+    }, wrong)).rejects.toThrow(/different verified agent or session/);
+    expect(launched).toBe(false);
+    expect((await executeReusablePermit(store, admission.permit, { caller: peer, engine: "typescript" })).stdout).toBe("permit");
   });
 
   it("requires a route-bound allow policy for managed SSH", async () => {

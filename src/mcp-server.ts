@@ -163,7 +163,7 @@ server.registerTool(
     return asText({
       approvalRequired: false,
       reusableAuthorization: admission.permit.authorization,
-      summary: await executeReusablePermit(store, admission.permit)
+      summary: await executeReusablePermit(store, admission.permit, { caller: mcpAgentContext() })
     });
   }
 );
@@ -296,7 +296,7 @@ server.registerTool(
       requestId: z.string().min(1)
     }
   },
-  async ({ requestId }) => asText(await executeApprovedRequest(store, requestId, { operationsOnly }))
+  async ({ requestId }) => asText(await executeApprovedRequest(store, requestId, { operationsOnly, caller: mcpAgentContext() }))
 );
 
 function asText(value: unknown) {

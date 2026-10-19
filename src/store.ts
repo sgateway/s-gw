@@ -253,6 +253,7 @@ export interface ReusableExecutionPermit {
   agentName: string;
   agentSource: AgentIdentitySource;
   principalId?: string;
+  agentSessionId?: string;
   action: CommandAction;
   createdAt: string;
   controlFingerprint: string;
@@ -1013,20 +1014,23 @@ export class SecretStore {
     return this.mutate((store) => oneShotExecutionAdmission(this.home, store, handle, action, reason, agentContext));
   }
 
-  async validateReusableExecutionPermit(permit: ReusableExecutionPermit): Promise<RequestRecord> {
+  async validateReusableExecutionPermit(permit: ReusableExecutionPermit, caller?: AgentIdentityContext): Promise<RequestRecord> {
     assertReusableExecutionPermit(permit, this.home);
+    assertExecutionCaller(permit, caller);
     const store = await this.read();
     return validatedReusableExecutionRequest(store, permit);
   }
 
   async launchReusableExecution<T>(
     permit: ReusableExecutionPermit,
-    launch: (request: RequestRecord) => ExecutionLaunch<T>
+    launch: (request: RequestRecord) => ExecutionLaunch<T>,
+    caller?: AgentIdentityContext
   ): Promise<T> {
     assertReusableExecutionPermit(permit, this.home);
     await ensureSgwHome(this.home);
     const started = await this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
+      assertExecutionCaller(permit, caller);
       const request = validatedReusableExecutionRequest(store, permit);
       return launch(request);
     });
@@ -1188,7 +1192,7 @@ export class SecretStore {
     if (error) throw new Error(error);
   }
 
-  async claimApprovedRequest(id: string): Promise<RequestRecord> {
+  async claimApprovedRequest(id: string, caller?: AgentIdentityContext): Promise<RequestRecord> {
     const claimed = await this.mutate((store) => {
       // Reap any abandoned executions first so a previously-stranded request for the same
       // handle does not keep its approval grant alive or confuse the audit trail.
@@ -1199,6 +1203,7 @@ export class SecretStore {
       if (!request) {
         throw new Error(`Unknown request: ${id}`);
       }
+      assertExecutionCaller(request, caller);
       if (request.state !== "approved") {
         throw new Error(`Request ${id} is ${request.state}; local approval is required before execution.`);
       }
@@ -2910,7 +2915,10 @@ function isValidApprovalGrant(grant: ApprovalGrant): boolean {
     typeof grant.actionKey === "string" &&
     (grant.mode === "timed-session" || grant.mode === "login-session" || grant.mode === "always") &&
     (grant.principalId === undefined || (typeof grant.principalId === "string" && Boolean(grant.principalId))) &&
+    (grant.agentSessionId === undefined ||
+      (typeof grant.agentSessionId === "string" && Boolean(grant.agentSessionId) && Boolean(grant.principalId))) &&
     (grant.agentScope !== "any-agent" || grant.principalId === undefined) &&
+    (grant.agentScope !== "any-agent" || grant.agentSessionId === undefined) &&
     typeof grant.loginSessionId === "string"
   );
 }
@@ -3029,6 +3037,7 @@ function activeApprovalGrant(
     if ((grant.agentScope || "same-agent") === "same-agent") {
       if (grant.principalId || agent.principalId) {
         if (!grant.principalId || grant.principalId !== agent.principalId) return false;
+        if (grant.agentSessionId !== agent.agentSessionId) return false;
       } else if (grant.agentName !== agent.name) {
         return false;
       }
@@ -3078,7 +3087,7 @@ function createApprovalGrant(
       grant.loginSessionId === loginSessionId &&
       (grant.agentScope || "same-agent") === agentScope &&
       (agentScope === "any-agent" || (agent.principalId
-        ? grant.principalId === agent.principalId
+        ? grant.principalId === agent.principalId && grant.agentSessionId === agent.agentSessionId
         : !grant.principalId && grant.agentName === agentName))
     );
   });
@@ -3099,6 +3108,7 @@ function createApprovalGrant(
     agentScope,
     agentName: agentScope === "same-agent" ? agentName : undefined,
     principalId: agentScope === "same-agent" ? agent.principalId : undefined,
+    agentSessionId: agentScope === "same-agent" ? agent.agentSessionId : undefined,
     loginSessionId: loginSessionId || "",
     createdAt: nowIso,
     updatedAt: nowIso,
@@ -3174,6 +3184,7 @@ function createRequestInStore(
     agentName: agent.name,
     agentSource: agent.source,
     principalId: agent.principalId,
+    agentSessionId: agent.agentSessionId,
     loginSessionId: admission.loginSessionId,
     action: admission.action,
     state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
@@ -3349,6 +3360,7 @@ function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExe
     agentName: permit.agentName,
     agentSource: permit.agentSource,
     principalId: permit.principalId,
+    agentSessionId: permit.agentSessionId,
     action,
     state: "approved",
     createdAt: permit.createdAt,
@@ -3378,6 +3390,7 @@ function reusableExecutionPermit(
     agentName: agent.name,
     agentSource: agent.source,
     principalId: agent.principalId,
+    agentSessionId: agent.agentSessionId,
     action: frozenAction,
     createdAt,
     controlFingerprint: controlPlaneFingerprint(store),
@@ -3457,6 +3470,7 @@ function requestDuplicateKeyFor(
     handle,
     actionKey: approvalActionKey(handle, action),
     agent: agent.principalId ? `principal:${agent.principalId}` : `name:${agent.name}`,
+    agentSession: agent.agentSessionId || "",
     loginSessionId: loginSessionId || ""
   });
 }
@@ -3472,6 +3486,7 @@ function assertReusableExecutionPermit(permit: ReusableExecutionPermit, home: st
     !isAgentIdentitySource(permit.agentSource) ||
     (permit.agentSource === "managed-peer" && (typeof permit.principalId !== "string" || !permit.principalId)) ||
     (permit.agentSource !== "managed-peer" && permit.principalId !== undefined) ||
+    (permit.agentSessionId !== undefined && (permit.agentSource !== "managed-peer" || !permit.agentSessionId)) ||
     typeof permit.createdAt !== "string" ||
     typeof permit.controlFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(permit.controlFingerprint) ||
     !permit.authorization ||
@@ -3714,6 +3729,7 @@ function approvalGrantIdentityKey(grant: ApprovalGrant): string {
     agentScope: grant.agentScope || "same-agent",
     agentName: grant.agentScope === "any-agent" || grant.principalId ? "" : grant.agentName || "",
     principalId: grant.agentScope === "any-agent" ? "" : grant.principalId || "",
+    agentSessionId: grant.agentScope === "any-agent" ? "" : grant.agentSessionId || "",
     loginSessionId: grant.mode === "always" ? "" : grant.loginSessionId
   });
 }
@@ -4035,13 +4051,33 @@ function durablePolicyAgentName(request: RequestRecord): string {
   throw new Error("s-gw could not identify the requesting agent. Approve once or create a policy with an explicit agent condition.");
 }
 
+function assertExecutionCaller(
+  request: Pick<RequestRecord, "agentSource" | "principalId" | "agentSessionId">,
+  caller?: AgentIdentityContext
+): void {
+  // Operator CLI and UI calls omit caller; every MCP call supplies one.
+  if (caller === undefined) return;
+  if (!caller.managedPrincipal) {
+    if (request.agentSource === "managed-peer") {
+      throw new Error("This execution is bound to a different verified agent or session.");
+    }
+    return;
+  }
+  const agent = requestAgentIdentity("", caller);
+  if (request.agentSource !== "managed-peer" || agent.source !== "managed-peer" ||
+      !request.principalId || request.principalId !== agent.principalId ||
+      request.agentSessionId !== agent.agentSessionId) {
+    throw new Error("This execution is bound to a different verified agent or session.");
+  }
+}
+
 function identityFromRequest(request: RequestRecord): AgentIdentity {
   const name = request.agentName || requestAgentName(request.reason);
   if (request.agentSource === "managed-peer") {
     if (!request.principalId?.trim()) {
       throw new Error("Managed request has no verified principal ID.");
     }
-    return { name, source: "managed-peer", principalId: request.principalId };
+    return { name, source: "managed-peer", principalId: request.principalId, agentSessionId: request.agentSessionId };
   }
   return { name, source: request.agentSource || "unknown" };
 }
@@ -4051,7 +4087,7 @@ function identityFromPermit(permit: ReusableExecutionPermit): AgentIdentity {
     if (!permit.principalId?.trim()) {
       throw new Error("Managed execution permit has no verified principal ID.");
     }
-    return { name: permit.agentName, source: "managed-peer", principalId: permit.principalId };
+    return { name: permit.agentName, source: "managed-peer", principalId: permit.principalId, agentSessionId: permit.agentSessionId };
   }
   return { name: permit.agentName, source: permit.agentSource };
 }

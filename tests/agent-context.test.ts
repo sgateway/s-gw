@@ -59,6 +59,11 @@ describe("agent context detection", () => {
       mcpClientName: "Codex",
       env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" }
     }).principalId).toBeUndefined();
+    expect(requestAgentIdentity("request", {
+      managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1")
+    }).agentSessionId).toBe("session-1");
+    expect(() => principalForVerifiedPeer("linux:codex", "Codex", "session with spaces"))
+      .toThrow(/verified principal/);
   });
 
   it("detects Codex from the launcher process tree when the reason is generic", () => {

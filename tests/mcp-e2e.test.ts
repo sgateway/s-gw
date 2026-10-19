@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
+import { buildEnvCommandAction } from "../src/gateway.js";
 import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
@@ -132,6 +134,49 @@ describe("MCP end-to-end flow", () => {
     } finally {
       await client.close();
     }
+  }, 20_000);
+
+  it("does not let ordinary MCP execute a managed request ID", async () => {
+    runCli(["init"]);
+    const secret = JSON.parse(runCli([
+      "secret", "add", "--name", "managed request fixture", "--type", "api-token", "--value-stdin",
+      "--inject-env", "TOKEN", "--allow-command", process.execPath
+    ], "synthetic-managed-request-secret-value"));
+    const oldPassphrase = process.env.SGW_MASTER_PASSPHRASE;
+    const oldRecovery = process.env.SGW_RECOVERY_HOME;
+    let requestId = "";
+    try {
+      process.env.SGW_MASTER_PASSPHRASE = testEnv.SGW_MASTER_PASSPHRASE;
+      process.env.SGW_RECOVERY_HOME = testEnv.SGW_RECOVERY_HOME;
+      const store = new SecretStore(tmpHome);
+      const request = await store.createRequest(secret.handle, buildEnvCommandAction({
+        command: process.execPath, args: ["-e", "process.stdout.write('operator executed')"], injectEnv: "TOKEN"
+      }), "managed request", {
+        managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {}
+      });
+      await store.approveRequest(request.id);
+      requestId = request.id;
+    } finally {
+      if (oldPassphrase === undefined) delete process.env.SGW_MASTER_PASSPHRASE;
+      else process.env.SGW_MASTER_PASSPHRASE = oldPassphrase;
+      if (oldRecovery === undefined) delete process.env.SGW_RECOVERY_HOME;
+      else process.env.SGW_RECOVERY_HOME = oldRecovery;
+    }
+
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+      env: testEnv as Record<string, string>, stderr: "pipe"
+    });
+    const client = new Client({ name: "Codex", version: "0.0.1" });
+    await client.connect(transport);
+    try {
+      const denied = await client.callTool({ name: "sgw_execute_request", arguments: { requestId } });
+      expect(denied.isError).toBe(true);
+      expect(denied.content[0].text).toMatch(/different verified agent or session/);
+    } finally {
+      await client.close();
+    }
+    expect(JSON.parse(runCli(["execute", requestId])).stdout).toBe("operator executed");
   }, 20_000);
 
   it("resolves a managed SSH route ID without accepting an agent-selected endpoint", async () => {

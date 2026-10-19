@@ -7,6 +7,7 @@ export interface AgentIdentity {
   name: string;
   source: AgentIdentitySource;
   principalId?: string;
+  agentSessionId?: string;
 }
 
 const verifiedPrincipals = new WeakSet<object>();
@@ -14,17 +15,19 @@ const verifiedPrincipals = new WeakSet<object>();
 export interface VerifiedAgentPrincipal {
   readonly id: string;
   readonly name: string;
+  readonly sessionId?: string;
 }
 
 // Only a trusted adapter that has checked the OS peer may call this. MCP input and
 // agent environment variables must never be passed here as identity evidence.
-export function principalForVerifiedPeer(id: string, name: string): VerifiedAgentPrincipal {
+export function principalForVerifiedPeer(id: string, name: string, sessionId?: string): VerifiedAgentPrincipal {
   const principalId = id.trim();
   const displayName = cleanAgentName(name);
-  if (!/^[A-Za-z0-9:/._-]{1,256}$/.test(principalId) || !displayName) {
+  if (!/^[A-Za-z0-9:/._-]{1,256}$/.test(principalId) || !displayName ||
+      (sessionId !== undefined && !/^[A-Za-z0-9:/._-]{1,256}$/.test(sessionId))) {
     throw new Error("A managed agent needs a verified principal ID and display name.");
   }
-  const principal = Object.freeze({ id: principalId, name: displayName });
+  const principal = Object.freeze({ id: principalId, name: displayName, sessionId });
   verifiedPrincipals.add(principal);
   return principal;
 }
@@ -52,7 +55,8 @@ export function requestAgentIdentity(reason: string, context: AgentIdentityConte
     return {
       name: context.managedPrincipal.name,
       source: "managed-peer",
-      principalId: context.managedPrincipal.id
+      principalId: context.managedPrincipal.id,
+      agentSessionId: context.managedPrincipal.sessionId
     };
   }
 
