@@ -1,0 +1,285 @@
+import { lookup } from "node:dns/promises";
+import { request as httpsRequest, type RequestOptions } from "node:https";
+import { validateHeaderValue, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import { httpAddressAllowed } from "./http-executor.js";
+
+export type ModelProvider = "anthropic" | "openai";
+
+export interface ModelRelayAuthority {
+  provider: ModelProvider;
+  credential: string;
+  assertAuthorized: () => Promise<void>;
+  workspaceId?: string;
+  organizationId?: string;
+  projectId?: string;
+  ca?: string;
+}
+
+export type ModelUpstreamRequest = (
+  url: URL, options: RequestOptions, callback: (response: IncomingMessage) => void
+) => ClientRequest;
+
+const destinations: Record<ModelProvider, string> = {
+  anthropic: "api.anthropic.com",
+  openai: "api.openai.com"
+};
+const maxBodyBytes = 32 * 1024 * 1024;
+const maxResponseBytes = 64 * 1024 * 1024;
+const marker = Buffer.from("[s-gw withheld credential]");
+
+class RelayError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
+function modelRoute(provider: ModelProvider, method: string | undefined, target: string | undefined): URL {
+  if (provider !== "anthropic" && provider !== "openai") {
+    throw new RelayError(404, "Unsupported model provider.");
+  }
+  if (!target || !target.startsWith("/") || target.startsWith("//") || target.includes("\\") || target.includes("#")) {
+    throw new RelayError(404, "Unsupported model relay route.");
+  }
+  const route = new URL(target, "http://localhost");
+  if (route.origin !== "http://localhost") throw new RelayError(404, "Unsupported model relay route.");
+  const pathname = route.pathname;
+  const allowed = provider === "anthropic"
+    ? (method === "POST" && ["/v1/messages", "/v1/messages/count_tokens"].includes(pathname)) ||
+      (method === "GET" && pathname === "/v1/models")
+    : method === "POST" && pathname === "/v1/responses";
+  if (!allowed) throw new RelayError(404, "Unsupported model relay route.");
+
+  const entries = [...route.searchParams.entries()];
+  if (provider === "anthropic" && pathname === "/v1/messages" && entries.length === 1 &&
+      entries[0][0] === "beta" && entries[0][1] === "true") {
+    return new URL(target, `https://${destinations[provider]}`);
+  }
+  if (provider === "anthropic" && pathname === "/v1/models" && entries.length === 1 &&
+      entries[0][0] === "limit" && /^\d{1,4}$/.test(entries[0][1]) &&
+      Number(entries[0][1]) >= 1 && Number(entries[0][1]) <= 1000) {
+    return new URL(target, `https://${destinations[provider]}`);
+  }
+  if (entries.length) throw new RelayError(404, "Unsupported model relay query.");
+  return new URL(target, `https://${destinations[provider]}`);
+}
+
+function singleHeader(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  if (value === undefined) return;
+  if (typeof value !== "string") throw new RelayError(400, `Invalid ${name} header.`);
+  validateHeaderValue(name, value);
+  return value;
+}
+
+function upstreamHeaders(req: IncomingMessage, authority: ModelRelayAuthority, bodyLength: number): Record<string, string> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${authority.credential}`,
+    "accept-encoding": "identity",
+    accept: "application/json, text/event-stream",
+    "user-agent": "s-gw-model-relay",
+    "content-type": "application/json"
+  };
+  if (req.method !== "GET") headers["content-length"] = String(bodyLength);
+
+  const encoding = singleHeader(req, "content-encoding");
+  if (encoding && encoding !== "identity") throw new RelayError(415, "Encoded model requests are unsupported.");
+  const contentType = singleHeader(req, "content-type");
+  if (req.method !== "GET" && contentType && !/^application\/json(?:;\s*charset=utf-8)?$/i.test(contentType)) {
+    throw new RelayError(415, "Model requests must use application/json.");
+  }
+
+  if (authority.provider === "anthropic") {
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (!name.startsWith("anthropic-") || /(?:key|token|secret|auth|cookie|credential)/i.test(name)) continue;
+      if (typeof value !== "string") throw new RelayError(400, `Invalid ${name} header.`);
+      validateHeaderValue(name, value);
+      headers[name] = value;
+    }
+    headers["anthropic-version"] ||= "2023-06-01";
+    if (authority.workspaceId) headers["anthropic-workspace-id"] = authority.workspaceId;
+    else delete headers["anthropic-workspace-id"];
+  } else {
+    const beta = singleHeader(req, "openai-beta");
+    if (beta) headers["openai-beta"] = beta;
+    if (authority.organizationId) headers["openai-organization"] = authority.organizationId;
+    if (authority.projectId) headers["openai-project"] = authority.projectId;
+  }
+
+  for (const [name, value] of Object.entries(headers)) validateHeaderValue(name, value);
+  return headers;
+}
+
+async function requestBody(req: IncomingMessage, signal: AbortSignal): Promise<Buffer> {
+  if (req.method === "GET") {
+    if (req.headers["transfer-encoding"] || (req.headers["content-length"] && req.headers["content-length"] !== "0")) {
+      throw new RelayError(400, "GET model requests cannot have a body.");
+    }
+    return Buffer.alloc(0);
+  }
+  const parts: Buffer[] = [];
+  let size = 0;
+  for await (const part of req) {
+    signal.throwIfAborted();
+    const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
+    size += chunk.length;
+    if (size > maxBodyBytes) throw new RelayError(413, "Model request exceeds 32 MiB.");
+    parts.push(chunk);
+  }
+  return Buffer.concat(parts, size);
+}
+
+class StreamRedactor {
+  private tail = Buffer.alloc(0);
+  private readonly patterns: Buffer[];
+
+  constructor(secret: string) {
+    this.patterns = secretVariants(secret);
+  }
+
+  push(chunk: Buffer, finish = false): Buffer {
+    const data = Buffer.concat([this.tail, chunk]);
+    const keep = finish ? 0 : Math.max(...this.patterns.map(item => item.length)) - 1;
+    const limit = Math.max(0, data.length - keep);
+    const output: Buffer[] = [];
+    let cursor = 0;
+    while (cursor < limit) {
+      let index = -1;
+      let found: Buffer | undefined;
+      for (const pattern of this.patterns) {
+        const at = data.indexOf(pattern, cursor);
+        if (at >= 0 && (index < 0 || at < index || (at === index && pattern.length > found!.length))) {
+          index = at;
+          found = pattern;
+        }
+      }
+      if (index < 0 || index >= limit) break;
+      output.push(data.subarray(cursor, index), marker);
+      cursor = index + found!.length;
+    }
+    if (cursor < limit) { output.push(data.subarray(cursor, limit)); cursor = limit; }
+    this.tail = data.subarray(cursor);
+    return Buffer.concat(output);
+  }
+}
+
+function secretVariants(secret: string): Buffer[] {
+  const candidates = [secret, Buffer.from(secret).toString("base64"), encodeURIComponent(secret),
+    JSON.stringify(secret).slice(1, -1)];
+  return [...new Set(candidates)].filter(value => value.length > 0).map(value => Buffer.from(value));
+}
+
+function responseHeaders(upstream: IncomingMessage, credential: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const variants = secretVariants(credential).map(value => value.toString());
+  for (const [name, value] of Object.entries(upstream.headers)) {
+    if (typeof value !== "string" || variants.some(secret => value.includes(secret))) continue;
+    if (name === "content-type" || name === "retry-after" || name === "x-should-retry" ||
+        name === "x-request-id" || name.startsWith("anthropic-ratelimit-") ||
+        name.startsWith("x-ratelimit-")) {
+      validateHeaderValue(name, value);
+      headers[name] = value;
+    }
+  }
+  headers["cache-control"] = "no-store";
+  return headers;
+}
+
+async function writeChunk(res: ServerResponse, chunk: Buffer, signal: AbortSignal): Promise<void> {
+  if (!chunk.length) return;
+  signal.throwIfAborted();
+  if (res.write(chunk)) return;
+  await new Promise<void>((resolve, reject) => {
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error("Model relay client disconnected.")); };
+    const cleanup = () => { res.off("drain", onDrain); res.off("close", onClose); };
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+  });
+}
+
+export async function relayModelRequest(
+  req: IncomingMessage, res: ServerResponse, authority: ModelRelayAuthority,
+  requestUpstream: ModelUpstreamRequest = httpsRequest
+): Promise<void> {
+  const abort = new AbortController();
+  const onClose = () => abort.abort(new Error("Model relay client disconnected."));
+  req.once("aborted", onClose);
+  res.once("close", onClose);
+  const timeout = setTimeout(() => abort.abort(new Error("Model relay timed out.")), 30 * 60_000);
+  let checking: Promise<void> | undefined;
+  const check = async () => {
+    if (!checking) {
+      checking = Promise.resolve().then(authority.assertAuthorized).catch(() => {
+        abort.abort(new Error("Model relay authorization ended."));
+      }).finally(() => { checking = undefined; });
+    }
+    await checking;
+  };
+  const monitor = setInterval(() => { void check(); }, 1000);
+  try {
+    if (!authority.credential || authority.credential.length > 16_384) throw new RelayError(403, "Model relay credential is unavailable.");
+    validateHeaderValue("authorization", authority.credential);
+    const route = modelRoute(authority.provider, req.method, req.url);
+    await check();
+    abort.signal.throwIfAborted();
+    const body = await requestBody(req, abort.signal);
+    const headers = upstreamHeaders(req, authority, body.length);
+    await check();
+    abort.signal.throwIfAborted();
+
+    const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
+      const call = requestUpstream(route, {
+        method: req.method, headers, agent: false, signal: abort.signal, ca: authority.ca,
+        rejectUnauthorized: true,
+        lookup: (hostname, opts, callback) => {
+          void lookup(hostname, { all: true }).then(addresses => {
+            if (!addresses.length || addresses.some(item => !httpAddressAllowed(item.address, false))) {
+              throw new Error("Model provider resolves to a restricted address.");
+            }
+            const chosen = addresses[0];
+            if (opts.all) callback(null, [chosen]);
+            else callback(null, chosen.address, chosen.family);
+          }).catch(error => callback(error, "", 4));
+        }
+      }, resolve);
+      call.once("error", reject);
+      call.end(body);
+    });
+    if (upstream.statusCode && upstream.statusCode >= 300 && upstream.statusCode < 400) {
+      upstream.destroy();
+      throw new RelayError(502, "Model provider redirect was refused.");
+    }
+    if (upstream.headers["content-encoding"] && upstream.headers["content-encoding"] !== "identity") {
+      upstream.destroy();
+      throw new RelayError(502, "Encoded model response was refused.");
+    }
+    await check();
+    abort.signal.throwIfAborted();
+    res.writeHead(upstream.statusCode || 502, responseHeaders(upstream, authority.credential));
+    const redactor = new StreamRedactor(authority.credential);
+    let received = 0;
+    for await (const part of upstream) {
+      abort.signal.throwIfAborted();
+      received += part.length;
+      if (received > maxResponseBytes) throw new RelayError(502, "Model response exceeded 64 MiB.");
+      await check();
+      abort.signal.throwIfAborted();
+      await writeChunk(res, redactor.push(part), abort.signal);
+    }
+    await writeChunk(res, redactor.push(Buffer.alloc(0), true), abort.signal);
+    res.end();
+  } catch (error) {
+    if (res.headersSent) { res.destroy(); return; }
+    const status = error instanceof RelayError ? error.status
+      : abort.signal.aborted && abort.signal.reason instanceof Error && abort.signal.reason.message.includes("timed out") ? 504
+        : abort.signal.aborted ? 403 : 502;
+    const message = error instanceof RelayError ? error.message
+      : status === 403 ? "Model relay authorization ended."
+        : status === 504 ? "Model relay timed out." : "Model relay upstream failed.";
+    res.writeHead(status, { "content-type": "text/plain", "cache-control": "no-store" });
+    res.end(message);
+  } finally {
+    clearTimeout(timeout);
+    clearInterval(monitor);
+    req.off("aborted", onClose);
+    res.off("close", onClose);
+  }
+}
