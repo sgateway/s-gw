@@ -37,7 +37,7 @@ egui_kittest = "=0.36.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 eframe = { version = "=0.36.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu_no_default_features"] }
-wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "dx12"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "dx12"] }
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
