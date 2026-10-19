@@ -194,6 +194,7 @@ try {
   process.env = env;
   const { startConsoleServer } = await import(pathToFileURL(path.join(installed, 'dist', 'console-server.js')).href);
   consoleServer = await startConsoleServer({ port: 0 });
+  env.SGW_E2E_CONSOLE_URL = consoleServer.url;
   assert.equal((await fetch(consoleServer.url)).status, 200);
   const deniedConsole = await fetch(new URL('api/state', consoleServer.url)); assert.equal(deniedConsole.status, 403);
   const probe = path.join(root, 'agent.mjs'); await copyFile(path.join(repo, 'tests', 'fixtures', 'anthropic-e2e-agent.mjs'), probe);

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { connect } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -9,6 +10,14 @@ assert.equal(process.env.SGW_MASTER_PASSPHRASE, undefined);
 assert.equal(process.env.SGW_ALLOW_NONINTERACTIVE_OPERATOR, undefined);
 assert.throws(() => readFileSync(process.env.SGW_E2E_STORE + '/store.json'), /EPERM|EACCES|ENOENT/);
 assert.throws(() => writeFileSync(configPath, '{}'), /EPERM|EACCES|EROFS/);
+const consolePort = Number(new URL(process.env.SGW_E2E_CONSOLE_URL).port);
+const consoleReachable = await new Promise(resolve => {
+  const socket = connect(consolePort, '127.0.0.1');
+  socket.once('connect', () => { socket.destroy(); resolve(true); });
+  socket.once('error', () => resolve(false));
+  socket.setTimeout(2000, () => { socket.destroy(); resolve(false); });
+});
+assert.equal(consoleReachable, false, 'Confined agent reached the operator console listener');
 writeFileSync('session.json', JSON.stringify({ configPath, brokerPort: Number(config.env.SGW_SANDBOX_BROKER_PORT) }));
 
 const client = new Client({ name: 'sandbox e2e fixture', version: '1' });
