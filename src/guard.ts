@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { resolveAgentProfile, type AgentProfile } from "./agents.js";
 import { addLocalSecret, preferredLocalSecretBackend } from "./gateway.js";
-import { previewHandle, scanText } from "./scanner.js";
+import { previewHandle, scanText, tokenForHandle } from "./scanner.js";
 import { SecretStore } from "./store.js";
 import type { ScanCandidate } from "./types.js";
 import { anthropicSandboxConfig, anthropicSandboxReadiness, macAgentKeychainReadPath, runAnthropicSandbox, type AnthropicSandboxOptions } from "./anthropic-sandbox.js";
@@ -17,6 +17,7 @@ export interface GuardRunOptions {
   env?: NodeJS.ProcessEnv;
   extraEnv?: Record<string, string>;
   scrubEnv?: boolean;
+  strictNpmEnv?: boolean;
   persist?: boolean;
   allowedCommands?: string[];
   sandbox?: "builtin" | "anthropic";
@@ -121,6 +122,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   const profile = resolveAgentProfile(options.agent);
   if (options.sandbox && !["builtin", "anthropic"].includes(options.sandbox)) throw new Error("Unknown sandbox provider. Use builtin or anthropic.");
   if (options.sandbox === "anthropic" && options.scrubEnv === false) throw new Error("Anthropic sandbox mode requires credential environment scrubbing.");
+  if (options.strictNpmEnv && options.scrubEnv === false) throw new Error("Strict npm environment mode requires credential environment scrubbing.");
   if (options.sandbox === "anthropic" && options.persist === true && !["darwin", "linux"].includes(process.platform)) {
     throw new Error("The Anthropic s-gw launcher currently supports macOS and Linux. Native Windows integration is pending validation.");
   }
@@ -137,7 +139,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   for (const [key, value] of Object.entries(options.extraEnv || {})) {
     baseEnv[key] = value;
   }
-  const sandboxConfig = options.sandbox === "anthropic" ? anthropicSandboxConfig(cwd, store.home, options.sandboxOptions, baseEnv) : undefined;
+  const sandboxConfig = options.sandbox === "anthropic" ? anthropicSandboxConfig(cwd, store.home, options.sandboxOptions, baseEnv, command) : undefined;
   const loginKeychain = sandboxConfig ? macAgentKeychainReadPath(cwd, options.sandboxOptions) : undefined;
   if (options.sandbox === "anthropic" && options.persist === true) {
     const readiness = anthropicSandboxReadiness();
@@ -149,7 +151,8 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   if (options.scrubEnv !== false) {
     const scrubbed = await scrubEnvironment(store, profile, guardedEnv, {
       persist: options.persist === true,
-      allowedCommands: options.allowedCommands || []
+      allowedCommands: options.allowedCommands || [],
+      strictNpmEnv: options.strictNpmEnv === true
     });
     guardedEnv = scrubbed.env;
     scrubbedEnv.push(...scrubbed.findings);
@@ -181,10 +184,11 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   }
   if (options.sandbox === "anthropic") {
     warnings.push("Experimental Anthropic sandbox: credential operations use external owned SSH and HTTPS executors. Database and service-specific connectors are pending.");
-    if (!options.sandboxOptions?.denyAgentAuth) warnings.push("Saved agent authentication files remain readable. macOS login Keychain reads require --allow-agent-keychain. Use --deny-agent-auth to block known login files and Keychain IPC.");
+    if (!options.sandboxOptions?.denyAgentAuth && !options.sandboxOptions?.isolatedAuth) warnings.push("Saved agent authentication files remain readable. macOS login Keychain reads require --allow-agent-keychain. Use --deny-agent-auth to block known login files and Keychain IPC.");
+    if (options.sandboxOptions?.isolatedAuth) warnings.push("Isolated authentication uses a temporary agent home and blocks reads from the original home. Files in the allowed workspace remain readable, including any credentials stored there.");
     if (loginKeychain) warnings.push("--allow-agent-keychain permits this process tree to read the encrypted login Keychain database, which contains credentials beyond the agent's login. Remove the flag to restore the block.");
     else if (options.sandboxOptions?.allowAgentKeychain) warnings.push("--allow-agent-keychain is inactive on this platform or overridden by an explicit credential deny.");
-    if (!options.sandboxOptions?.strictEgress) warnings.push("Default agent destinations are permitted. Use --strict-egress with explicit --allow-host entries to constrain that list.");
+    if (!options.sandboxOptions?.strictEgress && !options.sandboxOptions?.isolatedAuth) warnings.push("Default agent destinations are permitted. Use --strict-egress with explicit --allow-host entries to constrain that list.");
     guardedEnv.SGW_GUARD_INSTRUCTIONS = `s-gw Anthropic sandbox is active for ${profile.displayName}. Use s-gw MCP to request approved SSH or HTTPS operations through the external trusted executor. Raw credentials remain outside this sandbox. Generic credential-bearing commands and file scans are unavailable in this mode.`;
   }
 
@@ -213,7 +217,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
         provider: options.sandbox || "builtin", tlsInterception: false,
         ...(sandboxConfig ? { policy: {
           denyRead: sandboxConfig.filesystem.denyRead,
-          allowRead: loginKeychain ? [loginKeychain] : [],
+          allowRead: [...(sandboxConfig.filesystem.allowRead || []), ...(loginKeychain ? [loginKeychain] : [])],
           allowWrite: sandboxConfig.filesystem.allowWrite,
           denyWrite: sandboxConfig.filesystem.denyWrite,
           allowedDomains: sandboxConfig.network.allowedDomains,
@@ -457,7 +461,7 @@ async function scrubEnvironment(
   store: SecretStore,
   profile: AgentProfile,
   env: Record<string, string>,
-  options: { persist: boolean; allowedCommands: string[] }
+  options: { persist: boolean; allowedCommands: string[]; strictNpmEnv: boolean }
 ): Promise<{ env: Record<string, string>; findings: GuardEnvFinding[] }> {
   const out = { ...env };
   const findings: GuardEnvFinding[] = [];
@@ -468,12 +472,11 @@ async function scrubEnvironment(
       continue;
     }
 
-    if (!value || shouldSkipEnv(name)) {
+    if (!value || shouldSkipEnv(name, options.strictNpmEnv)) {
       continue;
     }
 
-    const line = `${name}=${value}`;
-    const result = await scanText(line, async (candidate: ScanCandidate) => {
+    const getHandle = async (candidate: ScanCandidate) => {
       if (!options.persist) {
         return previewHandle(candidate);
       }
@@ -488,20 +491,41 @@ async function scrubEnvironment(
         value: candidate.value,
         source: `guard-env:${profile.id}:${name}`,
         policy: {
-          injectEnv: name,
+          injectEnv: /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : undefined,
           allowedCommands: options.allowedCommands,
           maxOutputBytes: 16_384
         }
       }, preferredLocalSecretBackend());
       return record.handle;
-    });
+    };
+
+    if (options.strictNpmEnv && isNpmEnv(name) && npmValueNeedsWholeToken(name, value)) {
+      const candidate = npmEnvCandidate(name, value);
+      const handle = await getHandle(candidate);
+      const token = tokenForHandle(handle);
+      out[name] = token;
+      findings.push({
+        name, handle, token,
+        type: candidate.type,
+        provider: candidate.provider,
+        ruleId: candidate.ruleId,
+        severity: candidate.severity
+      });
+      continue;
+    }
+
+    const valueOnly = options.strictNpmEnv && isNpmEnv(name);
+    const line = valueOnly ? value : `${name}=${value}`;
+    const result = await scanText(line, getHandle);
 
     if (result.findings.length === 0) {
       continue;
     }
 
     const prefix = `${name}=`;
-    out[name] = result.tokenizedText.startsWith(prefix)
+    out[name] = valueOnly
+      ? result.tokenizedText
+      : result.tokenizedText.startsWith(prefix)
       ? result.tokenizedText.slice(prefix.length)
       : result.findings.map((finding) => finding.token).join("\n");
 
@@ -541,7 +565,7 @@ function shouldDropEnv(name: string): boolean {
   );
 }
 
-function shouldSkipEnv(name: string): boolean {
+function shouldSkipEnv(name: string, strictNpmEnv: boolean): boolean {
   const commonNonSecret = new Set([
     "HOME",
     "LANG",
@@ -559,8 +583,51 @@ function shouldSkipEnv(name: string): boolean {
 
   return (
     commonNonSecret.has(name) ||
-    name.startsWith("npm_")
+    (!strictNpmEnv && name.startsWith("npm_"))
   );
+}
+
+function isNpmEnv(name: string): boolean {
+  return name.toLowerCase().startsWith("npm_");
+}
+
+function npmValueNeedsWholeToken(name: string, value: string): boolean {
+  const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (!key.endsWith("always_auth") && /(?:^|_)(?:auth|authtoken|auth_token|token|password|passwd|pwd|secret|client_secret|credential|otp|api_key|access_key)(?:_|$)/.test(key)) {
+    return true;
+  }
+
+  if (/^\s*(?:basic|bearer)\s+\S+/i.test(value)) return true;
+
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) return true;
+    for (const queryKey of url.searchParams.keys()) {
+      if (/^(?:token|auth|password|passwd|secret|credential|api[_-]?key|access[_-]?key|access[_-]?token|client[_-]?secret|sig|signature)$/i.test(queryKey)) {
+        return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+function npmEnvCandidate(name: string, value: string): ScanCandidate {
+  const password = /(?:^|[_/:.-])(?:password|passwd|pwd)(?:$|[_/:.-])/i.test(name);
+  const token = /(?:^|[_/:.-])(?:auth_?token|token|otp|api_?key|access_?key)(?:$|[_/:.-])/i.test(name);
+  return {
+    type: password ? "password" : token ? "api-token" : "credential",
+    provider: "npm",
+    ruleId: "GUARD-NPM-ENV",
+    severity: "high",
+    confidence: 0.9,
+    label: "npm environment credential",
+    value,
+    start: 0,
+    end: value.length
+  };
 }
 
 function guardInstructions(profile: AgentProfile, scrubbedEnv: GuardEnvFinding[]): string {

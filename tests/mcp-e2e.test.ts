@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 let testEnv: NodeJS.ProcessEnv;
@@ -128,6 +129,65 @@ describe("MCP end-to-end flow", () => {
       expect(summary.stdout).not.toContain("mcp-e2e-secret-value");
       expect(summary.stdout).toContain(`<<SGW_SECRET:${addPayload.handle}>>`);
       expect(summary.proof).toMatch(/^s-gw-proof:/);
+    } finally {
+      await client.close();
+    }
+  }, 20_000);
+
+  it("resolves a managed SSH route ID without accepting an agent-selected endpoint", async () => {
+    runCli(["init"]);
+    const handle = JSON.parse(runCli([
+      "secret", "add", "--name", "route fixture", "--type", "ssh-key", "--value-stdin",
+      "--allow-command", "s-gw:ssh-session"
+    ], "synthetic-route-key-value"));
+    const previousPassphrase = process.env.SGW_MASTER_PASSPHRASE;
+    const previousRecovery = process.env.SGW_RECOVERY_HOME;
+    process.env.SGW_MASTER_PASSPHRASE = testEnv.SGW_MASTER_PASSPHRASE;
+    process.env.SGW_RECOVERY_HOME = testEnv.SGW_RECOVERY_HOME;
+    let routeId = "";
+    try {
+      const keyType = Buffer.from("ssh-ed25519");
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(keyType.length);
+      const keyLength = Buffer.alloc(4);
+      keyLength.writeUInt32BE(32);
+      const publicKey = `ssh-ed25519 ${Buffer.concat([
+        length, keyType, keyLength, Buffer.alloc(32, 3)
+      ]).toString("base64")}`;
+      routeId = (await new SecretStore(tmpHome).addManagedSshRoute({
+        name: "Build fixture", host: "build.example", user: "runner", port: 2222,
+        hostPublicKey: publicKey
+      })).id;
+    } finally {
+      if (previousPassphrase === undefined) delete process.env.SGW_MASTER_PASSPHRASE;
+      else process.env.SGW_MASTER_PASSPHRASE = previousPassphrase;
+      if (previousRecovery === undefined) delete process.env.SGW_RECOVERY_HOME;
+      else process.env.SGW_RECOVERY_HOME = previousRecovery;
+    }
+
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+      env: testEnv as Record<string, string>, stderr: "pipe"
+    });
+    const client = new Client({ name: "Unprivileged Probe", version: "0.0.1" });
+    await client.connect(transport);
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toContain("sgw_list_ssh_routes");
+      expect(tools.tools.map((tool) => tool.name)).not.toContain("sgw_add_ssh_route");
+      const listed = await client.callTool({ name: "sgw_list_ssh_routes", arguments: {} });
+      expect(JSON.parse(listed.content[0].text)[0]).toMatchObject({ id: routeId, host: "build.example", port: 2222 });
+      const response = await client.callTool({ name: "sgw_request_ssh_session", arguments: {
+        handle: handle.handle, routeId, args: ["id"], reason: "managed fixture"
+      } });
+      const request = JSON.parse(response.content[0].text).request;
+      expect(request.state).toBe("pending");
+      expect(request.action.ssh.managedRouteId).toBe(routeId);
+      expect(request.action.ssh.managed).toMatchObject({ host: "build.example", user: "runner", port: 2222 });
+      const forged = await client.callTool({ name: "sgw_request_ssh_session", arguments: {
+        handle: handle.handle, routeId, target: "attacker.example", args: ["id"]
+      } });
+      expect(forged.isError).toBe(true);
     } finally {
       await client.close();
     }

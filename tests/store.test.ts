@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
@@ -3432,6 +3433,142 @@ describe("SecretStore", () => {
         "absolute request"
       )
     ).rejects.toThrow(/not allowed/i);
+  });
+
+  it("binds a managed scoped policy to the verified principal, not its display name", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "managed policy token", type: "api-token", value: fakeOpenAiToken("managed_policy"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "process.stdout.write('ok')"], injectEnv: "TOKEN"
+    });
+    const managedPrincipal = principalForVerifiedPeer("local:codex", "Codex");
+    const managed = { managedPrincipal, env: {} };
+    const first = await store.createRequest(secret.handle, action, "managed request", managed);
+    expect(first.state).toBe("pending");
+    expect(first.principalId).toBe("local:codex");
+    expect(first.agentSource).toBe("managed-peer");
+
+    const approval = await store.approveRequestWithScopedPolicy(first.id);
+    expect(approval.rule.conditions.principalIds).toEqual(["local:codex"]);
+    expect(approval.rule.conditions.agents).toEqual([]);
+    expect((await store.createRequest(secret.handle, action, "managed repeat", managed)).state).toBe("approved");
+    expect((await store.createRequest(secret.handle, action, "spoofed Codex", {
+      mcpClientName: "Codex", env: {}
+    })).state).toBe("pending");
+    expect((await store.createRequest(secret.handle, action, "other managed", {
+      managedPrincipal: principalForVerifiedPeer("local:other", "Codex"), env: {}
+    })).state).toBe("pending");
+  });
+
+  it("keeps legacy name policies working without granting them to managed principals", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "legacy policy token", type: "api-token", value: fakeOpenAiToken("legacy_policy"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({ command: process.execPath, args: ["-e", ""], injectEnv: "TOKEN" });
+    await store.addApprovalPolicyRule({
+      decision: "allow",
+      conditions: { handles: [secret.handle], agents: ["Codex"],
+        commands: [process.execPath], resolvedCommands: [resolvedNodeExecutable] }
+    });
+
+    expect((await store.createRequest(secret.handle, action, "legacy", {
+      mcpClientName: "Codex", env: {}
+    })).state).toBe("approved");
+    expect((await store.createRequest(secret.handle, action, "managed", {
+      managedPrincipal: principalForVerifiedPeer("local:codex", "Codex"), env: {}
+    })).state).toBe("pending");
+  });
+
+  it("binds managed reusable grants and one-shot permits to the verified principal", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "managed grant token", type: "api-token", value: fakeOpenAiToken("managed_grant"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "process.stdout.write('managed')"], injectEnv: "TOKEN"
+    });
+    const managed = { managedPrincipal: principalForVerifiedPeer("local:codex", "Codex"), env: {} };
+    const first = await store.createRequest(secret.handle, action, "managed grant", managed);
+    const approved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
+    const same = await store.prepareOneShotExecution(secret.handle, action, "managed repeat", managed);
+    expect(same.kind).toBe("reusable");
+    if (same.kind !== "reusable") throw new Error("Expected managed permit.");
+    expect(same.permit.principalId).toBe("local:codex");
+
+    expect((await store.prepareOneShotExecution(secret.handle, action, "name spoof", {
+      mcpClientName: "Codex", env: {}
+    })).kind).toBe("request");
+    expect((await store.prepareOneShotExecution(secret.handle, action, "other managed", {
+      managedPrincipal: principalForVerifiedPeer("local:other", "Codex"), env: {}
+    })).kind).toBe("request");
+    const result = await executeReusablePermit(store, same.permit, { engine: "typescript" });
+    expect(result.stdout).toBe("managed");
+    await store.revokeApprovalGrant(approved.approvalGrantId!);
+    await expect(executeReusablePermit(store, same.permit, { engine: "typescript" }))
+      .rejects.toThrow(/authorization changed|approval grant.*valid/i);
+  });
+
+  it("requires a route-bound allow policy for managed SSH", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "managed SSH key", type: "ssh-key", value: "synthetic-managed-ssh-key",
+      policy: { allowedCommands: [SGW_SSH_SESSION_COMMAND] }
+    });
+    const keyType = Buffer.from("ssh-ed25519");
+    const keyBytes = Buffer.alloc(32, 7);
+    const len = (size: number) => { const out = Buffer.alloc(4); out.writeUInt32BE(size); return out; };
+    const hostPublicKey = `ssh-ed25519 ${Buffer.concat([
+      len(keyType.length), keyType, len(keyBytes.length), keyBytes
+    ]).toString("base64")}`;
+    const route = await store.addManagedSshRoute({
+      name: "Build route", host: "build.example", user: "runner", port: 22, hostPublicKey
+    });
+    expect((await store.listManagedSshRoutes()).map((item) => item.id)).toEqual([route.id]);
+    const managedAgent = { managedPrincipal: principalForVerifiedPeer("local:codex", "Codex"), env: {} };
+
+    await store.addApprovalPolicyRule({ decision: "allow", conditions: {
+      handles: [secret.handle], sshTargets: ["build-alias"], sshPorts: [22]
+    } });
+    expect((await store.createRequest(secret.handle,
+      buildSshSessionAction({ target: "build-alias", port: 22, args: ["id"] }), "legacy route")).state).toBe("approved");
+    const input = { injectEnv: "SGW_SSH_CREDENTIAL", args: ["id"] };
+    const managed = await store.createManagedSshRequest(secret.handle, route.id, input, "managed route", managedAgent);
+    expect(managed.state).toBe("pending");
+    expect(managed.action.owned).toBe(true);
+    expect(managed.action.ssh?.managed).toEqual(route.route);
+    expect(managed.action.ssh?.managedRouteId).toBe(route.id);
+    const approval = await store.approveRequestWithScopedPolicy(managed.id);
+    expect(approval.rule.conditions.actionKeys).toHaveLength(1);
+    const approved = await store.createManagedSshRequest(secret.handle, route.id, input, "same managed route", managedAgent);
+    expect(approved.state).toBe("approved");
+    await store.assertOwnedRequestAuthorized(approved.id);
+
+    const forged = buildSshSessionAction({ target: route.id, args: ["id"] });
+    forged.ssh!.managed = { ...route.route, host: "attacker.example" };
+    await expect(store.createRequest(secret.handle, forged, "forged managed route", managedAgent))
+      .rejects.toThrow(/operator-owned route ID/);
+    forged.ssh!.managedRouteId = route.id;
+    await expect(store.createRequest(secret.handle, forged, "forged route snapshot", managedAgent))
+      .rejects.toThrow(/does not match/);
+
+    await store.updateManagedSshRoute(route.id, { host: "other.example" });
+    await expect(store.assertOwnedRequestAuthorized(approved.id)).rejects.toThrow(/changed or was revoked/);
+    await expect(store.claimApprovedRequest(approved.id)).rejects.toThrow(/changed or was revoked/);
+    expect((await store.getRequest(approved.id)).state).toBe("failed");
+    expect((await store.createManagedSshRequest(secret.handle, route.id, input, "different host", managedAgent)).state).toBe("pending");
+    await store.updateManagedSshRoute(route.id, { hostPublicKey: `ssh-ed25519 ${Buffer.concat([
+      len(keyType.length), keyType, len(keyBytes.length), Buffer.alloc(32, 8)
+    ]).toString("base64")}` });
+    expect((await store.createManagedSshRequest(secret.handle, route.id, input, "different key", managedAgent)).state).toBe("pending");
+    await store.deleteManagedSshRoute(route.id);
+    await expect(store.createManagedSshRequest(secret.handle, route.id, input, "removed route", managedAgent))
+      .rejects.toThrow(/unknown managed SSH route/i);
   });
 });
 

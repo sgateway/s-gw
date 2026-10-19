@@ -1,10 +1,13 @@
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { getSgwInstanceKey } from "../src/paths.js";
+import { buildSshSessionAction } from "../src/ssh.js";
+import { SecretStore } from "../src/store.js";
 import { ReleaseChecker } from "../src/update-check.js";
 
 let tmpHome = "";
@@ -773,6 +776,38 @@ describe("local console server", () => {
       ])
     );
   }, 15_000);
+
+  it("shows the resolved managed SSH destination and pinned host-key fingerprint", async () => {
+    const rawKey = generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).subarray(-32);
+    const type = Buffer.from("ssh-ed25519");
+    const length = (value: Buffer) => { const prefix = Buffer.alloc(4); prefix.writeUInt32BE(value.length); return Buffer.concat([prefix, value]); };
+    const wireKey = Buffer.concat([length(type), length(rawKey)]);
+    const hostPublicKey = `ssh-ed25519 ${wireKey.toString("base64")}`;
+    const expectedFingerprint = `SHA256:${createHash("sha256").update(wireKey).digest("base64").replace(/=+$/, "")}`;
+    const store = new SecretStore();
+    const route = await store.addManagedSshRoute({ name: "innocent-alias", host: "127.0.0.1", user: "deploy", port: 2222, hostPublicKey });
+    const secret = await store.addSecret({ name: "managed SSH key", type: "private-key", value: "synthetic-key-material", policy: { allowedCommands: ["s-gw:ssh-session"] } });
+    const action = buildSshSessionAction({ target: route.name, port: 2222, args: ["hostname"] });
+    action.ssh!.managedRouteId = route.id;
+    const request = await store.createRequest(secret.handle, action, "managed SSH approval fixture");
+    running = await startConsoleServer({ port: 0, store });
+
+    const state = await fetchJson("api/state");
+    expect(state.pendingRequests[0]).toMatchObject({ id: request.id, managedSsh: {
+      destination: "deploy@127.0.0.1:2222", hostKeyFingerprint: expectedFingerprint, routeName: "innocent-alias", routeCurrent: true
+    } });
+    expect(state.pendingRequests[0].action.ssh.target).toBe(route.id);
+    expect(state.usageFlow.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requestId: request.id, target: "deploy@127.0.0.1:2222", action: "ssh -> deploy@127.0.0.1:2222" })
+    ]));
+    expect(JSON.stringify(state)).not.toContain("synthetic-key-material");
+
+    await store.updateManagedSshRoute(route.id, { host: "127.0.0.2" });
+    const stale = await fetchJson("api/state");
+    expect(stale.pendingRequests[0].managedSsh).toMatchObject({
+      destination: "deploy@127.0.0.1:2222", hostKeyFingerprint: expectedFingerprint, routeCurrent: false
+    });
+  });
 
   it("reports a ready readiness verdict when an unlock source is configured", async () => {
     running = await startConsoleServer({ port: 0 });

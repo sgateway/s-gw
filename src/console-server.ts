@@ -25,6 +25,7 @@ import {
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { assertMacRuntimeForManagedSurfaces, getPackageLayout, readinessForUnlock } from "./install.js";
 import { getSgwInstanceKey } from "./paths.js";
+import { managedSshHostFingerprint, type ManagedSshRoute } from "./managed-ssh.js";
 import { SecretStore, type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput } from "./store.js";
 import { unlockStatus } from "./unlock.js";
 import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
@@ -453,6 +454,8 @@ async function handleApi(
 async function buildState(store: SecretStore, update: UpdateCheckResult | null, agentOptions: AgentIntegrationOptions) {
   const handles = await store.listHandles();
   const requests = await store.listRequests();
+  const managedRoutes = await store.listManagedSshRoutes();
+  const managedRoutesById = new Map(managedRoutes.map((route) => [route.id, route]));
   const audit = await store.auditLog();
   const approvalSettings = await store.getApprovalSettings();
   const approvalGrants = await store.listApprovalGrants();
@@ -489,8 +492,8 @@ async function buildState(store: SecretStore, update: UpdateCheckResult | null, 
     approvalPolicyRules,
     usageFlow,
     credentials: groupHandles(handles),
-    requests: sortRequests(requests),
-    pendingRequests: sortRequests(pending),
+    requests: sortRequests(requests, managedRoutesById),
+    pendingRequests: sortRequests(pending, managedRoutesById),
     audit: [...audit].reverse(),
     agents: agents.map((agent) => {
       const profile = resolveAgentProfile(agent.id);
@@ -587,8 +590,18 @@ function groupHandles(handles: HandleSummary[]): ProviderSummary[] {
   return [...grouped.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function sortRequests(requests: RequestRecord[]): RequestRecord[] {
-  return [...requests].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+function sortRequests(requests: RequestRecord[], routes: Map<string, { name: string; route: ManagedSshRoute }>) {
+  return [...requests].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map((request) => {
+    const route = request.action.ssh?.managed;
+    if (!route) return request;
+    const current = routes.get(request.action.ssh?.managedRouteId || "");
+    return { ...request, managedSsh: {
+      destination: managedSshDestination(route),
+      hostKeyFingerprint: managedSshHostFingerprint(route),
+      routeName: current?.name || request.action.ssh?.managedRouteId || "Unknown route",
+      routeCurrent: Boolean(current && JSON.stringify(current.route) === JSON.stringify(route))
+    } };
+  });
 }
 
 function buildUsageFlow(requests: RequestRecord[], handles: HandleSummary[]): UsageFlow {
@@ -888,6 +901,7 @@ const sshOptionsWithValue = new Set([
 ]);
 
 function sshDestination(action: RequestRecord["action"]): string | undefined {
+  if (action.kind === "ssh_session" && action.ssh?.managed) return managedSshDestination(action.ssh.managed);
   if (action.kind === "ssh_session" && action.ssh?.target) {
     return action.ssh.port && action.ssh.port !== 22 ? `${action.ssh.target}:${action.ssh.port}` : action.ssh.target;
   }
@@ -907,6 +921,11 @@ function sshDestination(action: RequestRecord["action"]): string | undefined {
     return arg;
   }
   return undefined;
+}
+
+function managedSshDestination(route: ManagedSshRoute): string {
+  const host = route.host.includes(":") ? `[${route.host}]` : route.host;
+  return `${route.user}@${host}:${route.port}`;
 }
 
 function commandBase(command: string): string {

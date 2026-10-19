@@ -63,6 +63,7 @@ import {
 import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordReference } from "./onepassword.js";
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
 import { getSgwInstanceKey } from "./paths.js";
+import { managedSshHostFingerprint } from "./managed-ssh.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { normalizeCommandGrant, SecretStore } from "./store.js";
 import {
@@ -562,6 +563,7 @@ async function main(): Promise<void> {
     const mode = getFlag(parsed.flags, "mode");
     const duration = getFlag(parsed.flags, "duration") || getFlag(parsed.flags, "duration-ms");
     const agentScope = getFlag(parsed.flags, "agent-scope");
+    await reviewManagedSshCliApproval(store, second, parsed.flags);
     printJson(
       await store.approveRequest(second, {
         mode: mode ? approvalMode(mode) : undefined,
@@ -577,6 +579,7 @@ async function main(): Promise<void> {
       throw new Error("approve-policy requires a request id.");
     }
 
+    await reviewManagedSshCliApproval(store, second, parsed.flags);
     printJson(await store.approveRequestWithScopedPolicy(second));
     return;
   }
@@ -686,6 +689,7 @@ const valueFlags = new Set([
   "args-json",
   "backend",
   "command",
+  "confirm-route",
   "console-url",
   "count",
   "cwd",
@@ -695,6 +699,8 @@ const valueFlags = new Set([
   "env",
   "expires-at",
   "handle",
+  "host",
+  "host-public-key",
   "id",
   "inject-env",
   "kind",
@@ -714,6 +720,7 @@ const valueFlags = new Set([
   "reason",
   "recover",
   "ref",
+  "route",
   "resolved-command",
   "secret-handle",
   "service",
@@ -725,6 +732,7 @@ const valueFlags = new Set([
   "target",
   "timeout-ms",
   "type",
+  "user",
   "vault",
   "with-env",
   "working-dir",
@@ -1741,6 +1749,10 @@ async function handleSshCommand(
   handleArg: string | undefined,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  if (action === "route") {
+    await handleSshRouteCommand(store, handleArg, flags);
+    return;
+  }
   if (action === "close") {
     const handle = handleArg || requireFlag(flags, "handle");
     printJson(await closeOwnedSshSession({
@@ -1761,16 +1773,22 @@ async function handleSshCommand(
     const handle = handleArg || requireFlag(flags, "handle");
     const secret = await store.getSecretRecord(handle);
     const remoteArgs = commandArgsFromFlags(flags);
-    const sshAction = buildSshSessionAction({
-      target: requireFlag(flags, "target"),
-      port: numericFlag(flags, "port", 22),
+    const routeId = getFlag(flags, "route");
+    if (routeId && (getFlag(flags, "target") || getFlag(flags, "port"))) {
+      throw new Error("--route cannot be combined with --target or --port.");
+    }
+    const input = {
       args: remoteArgs,
       injectEnv: getFlag(flags, "inject-env") || defaultSshInjectEnv(secret),
       workingDir: getFlag(flags, "cwd"),
       timeoutMs: numericFlag(flags, "timeout-ms", 30_000)
-    });
+    };
     const reason = getFlag(flags, "reason") || "s-gw-owned SSH session request";
-    const request = await store.createRequest(handle, sshAction, reason);
+    const request = routeId
+      ? await store.createManagedSshRequest(handle, routeId, input, reason)
+      : await store.createRequest(handle, buildSshSessionAction({
+        ...input, target: requireFlag(flags, "target"), port: numericFlag(flags, "port", 22)
+      }), reason);
     if (action === "request" || request.state !== "approved") {
       printJson({
         approvalRequired: request.state !== "approved",
@@ -1786,6 +1804,53 @@ async function handleSshCommand(
   }
 
   throw new Error("ssh requires request, run, or close.");
+}
+
+async function handleSshRouteCommand(
+  store: SecretStore,
+  action: string | undefined,
+  flags: Record<string, string | boolean | string[]>
+): Promise<void> {
+  if (action === "list") { printJson(await store.listManagedSshRoutes()); return; }
+  if (action === "show") { printJson(await store.getManagedSshRoute(requireFlag(flags, "id"))); return; }
+  if (action === "add") {
+    printJson(await store.addManagedSshRoute({
+      name: requireFlag(flags, "name"), host: requireFlag(flags, "host"),
+      user: requireFlag(flags, "user"), port: numericFlag(flags, "port", 22),
+      hostPublicKey: requireFlag(flags, "host-public-key")
+    }));
+    return;
+  }
+  if (action === "update") {
+    const input = {
+      name: getFlag(flags, "name"), host: getFlag(flags, "host"),
+      user: getFlag(flags, "user"),
+      port: getFlag(flags, "port") ? numericFlag(flags, "port", 22) : undefined,
+      hostPublicKey: getFlag(flags, "host-public-key")
+    };
+    printJson(await store.updateManagedSshRoute(requireFlag(flags, "id"), input));
+    return;
+  }
+  if (action === "delete") { printJson(await store.deleteManagedSshRoute(requireFlag(flags, "id"))); return; }
+  throw new Error("ssh route requires list, show, add, update, or delete.");
+}
+
+async function reviewManagedSshCliApproval(
+  store: SecretStore,
+  requestId: string,
+  flags: Record<string, string | boolean | string[]>
+): Promise<void> {
+  const request = await store.getRequest(requestId);
+  const ssh = request.action.ssh;
+  if (!ssh?.managed || !ssh.managedRouteId) return;
+  const current = await store.getManagedSshRoute(ssh.managedRouteId);
+  if (JSON.stringify(current.route) !== JSON.stringify(ssh.managed)) {
+    throw new Error("Managed SSH route changed since the request; create and review a new request.");
+  }
+  const route = `${ssh.managed.user}@${ssh.managed.host}:${ssh.managed.port} ${managedSshHostFingerprint(ssh.managed)}`;
+  if (getFlag(flags, "confirm-route") !== route) {
+    throw new Error(`Managed SSH approval requires review of ${current.name}: ${route}. Repeat with --confirm-route ${JSON.stringify(route)}.`);
+  }
 }
 
 async function handleAwsCommand(
@@ -2424,6 +2489,7 @@ async function handleGuardRun(
     cwd: getFlag(flags, "cwd") || process.cwd(),
     extraEnv: parseEnvFlags(getFlagList(flags, "env")),
     scrubEnv: !hasFlag(flags, "no-scrub-env"),
+    strictNpmEnv: hasFlag(flags, "strict-npm-env"),
     allowedCommands: getFlagList(flags, "allow-command"),
     sandbox: (getFlag(flags, "sandbox") || "builtin") as GuardRunOptions["sandbox"],
     sandboxOptions: {
@@ -2431,6 +2497,8 @@ async function handleGuardRun(
       allowWrite: getFlagList(flags, "allow-write"),
       denyRead: getFlagList(flags, "deny-read"),
       strictEgress: hasFlag(flags, "strict-egress"),
+      strictBrokerEnv: hasFlag(flags, "strict-broker-env"),
+      isolatedAuth: hasFlag(flags, "isolated-auth"),
       denyAgentAuth: hasFlag(flags, "deny-agent-auth"),
       allowAgentKeychain: hasFlag(flags, "allow-agent-keychain")
     }
@@ -2575,8 +2643,8 @@ Commands:
   s-gw app refresh-agents [--lock-timeout-ms 35000]
   s-gw guard doctor
   s-gw guard status
-  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--deny-agent-auth] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
-  s-gw run AGENT [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-npm-env] [--deny-agent-auth] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
   s-gw service install [--port 8718] [--start] [--menubar]
   s-gw service start|stop|status|uninstall
@@ -2602,7 +2670,11 @@ Commands:
   s-gw onepassword capture --text-stdin [--vault Dev] [--name NAME] [--inject-env ENV] [--allow-command CMD]
   s-gw aws plan|request|run [--wrapper CMD] [--timeout-ms 0] [--raw] -- AWS_ARGS...
   s-gw ssh request HANDLE --target user@host [--port 22] [--arg VALUE]
+  s-gw ssh route add --name NAME --host HOST --user USER --port 22 --host-public-key 'ssh-ed25519 AAAA...'
+  s-gw ssh route list|show|update|delete [--id ROUTE_ID]
+  s-gw ssh request HANDLE --route ROUTE_ID [--arg VALUE]
   s-gw ssh run HANDLE --target user@host [--port 22] [--] [remote command...]
+  s-gw ssh run HANDLE --route ROUTE_ID [--] [remote command...]
   s-gw ssh run --request-id REQUEST_ID
   s-gw ssh close HANDLE --target user@host [--port 22]
   s-gw approval settings
@@ -2630,8 +2702,8 @@ Commands:
   s-gw requests cleanup [--pending-ttl-ms 86400000] [--approved-ttl-ms 3600000] [--no-dedupe]
   s-gw execute-next [--handle HANDLE] [--kind env_command|ssh_session] [--command CMD]
   s-gw store backups
-  s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent]
-  s-gw approve-policy REQUEST_ID
+  s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent] [--confirm-route 'user@host:port SHA256:...']
+  s-gw approve-policy REQUEST_ID [--confirm-route 'user@host:port SHA256:...']
   s-gw deny REQUEST_ID
   s-gw execute REQUEST_ID
 `);

@@ -10,6 +10,7 @@ import { CURRENT_VERSION } from "./version.js";
 
 import { prepareUpload } from "./ssh-upload.js";
 import { buildHttpRequestAction } from "./http-action.js";
+import { managedSshHostFingerprint } from "./managed-ssh.js";
 import { runSandboxMcpBridge } from "./sandbox-broker.js";
 
 if (process.env.SGW_SANDBOX_BROKER_PORT) {
@@ -27,6 +28,7 @@ const server = new McpServer({
 
 function mcpAgentContext() {
   if (operationsOnly) return { agentName: process.env.SGW_SANDBOX_AGENT_NAME };
+  // The client name is display metadata. A managed principal must come from a separate trusted peer adapter.
   return { mcpClientName: server.server.getClientVersion()?.name };
 }
 
@@ -169,13 +171,27 @@ server.registerTool(
 
 
 server.registerTool(
+  "sgw_list_ssh_routes",
+  {
+    title: "List Managed SSH Routes",
+    description: "List operator-managed SSH route IDs and non-secret endpoint metadata.",
+    inputSchema: {}
+  },
+  async () => asText((await store.listManagedSshRoutes()).map((item) => ({
+    id: item.id, name: item.name, host: item.route.host, user: item.route.user,
+    port: item.route.port, hostKeyFingerprint: managedSshHostFingerprint(item.route)
+  })))
+);
+
+server.registerTool(
   "sgw_request_ssh_session",
   {
     title: "Request s-gw-Owned SSH Session",
     description: "Create a local approval request for an SSH command. Unix-like systems use an s-gw-owned ControlMaster; Windows uses a hardened one-shot ssh.exe command with an SSH private key.",
     inputSchema: {
       handle: z.string().min(1),
-      target: z.string().min(1),
+      target: z.string().min(1).optional(),
+      routeId: z.string().min(1).optional(),
       port: z.number().int().positive().optional(),
       args: z.array(z.string()).optional(),
       injectEnv: z.string().optional(),
@@ -184,8 +200,20 @@ server.registerTool(
       reason: z.string().optional()
     }
   },
-  async ({ handle, target, port, args, injectEnv, workingDir, timeoutMs, reason }) => {
+  async ({ handle, target, routeId, port, args, injectEnv, workingDir, timeoutMs, reason }) => {
     const secret = await store.getSecretRecord(handle);
+    if (routeId) {
+      if (target !== undefined || port !== undefined) throw new Error("Use routeId alone for a managed SSH destination.");
+      const request = await store.createManagedSshRequest(handle, routeId, {
+        args, injectEnv: injectEnv || defaultSshInjectEnv(secret), workingDir, timeoutMs
+      }, reason || "Agent requested s-gw-owned SSH access.", mcpAgentContext());
+      return asText({
+        approvalRequired: request.state !== "approved",
+        localApprovalCommand: request.state === "approved" ? undefined : `s-gw approve ${request.id}`,
+        request
+      });
+    }
+    if (!target) throw new Error("SSH target or managed routeId is required.");
     const action = buildSshSessionAction({
       target,
       port,
@@ -214,12 +242,20 @@ server.registerTool(
   {
     title: "Request s-gw-Owned SSH Upload",
     description: "Request an SSH upload from the agent workspace. Approval binds the source contents and remote destination.",
-    inputSchema: { handle: z.string(), target: z.string(), port: z.number().int().positive().optional(),
+    inputSchema: { handle: z.string(), target: z.string().min(1).optional(), routeId: z.string().min(1).optional(), port: z.number().int().positive().optional(),
       sourcePath: z.string(), destinationPath: z.string(), timeoutMs: z.number().int().positive().optional(), reason: z.string().optional() }
   },
-  async ({ handle, target, port, sourcePath, destinationPath, timeoutMs, reason }) => {
+  async ({ handle, target, routeId, port, sourcePath, destinationPath, timeoutMs, reason }) => {
     const transfer = await prepareUpload(sourcePath, destinationPath, store.home);
     const secret = await store.getSecretRecord(handle);
+    if (routeId) {
+      if (target !== undefined || port !== undefined) throw new Error("Use routeId alone for a managed SSH destination.");
+      const request = await store.createManagedSshRequest(handle, routeId, {
+        injectEnv: defaultSshInjectEnv(secret), timeoutMs, transfer
+      }, reason || "Agent requested an SSH upload.", mcpAgentContext());
+      return asText({ approvalRequired: request.state !== "approved", request });
+    }
+    if (!target) throw new Error("SSH target or managed routeId is required.");
     const action = buildSshSessionAction({ target, port, timeoutMs, injectEnv: defaultSshInjectEnv(secret) });
     action.owned = true;
     action.ssh!.transfer = transfer;

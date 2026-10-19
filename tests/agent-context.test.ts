@@ -3,6 +3,7 @@ import {
   agentNameFromMcpClient,
   detectProcessTreeAgentName,
   detectRuntimeAgentName,
+  principalForVerifiedPeer,
   requestAgentIdentity,
   requestAgentName
 } from "../src/agent-context.js";
@@ -41,6 +42,23 @@ describe("agent context detection", () => {
         env: { SGW_AGENT_NAME: "codex" }
       })
     ).toEqual({ name: "Codex", source: "configured" });
+  });
+
+  it("only accepts an in-process verified peer principal", () => {
+    const managedPrincipal = principalForVerifiedPeer("local:codex", "Codex");
+    expect(requestAgentIdentity("Claude asks for access", {
+      managedPrincipal,
+      mcpClientName: "Claude",
+      env: { SGW_AGENT_NAME: "Claude" }
+    })).toEqual({ name: "Codex", source: "managed-peer", principalId: "local:codex" });
+
+    expect(() => requestAgentIdentity("request", {
+      managedPrincipal: { id: "local:codex", name: "Codex" }
+    })).toThrow(/not verified/);
+    expect(requestAgentIdentity("request", {
+      mcpClientName: "Codex",
+      env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" }
+    }).principalId).toBeUndefined();
   });
 
   it("detects Codex from the launcher process tree when the reason is generic", () => {

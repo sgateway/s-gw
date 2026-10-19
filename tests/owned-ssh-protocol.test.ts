@@ -82,10 +82,10 @@ async function sshFixture(authKind: "password" | "private-key") {
   const helper = path.join(store.home, "real-ssh.cjs");
   await writeFile(helper, `#!${process.execPath}\nconst {spawnSync}=require('node:child_process'); const result=spawnSync('/usr/bin/ssh', ['-F','/dev/null','-o',${JSON.stringify(`UserKnownHostsFile=${knownHosts}`)},...process.argv.slice(2)], {stdio:'inherit'}); process.exit(result.status ?? 1);\n`, { mode: 0o700 });
   process.env.SGW_SSH_CLI = helper;
-  return { store, handle, credential, port, knownHosts, commands, uploads, clients,
+  return { store, handle, credential, port, knownHosts, hostPublicKey: `ssh-rsa ${publicKey}`, commands, uploads, clients,
     authentications: () => authentications,
-    close: async () => {
-      await closeOwnedSshSession({ handle: handle.handle, target: "fixture@127.0.0.1", port, home: store.home });
+    close: async (skipControlClose = false) => {
+      if (!skipControlClose) await closeOwnedSshSession({ handle: handle.handle, target: "fixture@127.0.0.1", port, home: store.home });
       for (const client of clients) client.end();
       await new Promise<void>(resolve => server.close(resolve));
     } };
@@ -127,6 +127,66 @@ it.skipIf(process.platform === "win32")("authenticates a real private key and up
     expect(f.uploads).toHaveLength(1);
     expect(await readdir(path.join(f.store.home, "ssh-control")).catch(() => [])).toEqual([]);
   } finally { await f.close(); }
+});
+
+it.skipIf(process.platform === "win32")("routes a managed alias to the pinned host without reading SSH configuration", async () => {
+  const f = await sshFixture("private-key");
+  delete process.env.SGW_SSH_CLI;
+  const route = await f.store.addManagedSshRoute({ name: "managed-alias", host: "127.0.0.1", user: "fixture", port: f.port, hostPublicKey: f.hostPublicKey });
+  const action = buildSshSessionAction({ target: "managed-alias", port: f.port, args: ["hostname"], timeoutMs: 10000 });
+  action.ssh!.managedRouteId = route.id;
+  try {
+    const request = await f.store.createRequest(f.handle.handle, action, "managed route fixture");
+    await f.store.approveRequest(request.id);
+    const result = await executeApprovedRequest(f.store, request.id);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("remote SSH fixture: hostname");
+    expect(result.stdout).not.toContain(f.credential);
+    expect(f.authentications()).toBe(1);
+    expect(f.commands).toEqual(["hostname"]);
+
+    const bytes = Buffer.from([0, 1, 255, 10, 34]);
+    const sourcePath = path.join(root, "managed-upload.bin");
+    await writeFile(sourcePath, bytes);
+    const upload = buildSshSessionAction({ target: "managed-alias", port: f.port, timeoutMs: 10000 });
+    upload.ssh!.managedRouteId = route.id;
+    upload.ssh!.transfer = await prepareUpload(sourcePath, "/tmp/managed.bin", f.store.home);
+    const uploadRequest = await f.store.createRequest(f.handle.handle, upload, "managed upload fixture");
+    await f.store.approveRequest(uploadRequest.id);
+    expect((await executeApprovedRequest(f.store, uploadRequest.id)).exitCode).toBe(0);
+    expect(f.uploads).toEqual([bytes]);
+    expect(f.authentications()).toBe(2);
+
+    const wrong = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs1" });
+    const wrongRoute = await f.store.addManagedSshRoute({ name: "wrong-managed-alias", host: "127.0.0.1", user: "fixture", port: f.port,
+      hostPublicKey: `ssh-rsa ${utils.parseKey(wrong).getPublicSSH().toString("base64")}` });
+    const changed = buildSshSessionAction({ target: "wrong-managed-alias", port: f.port, args: ["hostname"], timeoutMs: 10000 });
+    changed.ssh!.managedRouteId = wrongRoute.id;
+    const denied = await f.store.createRequest(f.handle.handle, changed, "wrong managed host key");
+    expect(denied.state).toBe("pending");
+    await f.store.approveRequest(denied.id);
+    const failed = await executeApprovedRequest(f.store, denied.id);
+    expect(failed.exitCode).toBe(255);
+    expect(failed.stderr).toMatch(/HOST IDENTIFICATION|Host key verification/i);
+    expect(f.authentications()).toBe(2);
+  } finally { await f.close(true); }
+});
+
+it.skipIf(process.platform === "win32")("authenticates a managed route with the approved password", async () => {
+  const f = await sshFixture("password");
+  delete process.env.SGW_SSH_CLI;
+  try {
+    const route = await f.store.addManagedSshRoute({ name: "managed-password-alias", host: "127.0.0.1", user: "fixture", port: f.port, hostPublicKey: f.hostPublicKey });
+    const action = buildSshSessionAction({ target: "managed-password-alias", port: f.port, args: ["uptime"], timeoutMs: 10000 });
+    action.ssh!.managedRouteId = route.id;
+    const request = await f.store.createRequest(f.handle.handle, action, "managed password fixture");
+    await f.store.approveRequest(request.id);
+    const result = await executeApprovedRequest(f.store, request.id);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("remote SSH fixture: uptime");
+    expect(result.stdout).not.toContain(f.credential);
+    expect(f.authentications()).toBe(1);
+  } finally { await f.close(true); }
 });
 
 it.skipIf(process.platform === "win32")("rejects a wrong real SSH host key before authentication and recovers on a later request", async () => {

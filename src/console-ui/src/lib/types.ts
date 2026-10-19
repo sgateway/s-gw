@@ -107,6 +107,7 @@ export interface RequestRecord {
   handle: string;
   reason: string;
   agentName?: string;
+  managedSsh?: { destination: string; hostKeyFingerprint: string; routeName: string; routeCurrent: boolean };
   action: {
     kind: "env_command" | "ssh_session" | "http_request" | string;
     owned?: boolean;
@@ -120,6 +121,8 @@ export interface RequestRecord {
     ssh?: {
       target: string;
       port?: number;
+      managedRouteId?: string;
+      managed?: { host: string; user: string; port: number; hostPublicKey: string };
       transfer?: { direction: string; sourcePath: string; destinationPath: string; sha256?: string };
     };
   };

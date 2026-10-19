@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { anthropicSandboxConfig, runAnthropicSandbox, sandboxAgentArguments } from "../src/anthropic-sandbox.js";
+import { anthropicSandboxConfig, isolatedAgentEnvironment, runAnthropicSandbox, sandboxAgentArguments } from "../src/anthropic-sandbox.js";
 import { prepareGuardedRun, runGuardedAgent } from "../src/guard.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { SecretStore } from "../src/store.js";
@@ -100,6 +100,91 @@ describe("Anthropic sandbox", () => {
     expect(anthropicSandboxReadiness("win32")).toMatchObject({ supported: false, ready: false, tlsInterception: false });
   });
 
+  it("starts isolated authentication with a fresh agent home and a small environment", () => {
+    const workspace = path.resolve("fixture-workspace");
+    const store = path.resolve("fixture-store");
+    const outside = path.resolve("fixture-outside");
+    const config = anthropicSandboxConfig(workspace, store, { isolatedAuth: true, allowHosts: ["model.example.test"] },
+      { HOME: outside, PATH: process.env.PATH }, process.execPath);
+    expect(config.filesystem.denyRead).toContain(outside);
+    expect(config.filesystem.allowRead).toContain(workspace);
+    expect(config.network.allowedDomains).toEqual(["model.example.test"]);
+    expect(() => anthropicSandboxConfig(workspace, store, { isolatedAuth: true, allowAgentKeychain: true })).toThrow();
+    expect(() => anthropicSandboxConfig(workspace, store, { isolatedAuth: true, denyRead: ["private"] })).toThrow();
+    expect(() => anthropicSandboxConfig(store, store, { isolatedAuth: true })).toThrow();
+    const env = isolatedAgentEnvironment({ PATH: "/usr/bin", LANG: "en_US.UTF-8", API_KEY: "private",
+      SGW_MASTER_PASSPHRASE: "private", NODE_OPTIONS: "--require /private", SSH_AUTH_SOCK: "/private/socket" },
+    { SGW_SANDBOX_BROKER_PORT: "1234" }, "/fixture/agent-tmp", "/fixture/mcp.json");
+    expect(env).toMatchObject({ HOME: "/fixture/agent-tmp", PATH: "/usr/bin", LANG: "en_US.UTF-8",
+      SGW_SANDBOX_BROKER_PORT: "1234", SGW_SANDBOX_MCP_CONFIG: "/fixture/mcp.json" });
+    for (const name of ["API_KEY", "SGW_MASTER_PASSPHRASE", "NODE_OPTIONS", "SSH_AUTH_SOCK"]) expect(env[name]).toBeUndefined();
+  });
+
+  it("refuses isolated Linux mode when Unix socket blocking is unavailable", async () => {
+    const store = await fixtureStore();
+    const opts = { isolatedAuth: true };
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      cwd: path.join(root, "workspace"), env: { PATH: process.env.PATH }, sandbox: "anthropic", sandboxOptions: opts });
+    const platform = process.platform;
+    try {
+      Object.defineProperty(process, "platform", { value: "linux" });
+      vi.spyOn(SandboxManager, "checkDependencies").mockReturnValue({ errors: [],
+        warnings: ["seccomp not available - unix socket access not restricted"] });
+      await expect(runAnthropicSandbox(prepared, store.home, opts)).rejects.toThrow("Unix-socket seccomp filter");
+    } finally { Object.defineProperty(process, "platform", { value: platform }); }
+  });
+
+  it.skipIf(!["darwin", "linux"].includes(process.platform))("blocks outside authentication files and symlink aliases in isolated mode", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    const auth = path.join(outside, "auth.json");
+    await writeFile(auth, randomUUID());
+    await symlink(auth, path.join(workspace, "auth-link"));
+    const probe = path.join(workspace, "isolated-auth-probe.mjs");
+    await writeFile(probe, `import { readFileSync, writeFileSync } from 'node:fs';
+const read = file => { try { readFileSync(file); return true; } catch { return false; } };
+writeFileSync('isolated-result.json', JSON.stringify({
+  direct: read(${JSON.stringify(auth)}),
+  symlink: read('auth-link'),
+  inheritedSecret: Boolean(process.env.SGW_TEST_SECRET),
+  inheritedStore: Boolean(process.env.SGW_MASTER_PASSPHRASE),
+  freshHome: process.env.HOME.includes('.sgw-tmp-')
+}));
+`);
+    const opts = { isolatedAuth: true };
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      args: [probe], cwd: workspace, env: { PATH: process.env.PATH, HOME: outside,
+        SGW_TEST_SECRET: randomUUID(), SGW_MASTER_PASSPHRASE: randomUUID() }, sandbox: "anthropic", sandboxOptions: opts });
+    expect(await runAnthropicSandbox(prepared, store.home, opts)).toBe(0);
+    expect(JSON.parse(await readFile(path.join(workspace, "isolated-result.json"), "utf8"))).toEqual({
+      direct: false, symlink: false, inheritedSecret: false, inheritedStore: false, freshHome: true
+    });
+  });
+
+  it.skipIf(!["darwin", "linux"].includes(process.platform))("runs restricted MCP through the strict outside broker environment", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const probe = path.join(workspace, "strict-broker-probe.mjs");
+    const sdkRoot = path.resolve("node_modules/@modelcontextprotocol/sdk/dist/esm");
+    await writeFile(probe, `import { readFileSync, writeFileSync } from 'node:fs';
+import { Client } from ${JSON.stringify(new URL(`file://${path.join(sdkRoot, "client/index.js")}`).href)};
+import { StdioClientTransport } from ${JSON.stringify(new URL(`file://${path.join(sdkRoot, "client/stdio.js")}`).href)};
+const entry = JSON.parse(readFileSync(process.env.SGW_SANDBOX_MCP_CONFIG, 'utf8')).mcpServers['s-gw'];
+const client = new Client({ name: 'untrusted display name', version: '1' });
+try {
+  await client.connect(new StdioClientTransport({ ...entry, stderr: 'pipe' }));
+  const names = (await client.listTools()).tools.map(tool => tool.name);
+  writeFileSync('strict-broker-result.json', JSON.stringify({ http: names.includes('sgw_request_http'), scan: names.includes('sgw_scan_file') }));
+} finally { await client.close(); }
+`);
+    const opts = { strictBrokerEnv: true };
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      args: [probe], cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic", sandboxOptions: opts });
+    expect(await runAnthropicSandbox(prepared, store.home, opts)).toBe(0);
+    expect(JSON.parse(await readFile(path.join(workspace, "strict-broker-result.json"), "utf8"))).toEqual({ http: true, scan: false });
+  });
+
   it("adds the Keychain IPC denial to the existing trusted macOS profile", () => {
     const wrapped = "env NO_PROXY=localhost,*.local /usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/bash -c 'fixed command'";
     const restricted = restrictMacCredentialIpc(wrapped);
@@ -156,6 +241,44 @@ describe("Anthropic sandbox", () => {
     }
     expect(await readFile(loginFile, "utf8")).toBe("synthetic database");
   });
+
+  it.skipIf(process.platform !== "darwin")("denies native retrieval of a disposable Keychain item", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const keychain = path.join(root, "outside", "fixture.keychain-db");
+    const password = randomUUID();
+    const item = randomUUID();
+    const service = "sgw-keychain-fixture";
+    const account = "fixture-agent";
+    const security = (args: string[]) => execFileSync("/usr/bin/security", args, { encoding: "utf8", timeout: 10_000 });
+    security(["create-keychain", "-p", password, keychain]);
+    try {
+      security(["unlock-keychain", "-p", password, keychain]);
+      security(["add-generic-password", "-a", account, "-s", service, "-w", item, "-A", keychain]);
+      expect(security(["find-generic-password", "-w", "-a", account, "-s", service, keychain]).trim()).toBe(item);
+
+      const probe = path.join(workspace, "native-keychain-probe.mjs");
+      await writeFile(probe, `import { spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const result = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-a', process.env.SGW_TEST_ACCOUNT, '-s', process.env.SGW_TEST_SERVICE, process.env.SGW_TEST_KEYCHAIN], { encoding: 'utf8', timeout: 10000 });
+writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0, timedOut: result.error?.code === 'ETIMEDOUT' }));
+`);
+      const launch = async (sandboxOptions: { denyAgentAuth?: boolean; denyRead?: string[] }) => {
+        const prepared = await prepareGuardedRun(store, {
+          agent: "claude-code", command: process.execPath, args: [probe], cwd: workspace,
+          env: { PATH: process.env.PATH, SGW_TEST_ACCOUNT: account, SGW_TEST_SERVICE: service, SGW_TEST_KEYCHAIN: keychain },
+          sandbox: "anthropic", sandboxOptions
+        });
+        expect(await runAnthropicSandbox(prepared, store.home, sandboxOptions)).toBe(0);
+        return JSON.parse(await readFile(path.join(workspace, "keychain-result.json"), "utf8"));
+      };
+      expect(await launch({})).toEqual({ read: true, timedOut: false });
+      const sandboxOptions = { denyAgentAuth: true, denyRead: [keychain] };
+      expect(await launch(sandboxOptions)).toEqual({ read: false, timedOut: false });
+    } finally {
+      security(["delete-keychain", keychain]);
+    }
+  }, 30_000);
 
   it("fails before credential enrollment when platform or dependency checks fail", async () => {
     const store = await fixtureStore();

@@ -2921,8 +2921,13 @@ function MenubarSurface({ ctx }: { ctx: ConsoleContext }) {
               <Badge variant="secondary">{relativeTime(request.updatedAt)}</Badge>
             </div>
             <div className="mt-1 truncate text-muted-foreground">{commandName(request)} · {requestTarget(request)}</div>
+            {request.action.ssh?.managed ? (
+              <div className="mt-1 break-all text-xs text-muted-foreground">Host key SHA-256: {request.managedSsh?.hostKeyFingerprint || "Unavailable"}</div>
+            ) : null}
             <div className="mt-2 grid grid-cols-2 gap-2">
-              <Button
+              {request.action.ssh?.managed ? <Button size="sm" onClick={() => window.location.assign("/approvals")}>
+                Review route
+              </Button> : <Button
                 size="sm"
                 onClick={() => void decide(request, true)}
                 disabled={decidingId !== null}
@@ -2930,7 +2935,7 @@ function MenubarSurface({ ctx }: { ctx: ConsoleContext }) {
               >
                 {decidingId === request.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
                 Approve once
-              </Button>
+              </Button>}
               <Button
                 variant="outline"
                 size="sm"
@@ -2982,9 +2987,10 @@ function ApprovalSheet({
   const [busy, setBusy] = React.useState(false);
   const busyRef = React.useRef(false);
   const handle = state?.handles.find((item) => item.handle === request?.handle);
+  const managedRouteReady = !request?.action.ssh?.managed || Boolean(request.managedSsh?.hostKeyFingerprint && request.managedSsh.routeCurrent);
 
   const approve = async (choice: { mode?: ApprovalMode; durationMs?: number; agentScope?: ApprovalAgentScope }) => {
-    if (!request) return;
+    if (!request || !managedRouteReady) return;
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
@@ -3002,7 +3008,7 @@ function ApprovalSheet({
   };
 
   const alwaysAllow = async () => {
-    if (!request || busyRef.current) return;
+    if (!request || !managedRouteReady || busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     try {
@@ -3069,6 +3075,16 @@ function ApprovalSheet({
                 ["Policy", "User approval required"]
               ]}
             />
+            {request.action.ssh?.managed ? (
+              <div className="space-y-1 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm break-all" data-managed-ssh-route>
+                <div className="font-medium">Managed SSH route</div>
+                <div>Resolved destination: {requestTarget(request)}</div>
+                <div>Route: {request.managedSsh?.routeName || request.action.ssh.managedRouteId || request.action.ssh.target}</div>
+                <div>Host key SHA-256: {request.managedSsh?.hostKeyFingerprint || "Unavailable"}</div>
+                {!request.managedSsh?.routeCurrent ? <div className="text-amber-700 dark:text-amber-300">This route changed or was removed. Create a new request before approving.</div> : null}
+                <div className="text-xs text-muted-foreground">The connection ignores user SSH configuration.</div>
+              </div>
+            ) : null}
             {request.action.owned && request.action.ssh ? (
               <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded border p-2">{JSON.stringify(request.action.args, null, 2)}</pre>
             ) : null}
@@ -3099,13 +3115,13 @@ function ApprovalSheet({
           </div>
         ) : null}
         {!request?.demo ? <SheetFooter>
-          <Button disabled={busy} onClick={() => approve({ mode: "per-transaction", agentScope: "same-agent" })} data-approve={request?.id}>
+          <Button disabled={busy || !managedRouteReady} onClick={() => approve({ mode: "per-transaction", agentScope: "same-agent" })} data-approve={request?.id}>
             {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Approve once
           </Button>
           <Popover>
             <PopoverTrigger asChild>
-              <Button disabled={busy} variant="outline">
+              <Button disabled={busy || !managedRouteReady} variant="outline">
                 Allow for...
                 <ChevronDown className="ml-2 h-4 w-4" />
               </Button>
@@ -3116,7 +3132,7 @@ function ApprovalSheet({
               <Button variant="ghost" onClick={() => approve({ mode: "timed-session", durationMs: 24 * 60 * 60 * 1000, agentScope: "same-agent" })}>1 day</Button>
               <Button variant="ghost" onClick={() => approve({ mode: "login-session", agentScope: "same-agent" })}>Current login session</Button>
               <Separator />
-              <Button variant="ghost" className="justify-start gap-2" disabled={busy} onClick={() => void alwaysAllow()} data-approve-policy={request?.id}>
+              <Button variant="ghost" className="justify-start gap-2" disabled={busy || !managedRouteReady} onClick={() => void alwaysAllow()} data-approve-policy={request?.id}>
                 <ShieldCheck className="h-4 w-4" />
                 Always allow this request scope
               </Button>

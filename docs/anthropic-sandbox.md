@@ -25,14 +25,20 @@ Use `sgw_request_http` with the handle, full HTTPS URL, method, headers, optiona
 
 Use `sgw_request_ssh_session` for a bounded remote command or `sgw_request_ssh_transfer` for an upload. Approved files are hashed and copied into protected storage before connecting. A named pipe is approved by path and destination; its bytes are produced during execution. There is no added upload size limit. Credential paths and explicit read denies cannot be uploaded. These sandbox operations use individual connections with revocation monitoring. Ordinary SSH keeps its existing session behavior.
 
+For a pinned SSH destination, an operator can add a managed route with `s-gw ssh route add --name NAME --host HOST --user USER --port PORT --host-public-key 'ssh-ed25519 AAAA...'`. Agents request it by `routeId` rather than supplying a host or key. The approval screen shows the final `user@host:port` and SHA256 host-key fingerprint; changed or removed routes require a new request. CLI approvals require `--confirm-route` with that endpoint and fingerprint. Managed execution ignores user SSH configuration and uses the pinned host key. Existing target-based requests remain available and may follow the user's OpenSSH aliases, proxies, and jump hosts.
+
 ## Explicit policy controls
 
 - `--allow-host HOST` adds an agent network destination. `--strict-egress` removes the default agent provider allowlist, so needed login/model hosts must be explicitly allowed.
 - `--allow-write PATH` adds a writable path. `--deny-read PATH` restricts a path or supported glob.
-- Saved agent login files remain readable by default. `--deny-agent-auth` blocks known login files and disables Keychain access.
+- Saved agent login files remain readable by default. `--deny-agent-auth` blocks known login files and the tested Keychain IPC route. Complete native Keychain isolation has not been established.
 - macOS `--allow-agent-keychain` allows read access to only the encrypted login Keychain database for agents that use native authentication. That database contains more than agent credentials. Keychain services still authorize item access, writes and sibling databases remain blocked, and explicit read denies win.
+- `--strict-broker-env` starts the trusted outside-sandbox MCP child with a validated environment allowlist. It keeps the store and recovery paths, supported backend and Keychain settings, 1Password credentials and session settings, a local user session bus, and custom CA files outside agent-writable paths. It removes Node preload/loader variables and test isolation overrides. Custom CA files and `SGW_OP_CLI` must be absolute files outside agent-writable paths. `--isolated-auth` also selects this broker setting. The default launch environment remains unchanged.
+- `--isolated-auth` starts the agent with a fresh temporary home, a small environment, denied reads of the original home, strict egress, and the strict broker environment. This is an experimental probe for workflows that do not require saved agent login. The selected workspace and required runtime files remain readable; credentials stored there are still exposed. Native Codex and Claude model login is not yet brokered through this profile.
 
 The mode cannot protect credentials already embedded in prompts or returned by unrelated tools. Agent login is a separate credential boundary. A service or database needs an owned protocol executor before sandboxed agents can use its credential; HTTPS covers HTTP APIs, and SSH covers approved commands/uploads. There is no arbitrary database driver in this release.
+
+The current launcher and broker run under the same OS user, and the agent can read its broker capability. Neither the default profile nor `--isolated-auth` establishes a kernel-verifiable agent principal. The cross-platform design and rollout gates are in [OS identity for confined agents](agent-os-identity.md).
 
 ## Validation
 

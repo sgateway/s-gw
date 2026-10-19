@@ -6,12 +6,34 @@ export type { AgentIdentitySource } from "./types.js";
 export interface AgentIdentity {
   name: string;
   source: AgentIdentitySource;
+  principalId?: string;
+}
+
+const verifiedPrincipals = new WeakSet<object>();
+
+export interface VerifiedAgentPrincipal {
+  readonly id: string;
+  readonly name: string;
+}
+
+// Only a trusted adapter that has checked the OS peer may call this. MCP input and
+// agent environment variables must never be passed here as identity evidence.
+export function principalForVerifiedPeer(id: string, name: string): VerifiedAgentPrincipal {
+  const principalId = id.trim();
+  const displayName = cleanAgentName(name);
+  if (!/^[A-Za-z0-9:/._-]{1,256}$/.test(principalId) || !displayName) {
+    throw new Error("A managed agent needs a verified principal ID and display name.");
+  }
+  const principal = Object.freeze({ id: principalId, name: displayName });
+  verifiedPrincipals.add(principal);
+  return principal;
 }
 
 export interface AgentIdentityContext {
   agentName?: string;
   mcpClientName?: string;
   env?: NodeJS.ProcessEnv;
+  managedPrincipal?: VerifiedAgentPrincipal;
 }
 
 export function agentNameFromReason(reason: string): string {
@@ -23,6 +45,17 @@ export function requestAgentName(reason: string, env: NodeJS.ProcessEnv = proces
 }
 
 export function requestAgentIdentity(reason: string, context: AgentIdentityContext = {}): AgentIdentity {
+  if (context.managedPrincipal !== undefined) {
+    if (!verifiedPrincipals.has(context.managedPrincipal)) {
+      throw new Error("Managed agent principal was not verified by s-gw.");
+    }
+    return {
+      name: context.managedPrincipal.name,
+      source: "managed-peer",
+      principalId: context.managedPrincipal.id
+    };
+  }
+
   const env = context.env || process.env;
   const configured = cleanAgentName(context.agentName || env.SGW_AGENT_NAME || env.SGW_REQUEST_AGENT_NAME);
   if (configured) {

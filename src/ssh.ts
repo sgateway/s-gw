@@ -6,9 +6,9 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, mkdtemp, realpath, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { getSgwHome } from "./paths.js";
+import { managedSshArgs, managedSshKnownHostsLine, normalizeManagedSshRoute } from "./managed-ssh.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
 import type { CommandAction, ExecutionSummary, RequestRecord, SecretRecord, SshTransferSpec } from "./types.js";
 import {
@@ -114,17 +114,38 @@ export async function runOwnedSshSession(
   const sshPath = await resolveSshClient();
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
   const captureCap = maxOutput + Math.max(secretValue.length, 0);
+  const managed = request.action.ssh?.managed;
   let auth: PreparedSshAuth | undefined;
   let upload: Awaited<ReturnType<typeof openApprovedUpload>> | undefined;
 
   try {
     assertSshCredentialSupported(secretRecord);
-    auth = await prepareSshAuth(secretRecord, secretValue);
+    auth = await prepareSshAuth(secretRecord, secretValue, home);
     if (assertAuthorized) {
       await assertAuthorized();
       const transfer = normalizeSshTransfer(request.action.ssh?.transfer);
       if (transfer) upload = await openApprovedUpload(transfer, home);
       await assertAuthorized();
+    }
+    if (managed) {
+      if (!assertAuthorized) throw new Error("Managed SSH requires owned-action authorization.");
+      const route = normalizeManagedSshRoute(managed);
+      if (route.port !== port) throw new Error("Managed SSH route port does not match the approved action.");
+      const knownHosts = path.join(auth.dirPath, "known_hosts");
+      await writeFile(knownHosts, managedSshKnownHostsLine(route).line, { flag: "wx", mode: 0o600 });
+      await auth.validateBeforeSpawn?.();
+      await assertAuthorized();
+      const remoteArgs = request.action.ssh?.transfer
+        ? [uploadCommand(request.action.ssh.transfer.destinationPath)]
+        : request.action.args.length ? request.action.args : ["true"];
+      const result = await runProcess(sshPath, managedSshArgs(route, knownHosts, auth.args, remoteArgs, isKeyAuth(secretRecord, secretValue)), {
+        timeoutMs: request.action.timeoutMs,
+        env: auth.env,
+        maxOutputBytes: maxOutput + captureHeadroomBytes([secretValue, Buffer.from(secretValue).toString("base64")]),
+        rejectOnNonZero: false, assertAuthorized, stdin: upload?.stream
+      });
+      await assertAuthorized();
+      return sshSummary(request, result, secretValue, maxOutput);
     }
     if (process.platform === "win32") {
       return await runWindowsSshCommand(request, sshPath, target, port, auth, secretValue, maxOutput, captureCap, assertAuthorized, upload?.stream);
@@ -386,14 +407,15 @@ async function openControlMaster(
 interface PreparedSshAuth {
   args: string[];
   env: NodeJS.ProcessEnv;
+  dirPath: string;
   cleanup: () => Promise<void>;
   validateBeforeSpawn?: () => Promise<void>;
 }
 
-async function prepareSshAuth(secret: SecretRecord, value: string): Promise<PreparedSshAuth> {
+async function prepareSshAuth(secret: SecretRecord, value: string, home: string): Promise<PreparedSshAuth> {
   const env = await baseSshEnv();
   const windowsDir = process.platform === "win32" ? await createPrivateWindowsSshDirectory() : undefined;
-  const tmpDir = windowsDir?.dirPath || await mkdtemp(path.join(os.tmpdir(), "sgw-ssh-"));
+  const tmpDir = windowsDir?.dirPath || await mkdtemp(path.join(home, "ssh-credential-"));
   let cleaned = false;
   const cleanup = async () => {
     if (cleaned) {
@@ -407,7 +429,7 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
   };
 
   try {
-    if (secret.type === "ssh-key" || secret.type === "private-key" || looksLikePrivateKey(value)) {
+    if (isKeyAuth(secret, value)) {
       const keyPath = path.join(tmpDir, "identity");
       let validateBeforeSpawn: (() => Promise<void>) | undefined;
       if (process.platform === "win32") {
@@ -420,6 +442,7 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
       return {
         args: ["-i", keyPath, "-o", "IdentitiesOnly=yes"],
         env,
+        dirPath: tmpDir,
         cleanup,
         validateBeforeSpawn
       };
@@ -440,6 +463,7 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
         SSH_ASKPASS: askpassPath,
         SGW_ASKPASS_FILE: passPath
       },
+      dirPath: tmpDir,
       cleanup
     };
   } catch (error) {
@@ -450,6 +474,10 @@ async function prepareSshAuth(secret: SecretRecord, value: string): Promise<Prep
     }
     throw error;
   }
+}
+
+function isKeyAuth(secret: SecretRecord, value: string): boolean {
+  return secret.type === "ssh-key" || secret.type === "private-key" || looksLikePrivateKey(value);
 }
 
 function looksLikePrivateKey(value: string): boolean {

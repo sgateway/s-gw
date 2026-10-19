@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -6,6 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { ReleaseChecker } from "../src/update-check.js";
+import { SecretStore } from "../src/store.js";
 
 const CHROME_CANDIDATES = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -54,6 +56,48 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it("shows the canonical managed SSH route and pinned host key before approval", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "managed-route-browser-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    const type = Buffer.from("ssh-ed25519");
+    const rawKey = generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).subarray(-32);
+    const sshString = (bytes: Buffer) => { const length = Buffer.alloc(4); length.writeUInt32BE(bytes.length); return Buffer.concat([length, bytes]); };
+    const wireKey = Buffer.concat([sshString(type), sshString(rawKey)]);
+    const fingerprint = `SHA256:${createHash("sha256").update(wireKey).digest("base64").replace(/=+$/, "")}`;
+    const store = new SecretStore();
+    const route = await store.addManagedSshRoute({ name: "friendly-alias", host: "127.0.0.1", user: "deploy", port: 2222,
+      hostPublicKey: `ssh-ed25519 ${wireKey.toString("base64")}` });
+    const secret = await store.addSecret({ name: "SSH fixture", type: "private-key", value: "synthetic-private-key", policy: { allowedCommands: ["s-gw:ssh-session"] } });
+    const request = await store.createManagedSshRequest(secret.handle, route.id, { injectEnv: "SGW_SSH_PRIVATE_KEY", args: ["hostname"] }, "managed browser fixture");
+    running = await startConsoleServer({ port: 0, store });
+    const launched = await launchChrome(new URL("approvals", running.url).toString());
+    cdp = launched.cdp;
+
+    await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length > 0"), "managed SSH approval row");
+    expect(await cdp.eval<string>("document.querySelector('tbody tr')?.innerText || ''")).toContain("deploy@127.0.0.1:2222");
+    await cdp.eval("document.querySelector('tbody tr').dispatchEvent(new MouseEvent('click', { bubbles: true }))");
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('[data-managed-ssh-route]'))"), "managed SSH review");
+    const details = await cdp.eval<string>("document.querySelector('[data-managed-ssh-route]')?.innerText || ''");
+    expect(details).toContain("Resolved destination: deploy@127.0.0.1:2222");
+    expect(details).toContain("Route: friendly-alias");
+    expect(details).toContain(`Host key SHA-256: ${fingerprint}`);
+    expect(await cdp.eval<boolean>(`Boolean(document.querySelector('[data-approve="${request.id}"]')?.disabled)`)).toBe(false);
+
+    await store.updateManagedSshRoute(route.id, { host: "127.0.0.2" });
+    await cdp.eval("window.location.reload()");
+    await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length > 0"), "stale managed SSH row");
+    await cdp.eval("document.querySelector('tbody tr').dispatchEvent(new MouseEvent('click', { bubbles: true }))");
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('[data-managed-ssh-route]'))"), "stale managed SSH review");
+    expect(await cdp.eval<string>("document.querySelector('[data-managed-ssh-route]')?.innerText || ''"))
+      .toContain("This route changed or was removed");
+    expect(await cdp.eval<boolean>(`Boolean(document.querySelector('[data-approve="${request.id}"]')?.disabled)`)).toBe(true);
+
+    await cdp.eval('window.location.assign("/menubar")');
+    await waitFor(() => cdp!.eval<boolean>("document.body.innerText.includes('Review route')"), "managed SSH menubar review");
+    expect(await cdp.eval<boolean>(`Boolean(document.querySelector('[data-menubar-approve="${request.id}"]'))`)).toBe(false);
+    expect(await cdp.eval<string>("document.body.innerText")).toContain(fingerprint);
+  }, 45_000);
+
   it("adds and completely removes display-only demo data from the native menu", async () => {
     running = await startConsoleServer({ port: 0 });
     const url = new URL("overview", running.url);

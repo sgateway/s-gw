@@ -13,6 +13,12 @@ export function commandName(request: RequestRecord): string {
 }
 
 export function requestTarget(request: RequestRecord): string {
+  if (request.action.kind === "ssh_session" && request.action.ssh?.managed) {
+    if (request.managedSsh?.destination) return request.managedSsh.destination;
+    const route = request.action.ssh.managed;
+    const host = route.host.includes(":") ? `[${route.host}]` : route.host;
+    return `${route.user}@${host}:${route.port}`;
+  }
   if (request.action.kind === "ssh_session" && request.action.ssh?.target) {
     const port = request.action.ssh.port;
     return port && port !== 22 ? `${request.action.ssh.target}:${port}` : request.action.ssh.target;

@@ -227,6 +227,7 @@ export function describeEventFlow(event: AuditEvent, state: ConsoleState): Activ
       tone,
       lines: [
         ["Target", destination],
+        ...(request?.action.ssh?.managed ? [["Host key SHA-256", request.managedSsh?.hostKeyFingerprint || "Unavailable"]] as Array<[string, string]> : []),
         ["Provider", target.detail],
         ["Handle", event.handle ? shortHandle(event.handle) : "None"]
       ]
@@ -319,7 +320,7 @@ function targetNode(
   handle: ConsoleState["handles"][number] | undefined
 ): ActivityNode {
   if (request?.action.kind === "ssh_session" && request.action.ssh?.target) {
-    const host = request.action.ssh.target.split("@").pop() || request.action.ssh.target;
+    const host = request.action.ssh.managed?.host || request.action.ssh.target.split("@").pop() || request.action.ssh.target;
     const context = activityText(event, request, handle);
     const isEC2 = context.includes("ec2")
       || context.includes("aws")

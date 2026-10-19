@@ -200,6 +200,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     const identityIndex = openCall?.args.indexOf("-i") ?? -1;
     expect(identityIndex).toBeGreaterThanOrEqual(0);
     const keyPath = openCall!.args[identityIndex + 1];
+    expect(path.relative(store.home, keyPath)).toMatch(/^ssh-credential-[^/]+\/identity$/);
     expect(existsSync(keyPath)).toBe(false);
 
     const second = await store.createRequest(

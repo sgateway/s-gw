@@ -1,5 +1,5 @@
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,10 +19,12 @@ export interface AnthropicSandboxOptions {
   strictEgress?: boolean;
   denyAgentAuth?: boolean;
   allowAgentKeychain?: boolean;
+  isolatedAuth?: boolean;
+  strictBrokerEnv?: boolean;
 }
 
 export function macAgentKeychainReadPath(cwd: string, options: AnthropicSandboxOptions = {}, platform = process.platform): string | undefined {
-  if (platform !== "darwin" || !options.allowAgentKeychain || options.denyAgentAuth) return;
+  if (platform !== "darwin" || !options.allowAgentKeychain || options.denyAgentAuth || options.isolatedAuth) return;
   const loginFile = normalizePathForSandbox(path.join(os.homedir(), "Library", "Keychains", "login.keychain-db"));
   for (const file of options.denyRead || []) {
     let denied = normalizePathForSandbox(path.resolve(cwd, file));
@@ -59,20 +61,88 @@ export function anthropicSandboxReadiness(platform = process.platform) {
     credentialOperations: ["ssh", "https"], nativeWindows: "pending; no account or VM is provisioned automatically" };
 }
 
-export function anthropicSandboxConfig(cwd: string, home: string, options: AnthropicSandboxOptions = {}, env: NodeJS.ProcessEnv = process.env): SandboxRuntimeConfig {
+export function anthropicSandboxConfig(cwd: string, home: string, options: AnthropicSandboxOptions = {}, env: NodeJS.ProcessEnv = process.env, command?: string): SandboxRuntimeConfig {
+  if (options.isolatedAuth && options.allowAgentKeychain) throw new Error("Isolated authentication cannot allow the agent login Keychain.");
+  const workspace = path.resolve(cwd);
+  const userHome = path.resolve(os.homedir());
+  if (options.isolatedAuth && (userHome === workspace || userHome.startsWith(workspace + path.sep))) {
+    throw new Error("Isolated authentication requires a workspace narrower than the user home.");
+  }
+  if (options.isolatedAuth && (workspace === path.resolve(home) || workspace.startsWith(path.resolve(home) + path.sep))) {
+    throw new Error("Isolated authentication cannot use the s-gw store as the workspace.");
+  }
+  if (options.isolatedAuth && (options.denyRead || []).some(file => {
+    const denied = path.resolve(cwd, file);
+    return denied === workspace || denied.startsWith(workspace + path.sep);
+  })) {
+    throw new Error("Isolated authentication cannot enforce a read denial inside the allowed workspace.");
+  }
+  const allowRead = options.isolatedAuth ? [workspace, ...trustedRuntimeReadPaths(env, command)] : [];
   return SandboxRuntimeConfigSchema.parse({
     filesystem: {
       denyRead: [...new Set([...sensitiveChildPaths(home), home,
         path.join(os.homedir(), ".config", "op"),
         path.join(os.homedir(), "Library", "Application Support", "1Password"),
-        ...(options.denyAgentAuth ? agentAuthenticationPaths(env).map(file => path.resolve(cwd, file)) : []),
+        ...(options.isolatedAuth ? [userHome, ...(env.HOME ? [path.resolve(env.HOME)] : [])] : []),
+        ...(options.denyAgentAuth || options.isolatedAuth ? agentAuthenticationPaths(env).map(file => path.resolve(cwd, file)) : []),
         ...(options.denyRead || []).map(file => path.resolve(cwd, file))])],
+      ...(allowRead.length ? { allowRead } : {}),
       allowWrite: [path.resolve(cwd), ...(options.allowWrite || []).map(file => path.resolve(cwd, file))],
       denyWrite: [home, fileURLToPath(new URL("../", import.meta.url)), process.execPath,
         ...(options.allowAgentKeychain && process.platform === "darwin" ? [path.join(os.homedir(), "Library", "Keychains")] : [])]
     },
-    network: { allowedDomains: [...(options.strictEgress ? [] : DEFAULT_GUARD_ALLOWLIST), ...(options.allowHosts || [])], deniedDomains: [] }
+    network: { allowedDomains: [...(options.strictEgress || options.isolatedAuth ? [] : DEFAULT_GUARD_ALLOWLIST), ...(options.allowHosts || [])], deniedDomains: [] }
   });
+}
+
+function trustedRuntimeReadPaths(env: NodeJS.ProcessEnv, command?: string): string[] {
+  const packageRoot = fileURLToPath(new URL("../", import.meta.url));
+  const paths = [packageRoot, process.execPath];
+  if (command) {
+    const resolved = path.isAbsolute(command) ? command : env.PATH?.split(path.delimiter).map(dir => path.join(dir, command)).find(file => {
+      try { return statSync(file).isFile(); } catch { return false; }
+    });
+    if (resolved) {
+      const real = realpathSync(resolved);
+      const modules = real.indexOf(`${path.sep}node_modules${path.sep}`);
+      if (modules >= 0) {
+        const parts = real.slice(modules + `${path.sep}node_modules${path.sep}`.length).split(path.sep);
+        const count = parts[0]?.startsWith("@") ? 2 : 1;
+        paths.push(real.slice(0, modules + `${path.sep}node_modules${path.sep}`.length) + parts.slice(0, count).join(path.sep));
+      } else paths.push(real);
+    }
+  }
+  for (const name of ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"] as const) {
+    const file = env[name];
+    if (!file) continue;
+    if (!path.isAbsolute(file)) throw new Error(`${name} must use an absolute path in isolated authentication mode.`);
+    const real = realpathSync(file);
+    if (!statSync(real).isFile()) throw new Error(`${name} must be a regular file in isolated authentication mode.`);
+    paths.push(real);
+  }
+  return [...new Set(paths.map(file => path.resolve(file)))];
+}
+
+export function isolatedAgentEnvironment(parentEnv: NodeJS.ProcessEnv, capabilityEnv: Record<string, string>, agentTmp: string, mcpConfig: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    HOME: agentTmp,
+    TMPDIR: agentTmp,
+    XDG_CONFIG_HOME: path.join(agentTmp, "config"),
+    XDG_CACHE_HOME: path.join(agentTmp, "cache"),
+    XDG_DATA_HOME: path.join(agentTmp, "data"),
+    CODEX_HOME: path.join(agentTmp, "codex"),
+    CLAUDE_CONFIG_DIR: path.join(agentTmp, "claude"),
+    USER: os.userInfo().username,
+    LOGNAME: os.userInfo().username,
+    SGW_SANDBOX_MCP_CONFIG: mcpConfig,
+    ...capabilityEnv
+  };
+  for (const name of ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "CLICOLOR",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SGW_GUARD_MODE", "SGW_GUARD_AGENT",
+    "SGW_GUARD_INSTRUCTIONS", "SGW_GUARD_TOKENIZED_ENV"] as const) {
+    if (parentEnv[name] !== undefined) env[name] = parentEnv[name];
+  }
+  return env;
 }
 
 let running = false;
@@ -89,9 +159,10 @@ function macSandboxProfileArgs(wrapped: string): { args: string[]; at: number } 
   return { args, at };
 }
 
-export function restrictMacCredentialIpc(wrapped: string): string {
+export function restrictMacCredentialIpc(wrapped: string, strict = false): string {
   const { args, at } = macSandboxProfileArgs(wrapped);
   args[at + 2] += '\n(deny mach-lookup (global-name "com.apple.securityd.xpc"))\n';
+  if (strict) args[at + 2] += '(deny mach-lookup (global-name "com.apple.SecurityServer"))\n';
   return quoteShell(args);
 }
 
@@ -128,8 +199,12 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
   if (!["darwin", "linux"].includes(process.platform)) {
     throw new Error("The Anthropic s-gw launcher currently supports macOS and Linux. Native Windows integration is pending alpha-runtime validation.");
   }
+  if (options.isolatedAuth && process.platform === "linux" &&
+    SandboxManager.checkDependencies().warnings.some(warning => warning.includes("unix socket access not restricted"))) {
+    throw new Error("Isolated authentication on Linux requires Anthropic's Unix-socket seccomp filter.");
+  }
   if (running) throw new Error("An Anthropic sandbox is already running in this process.");
-  const config = anthropicSandboxConfig(prepared.plan.cwd, home, options, prepared.env);
+  const config = anthropicSandboxConfig(prepared.plan.cwd, home, options, prepared.env, prepared.plan.command);
   running = true;
   let sessionDir: string | undefined;
   let agentTmp: string | undefined;
@@ -139,7 +214,8 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     agentTmp = await mkdtemp(path.join(prepared.plan.cwd, ".sgw-tmp-"));
     const manifestPath = path.join(sessionDir, "launch.json");
     config.filesystem.denyWrite.push(sessionDir);
-    broker = await startSandboxBroker(prepared.plan.cwd, home, prepared.plan.agent.displayName, config.filesystem.denyRead);
+    broker = await startSandboxBroker(prepared.plan.cwd, home, prepared.plan.agent.displayName, config.filesystem.denyRead,
+      { strictEnv: options.strictBrokerEnv || options.isolatedAuth, agentWritablePaths: config.filesystem.allowWrite });
     const brokerPort = broker.port;
     await SandboxManager.initialize(config, async ({ host, port }) => host === "127.0.0.1" && port === brokerPort);
     const proxyPort = process.platform === "linux" ? 3128 : SandboxManager.getProxyPort();
@@ -161,8 +237,10 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     let wrapped = await SandboxManager.wrapWithSandbox(fixedCommand, "/bin/bash");
     const loginFile = macAgentKeychainReadPath(prepared.plan.cwd, options);
     if (loginFile) wrapped = allowMacAgentKeychainRead(wrapped, loginFile);
-    if (options.denyAgentAuth && process.platform === "darwin") wrapped = restrictMacCredentialIpc(wrapped);
-    const env: NodeJS.ProcessEnv = { ...prepared.env, ...capabilityEnv, SGW_SANDBOX_MCP_CONFIG: mcpConfig };
+    if ((options.denyAgentAuth || options.isolatedAuth) && process.platform === "darwin") wrapped = restrictMacCredentialIpc(wrapped, options.isolatedAuth);
+    const env: NodeJS.ProcessEnv = options.isolatedAuth
+      ? isolatedAgentEnvironment(prepared.env, capabilityEnv, agentTmp, mcpConfig)
+      : { ...prepared.env, ...capabilityEnv, SGW_SANDBOX_MCP_CONFIG: mcpConfig };
     delete env.SGW_HOME;
     delete env.SGW_SANDBOX_OPERATIONS_ONLY;
     delete env.SSH_AUTH_SOCK;

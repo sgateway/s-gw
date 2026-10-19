@@ -86,6 +86,92 @@ describe("guard mode", () => {
     expect(await store.listHandles()).toHaveLength(0);
   });
 
+  it("keeps the existing npm environment behavior unless strict npm scanning is selected", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    const raw = fakeGithubToken();
+
+    const prepared = await prepareGuardedRun(store, {
+      agent: "codex",
+      command: process.execPath,
+      env: { npm_config_password: raw },
+      persist: false
+    });
+
+    expect(prepared.env.npm_config_password).toBe(raw);
+    expect(prepared.plan.scrubbedEnv).toHaveLength(0);
+  });
+
+  it("scans npm values and tokenizes short auth fields in strict npm mode", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    const raw = fakeGithubToken();
+    const env = {
+      npm_config_custom_setting: raw,
+      npm_config_password: "p4",
+      "NPM_CONFIG_//registry.example.test/:_authToken": "q7",
+      npm_config_registry: "https://registry.example.test/",
+      npm_config_user_agent: "npm/10 node/v22",
+      npm_config_always_auth: "true"
+    };
+
+    const prepared = await prepareGuardedRun(store, {
+      agent: "codex",
+      command: process.execPath,
+      env,
+      strictNpmEnv: true,
+      persist: true
+    });
+
+    expect(prepared.env.npm_config_custom_setting).toMatch(/^<<SGW_SECRET:/);
+    expect(prepared.env.npm_config_password).toMatch(/^<<SGW_SECRET:/);
+    expect(prepared.env["NPM_CONFIG_//registry.example.test/:_authToken"]).toMatch(/^<<SGW_SECRET:/);
+    expect(prepared.env.npm_config_registry).toBe(env.npm_config_registry);
+    expect(prepared.env.npm_config_user_agent).toBe(env.npm_config_user_agent);
+    expect(prepared.env.npm_config_always_auth).toBe(env.npm_config_always_auth);
+    expect(JSON.stringify(prepared)).not.toContain(raw);
+    const handles = await store.listHandles();
+    expect(handles).toHaveLength(3);
+    expect(handles.find((item) => item.source.includes("/_authToken"))?.policy.injectEnv).toBeUndefined();
+  });
+
+  it("tokenizes npm registry URLs carrying credentials in strict npm mode", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    const env = {
+      npm_config_registry: "https://user:tiny@registry.example.test/",
+      npm_config_cache: "https://registry.example.test/cache?access_token=x2"
+    };
+
+    const prepared = await prepareGuardedRun(store, {
+      agent: "codex",
+      command: process.execPath,
+      env,
+      strictNpmEnv: true,
+      persist: true
+    });
+
+    expect(prepared.env.npm_config_registry).toMatch(/^<<SGW_SECRET:/);
+    expect(prepared.env.npm_config_cache).toMatch(/^<<SGW_SECRET:/);
+    expect(JSON.stringify(prepared)).not.toContain("tiny");
+    expect(JSON.stringify(prepared)).not.toContain("access_token=x2");
+    const handles = await store.listHandles();
+    expect(handles).toHaveLength(2);
+    expect(handles.every((item) => item.source.startsWith("guard-env:codex:npm_config_"))).toBe(true);
+  });
+
+  it("requires environment scrubbing when strict npm mode is selected", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    await expect(prepareGuardedRun(store, {
+      agent: "codex",
+      command: process.execPath,
+      env: { npm_config_password: "p4" },
+      strictNpmEnv: true,
+      scrubEnv: false
+    })).rejects.toThrow("requires credential environment scrubbing");
+  });
+
   it("drops the s-gw master passphrase before launching a guarded agent", async () => {
     const store = new SecretStore(tmpHome);
     await store.init();
@@ -143,6 +229,55 @@ describe("guard mode", () => {
     expect(plan.scrubbedEnv.some((item: { name: string }) => item.name === "OPENAI_API_KEY")).toBe(true);
     expect(plan.args).toEqual(["-v"]);
     expect(plan.dryRun).toBe(true);
+  });
+
+  it("CLI strict npm dry-run replaces npm authentication values", () => {
+    const out = execFileSync(
+      process.execPath,
+      [tsxCli, "src/cli.ts", "guard", "run", "codex", "--dry-run", "--strict-npm-env", "--command", process.execPath],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          SGW_HOME: tmpHome,
+          SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
+          SGW_MASTER_PASSPHRASE: "guard cli passphrase",
+          SGW_DISABLE_KEYCHAIN: "1",
+          npm_config_password: "short-private-registry-password"
+        },
+        encoding: "utf8"
+      }
+    );
+
+    expect(out).not.toContain("short-private-registry-password");
+    const plan = JSON.parse(out);
+    expect(plan.scrubbedEnv.some((item: { name: string }) => item.name === "npm_config_password")).toBe(true);
+  });
+
+  it("passes a handle to a launched child in strict npm mode", () => {
+    const raw = "short-private-registry-password";
+    const out = execFileSync(
+      process.execPath,
+      [
+        tsxCli, "src/cli.ts", "guard", "run", "codex", "--strict-npm-env", "--command", process.execPath,
+        "--", "-e", "process.stdout.write(process.env.npm_config_password || '')"
+      ],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          SGW_HOME: tmpHome,
+          SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
+          SGW_MASTER_PASSPHRASE: "guard cli passphrase",
+          SGW_DISABLE_KEYCHAIN: "1",
+          npm_config_password: raw
+        },
+        encoding: "utf8"
+      }
+    );
+
+    expect(out).toMatch(/^<<SGW_SECRET:s-gw:password:/);
+    expect(out).not.toContain(raw);
   });
 
   it("launches canonical npm cmd shims without a command shell", async () => {

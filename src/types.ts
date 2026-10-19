@@ -1,3 +1,5 @@
+import type { ManagedSshRoute } from "./managed-ssh.js";
+
 export type SecretType =
   | "api-token"
   | "ssh-key"
@@ -16,7 +18,7 @@ export type ApprovalMode = "per-transaction" | "timed-session" | "login-session"
 export type ApprovalAgentScope = "same-agent" | "any-agent";
 export type ApprovalPolicyDecision = "ask" | "allow" | "deny";
 export type ApprovalPolicyActionKind = "env_command" | "ssh_session" | "http_request";
-export type AgentIdentitySource = "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
+export type AgentIdentitySource = "managed-peer" | "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
 
 export interface ApprovalSettings {
   mode: ApprovalMode;
@@ -30,6 +32,7 @@ export interface ApprovalGrant {
   mode: Exclude<ApprovalMode, "per-transaction">;
   agentScope?: ApprovalAgentScope;
   agentName?: string;
+  principalId?: string;
   loginSessionId: string;
   createdAt: string;
   updatedAt: string;
@@ -44,6 +47,7 @@ export interface ApprovalPolicyConditions {
   providers?: string[];
   minSeverity?: SecretSeverity;
   agents?: string[];
+  principalIds?: string[];
   actionKinds?: ApprovalPolicyActionKind[];
   commands?: string[];
   resolvedCommands?: string[];
@@ -134,6 +138,16 @@ export interface SshSessionSpec {
   target: string;
   port: number;
   transfer?: SshTransferSpec;
+  managedRouteId?: string;
+  managed?: ManagedSshRoute;
+}
+
+export interface ManagedSshRouteRecord {
+  id: string;
+  name: string;
+  route: ManagedSshRoute;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SshTransferSpec {
@@ -188,6 +202,7 @@ export interface RequestRecord {
   reason: string;
   agentName?: string;
   agentSource?: AgentIdentitySource;
+  principalId?: string;
   loginSessionId?: string;
   action: CommandAction;
   state: RequestState;
@@ -220,6 +235,7 @@ export interface StoreFile {
   approvalSettings: ApprovalSettings;
   approvalGrants: ApprovalGrant[];
   approvalPolicyRules: ApprovalPolicyRule[];
+  managedSshRoutes?: ManagedSshRouteRecord[];
 }
 
 export interface ScanCandidate {

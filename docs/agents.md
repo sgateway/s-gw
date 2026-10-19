@@ -88,6 +88,8 @@ s-gw guard run cursor --command cursor --dry-run
 
 `--dry-run` uses preview handles and does not write to the store. A real run may use `--allow-command CMD` to attach an initial approved-execution policy to any handles created from environment variables, but production policies should remain narrow.
 
+Use `--strict-npm-env` to scan `npm_` environment values too. It tokenizes known credential patterns, npm authentication fields (including short opaque values), and registry URLs containing credentials. Existing runs continue to pass `npm_` variables through for compatibility. Pattern scanning cannot identify every secret placed in a harmless-looking variable; review the dry-run before using this option with a private registry.
+
 ## Agent Profile Registry
 
 s-gw tracks the 13 first-class agents documented by DefenseClaw as of tag `0.8.3`: OpenClaw, ZeptoClaw, Claude Code, Codex, Hermes, Cursor, Windsurf, Gemini CLI, GitHub Copilot CLI, OpenHands, Antigravity, OpenCode, and OmniGent.

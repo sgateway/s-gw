@@ -1,5 +1,6 @@
 import { assertHttpDestination, buildHttpRequestAction, SGW_HTTP_COMMAND } from "./http-action.js";
 import { parseAllowedDestination } from "./destinations.js";
+import { normalizeManagedSshRoute, type ManagedSshRoute } from "./managed-ssh.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
@@ -13,7 +14,7 @@ import {
   compareApprovalPolicyRules,
   policyAllowsAnyEnvCommand
 } from "./policy-order.js";
-import { SGW_SSH_SESSION_COMMAND, normalizeSshPort, normalizeSshTarget, normalizeSshTransfer, sshSessionIdentity } from "./ssh.js";
+import { SGW_SSH_SESSION_COMMAND, buildSshSessionAction, normalizeSshPort, normalizeSshTarget, normalizeSshTransfer, sshSessionIdentity } from "./ssh.js";
 import {
   compareRuntimeVersions,
   isHistoryFreeLedger,
@@ -48,6 +49,7 @@ import type {
   CommandEnvBinding,
   ExecutionSummary,
   HandleSummary,
+  ManagedSshRouteRecord,
   RequestRecord,
   RequestState,
   SecretPolicy,
@@ -55,6 +57,7 @@ import type {
   SecretSeverity,
   SecretType,
   SecretValueCache,
+  SshTransferSpec,
   StoreFile
 } from "./types.js";
 
@@ -94,6 +97,7 @@ const approvalPolicyConditionFields: Array<keyof ApprovalPolicyConditions> = [
   "providers",
   "minSeverity",
   "agents",
+  "principalIds",
   "actionKinds",
   "commands",
   "resolvedCommands",
@@ -111,7 +115,8 @@ const emptyStore = (): StoreFile => ({
   audit: [],
   approvalSettings: { ...defaultApprovalSettings },
   approvalGrants: [],
-  approvalPolicyRules: []
+  approvalPolicyRules: [],
+  managedSshRoutes: []
 });
 
 export interface AddSecretInput {
@@ -136,6 +141,26 @@ export interface AddOnePasswordReferenceInput {
 
 export interface AddKeychainSecretInput extends AddSecretInput {
   service?: string;
+}
+
+export interface AddManagedSshRouteInput extends ManagedSshRoute {
+  name: string;
+}
+
+export interface UpdateManagedSshRouteInput {
+  name?: string;
+  host?: string;
+  user?: string;
+  port?: number;
+  hostPublicKey?: string;
+}
+
+export interface ManagedSshRequestInput {
+  injectEnv: string;
+  args?: string[];
+  workingDir?: string;
+  timeoutMs?: number;
+  transfer?: SshTransferSpec;
 }
 
 export interface SetApprovalSettingsInput {
@@ -227,6 +252,7 @@ export interface ReusableExecutionPermit {
   reason: string;
   agentName: string;
   agentSource: AgentIdentitySource;
+  principalId?: string;
   action: CommandAction;
   createdAt: string;
   controlFingerprint: string;
@@ -621,7 +647,7 @@ export class SecretStore {
       const secret = store.secrets.find((item) => item.handle === handle && item.backend === "onepassword");
       const primary = store.secrets.find((item) => item.handle === request.handle);
       const policyRule = request.approvalPolicyRuleId && primary
-        ? matchingApprovalPolicyRuleForAction(store, primary, request.action, request.agentName || requestAgentName(request.reason), now)
+        ? matchingApprovalPolicyRuleForAction(store, primary, request.action, identityFromRequest(request), now)
         : undefined;
       const policyAuthorized = Boolean(
         policyRule?.decision === "allow" &&
@@ -888,6 +914,87 @@ export class SecretStore {
     });
   }
 
+  async listManagedSshRoutes(): Promise<ManagedSshRouteRecord[]> {
+    const store = await this.read();
+    return [...(store.managedSshRoutes || [])].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async getManagedSshRoute(id: string): Promise<ManagedSshRouteRecord> {
+    const store = await this.read();
+    const route = (store.managedSshRoutes || []).find((item) => item.id === requireManagedSshRouteId(id));
+    if (!route) throw new Error(`Unknown managed SSH route: ${id}`);
+    return route;
+  }
+
+  async addManagedSshRoute(input: AddManagedSshRouteInput): Promise<ManagedSshRouteRecord> {
+    const name = requireManagedSshRouteName(input.name);
+    const route = normalizeManagedSshRoute(input);
+    return this.mutate((store) => {
+      if ((store.managedSshRoutes || []).some((item) => item.name.toLowerCase() === name.toLowerCase())) {
+        throw new Error(`A managed SSH route named ${name} already exists.`);
+      }
+      const now = new Date().toISOString();
+      const record = { id: shortId("route"), name, route, createdAt: now, updatedAt: now };
+      (store.managedSshRoutes ||= []).push(record);
+      store.audit.push(audit("ssh.route.created", `Created managed SSH route ${name}.`));
+      return record;
+    });
+  }
+
+  async updateManagedSshRoute(id: string, input: UpdateManagedSshRouteInput): Promise<ManagedSshRouteRecord> {
+    const routeId = requireManagedSshRouteId(id);
+    return this.mutate((store) => {
+      const record = (store.managedSshRoutes || []).find((item) => item.id === routeId);
+      if (!record) throw new Error(`Unknown managed SSH route: ${id}`);
+      const name = input.name === undefined ? record.name : requireManagedSshRouteName(input.name);
+      if ((store.managedSshRoutes || []).some((item) => item.id !== routeId && item.name.toLowerCase() === name.toLowerCase())) {
+        throw new Error(`A managed SSH route named ${name} already exists.`);
+      }
+      const route = normalizeManagedSshRoute({
+        host: input.host === undefined ? record.route.host : input.host,
+        user: input.user === undefined ? record.route.user : input.user,
+        port: input.port === undefined ? record.route.port : input.port,
+        hostPublicKey: input.hostPublicKey === undefined ? record.route.hostPublicKey : input.hostPublicKey
+      });
+      if (name === record.name && JSON.stringify(route) === JSON.stringify(record.route)) return record;
+      record.name = name;
+      record.route = route;
+      record.updatedAt = new Date().toISOString();
+      store.audit.push(audit("ssh.route.updated", `Updated managed SSH route ${name}.`));
+      return record;
+    });
+  }
+
+  async deleteManagedSshRoute(id: string): Promise<ManagedSshRouteRecord> {
+    const routeId = requireManagedSshRouteId(id);
+    return this.mutate((store) => {
+      const routes = store.managedSshRoutes || [];
+      const index = routes.findIndex((item) => item.id === routeId);
+      if (index < 0) throw new Error(`Unknown managed SSH route: ${id}`);
+      const [removed] = routes.splice(index, 1);
+      store.audit.push(audit("ssh.route.deleted", `Deleted managed SSH route ${removed.name}.`));
+      return removed;
+    });
+  }
+
+  async createManagedSshRequest(
+    handle: string,
+    routeId: string,
+    input: ManagedSshRequestInput,
+    reason: string,
+    agentContext: AgentIdentityContext = {}
+  ): Promise<RequestRecord> {
+    const id = requireManagedSshRouteId(routeId);
+    const action = buildSshSessionAction({
+      target: id, injectEnv: input.injectEnv, args: input.args,
+      workingDir: input.workingDir, timeoutMs: input.timeoutMs
+    });
+    action.owned = true;
+    action.ssh!.managedRouteId = id;
+    if (input.transfer) action.ssh!.transfer = input.transfer;
+    return this.createRequest(handle, action, reason, agentContext);
+  }
+
   async createRequest(
     handle: string,
     action: CommandAction,
@@ -996,12 +1103,13 @@ export class SecretStore {
       if (!secret) {
         throw new Error(`Unknown secret handle: ${request.handle}`);
       }
-      const agentName = durablePolicyAgentName(request);
-      let rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, now);
+      const agent = identityFromRequest(request);
+      const agentName = agent.principalId ? agent.name : durablePolicyAgentName(request);
+      let rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
       let created = false;
 
       if (rule?.decision !== "allow") {
-        const deny = blockingDenyPolicyRuleForAction(store, secret, request.action, agentName, now);
+        const deny = blockingDenyPolicyRuleForAction(store, secret, request.action, agent, now);
         if (deny) {
           throw new Error(`Approval policy ${deny.name} denies this request. Edit or disable it before creating an allow rule.`);
         }
@@ -1013,7 +1121,7 @@ export class SecretStore {
         created = true;
         const arranged = arrangePolicyRules(store.approvalPolicyRules || [], now);
         store.approvalPolicyRules = arranged.rules;
-        rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, now);
+        rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
         if (rule?.decision !== "allow") {
           throw new Error("An existing policy takes precedence over this allow rule. Edit that policy before allowing this request.");
         }
@@ -1066,13 +1174,14 @@ export class SecretStore {
     }
     const secret = store.secrets.find(item => item.handle === request.handle);
     if (!secret) throw new Error("Owned credential handle was removed.");
+    assertManagedSshRouteCurrent(store, request.action);
     assertActionAllowed(secret, request.action);
     const now = new Date().toISOString();
-    const agentName = request.agentName || requestAgentName(request.reason);
-    const rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, now);
+    const agent = identityFromRequest(request);
+    const rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
     if (rule?.decision === "deny") throw new Error("Owned operation was denied by the current policy.");
     if (request.approvalGrantId) {
-      const grant = activeApprovalGrant(store, request.handle, request.action, agentName, now);
+      const grant = activeApprovalGrant(store, request.handle, request.action, agent, now);
       if (!grant || grant.id !== request.approvalGrantId) throw new Error("Owned approval grant expired or was revoked.");
     }
     const error = automaticRequestAuthorizationError(store, request, now);
@@ -1101,6 +1210,7 @@ export class SecretStore {
         request.action = actionReadyForExecution(request.action, true);
         const secret = store.secrets.find((item) => item.handle === request.handle);
         if (!secret) throw new Error(`Unknown secret handle: ${request.handle}`);
+        assertManagedSshRouteCurrent(store, request.action);
         assertActionAllowed(secret, request.action);
         assertBoundHandlesAllowed(store, request.handle, request.action);
         if (upgradedLegacyAbsolute) migrateRequestGrantToPinnedAction(store, request);
@@ -1710,7 +1820,8 @@ function controlPlaneFingerprint(store: StoreFile): string {
     secrets,
     approvalSettings: store.approvalSettings,
     approvalGrants: grants,
-    approvalPolicyRules: rules
+    approvalPolicyRules: rules,
+    ...(store.managedSshRoutes?.length ? { managedSshRoutes: [...store.managedSshRoutes].sort((a, b) => a.id.localeCompare(b.id)) } : {})
   };
   return createHash("sha256").update(JSON.stringify(canonicalValue(control))).digest("hex");
 }
@@ -1746,7 +1857,8 @@ function controlPlaneSnapshot(store: StoreFile): StoreFile {
     audit: [],
     approvalSettings: store.approvalSettings,
     approvalGrants: store.approvalGrants,
-    approvalPolicyRules: store.approvalPolicyRules
+    approvalPolicyRules: store.approvalPolicyRules,
+    managedSshRoutes: store.managedSshRoutes
   };
 }
 
@@ -2599,8 +2711,46 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
     approvalGrants: Array.isArray(parsed.approvalGrants)
       ? parsed.approvalGrants.filter(isValidApprovalGrant)
       : [],
-    approvalPolicyRules: storedApprovalPolicyRules(parsed.approvalPolicyRules)
+    approvalPolicyRules: storedApprovalPolicyRules(parsed.approvalPolicyRules),
+    managedSshRoutes: storedManagedSshRoutes(parsed.managedSshRoutes)
   };
+}
+
+function storedManagedSshRoutes(value: unknown): ManagedSshRouteRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("managedSshRoutes must be an array.");
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Invalid managed SSH route at index ${index}.`);
+    }
+    const record = item as ManagedSshRouteRecord;
+    const id = requireManagedSshRouteId(record.id);
+    const name = requireManagedSshRouteName(record.name);
+    if (ids.has(id) || names.has(name.toLowerCase()) || !isCanonicalPolicyTimestamp(record.createdAt) ||
+        !isCanonicalPolicyTimestamp(record.updatedAt)) {
+      throw new Error(`Invalid managed SSH route at index ${index}.`);
+    }
+    ids.add(id);
+    names.add(name.toLowerCase());
+    return { id, name, route: normalizeManagedSshRoute(record.route), createdAt: record.createdAt, updatedAt: record.updatedAt };
+  });
+}
+
+function requireManagedSshRouteId(value: string): string {
+  if (typeof value !== "string" || !/^route_[A-Za-z0-9_-]{12}$/.test(value)) {
+    throw new Error("Invalid managed SSH route ID.");
+  }
+  return value;
+}
+
+function requireManagedSshRouteName(value: string): string {
+  const name = typeof value === "string" ? value.trim() : "";
+  if (!name || name.length > 120 || /[\x00-\x1f\x7f]/.test(name)) {
+    throw new Error("Managed SSH route name must be 1 to 120 printable characters.");
+  }
+  return name;
 }
 
 function storedApprovalPolicyRules(value: unknown): ApprovalPolicyRule[] {
@@ -2759,6 +2909,8 @@ function isValidApprovalGrant(grant: ApprovalGrant): boolean {
     typeof grant.handle === "string" &&
     typeof grant.actionKey === "string" &&
     (grant.mode === "timed-session" || grant.mode === "login-session" || grant.mode === "always") &&
+    (grant.principalId === undefined || (typeof grant.principalId === "string" && Boolean(grant.principalId))) &&
+    (grant.agentScope !== "any-agent" || grant.principalId === undefined) &&
     typeof grant.loginSessionId === "string"
   );
 }
@@ -2859,7 +3011,7 @@ function activeApprovalGrant(
   store: StoreFile,
   handle: string,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   nowIso: string,
   loginSessionId = currentLoginSessionId()
 ): ApprovalGrant | undefined {
@@ -2874,8 +3026,12 @@ function activeApprovalGrant(
     if (grant.mode !== "always" && grant.loginSessionId !== loginSessionId) {
       return false;
     }
-    if ((grant.agentScope || "same-agent") === "same-agent" && grant.agentName !== agentName) {
-      return false;
+    if ((grant.agentScope || "same-agent") === "same-agent") {
+      if (grant.principalId || agent.principalId) {
+        if (!grant.principalId || grant.principalId !== agent.principalId) return false;
+      } else if (grant.agentName !== agent.name) {
+        return false;
+      }
     }
     return !grant.expiresAt || grant.expiresAt > nowIso;
   });
@@ -2912,7 +3068,8 @@ function createApprovalGrant(
     ? new Date(Date.parse(nowIso) + durationMs).toISOString()
     : undefined;
   const agentScope = isApprovalAgentScope(options.agentScope) ? options.agentScope : "same-agent";
-  const agentName = request.agentName || requestAgentName(request.reason);
+  const agent = identityFromRequest(request);
+  const agentName = agent.name;
   const existing = store.approvalGrants.find((grant) => {
     return (
       grant.mode === mode &&
@@ -2920,7 +3077,9 @@ function createApprovalGrant(
       grant.actionKey === actionKey &&
       grant.loginSessionId === loginSessionId &&
       (grant.agentScope || "same-agent") === agentScope &&
-      (agentScope === "any-agent" || grant.agentName === agentName)
+      (agentScope === "any-agent" || (agent.principalId
+        ? grant.principalId === agent.principalId
+        : !grant.principalId && grant.agentName === agentName))
     );
   });
 
@@ -2939,6 +3098,7 @@ function createApprovalGrant(
     mode,
     agentScope,
     agentName: agentScope === "same-agent" ? agentName : undefined,
+    principalId: agentScope === "same-agent" ? agent.principalId : undefined,
     loginSessionId: loginSessionId || "",
     createdAt: nowIso,
     updatedAt: nowIso,
@@ -2985,7 +3145,7 @@ function createRequestInStore(
       store,
       handle,
       admission.action,
-      agent.name,
+      agent,
       admission.loginSessionId,
       policyRule.id
     );
@@ -2999,7 +3159,7 @@ function createRequestInStore(
       store,
       handle,
       admission.action,
-      agent.name,
+      agent,
       admission.loginSessionId
     );
     if (existing) {
@@ -3013,6 +3173,7 @@ function createRequestInStore(
     reason: reason || "No reason supplied.",
     agentName: agent.name,
     agentSource: agent.source,
+    principalId: agent.principalId,
     loginSessionId: admission.loginSessionId,
     action: admission.action,
     state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
@@ -3105,15 +3266,15 @@ function executionAdmissionContext(
     throw new Error(`Unknown secret handle: ${handle}`);
   }
 
-  const normalizedAction = normalizeAction(action);
+  const normalizedAction = resolveManagedSshAction(store, action);
   const agent = requestAgentIdentity(reason, agentContext);
   const loginSessionId = currentLoginSessionId();
   assertActionAllowed(secret, normalizedAction);
   assertBoundHandlesAllowed(store, handle, normalizedAction);
   const admittedAction = actionForAdmission(normalizedAction);
   assertCredentialBackedExecutableAllowed(admittedAction);
-  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, admittedAction, agent.name, now);
-  const grant = activeApprovalGrant(store, handle, admittedAction, agent.name, now, loginSessionId);
+  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, admittedAction, agent, now);
+  const grant = activeApprovalGrant(store, handle, admittedAction, agent, now, loginSessionId);
   return { secret, action: admittedAction, agent, loginSessionId, now, policyRule, grant };
 }
 
@@ -3123,8 +3284,7 @@ function automaticRequestAuthorizationError(
   nowIso: string
 ): string | undefined {
   if (request.approvalSource === "grant") {
-    const agentName = request.agentName || requestAgentName(request.reason);
-    const grant = activeApprovalGrant(store, request.handle, request.action, agentName, nowIso);
+    const grant = activeApprovalGrant(store, request.handle, request.action, identityFromRequest(request), nowIso);
     if (!request.approvalGrantId || !grant || grant.id !== request.approvalGrantId) {
       return "The reusable approval for this request was revoked or expired; request approval again.";
     }
@@ -3132,9 +3292,8 @@ function automaticRequestAuthorizationError(
 
   if (request.approvalSource === "policy") {
     const secret = store.secrets.find((item) => item.handle === request.handle);
-    const agentName = request.agentName || requestAgentName(request.reason);
     const policyRule = secret
-      ? matchingApprovalPolicyRuleForAction(store, secret, request.action, agentName, nowIso)
+      ? matchingApprovalPolicyRuleForAction(store, secret, request.action, identityFromRequest(request), nowIso)
       : undefined;
     if (
       !request.approvalPolicyRuleId ||
@@ -3163,7 +3322,8 @@ function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExe
   assertBoundHandlesAllowed(store, permit.handle, action);
 
   const now = new Date().toISOString();
-  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, action, permit.agentName, now);
+  const agent = identityFromPermit(permit);
+  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, action, agent, now);
   if (policyRule?.decision === "deny") {
     throw new Error(`Execution is denied by approval policy ${policyRule.name}.`);
   }
@@ -3176,7 +3336,7 @@ function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExe
     if (policyRule?.decision === "allow") {
       throw new Error("s-gw approval policy changed before the command started; retry the command.");
     }
-    const grant = activeApprovalGrant(store, permit.handle, action, permit.agentName, now);
+    const grant = activeApprovalGrant(store, permit.handle, action, agent, now);
     if (!grant || grant.id !== permit.authorization.id) {
       throw new Error("s-gw approval grant is no longer valid; request approval again.");
     }
@@ -3188,6 +3348,7 @@ function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExe
     reason: permit.reason,
     agentName: permit.agentName,
     agentSource: permit.agentSource,
+    principalId: permit.principalId,
     action,
     state: "approved",
     createdAt: permit.createdAt,
@@ -3216,6 +3377,7 @@ function reusableExecutionPermit(
     reason: reason || "No reason supplied.",
     agentName: agent.name,
     agentSource: agent.source,
+    principalId: agent.principalId,
     action: frozenAction,
     createdAt,
     controlFingerprint: controlPlaneFingerprint(store),
@@ -3241,10 +3403,10 @@ function matchingPendingRequest(
   store: StoreFile,
   handle: string,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   loginSessionId?: string
 ): RequestRecord | undefined {
-  const key = requestDuplicateKeyFor(handle, action, agentName, loginSessionId);
+  const key = requestDuplicateKeyFor(handle, action, agent, loginSessionId);
   for (let index = store.requests.length - 1; index >= 0; index -= 1) {
     const request = store.requests[index];
     if (request.state === "pending" && requestDuplicateKey(request) === key) {
@@ -3258,11 +3420,11 @@ function matchingDeniedRequest(
   store: StoreFile,
   handle: string,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   loginSessionId: string | undefined,
   policyRuleId: string
 ): RequestRecord | undefined {
-  const key = requestDuplicateKeyFor(handle, action, agentName, loginSessionId);
+  const key = requestDuplicateKeyFor(handle, action, agent, loginSessionId);
   for (let index = store.requests.length - 1; index >= 0; index -= 1) {
     const request = store.requests[index];
     if (
@@ -3280,7 +3442,7 @@ function requestDuplicateKey(request: RequestRecord): string {
   return requestDuplicateKeyFor(
     request.handle,
     request.action,
-    request.agentName || requestAgentName(request.reason),
+    identityFromRequest(request),
     request.loginSessionId || ""
   );
 }
@@ -3288,13 +3450,13 @@ function requestDuplicateKey(request: RequestRecord): string {
 function requestDuplicateKeyFor(
   handle: string,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   loginSessionId?: string
 ): string {
   return JSON.stringify({
     handle,
     actionKey: approvalActionKey(handle, action),
-    agentName,
+    agent: agent.principalId ? `principal:${agent.principalId}` : `name:${agent.name}`,
     loginSessionId: loginSessionId || ""
   });
 }
@@ -3308,6 +3470,8 @@ function assertReusableExecutionPermit(permit: ReusableExecutionPermit, home: st
     typeof permit.reason !== "string" ||
     typeof permit.agentName !== "string" || !permit.agentName ||
     !isAgentIdentitySource(permit.agentSource) ||
+    (permit.agentSource === "managed-peer" && (typeof permit.principalId !== "string" || !permit.principalId)) ||
+    (permit.agentSource !== "managed-peer" && permit.principalId !== undefined) ||
     typeof permit.createdAt !== "string" ||
     typeof permit.controlFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(permit.controlFingerprint) ||
     !permit.authorization ||
@@ -3319,7 +3483,8 @@ function assertReusableExecutionPermit(permit: ReusableExecutionPermit, home: st
 }
 
 function isAgentIdentitySource(value: unknown): value is AgentIdentitySource {
-  return value === "configured" ||
+  return value === "managed-peer" ||
+    value === "configured" ||
     value === "mcp-client" ||
     value === "runtime" ||
     value === "process" ||
@@ -3547,7 +3712,8 @@ function approvalGrantIdentityKey(grant: ApprovalGrant): string {
     actionKey: grant.actionKey,
     mode: grant.mode,
     agentScope: grant.agentScope || "same-agent",
-    agentName: grant.agentScope === "any-agent" ? "" : grant.agentName || "",
+    agentName: grant.agentScope === "any-agent" || grant.principalId ? "" : grant.agentName || "",
+    principalId: grant.agentScope === "any-agent" ? "" : grant.principalId || "",
     loginSessionId: grant.mode === "always" ? "" : grant.loginSessionId
   });
 }
@@ -3573,6 +3739,7 @@ function approvalActionKey(handle: string, action: CommandAction): string {
     env: normalized.env || [],
     workingDir: normalized.workingDir ? path.resolve(normalized.workingDir) : "",
     ssh: normalized.kind === "ssh_session" && normalized.ssh ? sshSessionIdentity(normalized) : "",
+    ...(normalized.ssh?.managed ? { managedSshRoute: normalized.ssh.managed } : {}),
     ...(normalized.kind === "http_request" ? { http: normalized.http, timeoutMs: normalized.timeoutMs } : {}),
     ...(normalized.kind === "ssh_session" && normalized.owned ? { owned: true, args: normalized.args, timeoutMs: normalized.timeoutMs, ...(normalized.ssh?.transfer ? { transfer: normalized.ssh.transfer } : {}) } : {})
   };
@@ -3584,7 +3751,7 @@ function matchingApprovalPolicyRule(
   store: StoreFile,
   secret: SecretRecord,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   nowIso: string,
   envBindings: CommandEnvBinding[]
 ): ApprovalPolicyRule | undefined {
@@ -3596,7 +3763,7 @@ function matchingApprovalPolicyRule(
     if (rule.expiresAt && rule.expiresAt <= nowIso) {
       continue;
     }
-    if (approvalPolicyMatches(rule, secret, action, agentName, envBindings)) {
+    if (approvalPolicyMatches(rule, secret, action, agent, envBindings)) {
       return rule;
     }
   }
@@ -3608,12 +3775,12 @@ function matchingApprovalPolicyRuleForAction(
   store: StoreFile,
   primarySecret: SecretRecord,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   nowIso: string
 ): ApprovalPolicyRule | undefined {
   const envBindings = policyEnvBindingsForAction(primarySecret.handle, action);
   const matched = [
-    matchingApprovalPolicyRule(store, primarySecret, policyActionForBinding(action, action.injectEnv), agentName, nowIso, envBindings)
+    matchingApprovalPolicyRule(store, primarySecret, policyActionForBinding(action, action.injectEnv), agent, nowIso, envBindings)
   ];
   for (const binding of action.env || []) {
     const secret = store.secrets.find((item) => item.handle === binding.handle);
@@ -3621,7 +3788,7 @@ function matchingApprovalPolicyRuleForAction(
       throw new Error(`Unknown secret handle: ${binding.handle}`);
     }
     matched.push(
-      matchingApprovalPolicyRule(store, secret, policyActionForBinding(action, binding.injectEnv), agentName, nowIso, envBindings)
+      matchingApprovalPolicyRule(store, secret, policyActionForBinding(action, binding.injectEnv), agent, nowIso, envBindings)
     );
   }
 
@@ -3644,7 +3811,7 @@ function blockingDenyPolicyRuleForAction(
   store: StoreFile,
   primarySecret: SecretRecord,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   nowIso: string
 ): ApprovalPolicyRule | undefined {
   const envBindings = policyEnvBindingsForAction(primarySecret.handle, action);
@@ -3666,7 +3833,7 @@ function blockingDenyPolicyRuleForAction(
     if (rule.expiresAt && rule.expiresAt <= nowIso) {
       continue;
     }
-    if (secrets.some((item) => approvalPolicyMatches(rule, item.secret, item.action, agentName, envBindings))) {
+    if (secrets.some((item) => approvalPolicyMatches(rule, item.secret, item.action, agent, envBindings))) {
       return rule;
     }
   }
@@ -3682,10 +3849,11 @@ function approvalPolicyMatches(
   rule: ApprovalPolicyRule,
   secret: SecretRecord,
   action: CommandAction,
-  agentName: string,
+  agent: AgentIdentity,
   envBindings: CommandEnvBinding[]
 ): boolean {
   const conditions = normalizeApprovalPolicyConditions(rule.conditions);
+  if (rule.decision === "allow" && action.ssh?.managed && !conditions.actionKeys?.length) return false;
   if (conditions.actionKeys?.length && !conditions.actionKeys.includes(approvalActionKey(secret.handle, action))) return false;
   if (conditions.handles?.length && !conditions.handles.includes(secret.handle)) {
     return false;
@@ -3703,7 +3871,13 @@ function approvalPolicyMatches(
     return false;
   }
 
-  if (conditions.agents?.length && !conditions.agents.includes(agentName.toLowerCase())) {
+  if (conditions.principalIds?.length && (!agent.principalId || !conditions.principalIds.includes(agent.principalId))) {
+    return false;
+  }
+  if (conditions.agents?.length && !conditions.agents.includes(agent.name.toLowerCase())) {
+    return false;
+  }
+  if (rule.decision === "allow" && agent.principalId && conditions.agents?.length && !conditions.principalIds?.length) {
     return false;
   }
   if (conditions.actionKinds?.length && !conditions.actionKinds.includes(action.kind)) {
@@ -3861,6 +4035,27 @@ function durablePolicyAgentName(request: RequestRecord): string {
   throw new Error("s-gw could not identify the requesting agent. Approve once or create a policy with an explicit agent condition.");
 }
 
+function identityFromRequest(request: RequestRecord): AgentIdentity {
+  const name = request.agentName || requestAgentName(request.reason);
+  if (request.agentSource === "managed-peer") {
+    if (!request.principalId?.trim()) {
+      throw new Error("Managed request has no verified principal ID.");
+    }
+    return { name, source: "managed-peer", principalId: request.principalId };
+  }
+  return { name, source: request.agentSource || "unknown" };
+}
+
+function identityFromPermit(permit: ReusableExecutionPermit): AgentIdentity {
+  if (permit.agentSource === "managed-peer") {
+    if (!permit.principalId?.trim()) {
+      throw new Error("Managed execution permit has no verified principal ID.");
+    }
+    return { name: permit.agentName, source: "managed-peer", principalId: permit.principalId };
+  }
+  return { name: permit.agentName, source: permit.agentSource };
+}
+
 function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddApprovalPolicyRuleInput {
   const action = request.action;
   if (action.kind === "env_command" && !action.resolvedCommand) {
@@ -3879,7 +4074,8 @@ function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddAppro
     conditions: {
       handles,
       envBindings: bindings,
-      agents: [agent],
+      agents: request.agentSource === "managed-peer" ? [] : [agent],
+      principalIds: request.agentSource === "managed-peer" ? [request.principalId!] : [],
       actionKinds: [action.kind],
       commands: [action.command],
       resolvedCommands: action.kind === "env_command" ? [action.resolvedCommand!] : [],
@@ -3933,6 +4129,7 @@ function normalizeApprovalPolicyConditions(
     providers: policyStringValues(input?.providers, "providers", strict).map((provider) => provider.toLowerCase()),
     minSeverity,
     agents: policyStringValues(input?.agents, "agents", strict).map((agent) => agent.toLowerCase()),
+    principalIds: policyStringValues(input?.principalIds, "principalIds", strict),
     actionKinds: normalizePolicyActionKinds(actionKinds, strict),
     injectEnvs: policyStringValues(input?.injectEnvs, "injectEnvs", strict),
     workingDirs: policyStringValues(input?.workingDirs, "workingDirs", strict).map((dir) => path.resolve(dir)),
@@ -4367,7 +4564,7 @@ function normalizeAction(action: CommandAction): CommandAction {
     return {
       kind,
       command: SGW_SSH_SESSION_COMMAND,
-      ...(action.owned ? { owned: true } : {}),
+      ...(action.owned || action.ssh?.managed ? { owned: true } : {}),
       args: Array.isArray(action.args) ? action.args : [],
       injectEnv: action.injectEnv || "SGW_SSH_CREDENTIAL",
       env: [],
@@ -4376,7 +4573,9 @@ function normalizeAction(action: CommandAction): CommandAction {
       ssh: {
         target: normalizeSshTarget(action.ssh?.target || ""),
         port: normalizeSshPort(action.ssh?.port),
-        ...(action.ssh?.transfer ? { transfer: normalizeSshTransfer(action.ssh.transfer) } : {})
+        ...(action.ssh?.managedRouteId ? { managedRouteId: requireManagedSshRouteId(action.ssh.managedRouteId) } : {}),
+        ...(action.ssh?.transfer ? { transfer: normalizeSshTransfer(action.ssh.transfer) } : {}),
+        ...(action.ssh?.managed ? { managed: normalizeManagedSshRoute(action.ssh.managed) } : {})
       }
     };
   }
@@ -4391,6 +4590,42 @@ function normalizeAction(action: CommandAction): CommandAction {
     workingDir: action.workingDir,
     timeoutMs: clampTimeout(action.timeoutMs)
   };
+}
+
+function resolveManagedSshAction(store: StoreFile, action: CommandAction): CommandAction {
+  const normalized = normalizeAction(action);
+  if (normalized.kind !== "ssh_session" || !normalized.ssh) return normalized;
+  const routeId = normalized.ssh.managedRouteId;
+  if (!routeId) {
+    if (normalized.ssh.managed) throw new Error("Managed SSH requires an operator-owned route ID.");
+    return normalized;
+  }
+  const record = (store.managedSshRoutes || []).find((item) => item.id === routeId);
+  if (!record) throw new Error(`Unknown managed SSH route: ${routeId}`);
+  const managed = normalizeManagedSshRoute(record.route);
+  if (normalized.ssh.managed && JSON.stringify(normalized.ssh.managed) !== JSON.stringify(managed)) {
+    throw new Error("Managed SSH route snapshot does not match the operator-owned route.");
+  }
+  return {
+    ...normalized, owned: true,
+    ssh: { ...normalized.ssh, target: routeId, port: managed.port, managed }
+  };
+}
+
+function assertManagedSshRouteCurrent(store: StoreFile, action: CommandAction): void {
+  if (action.kind !== "ssh_session" || !action.ssh?.managedRouteId) {
+    if (action.ssh?.managed) throw new Error("Managed SSH route has no operator-owned route ID.");
+    return;
+  }
+  let current: CommandAction;
+  try {
+    current = resolveManagedSshAction(store, action);
+  } catch {
+    throw new Error("Managed SSH route changed or was revoked; request approval again.");
+  }
+  if (JSON.stringify(current.ssh) !== JSON.stringify(action.ssh) || !action.owned) {
+    throw new Error("Managed SSH route changed or was revoked; request approval again.");
+  }
 }
 
 function actionForAdmission(action: CommandAction): CommandAction {

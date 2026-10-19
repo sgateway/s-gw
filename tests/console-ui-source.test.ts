@@ -161,7 +161,8 @@ describe("React console source contracts", () => {
     expect(store).toContain("approvePendingRequest(store, request, id, { mode: \"per-transaction\", agentScope: \"same-agent\" }, now, rule)");
     expect(store).toContain("handles,");
     expect(store).toContain("envBindings: bindings,");
-    expect(store).toContain("agents: [agent]");
+    expect(store).toContain('agents: request.agentSource === "managed-peer" ? [] : [agent]');
+    expect(store).toContain('principalIds: request.agentSource === "managed-peer" ? [request.principalId!] : []');
     expect(store).toContain("actionKinds: [action.kind]");
     expect(store).toContain("commands: [action.command]");
     expect(store).toContain("injectEnvs,");
