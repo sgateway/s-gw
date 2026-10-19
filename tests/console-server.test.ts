@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -172,12 +172,63 @@ describe("local console server", () => {
       });
       expect(response.status).toBe(401);
     }
-    const blocked = await fetch(`${running.url}auth/enroll`, {
+    const blockedGuess = await fetch(`${running.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: "y".repeat(32) })
+    });
+    expect(blockedGuess.status).toBe(429);
+    const validCode = await fetch(`${running.url}auth/enroll`, {
       method: "POST",
       headers: { Origin: origin, "Content-Type": "application/json" },
       body: JSON.stringify({ code })
     });
-    expect(blocked.status).toBe(429);
+    expect(validCode.status).toBe(200);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects symlinks outside the protected UI directory", async () => {
+    const uiDir = path.join(tmpHome, "operator-ui");
+    mkdirSync(uiDir);
+    writeFileSync(path.join(uiDir, "index.html"), "<html><head></head><body>trusted UI</body></html>");
+    const outside = path.join(tmpHome, "outside.js");
+    writeFileSync(outside, "untrusted script");
+    symlinkSync(outside, path.join(uiDir, "outside.js"));
+
+    let code = "";
+    running = await startConsoleServer({ port: 0, uiDir, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const origin = new URL(running.url).origin;
+    const signedIn = await fetch(`${running.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code })
+    });
+    expect(signedIn.status).toBe(200);
+    const cookie = (signedIn.headers.get("set-cookie") || "").split(";")[0];
+    const escaped = await fetch(`${running.url}outside.js`, { headers: { Cookie: cookie } });
+    expect(escaped.status).toBe(403);
+    expect(await escaped.text()).not.toContain("untrusted script");
+  });
+
+  it("shows why every listener for one store needs the protected mode", async () => {
+    const store = new SecretStore();
+    let code = "";
+    running = await startConsoleServer({ port: 0, store, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const ordinary = await startConsoleServer({ port: 0, store });
+    try {
+      const ordinaryPage = await (await fetch(ordinary.url)).text();
+      expect(ordinaryPage).toContain(ordinary.token);
+      const ordinaryApi = await fetch(`${ordinary.url}api/state`, {
+        headers: { "X-SGW-Console-Token": ordinary.token }
+      });
+      expect(ordinaryApi.status).toBe(200);
+      const protectedApi = await fetch(`${running.url}api/state`, {
+        headers: { "X-SGW-Console-Token": ordinary.token }
+      });
+      expect(protectedApi.status).toBe(401);
+      expect(ordinaryPage).not.toContain(code);
+    } finally {
+      await ordinary.close();
+    }
   });
 
   it("expires the one-time code and operator session", async () => {

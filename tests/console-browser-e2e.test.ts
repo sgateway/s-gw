@@ -56,6 +56,40 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it("keeps operator proof while opening approvals from a protected menubar deep link", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "protected-menubar-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    const store = new SecretStore();
+    const type = Buffer.from("ssh-ed25519");
+    const rawKey = generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).subarray(-32);
+    const sshString = (bytes: Buffer) => { const length = Buffer.alloc(4); length.writeUInt32BE(bytes.length); return Buffer.concat([length, bytes]); };
+    const wireKey = Buffer.concat([sshString(type), sshString(rawKey)]);
+    const route = await store.addManagedSshRoute({ name: "operator-route", host: "127.0.0.1", user: "deploy", port: 2222,
+      hostPublicKey: `ssh-ed25519 ${wireKey.toString("base64")}` });
+    const secret = await store.addSecret({ name: "Operator SSH fixture", type: "private-key", value: "synthetic-private-key", policy: { allowedCommands: ["s-gw:ssh-session"] } });
+    await store.createManagedSshRequest(secret.handle, route.id, { injectEnv: "SGW_SSH_PRIVATE_KEY", args: ["hostname"] }, "protected menubar fixture");
+
+    let code = "";
+    running = await startConsoleServer({ port: 0, store, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const launched = await launchChrome(new URL("menubar", running.url).toString());
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "protected menubar sign-in");
+    await cdp.eval(`(() => { document.querySelector('#code').value = ${JSON.stringify(code)}; document.querySelector('#login').requestSubmit(); return true; })()`);
+    await waitFor(() => cdp!.eval<boolean>("document.body.innerText.includes('Review route')"), "protected menubar route review");
+    const proof = await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''");
+    expect(proof).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+
+    await cdp.eval(`(() => { const button = [...document.querySelectorAll('button')].find((item) => item.textContent.includes('Review route')); button.click(); return true; })()`);
+    await waitFor(() => cdp!.eval<boolean>("location.pathname === '/approvals' && document.body.innerText.includes('Approvals')"), "protected approval view");
+    expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe(proof);
+
+    await cdp.eval("history.back()");
+    await waitFor(() => cdp!.eval<boolean>("location.pathname === '/menubar' && document.body.innerText.includes('Open app')"), "protected menubar back navigation");
+    await cdp.eval(`(() => { const button = [...document.querySelectorAll('button')].find((item) => item.textContent.includes('Open app')); button.click(); return true; })()`);
+    await waitFor(() => cdp!.eval<boolean>("location.pathname === '/approvals' && document.body.innerText.includes('Approvals')"), "protected menubar open app");
+    expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe(proof);
+  }, 30_000);
+
   it("opens the protected console only after operator sign-in", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "protected-browser-fixture";
     process.env.SGW_SECRET_BACKEND = "local";

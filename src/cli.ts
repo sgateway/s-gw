@@ -191,6 +191,7 @@ async function main(): Promise<void> {
       displayCode: (code: string) => {
         process.stderr.write(`s-gw one-time operator code: ${code}\n`);
         process.stderr.write("The code expires in five minutes. Restart the console to get a new code.\n");
+        process.stderr.write("Stop any ordinary console serving this credential store before relying on protected mode.\n");
       }
     } : undefined;
 

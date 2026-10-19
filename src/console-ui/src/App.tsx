@@ -246,9 +246,24 @@ const RECENT_ACTIVITY_TABLE_HEADER_HEIGHT = 38;
 
 function App() {
   const [theme, setTheme] = React.useState(() => localStorage.getItem("sgw.theme") || "dark");
+  const [menuBar, setMenuBar] = React.useState(() => window.location.pathname === "/menubar");
   const nativeShell = isNativeShellRoute();
   const embedView = embeddedView();
-  const menuBar = window.location.pathname === "/menubar";
+
+  React.useEffect(() => {
+    const onPop = () => setMenuBar(window.location.pathname === "/menubar");
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const openApprovals = () => {
+    if (!isProtectedConsole()) {
+      window.location.assign("/approvals");
+      return;
+    }
+    window.history.pushState({}, "", "/approvals");
+    setMenuBar(false);
+  };
 
   React.useEffect(() => {
     document.documentElement.classList.toggle("light", theme === "light");
@@ -278,7 +293,7 @@ function App() {
     return (
       <TooltipProvider>
         <ConsoleProvider>
-          {(ctx) => <MenubarSurface ctx={ctx} />}
+          {(ctx) => <MenubarSurface ctx={ctx} openApprovals={openApprovals} />}
         </ConsoleProvider>
         <Toaster richColors theme={theme === "light" ? "light" : "dark"} />
       </TooltipProvider>
@@ -2875,7 +2890,7 @@ function EmbeddedSurface({ ctx, compact }: { ctx: ConsoleContext; compact: boole
   );
 }
 
-function MenubarSurface({ ctx }: { ctx: ConsoleContext }) {
+function MenubarSurface({ ctx, openApprovals }: { ctx: ConsoleContext; openApprovals: () => void }) {
   const state = ctx.state;
   const [decidingId, setDecidingId] = React.useState<string | null>(null);
   const decidingRef = React.useRef(false);
@@ -2932,7 +2947,7 @@ function MenubarSurface({ ctx }: { ctx: ConsoleContext }) {
               <div className="mt-1 break-all text-xs text-muted-foreground">Host key SHA-256: {request.managedSsh?.hostKeyFingerprint || "Unavailable"}</div>
             ) : null}
             <div className="mt-2 grid grid-cols-2 gap-2">
-              {request.action.ssh?.managed ? <Button size="sm" onClick={() => window.location.assign("/approvals")}>
+              {request.action.ssh?.managed ? <Button size="sm" onClick={openApprovals}>
                 Review route
               </Button> : <Button
                 size="sm"
@@ -2958,7 +2973,7 @@ function MenubarSurface({ ctx }: { ctx: ConsoleContext }) {
         {state.pendingRequests.length === 0 ? <div className="text-muted-foreground">No pending approvals.</div> : null}
       </div>
       <div className="mt-4 flex gap-2">
-        <Button className="flex-1" onClick={() => window.location.assign("/approvals")}>Open app</Button>
+        <Button className="flex-1" onClick={openApprovals}>Open app</Button>
         <Button variant="outline" size="icon" onClick={() => void ctx.refresh()}>
           <RefreshCw className="h-4 w-4" />
         </Button>

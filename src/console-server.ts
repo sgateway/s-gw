@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -312,7 +312,7 @@ async function handleProtectedRequest(
 
   const session = operatorSession(req, auth);
   if (!session) {
-    if ((req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html")) {
+    if ((req.method === "GET" || req.method === "HEAD") && operatorUiRoute(url.pathname, uiDir)) {
       serveOperatorLogin(req, res);
       return;
     }
@@ -332,7 +332,7 @@ async function handleProtectedRequest(
     return;
   }
 
-  if ((req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html" || shouldServeSpaFallback(url.pathname, uiDir))) {
+  if ((req.method === "GET" || req.method === "HEAD") && operatorUiRoute(url.pathname, uiDir)) {
     serveOperatorLogin(req, res);
     return;
   }
@@ -350,8 +350,29 @@ async function handleProtectedRequest(
   await serveUi(req, res, url.pathname, uiDir, "", true);
 }
 
+function operatorUiRoute(pathname: string, uiDir: string): boolean {
+  if (pathname.startsWith("/api/") || pathname.startsWith("/auth/")) return false;
+  return pathname === "/" || pathname === "/index.html" || shouldServeSpaFallback(pathname, uiDir);
+}
+
 async function enrollOperator(req: IncomingMessage, res: ServerResponse, auth: OperatorAuthState): Promise<void> {
+  const submitted = await readOperatorCode(req);
   const now = Date.now();
+  if (auth.code && now < auth.codeExpiresAt && sameSecret(submitted, auth.code)) {
+    auth.code = undefined;
+    auth.session = {
+      id: randomBytes(32).toString("base64url"),
+      proof: randomBytes(24).toString("base64url"),
+      expiresAt: now + operatorSessionLifetimeMs
+    };
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Set-Cookie": `${operatorCookieName}=${auth.session.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${operatorSessionLifetimeMs / 1000}`
+    });
+    res.end(JSON.stringify({ proof: auth.session.proof }));
+    return;
+  }
+
   if (now >= auth.attemptsResetAt) {
     auth.attempts = 0;
     auth.attemptsResetAt = now + 60_000;
@@ -360,23 +381,7 @@ async function enrollOperator(req: IncomingMessage, res: ServerResponse, auth: O
     throw new HttpError(429, "Operator sign-in temporarily unavailable.");
   }
   auth.attempts += 1;
-
-  const submitted = await readOperatorCode(req);
-  if (!auth.code || Date.now() >= auth.codeExpiresAt || !sameSecret(submitted, auth.code)) {
-    throw new HttpError(401, "Invalid or expired operator code.");
-  }
-
-  auth.code = undefined;
-  auth.session = {
-    id: randomBytes(32).toString("base64url"),
-    proof: randomBytes(24).toString("base64url"),
-    expiresAt: Date.now() + operatorSessionLifetimeMs
-  };
-  res.writeHead(200, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Set-Cookie": `${operatorCookieName}=${auth.session.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${operatorSessionLifetimeMs / 1000}`
-  });
-  res.end(JSON.stringify({ proof: auth.session.proof }));
+  throw new HttpError(401, "Invalid or expired operator code.");
 }
 
 async function readOperatorCode(req: IncomingMessage): Promise<string> {
@@ -1249,6 +1254,14 @@ async function serveUi(
   if (!existsSync(target) && shouldServeSpaFallback(pathname, uiDir)) {
     relative = "index.html";
     target = path.resolve(uiDir, relative);
+  }
+
+  if (operatorAuth) {
+    const actualRoot = await realpath(safeRoot);
+    const actualTarget = await realpath(target);
+    if (actualTarget !== actualRoot && !actualTarget.startsWith(`${actualRoot}${path.sep}`)) {
+      throw new HttpError(403, "Path is outside the protected console directory.");
+    }
   }
 
   let body = await readFile(target);
