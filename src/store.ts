@@ -1153,7 +1153,7 @@ export class SecretStore {
       request.state = "denied";
       request.deniedAt = now;
       request.updatedAt = now;
-      store.audit.push(audit("request.denied", `Denied execution request ${id}.`, request.handle, id));
+      store.audit.push(audit("request.denied", `Denied execution request ${id}.`, request.handle, id, request));
     });
   }
 
@@ -1224,7 +1224,7 @@ export class SecretStore {
         request.state = "failed";
         request.updatedAt = now;
         request.error = executionError;
-        store.audit.push(audit("request.failed", `Request ${id} failed: ${executionError}`, request.handle, id));
+        store.audit.push(audit("request.failed", `Request ${id} failed: ${executionError}`, request.handle, id, request));
         return { request, error: executionError };
       }
 
@@ -1234,13 +1234,13 @@ export class SecretStore {
         request.deniedAt = now;
         request.updatedAt = now;
         request.error = authorizationError;
-        store.audit.push(audit("request.authorization_revoked", authorizationError, request.handle, id));
+        store.audit.push(audit("request.authorization_revoked", authorizationError, request.handle, id, request));
         return { request, error: authorizationError };
       }
 
       request.state = "executing";
       request.updatedAt = now;
-      store.audit.push(audit("request.executing", `Executing approved request ${id}.`, request.handle, id));
+      store.audit.push(audit("request.executing", `Executing approved request ${id}.`, request.handle, id, request));
       return { request };
     });
 
@@ -1317,7 +1317,7 @@ export class SecretStore {
       request.updatedAt = now;
       request.resultSummary = summary;
       request.error = undefined;
-      store.audit.push(audit("request.executed", `Executed request ${id}.`, request.handle, id));
+      store.audit.push(audit("request.executed", `Executed request ${id}.`, request.handle, id, request));
     });
   }
 
@@ -1330,7 +1330,7 @@ export class SecretStore {
       request.state = "failed";
       request.updatedAt = new Date().toISOString();
       request.error = errorMessage;
-      store.audit.push(audit("request.failed", `Request ${id} failed: ${errorMessage}`, request.handle, id));
+      store.audit.push(audit("request.failed", `Request ${id} failed: ${errorMessage}`, request.handle, id, request));
     });
   }
 
@@ -3067,7 +3067,8 @@ function createApprovalGrant(
       "approval.grant.skipped",
       `Approved legacy request ${request.id} once because it has no requester login-session identity.`,
       request.handle,
-      request.id
+      request.id,
+      request
     ));
     return undefined;
   }
@@ -3096,7 +3097,7 @@ function createApprovalGrant(
     existing.updatedAt = nowIso;
     existing.expiresAt = expiresAt;
     existing.lastRequestId = request.id;
-    store.audit.push(audit("approval.grant.updated", `Updated approval grant ${existing.id}.`, request.handle, request.id));
+    store.audit.push(audit("approval.grant.updated", `Updated approval grant ${existing.id}.`, request.handle, request.id, request));
     return existing;
   }
 
@@ -3117,7 +3118,7 @@ function createApprovalGrant(
   };
 
   store.approvalGrants.push(grant);
-  store.audit.push(audit("approval.grant.created", `Created approval grant ${grant.id}.`, request.handle, request.id));
+  store.audit.push(audit("approval.grant.created", `Created approval grant ${grant.id}.`, request.handle, request.id, request));
   return grant;
 }
 
@@ -3209,7 +3210,7 @@ function createRequestInStore(
     ? "request.denied_by_policy"
     : (allowedByPolicy ? "request.auto_approved_by_policy" : (grant ? "request.auto_approved" : "request.created"));
   const message = requestCreationMessage(record, grant, policyRule, superseded.length);
-  store.audit.push(audit(eventType, message, secret.handle, record.id));
+  store.audit.push(audit(eventType, message, secret.handle, record.id, record));
   return record;
 }
 
@@ -3757,7 +3758,13 @@ function approvalActionKey(handle: string, action: CommandAction): string {
     ssh: normalized.kind === "ssh_session" && normalized.ssh ? sshSessionIdentity(normalized) : "",
     ...(normalized.ssh?.managed ? { managedSshRoute: normalized.ssh.managed } : {}),
     ...(normalized.kind === "http_request" ? { http: normalized.http, timeoutMs: normalized.timeoutMs } : {}),
-    ...(normalized.kind === "ssh_session" && normalized.owned ? { owned: true, args: normalized.args, timeoutMs: normalized.timeoutMs, ...(normalized.ssh?.transfer ? { transfer: normalized.ssh.transfer } : {}) } : {})
+    ...(normalized.kind === "ssh_session" && normalized.owned ? { owned: true, args: normalized.args, timeoutMs: normalized.timeoutMs,
+      ...(normalized.ssh?.transfer ? { transfer: {
+        direction: normalized.ssh.transfer.direction,
+        sourcePath: normalized.ssh.transfer.sourcePath,
+        destinationPath: normalized.ssh.transfer.destinationPath,
+        sha256: normalized.ssh.transfer.sha256
+      } } : {}) } : {})
   };
 
   return createHash("sha256").update(JSON.stringify(payload)).digest("base64url");
@@ -4032,8 +4039,8 @@ function approvePendingRequest(
   request.approvalGrantId = grant?.id;
   store.audit.push(
     policyRule
-      ? audit("request.approved_by_policy", `Approved execution request ${id} with approval policy ${policyRule.name}.`, request.handle, id)
-      : audit("request.approved", `Approved execution request ${id}.`, request.handle, id)
+      ? audit("request.approved_by_policy", `Approved execution request ${id} with approval policy ${policyRule.name}.`, request.handle, id, request)
+      : audit("request.approved", `Approved execution request ${id}.`, request.handle, id, request)
   );
 }
 
@@ -4895,14 +4902,23 @@ function clampTimeout(timeoutMs: number): number {
   return Math.min(Math.floor(timeoutMs), 24 * 60 * 60 * 1000);
 }
 
-function audit(type: string, message: string, handle?: string, requestId?: string): AuditEvent {
+function audit(type: string, message: string, handle?: string, requestId?: string, request?: RequestRecord): AuditEvent {
+  const transfer = request?.action.ssh?.transfer;
+  const uploadApprovalScope = transfer?.approvalScope || (transfer?.sha256 ? "content-sha256" : transfer ? "path-stream" : undefined);
+  let scopeMessage = "";
+  if (uploadApprovalScope === "path-stream") {
+    scopeMessage = " Upload scope: pipe path and destination; the producer supplies bytes during execution.";
+  } else if (uploadApprovalScope === "content-sha256") {
+    scopeMessage = " Upload scope: SHA-256 content digest and destination.";
+  }
   return {
     id: shortId("audit"),
     ts: new Date().toISOString(),
     type,
     handle,
     requestId,
-    message
+    ...(uploadApprovalScope ? { uploadApprovalScope } : {}),
+    message: message + scopeMessage
   };
 }
 

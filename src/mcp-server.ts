@@ -241,7 +241,7 @@ server.registerTool(
   "sgw_request_ssh_transfer",
   {
     title: "Request s-gw-Owned SSH Upload",
-    description: "Request an SSH upload from the agent workspace. Approval binds the source contents and remote destination.",
+    description: "Request an SSH upload from the agent workspace. A regular file approval binds its SHA-256 digest and destination. A named pipe approval binds only the pipe path and destination; its producer chooses the bytes streamed during execution.",
     inputSchema: { handle: z.string(), target: z.string().min(1).optional(), routeId: z.string().min(1).optional(), port: z.number().int().positive().optional(),
       sourcePath: z.string(), destinationPath: z.string(), timeoutMs: z.number().int().positive().optional(), reason: z.string().optional() }
   },

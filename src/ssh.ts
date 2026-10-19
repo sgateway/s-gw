@@ -88,8 +88,13 @@ export function normalizeSshTransfer(transfer?: SshTransferSpec): SshTransferSpe
   if (transfer.direction !== "upload" || !path.isAbsolute(transfer.sourcePath) ||
       !transfer.destinationPath || /[\x00\r\n]/.test(transfer.destinationPath) ||
       (transfer.sha256 !== undefined && !/^[a-f0-9]{64}$/.test(transfer.sha256))) throw new Error("Invalid approved SSH upload.");
+  const approvalScope = transfer.approvalScope || (transfer.sha256 ? "content-sha256" : "path-stream");
+  if ((approvalScope !== "content-sha256" && approvalScope !== "path-stream") ||
+      (approvalScope === "content-sha256") !== Boolean(transfer.sha256)) {
+    throw new Error("Invalid approved SSH upload scope.");
+  }
   return { direction: "upload", sourcePath: transfer.sourcePath,
-    destinationPath: transfer.destinationPath, sha256: transfer.sha256 };
+    destinationPath: transfer.destinationPath, sha256: transfer.sha256, approvalScope };
 }
 
 export function sshSessionIdentity(action: CommandAction): string {

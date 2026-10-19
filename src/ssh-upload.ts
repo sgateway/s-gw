@@ -41,13 +41,18 @@ export async function prepareUpload(sourcePath: string, destinationPath: string,
   }
   const info = await lstat(source);
   if (!info.isFile() && !info.isFIFO()) throw new Error("SSH upload source must be a regular file or named pipe.");
-  return { direction: "upload", sourcePath: source, destinationPath,
-    ...(info.isFile() ? { sha256: await hashUpload(source) } : {}) };
+  if (info.isFile()) {
+    return { direction: "upload", sourcePath: source, destinationPath,
+      approvalScope: "content-sha256", sha256: await hashUpload(source) };
+  }
+  return { direction: "upload", sourcePath: source, destinationPath, approvalScope: "path-stream" };
 }
 
 export async function openApprovedUpload(transfer: SshTransferSpec, home: string) {
   const current = await prepareUpload(transfer.sourcePath, transfer.destinationPath, home);
-  if (current.sourcePath !== transfer.sourcePath || current.sha256 !== transfer.sha256) throw new Error("SSH upload changed after approval.");
+  const approvedScope = transfer.approvalScope || (transfer.sha256 ? "content-sha256" : "path-stream");
+  if (current.sourcePath !== transfer.sourcePath || current.sha256 !== transfer.sha256 ||
+      current.approvalScope !== approvedScope) throw new Error("SSH upload changed after approval.");
   if (!transfer.sha256) {
     const stream = approvedPipeStream(current.sourcePath);
     return { stream, cleanup: async () => {} };

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { ReleaseChecker } from "../src/update-check.js";
 import { SecretStore } from "../src/store.js";
+import { buildSshSessionAction } from "../src/ssh.js";
+import { prepareUpload } from "../src/ssh-upload.js";
 
 const CHROME_CANDIDATES = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -56,6 +58,34 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it.skipIf(process.platform === "win32")("shows that named-pipe approval binds a path, not its streamed bytes", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "browser pipe fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    const source = path.join(profileDir, "upload.pipe");
+    execFileSync("mkfifo", [source]);
+    const store = new SecretStore();
+    const secret = await store.addSecret({ name: "Pipe fixture", type: "password", value: "synthetic-only",
+      policy: { allowedCommands: ["s-gw:ssh-session"] } });
+    const action = buildSshSessionAction({ target: "fixture@example.test" });
+    action.owned = true;
+    action.ssh!.transfer = await prepareUpload(source, "/tmp/output", store.home);
+    const request = await store.createRequest(secret.handle, action, "browser pipe fixture");
+    running = await startConsoleServer({ port: 0, store });
+    const launched = await launchChrome(new URL("approvals", running.url).toString());
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length > 0"), "pipe approval row");
+    await cdp.eval("document.querySelector('tbody tr').dispatchEvent(new MouseEvent('click', { bubbles: true }))");
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('[data-upload-approval-scope=path-stream]'))"), "pipe approval scope");
+    expect(await cdp.eval<string>("document.querySelector('[data-upload-approval-scope=path-stream]').innerText"))
+      .toContain("those bytes are not reviewed before approval");
+
+    await cdp.send("Page.navigate", { url: new URL("menubar", running.url).toString() });
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('[data-upload-approval-scope=path-stream]'))"), "menubar pipe scope");
+    expect(await cdp.eval<string>("document.querySelector('[data-upload-approval-scope=path-stream]').innerText"))
+      .toContain("Producer chooses bytes during execution");
+    expect(await cdp.eval<boolean>(`Boolean(document.querySelector('[data-menubar-approve="${request.id}"]'))`)).toBe(true);
+  }, 45_000);
+
   it("keeps operator proof while opening approvals from a protected menubar deep link", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "protected-menubar-fixture";
     process.env.SGW_SECRET_BACKEND = "local";

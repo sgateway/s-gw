@@ -156,6 +156,7 @@ export interface SshTransferSpec {
   sourcePath: string;
   destinationPath: string;
   sha256?: string;
+  approvalScope?: "content-sha256" | "path-stream";
 }
 
 export interface CommandEnvBinding {
@@ -226,6 +227,7 @@ export interface AuditEvent {
   type: string;
   handle?: string;
   requestId?: string;
+  uploadApprovalScope?: "content-sha256" | "path-stream";
   message: string;
 }
 

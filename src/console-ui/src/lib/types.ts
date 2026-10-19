@@ -123,7 +123,7 @@ export interface RequestRecord {
       port?: number;
       managedRouteId?: string;
       managed?: { host: string; user: string; port: number; hostPublicKey: string };
-      transfer?: { direction: string; sourcePath: string; destinationPath: string; sha256?: string };
+      transfer?: { direction: string; sourcePath: string; destinationPath: string; sha256?: string; approvalScope?: "content-sha256" | "path-stream" };
     };
   };
   state: RequestState;
@@ -142,6 +142,7 @@ export interface AuditEvent {
   type: string;
   handle?: string;
   requestId?: string;
+  uploadApprovalScope?: "content-sha256" | "path-stream";
   message: string;
 }
 

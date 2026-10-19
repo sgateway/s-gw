@@ -1,5 +1,6 @@
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import { mkdtemp, writeFile, readFile, rm, realpath, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -123,10 +124,44 @@ it.skipIf(process.platform === "win32")("authenticates a real private key and up
     expect(result.exitCode).toBe(0); expect(result.stdout).toContain("upload complete");
     expect(f.authentications()).toBe(1); expect(f.uploads).toEqual([bytes]);
     expect(f.commands[0]).toContain("quoted");
+    const uploadAudit = (await f.store.auditLog()).filter((event) => event.requestId === request.id);
+    expect(uploadAudit.map((event) => event.type)).toEqual(["request.created", "request.approved", "request.executing", "request.executed"]);
+    expect(uploadAudit.every((event) => event.uploadApprovalScope === "content-sha256")).toBe(true);
     await expect(executeApprovedRequest(f.store, request.id)).rejects.toThrow("executed");
     expect(f.uploads).toHaveLength(1);
     expect(await readdir(path.join(f.store.home, "ssh-control")).catch(() => [])).toEqual([]);
   } finally { await f.close(); }
+});
+
+it.skipIf(process.platform === "win32")("streams approved named-pipe bytes over a real SSH connection", async () => {
+  const f = await sshFixture("private-key");
+  const sourcePath = path.join(root, "upload.pipe");
+  execFileSync("mkfifo", [sourcePath]);
+  const bytes = Buffer.from(`pipe bytes after approval ${randomUUID()}`);
+  let writer: ReturnType<typeof createWriteStream> | undefined;
+  try {
+    const action = buildSshSessionAction({ target: "fixture@127.0.0.1", port: f.port, timeoutMs: 10000 });
+    action.owned = true;
+    action.ssh!.transfer = await prepareUpload(sourcePath, "/tmp/streamed.bin", f.store.home);
+    const request = await f.store.createRequest(f.handle.handle, action, "real named-pipe fixture");
+    expect(request.action.ssh?.transfer?.approvalScope).toBe("path-stream");
+    await expect(executeApprovedRequest(f.store, request.id)).rejects.toThrow("approval");
+    await f.store.approveRequest(request.id);
+    writer = createWriteStream(sourcePath);
+    const writerDone = new Promise<void>((resolve, reject) => {
+      writer!.once("error", reject);
+      writer!.once("finish", resolve);
+    });
+    writer.end(bytes);
+    const result = await executeApprovedRequest(f.store, request.id);
+    await writerDone;
+    expect(result.exitCode).toBe(0);
+    expect(f.uploads).toEqual([bytes]);
+    const uploadAudit = (await f.store.auditLog()).filter((event) => event.requestId === request.id);
+    expect(uploadAudit.map((event) => event.type)).toEqual(["request.created", "request.approved", "request.executing", "request.executed"]);
+    expect(uploadAudit.every((event) => event.uploadApprovalScope === "path-stream")).toBe(true);
+    expect(uploadAudit.every((event) => !event.message.includes(bytes.toString()))).toBe(true);
+  } finally { writer?.destroy(); await f.close(); }
 });
 
 it.skipIf(process.platform === "win32")("routes a managed alias to the pinned host without reading SSH configuration", async () => {
