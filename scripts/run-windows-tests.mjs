@@ -56,7 +56,7 @@ try {
   const vitest = path.join(stagedRoot, "node_modules", "vitest", "vitest.mjs");
   const testFiles = filesForWindowsTestGroup(testGroup, await discoverTestFiles(stagedRoot));
   const testNamePattern = testNamePatternForWindowsTestGroup(testGroup);
-  const vitestArgs = [vitest, "run", "--no-file-parallelism"];
+  const vitestArgs = [vitest, "run", "--no-file-parallelism", "--testTimeout", "30000"];
   if (testNamePattern) vitestArgs.push("--testNamePattern", testNamePattern);
   vitestArgs.push(...testFiles);
   testResult = spawnSync(privateNode, vitestArgs, {
