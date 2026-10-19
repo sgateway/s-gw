@@ -6,11 +6,13 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const configPath = process.env.SGW_SANDBOX_MCP_CONFIG;
 const config = JSON.parse(readFileSync(configPath, 'utf8')).mcpServers['s-gw'];
+const fixture = JSON.parse(readFileSync('fixture.json', 'utf8'));
 assert.equal(process.env.SGW_MASTER_PASSPHRASE, undefined);
 assert.equal(process.env.SGW_ALLOW_NONINTERACTIVE_OPERATOR, undefined);
-assert.throws(() => readFileSync(process.env.SGW_E2E_STORE + '/store.json'), /EPERM|EACCES|ENOENT/);
+assert.throws(() => readFileSync(fixture.storeHome + '/store.json'), /EPERM|EACCES|ENOENT/);
+if (fixture.isolatedAuth) assert.throws(() => readFileSync(fixture.syntheticAuthPath), /EPERM|EACCES|ENOENT/);
 assert.throws(() => writeFileSync(configPath, '{}'), /EPERM|EACCES|EROFS/);
-const consolePort = Number(new URL(process.env.SGW_E2E_CONSOLE_URL).port);
+const consolePort = Number(new URL(fixture.consoleUrl).port);
 const consoleReachable = await new Promise(resolve => {
   const socket = connect(consolePort, '127.0.0.1');
   socket.once('connect', () => { socket.destroy(); resolve(true); });
@@ -38,17 +40,17 @@ try {
   assert(!tools.includes('sgw_request_execution'));
   const handles = await call('sgw_list_handles');
   const httpHandle = handles.find(item => item.name === 'HTTPS package E2E').handle;
-  const input = { handle: httpHandle, url: process.env.SGW_E2E_URL, auth: { kind: 'bearer' } };
+  const input = { handle: httpHandle, url: fixture.url, auth: { kind: 'bearer' } };
   const first = (await call('sgw_request_http', input)).request;
   assert.equal(first.state, 'pending');
   await cannotExecute(first.id);
-  if (process.env.SGW_E2E_FRESH === '1') {
+  if (existsSync('fresh-mode')) {
     writeFileSync('fresh.json', JSON.stringify({ id: first.id, state: first.state }));
   } else {
     const changed = (await call('sgw_request_http', { ...input, method: 'POST', body: 'unapproved mutation' })).request;
     const ssh = (await call('sgw_request_ssh_session', {
       handle: handles.find(item => item.name === 'SSH package E2E').handle,
-      target: 'fixture@127.0.0.1', port: Number(process.env.SGW_E2E_SSH_PORT), args: ['hostname']
+      target: 'fixture@127.0.0.1', port: fixture.sshPort, args: ['hostname']
     })).request;
     await cannotExecute(ssh.id);
     writeFileSync('pending.json', JSON.stringify({ http: first.id, ssh: ssh.id, changed: changed.id }));

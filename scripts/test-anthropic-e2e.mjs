@@ -14,6 +14,8 @@ const repo = fileURLToPath(new URL('../', import.meta.url));
 const accountHome = os.homedir();
 const realAgent = process.argv.includes('--real-agent') ? process.argv[process.argv.indexOf('--real-agent') + 1] : undefined;
 if (realAgent && !['codex', 'claude'].includes(realAgent)) throw new Error('--real-agent must be codex or claude.');
+const isolatedAuth = process.argv.includes('--isolated-auth');
+if (isolatedAuth && realAgent) throw new Error('Native model login is not available in the isolated-auth test profile.');
 const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'sgw-package-e2e-')));
 const oldEnv = process.env;
 const home = path.join(root, 'home');
@@ -75,6 +77,9 @@ async function closedSession() {
 
 try {
   await Promise.all([home, workspace].map(dir => mkdir(dir)));
+  const syntheticAuthPath = path.join(home, '.codex', 'auth.json');
+  await mkdir(path.dirname(syntheticAuthPath));
+  await writeFile(syntheticAuthPath, JSON.stringify({ fake_token: 'synthetic-only' }));
   await writeFile(path.join(root, 'npmrc'), 'registry=https://registry.npmjs.org/\n');
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const packed = JSON.parse(run(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], { cwd: repo }))[0];
@@ -186,7 +191,6 @@ try {
   const helper = path.join(storeHome, 'ssh.cjs');
   await writeFile(helper, `#!${process.execPath}\nconst {spawnSync}=require('node:child_process'); const result=spawnSync('/usr/bin/ssh',['-F','/dev/null','-o',${JSON.stringify(`UserKnownHostsFile=${knownHosts}`)},...process.argv.slice(2)],{stdio:'inherit'}); process.exit(result.status ?? 1);\n`, { mode: 0o700 });
   env.SGW_SSH_CLI = helper; env.NODE_EXTRA_CA_CERTS = certFile;
-  env.SGW_E2E_STORE = storeHome; env.SGW_E2E_URL = url; env.SGW_E2E_SSH_PORT = String(sshPort);
   const httpHandle = runCli(['secret', 'add', '--name', 'HTTPS package E2E', '--type', 'api-token', '--value-stdin', '--inject-env', 'SGW_HTTP_CREDENTIAL',
     '--allow-command', 's-gw:https-request', '--allow-destination', `127.0.0.1:${https.address().port}`], httpCredential);
   runCli(['secret', 'add', '--name', 'SSH package E2E', '--type', 'password', '--value-stdin', '--inject-env', 'SGW_SSH_PASSWORD',
@@ -194,13 +198,15 @@ try {
   process.env = env;
   const { startConsoleServer } = await import(pathToFileURL(path.join(installed, 'dist', 'console-server.js')).href);
   consoleServer = await startConsoleServer({ port: 0 });
-  env.SGW_E2E_CONSOLE_URL = consoleServer.url;
   assert.equal((await fetch(consoleServer.url)).status, 200);
   const deniedConsole = await fetch(new URL('api/state', consoleServer.url)); assert.equal(deniedConsole.status, 403);
+  await writeFile(path.join(workspace, 'fixture.json'), JSON.stringify({ storeHome, url, sshPort, consoleUrl: consoleServer.url,
+    syntheticAuthPath, isolatedAuth }));
   const probe = path.join(root, 'agent.mjs'); await copyFile(path.join(repo, 'tests', 'fixtures', 'anthropic-e2e-agent.mjs'), probe);
-  function launch(fresh = false) {
+  function launch() {
     const child = spawn(process.execPath, [cli, 'run', 'codex', '--sandbox', 'anthropic', '--strict-egress', '--cwd', workspace,
-      '--command', process.execPath, '--', probe], { cwd: workspace, env: { ...env, ...(fresh ? { SGW_E2E_FRESH: '1' } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
+      ...(isolatedAuth ? ['--isolated-auth'] : []),
+      '--command', process.execPath, '--', probe], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
     children.add(child);
     let output = '';
     child.stdout.on('data', data => output += data); child.stderr.on('data', data => output += data);
@@ -231,7 +237,8 @@ try {
   for (const value of values) { assert(!outputs.includes(value)); assert(!result.output.includes(value)); }
   await closedSession(); await waitFor(() => clients.size === 0, 'SSH session cleanup');
   await api(`api/approval/grants/${approved.approvalGrantId}`, undefined, 'DELETE');
-  const fresh = launch(true); const freshResult = await fresh.completion;
+  await writeFile(path.join(workspace, 'fresh-mode'), '1');
+  const fresh = launch(); const freshResult = await fresh.completion;
   assert.equal(freshResult.code, 0, freshResult.output);
   const next = await jsonFile('fresh.json'); assert.equal(next.state, 'pending');
   await api(`api/requests/${next.id}/deny`, {});
@@ -285,7 +292,8 @@ try {
   console.log(JSON.stringify({ packageInstalled: true, ordinaryMcp: true, legacyEnvExecution: true, compiledLauncher: true, realHttps: true, realOpenSsh: true,
     consoleApproval: true, pendingDenied: true, changedActionDenied: true, replayDenied: true,
     exactGrantReused: true, freshRunAfterRevocationDenied: true, credentialsRedacted: true, cleanup: true,
-    cgroupRequired: process.platform === 'linux' && process.argv.includes('--require-cgroup'), realAgent: realAgent || 'not requested' }));
+    cgroupRequired: process.platform === 'linux' && process.argv.includes('--require-cgroup'), isolatedAuth,
+    realAgent: realAgent || 'not requested' }));
 } catch (error) {
   let message = error instanceof Error ? error.stack : String(error);
   for (const value of values) message = message.replaceAll(value, '<synthetic credential withheld>');
