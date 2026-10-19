@@ -17,12 +17,16 @@ if (process.env.SGW_SANDBOX_BROKER_PORT) {
 } else {
 const store = new SecretStore();
 const operationsOnly = process.env.SGW_SANDBOX_OPERATIONS_ONLY === "1";
+if (operationsOnly && !process.env.SGW_SANDBOX_AGENT_NAME?.trim()) {
+  throw new Error("Restricted MCP requires the launched agent identity.");
+}
 const server = new McpServer({
   name: "s-gw",
   version: CURRENT_VERSION
 });
 
 function mcpAgentContext() {
+  if (operationsOnly) return { agentName: process.env.SGW_SANDBOX_AGENT_NAME };
   return { mcpClientName: server.server.getClientVersion()?.name };
 }
 

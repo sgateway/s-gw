@@ -7,11 +7,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { anthropicSandboxConfig, runAnthropicSandbox, sandboxAgentArguments } from "../src/anthropic-sandbox.js";
 import { prepareGuardedRun, runGuardedAgent } from "../src/guard.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { SecretStore } from "../src/store.js";
-import { startSandboxBroker, runSandboxMcpBridge } from "../src/sandbox-broker.js";
+import { startSandboxBroker, runSandboxMcpBridge, ownedModuleCommand } from "../src/sandbox-broker.js";
 import { anthropicSandboxReadiness, agentAuthenticationPaths, restrictMacCredentialIpc, macAgentKeychainReadPath, allowMacAgentKeychainRead } from "../src/anthropic-sandbox.js";
 import { httpsFixture } from "./helpers/https-fixture.js";
 
@@ -188,7 +190,7 @@ describe("Anthropic sandbox", () => {
   it("rejects invalid broker capabilities and closes unauthenticated connections", async () => {
     const store = await fixtureStore();
     await expect(runSandboxMcpBridge({ SGW_SANDBOX_BROKER_PORT: "0" })).rejects.toThrow("Invalid sandbox");
-    const broker = await startSandboxBroker(path.join(root, "workspace"), store.home);
+    const broker = await startSandboxBroker(path.join(root, "workspace"), store.home, "Codex");
     try {
       await new Promise<void>((resolve, reject) => {
         const socket = connect(broker.port, "127.0.0.1", () => socket.write("invalid fixture capability\n"));
@@ -197,6 +199,28 @@ describe("Anthropic sandbox", () => {
       });
       expect(await store.listHandles()).toEqual([]);
     } finally { await broker.close(); }
+  });
+
+  it("pins restricted MCP identity and discards inherited Node startup options", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const secret = await store.addSecret({ name: "identity fixture", type: "api-token", value: randomUUID(),
+      policy: { allowedCommands: ["s-gw:https-request"], allowedDestinations: ["api.example.test:443"] } });
+    process.env.NODE_OPTIONS = `--require=${path.join(root, "missing-startup-option.cjs")}`;
+    const broker = await startSandboxBroker(workspace, store.home, "Claude Code");
+    const entry = ownedModuleCommand("mcp-server");
+    const bridgeEnv = { ...process.env, SGW_SANDBOX_BROKER_PORT: String(broker.port), SGW_SANDBOX_BROKER_TOKEN: broker.token };
+    delete bridgeEnv.NODE_OPTIONS;
+    const client = new Client({ name: "Fixture client", version: "1" });
+    try {
+      await client.connect(new StdioClientTransport({ ...entry, env: bridgeEnv, stderr: "pipe" }));
+      const response = await client.callTool({ name: "sgw_request_http", arguments: {
+        handle: secret.handle, url: "https://api.example.test/fixture", auth: { kind: "bearer" }, reason: "fixture request"
+      } });
+      expect(response.isError).not.toBe(true);
+      const request = JSON.parse((response.content[0] as { text: string }).text).request;
+      expect(request).toMatchObject({ state: "pending", agentName: "Claude", agentSource: "configured" });
+    } finally { await client.close(); await broker.close(); }
   });
 
   it.skipIf(!["darwin", "linux"].includes(process.platform))("resets after initialization or wrapping failure and can launch again", async () => {

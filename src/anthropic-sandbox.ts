@@ -139,7 +139,7 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     agentTmp = await mkdtemp(path.join(prepared.plan.cwd, ".sgw-tmp-"));
     const manifestPath = path.join(sessionDir, "launch.json");
     config.filesystem.denyWrite.push(sessionDir);
-    broker = await startSandboxBroker(prepared.plan.cwd, home, config.filesystem.denyRead);
+    broker = await startSandboxBroker(prepared.plan.cwd, home, prepared.plan.agent.displayName, config.filesystem.denyRead);
     const brokerPort = broker.port;
     await SandboxManager.initialize(config, async ({ host, port }) => host === "127.0.0.1" && port === brokerPort);
     const proxyPort = process.platform === "linux" ? 3128 : SandboxManager.getProxyPort();

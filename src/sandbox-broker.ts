@@ -15,7 +15,9 @@ export function ownedModuleCommand(name: "mcp-server" | "sandbox-child") {
   return { command: process.execPath, args: ["--import", loader, source] };
 }
 
-export async function startSandboxBroker(cwd: string, home: string, denyRead: string[] = []) {
+export async function startSandboxBroker(cwd: string, home: string, agentName: string, denyRead: string[] = []) {
+  const trustedAgent = agentName.trim();
+  if (!trustedAgent) throw new Error("A launched agent identity is required for the sandbox broker.");
   const token = randomBytes(32).toString("hex");
   const sockets = new Set<Socket>();
   const children = new Set<ChildProcess>();
@@ -39,11 +41,20 @@ export async function startSandboxBroker(cwd: string, home: string, denyRead: st
       }
       socket.removeListener("data", authenticate);
       socket.setTimeout(0);
-      const env: NodeJS.ProcessEnv = { ...process.env, SGW_HOME: home, SGW_SANDBOX_OPERATIONS_ONLY: "1", SGW_SANDBOX_DENY_READ: JSON.stringify(denyRead), TSX_DISABLE_CACHE: "1" };
+      const env: NodeJS.ProcessEnv = { ...process.env, SGW_HOME: home, SGW_SANDBOX_OPERATIONS_ONLY: "1",
+        SGW_SANDBOX_DENY_READ: JSON.stringify(denyRead), SGW_SANDBOX_AGENT_NAME: trustedAgent, TSX_DISABLE_CACHE: "1" };
       delete env.SGW_SANDBOX_BROKER_PORT;
       delete env.SGW_SANDBOX_BROKER_TOKEN;
       delete env.SGW_SANDBOX_PROXY_URL;
       delete env.SGW_SANDBOX_MCP_CONFIG;
+      delete env.SGW_AGENT_NAME;
+      delete env.SGW_REQUEST_AGENT_NAME;
+      delete env.SGW_CLIENT_IDENTITY;
+      delete env.NODE_OPTIONS;
+      delete env.NODE_PATH;
+      for (const name of Object.keys(env)) {
+        if (name.startsWith("LD_") || name.startsWith("DYLD_")) delete env[name];
+      }
       const entry = ownedModuleCommand("mcp-server");
       let child: ReturnType<typeof spawnIsolated>;
       try { child = spawnIsolated(entry.command, entry.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] }); }
