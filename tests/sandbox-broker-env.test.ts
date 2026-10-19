@@ -50,6 +50,7 @@ describe.skipIf(process.platform === "win32")("trusted sandbox broker environmen
     expect(env.SGW_SANDBOX_BROKER_TOKEN).toBeUndefined();
     expect(env.LD_PRELOAD).toBeUndefined();
     expect(env.SGW_SANDBOX_AGENT_NAME).toBe("Codex");
+    expect(env.SGW_SANDBOX_UPLOAD_WORKSPACE).toBeUndefined();
   });
 
   it("passes only validated runtime, CA, Keychain, recovery and 1Password settings", async () => {
@@ -107,6 +108,20 @@ describe.skipIf(process.platform === "win32")("trusted sandbox broker environmen
       "NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "ARBITRARY_AGENT_VALUE"]) {
       expect(env[name], name).toBeUndefined();
     }
+  });
+
+  it("passes the confined workspace for uploads only when the launcher selects it", async () => {
+    const { workspace, home } = await fixture();
+    const inheritedEnv = { PATH: "/usr/bin:/bin", SGW_SANDBOX_UPLOAD_WORKSPACE: path.dirname(workspace) };
+    const without = brokerChildEnvironment(workspace, home, "Codex", [path.dirname(workspace)], { inheritedEnv });
+    expect(without.SGW_SANDBOX_UPLOAD_WORKSPACE).toBeUndefined();
+    const selected = brokerChildEnvironment(workspace, home, "Codex", [path.dirname(workspace)], {
+      inheritedEnv, uploadWorkspace: workspace
+    });
+    expect(selected.SGW_SANDBOX_UPLOAD_WORKSPACE).toBe(workspace);
+    expect(() => brokerChildEnvironment(workspace, home, "Codex", [], {
+      inheritedEnv, uploadWorkspace: path.dirname(workspace)
+    })).toThrow("must match");
   });
 
   it("rejects CA files and executable overrides inside the agent workspace", async () => {
@@ -179,10 +194,16 @@ describe.skipIf(process.platform === "win32")("trusted sandbox broker environmen
   it("keeps a local user session bus for Linux credential stores", async () => {
     const { workspace, trusted, home } = await fixture();
     const socketPath = path.join(trusted, "session-bus.sock");
+    const fallbackPath = path.join(trusted, "backup-bus.sock");
     const server = createServer();
+    const fallback = createServer();
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(socketPath, resolve);
+    });
+    await new Promise<void>((resolve, reject) => {
+      fallback.once("error", reject);
+      fallback.listen(fallbackPath, resolve);
     });
     try {
       const address = `unix:path=${socketPath}`;
@@ -191,6 +212,11 @@ describe.skipIf(process.platform === "win32")("trusted sandbox broker environmen
         inheritedEnv: { DBUS_SESSION_BUS_ADDRESS: address }
       });
       expect(env.DBUS_SESSION_BUS_ADDRESS).toBe(address);
+      const safeFallback = `${address},guid=${"a".repeat(32)};unix:path=${fallbackPath}`;
+      expect(brokerChildEnvironment(workspace, home, "Codex", [], {
+        strictEnv: true,
+        inheritedEnv: { DBUS_SESSION_BUS_ADDRESS: safeFallback }
+      }).DBUS_SESSION_BUS_ADDRESS).toBe(safeFallback);
       expect(() => brokerChildEnvironment(workspace, home, "Codex", [], {
         strictEnv: true,
         agentWritablePaths: [trusted],
@@ -200,8 +226,20 @@ describe.skipIf(process.platform === "win32")("trusted sandbox broker environmen
         strictEnv: true,
         inheritedEnv: { DBUS_SESSION_BUS_ADDRESS: "tcp:host=attacker.example.test" }
       })).toThrow(/session bus/i);
+      for (const untrusted of [
+        `${address},guid=${"a".repeat(32)};tcp:host=attacker.example.test`,
+        `${address},path=${fallbackPath}`,
+        `${address};unix:path=${workspace}/agent-bus.sock`,
+        `${address},guid=${"a".repeat(32)};unix:abstract=agent-bus`
+      ]) {
+        expect(() => brokerChildEnvironment(workspace, home, "Codex", [], {
+          strictEnv: true,
+          inheritedEnv: { DBUS_SESSION_BUS_ADDRESS: untrusted }
+        })).toThrow(/session bus/i);
+      }
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      await new Promise<void>((resolve, reject) => fallback.close(error => error ? reject(error) : resolve()));
     }
   });
 

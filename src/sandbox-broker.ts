@@ -171,16 +171,7 @@ function strictBrokerEnvironment(inherited: NodeJS.ProcessEnv, cwd: string, home
 
   const sessionBus = inherited.DBUS_SESSION_BUS_ADDRESS;
   if (sessionBus) {
-    const address = sessionBus.split(",", 1)[0];
-    if (!address.startsWith("unix:path=")) throw new Error("Invalid trusted broker session bus address.");
-    const socketPath = decodeURIComponent(address.slice("unix:path=".length));
-    if (!path.isAbsolute(socketPath) || isWritable(writable, socketPath)) {
-      throw new Error("Untrusted broker session bus address.");
-    }
-    const info = statSync(realpathSync(socketPath));
-    if (!info.isSocket() || (process.getuid && info.uid !== process.getuid())) {
-      throw new Error("Untrusted broker session bus address.");
-    }
+    validateSessionBusAddress(sessionBus, writable);
     env.DBUS_SESSION_BUS_ADDRESS = sessionBus;
   }
 
@@ -210,6 +201,26 @@ function strictBrokerEnvironment(inherited: NodeJS.ProcessEnv, cwd: string, home
   }
 
   return env;
+}
+
+function validateSessionBusAddress(value: string, writable: string[]): void {
+  for (const address of value.split(";")) {
+    const parts = address.split(",");
+    if (!parts[0]?.startsWith("unix:path=") || parts.length > 2 ||
+      (parts[1] !== undefined && !/^guid=[a-fA-F0-9]{32}$/.test(parts[1]))) {
+      throw new Error("Invalid trusted broker session bus address.");
+    }
+    let socketPath: string;
+    try { socketPath = decodeURIComponent(parts[0].slice("unix:path=".length)); }
+    catch { throw new Error("Invalid trusted broker session bus address."); }
+    if (!path.isAbsolute(socketPath) || isWritable(writable, socketPath)) {
+      throw new Error("Untrusted broker session bus address.");
+    }
+    const info = statSync(realpathSync(socketPath));
+    if (!info.isSocket() || (process.getuid && info.uid !== process.getuid())) {
+      throw new Error("Untrusted broker session bus address.");
+    }
+  }
 }
 
 function brokerWritablePaths(cwd: string, extra: string[], inherited: NodeJS.ProcessEnv): string[] {

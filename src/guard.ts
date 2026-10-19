@@ -593,25 +593,28 @@ function isNpmEnv(name: string): boolean {
 
 function npmValueNeedsWholeToken(name: string, value: string): boolean {
   const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "_");
-  if (!key.endsWith("always_auth") && /(?:^|_)(?:auth|authtoken|auth_token|token|password|passwd|pwd|secret|client_secret|credential|otp|api_key|access_key)(?:_|$)/.test(key)) {
-    return true;
-  }
+  if (!key.endsWith("always_auth") && npmCredentialKey(key)) return true;
 
   if (/^\s*(?:basic|bearer)\s+\S+/i.test(value)) return true;
 
   try {
     const url = new URL(value);
     if (url.username || url.password) return true;
-    for (const queryKey of url.searchParams.keys()) {
-      if (/^(?:token|auth|password|passwd|secret|credential|api[_-]?key|access[_-]?key|access[_-]?token|client[_-]?secret|sig|signature)$/i.test(queryKey)) {
-        return true;
-      }
-    }
+    for (const queryKey of url.searchParams.keys()) if (npmCredentialKey(queryKey)) return true;
+    for (const hashKey of new URLSearchParams(url.hash.slice(1)).keys()) if (npmCredentialKey(hashKey)) return true;
   } catch {
-    return false;
+    // npm also accepts values that are not full URLs.
   }
 
+  for (const match of value.matchAll(/[?&#]([A-Za-z][A-Za-z0-9_.-]{0,60})=[^&#\s]*/g)) {
+    if (npmCredentialKey(match[1])) return true;
+  }
   return false;
+}
+
+function npmCredentialKey(raw: string): boolean {
+  const key = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  return /(?:^|_)(?:auth|authorization|authtoken|auth_token|token|password|passwd|pwd|secret|client_secret|clientsecret|credential|otp|api_key|apikey|access_key|accesskey|access_token|accesstoken|refresh_token|id_token|sig|signature)(?:_|$)/.test(key);
 }
 
 function npmEnvCandidate(name: string, value: string): ScanCandidate {

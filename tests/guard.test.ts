@@ -160,6 +160,30 @@ describe("guard mode", () => {
     expect(handles.every((item) => item.source.startsWith("guard-env:codex:npm_config_"))).toBe(true);
   });
 
+  it("tokenizes short npm credentials in custom URL parameters and fragments", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    const env = {
+      npm_config_registry: "https://registry.example.test/?custom_auth=x2",
+      npm_config_disturl: "https://registry.example.test/#_authToken=q7",
+      npm_config_cache: "registry.example.test/cache?access_token=y8",
+      npm_config_user_agent: "npm/10 node/v22"
+    };
+
+    const prepared = await prepareGuardedRun(store, {
+      agent: "codex", command: process.execPath, env,
+      strictNpmEnv: true, persist: true
+    });
+
+    for (const name of ["npm_config_registry", "npm_config_disturl", "npm_config_cache"] as const) {
+      expect(prepared.env[name]).toMatch(/^<<SGW_SECRET:/);
+    }
+    expect(prepared.env.npm_config_user_agent).toBe(env.npm_config_user_agent);
+    expect(JSON.stringify(prepared)).not.toContain("custom_auth=x2");
+    expect(JSON.stringify(prepared)).not.toContain("_authToken=q7");
+    expect(JSON.stringify(prepared)).not.toContain("access_token=y8");
+  });
+
   it("requires environment scrubbing when strict npm mode is selected", async () => {
     const store = new SecretStore(tmpHome);
     await store.init();
