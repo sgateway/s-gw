@@ -14,7 +14,8 @@ const repo = fileURLToPath(new URL('../', import.meta.url));
 const accountHome = os.homedir();
 const realAgent = process.argv.includes('--real-agent') ? process.argv[process.argv.indexOf('--real-agent') + 1] : undefined;
 if (realAgent && !['codex', 'claude'].includes(realAgent)) throw new Error('--real-agent must be codex or claude.');
-const isolatedAuth = process.argv.includes('--isolated-auth');
+const strictIsolatedAuth = process.argv.includes('--strict-isolated-auth');
+const isolatedAuth = process.argv.includes('--isolated-auth') || strictIsolatedAuth;
 if (isolatedAuth && realAgent) throw new Error('Native model login is not available in the isolated-auth test profile.');
 const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'sgw-package-e2e-')));
 const oldEnv = process.env;
@@ -190,7 +191,12 @@ try {
   await writeFile(knownHosts, `[127.0.0.1]:${sshPort} ssh-rsa ${utils.parseKey(hostKey).getPublicSSH().toString('base64')}\n`);
   const helper = path.join(storeHome, 'ssh.cjs');
   await writeFile(helper, `#!${process.execPath}\nconst {spawnSync}=require('node:child_process'); const result=spawnSync('/usr/bin/ssh',['-F','/dev/null','-o',${JSON.stringify(`UserKnownHostsFile=${knownHosts}`)},...process.argv.slice(2)],{stdio:'inherit'}); process.exit(result.status ?? 1);\n`, { mode: 0o700 });
-  env.SGW_SSH_CLI = helper; env.NODE_EXTRA_CA_CERTS = certFile;
+  env.SGW_SSH_CLI = helper;
+  if (strictIsolatedAuth) {
+    const agentCa = path.join(root, 'agent-ca.pem');
+    await copyFile(certFile, agentCa);
+    env.NODE_EXTRA_CA_CERTS = agentCa;
+  } else env.NODE_EXTRA_CA_CERTS = certFile;
   const httpHandle = runCli(['secret', 'add', '--name', 'HTTPS package E2E', '--type', 'api-token', '--value-stdin', '--inject-env', 'SGW_HTTP_CREDENTIAL',
     '--allow-command', 's-gw:https-request', '--allow-destination', `127.0.0.1:${https.address().port}`], httpCredential);
   runCli(['secret', 'add', '--name', 'SSH package E2E', '--type', 'password', '--value-stdin', '--inject-env', 'SGW_SSH_PASSWORD',
@@ -205,7 +211,7 @@ try {
   const probe = path.join(root, 'agent.mjs'); await copyFile(path.join(repo, 'tests', 'fixtures', 'anthropic-e2e-agent.mjs'), probe);
   function launch() {
     const child = spawn(process.execPath, [cli, 'run', 'codex', '--sandbox', 'anthropic', '--strict-egress', '--cwd', workspace,
-      ...(isolatedAuth ? ['--isolated-auth'] : []),
+      ...(strictIsolatedAuth ? ['--strict-isolated-auth'] : isolatedAuth ? ['--isolated-auth'] : []),
       '--command', process.execPath, '--', probe], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
     children.add(child);
     let output = '';

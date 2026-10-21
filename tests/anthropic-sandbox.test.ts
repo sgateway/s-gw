@@ -5,6 +5,7 @@ import { createServer as createHttpsServer } from "node:https";
 import { execFileSync, spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -33,6 +34,7 @@ async function fixtureStore() {
   root = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-anthropic-test-")));
   await Promise.all(["workspace", "outside"].map(name => mkdir(path.join(root, name))));
   process.env.SGW_HOME = path.join(root, "store");
+  process.env.SGW_RECOVERY_HOME = path.join(root, "recovery");
   process.env.SGW_MASTER_PASSPHRASE = randomUUID();
   process.env.SGW_DISABLE_KEYCHAIN = "1";
   process.env.SGW_DISABLE_ONEPASSWORD_BACKUP = "1";
@@ -120,6 +122,143 @@ describe("Anthropic sandbox", () => {
     expect(env).toMatchObject({ HOME: "/fixture/agent-tmp", PATH: "/usr/bin", LANG: "en_US.UTF-8",
       SGW_SANDBOX_BROKER_PORT: "1234", SGW_SANDBOX_MCP_CONFIG: "/fixture/mcp.json" });
     for (const name of ["API_KEY", "SGW_MASTER_PASSPHRASE", "NODE_OPTIONS", "SSH_AUTH_SOCK"]) expect(env[name]).toBeUndefined();
+  });
+
+  it("checks native account paths and workspace overlap in strict isolated mode", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    const nativeHome = path.join(root, "native-home");
+    await mkdir(nativeHome);
+    const account = os.userInfo();
+    vi.spyOn(os, "userInfo").mockReturnValue({ ...account, homedir: nativeHome });
+    process.env.HOME = outside;
+    const opts = { isolatedAuth: true, strictIsolatedAuth: true };
+    const config = anthropicSandboxConfig(workspace, store.home, opts, { HOME: outside, PATH: process.env.PATH }, process.execPath);
+    expect(config.filesystem.denyRead).toContain(nativeHome);
+    expect(config.filesystem.allowRead).toContain(workspace);
+    await mkdir(path.join(workspace, "nested-store"));
+    expect(() => anthropicSandboxConfig(workspace, path.join(workspace, "nested-store"), opts)).toThrow("overlap the s-gw store");
+    const storeAlias = path.join(root, "store-alias");
+    await symlink(store.home, storeAlias);
+    const aliasConfig = anthropicSandboxConfig(workspace, storeAlias, opts);
+    expect(aliasConfig.filesystem.denyRead).toContain(store.home);
+    expect(aliasConfig.filesystem.denyWrite).toContain(store.home);
+    const recovery = path.join(root, "recovery");
+    await mkdir(recovery, { recursive: true });
+    const recoveryConfig = anthropicSandboxConfig(workspace, store.home, opts);
+    expect(recoveryConfig.filesystem.denyRead).toContain(recovery);
+    expect(recoveryConfig.filesystem.denyWrite).toContain(recovery);
+    expect(() => anthropicSandboxConfig(recovery, store.home, opts)).toThrow("recovery vault and workspace");
+    expect(() => anthropicSandboxConfig(workspace, store.home, { ...opts, allowWrite: [outside] })).toThrow("only inside the workspace");
+    await symlink(outside, path.join(workspace, "writable-alias"));
+    expect(() => anthropicSandboxConfig(workspace, store.home, { ...opts, allowWrite: ["writable-alias"] })).toThrow("only inside the workspace");
+    const authFile = path.join(outside, ".codex", "auth.json");
+    await mkdir(path.dirname(authFile));
+    await writeFile(authFile, randomUUID());
+    expect(() => anthropicSandboxConfig(workspace, store.home, opts,
+      { HOME: outside, NODE_EXTRA_CA_CERTS: authFile }, process.execPath)).toThrow("runtime dependency");
+    expect(() => anthropicSandboxConfig(workspace, store.home, opts,
+      { HOME: outside, SSL_CERT_FILE: path.join(store.home, "store.json") }, process.execPath)).toThrow("runtime dependency");
+    expect(() => anthropicSandboxConfig(workspace, store.home, { strictIsolatedAuth: true })).toThrow("requires isolated authentication");
+  });
+
+  it("does not re-allow an arbitrary native-home file as a CA dependency", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const nativeHome = path.join(root, "native-home");
+    await mkdir(nativeHome);
+    const account = os.userInfo();
+    vi.spyOn(os, "userInfo").mockReturnValue({ ...account, homedir: nativeHome });
+    const canary = path.join(nativeHome, "runtime.pem");
+    await writeFile(canary, randomUUID());
+    const opts = { isolatedAuth: true, strictIsolatedAuth: true };
+    const env = { HOME: nativeHome, PATH: process.env.PATH };
+    for (const name of ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"] as const) {
+      expect(() => anthropicSandboxConfig(workspace, store.home, opts,
+        { ...env, [name]: canary }, process.execPath)).toThrow("runtime dependency");
+    }
+    const outsideCa = path.join(root, "outside", "runtime.pem");
+    await writeFile(outsideCa, randomUUID());
+    const config = anthropicSandboxConfig(workspace, store.home, opts,
+      { ...env, NODE_EXTRA_CA_CERTS: outsideCa }, process.execPath);
+    expect(config.filesystem.allowRead).toContain(outsideCa);
+  });
+
+  it("rejects package and command read allowances under protected homes", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    const packageRoot = await realpath(fileURLToPath(new URL("../", import.meta.url)));
+    const account = os.userInfo();
+    const userInfo = vi.spyOn(os, "userInfo").mockReturnValue({ ...account, homedir: path.dirname(packageRoot) });
+    const opts = { isolatedAuth: true, strictIsolatedAuth: true };
+    expect(() => anthropicSandboxConfig(workspace, store.home, opts,
+      { HOME: outside, PATH: process.env.PATH }, process.execPath)).toThrow("runtime dependency");
+
+    const nativeHome = path.join(root, "native-home");
+    await mkdir(nativeHome);
+    userInfo.mockReturnValue({ ...account, homedir: nativeHome });
+    const nativeCommand = path.join(nativeHome, "agent");
+    await writeFile(nativeCommand, randomUUID());
+    expect(() => anthropicSandboxConfig(workspace, store.home, opts,
+      { HOME: outside, PATH: process.env.PATH }, nativeCommand)).toThrow("runtime dependency");
+    const workspaceCommand = path.join(workspace, "agent");
+    await writeFile(workspaceCommand, "fixture");
+    expect(anthropicSandboxConfig(workspace, store.home, opts,
+      { HOME: outside, PATH: process.env.PATH }, workspaceCommand).filesystem.allowRead).toContain(workspaceCommand);
+    expect(() => anthropicSandboxConfig(packageRoot, store.home, opts,
+      { HOME: outside, PATH: process.env.PATH }, process.execPath)).toThrow("runtime package and workspace");
+  });
+
+  it.skipIf(!["darwin", "linux"].includes(process.platform))("denies a native-home canary when the parent HOME is overridden", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    const nativeProbe = await mkdtemp(path.join(os.userInfo().homedir, ".sgw-native-home-probe-"));
+    try {
+      const canary = path.join(nativeProbe, "canary.txt");
+      const authFile = path.join(outside, ".codex", "auth.json");
+      const logDir = path.join(outside, ".npm", "_logs");
+      const logFile = path.join(logDir, "canary.txt");
+      const recoveryFile = path.join(root, "recovery", "canary.txt");
+      await mkdir(path.dirname(authFile));
+      await mkdir(logDir, { recursive: true });
+      await writeFile(authFile, randomUUID());
+      await writeFile(logFile, randomUUID());
+      await mkdir(path.dirname(recoveryFile), { recursive: true });
+      await writeFile(recoveryFile, randomUUID());
+      const homeAlias = path.join(root, "home-alias");
+      await symlink(outside, homeAlias);
+      const script = path.join(workspace, "native-home-probe.mjs");
+      await writeFile(canary, randomUUID());
+      await writeFile(script, `import { readFileSync, writeFileSync } from 'node:fs';
+const read = file => { try { readFileSync(file); return true; } catch { return false; } };
+let logWritable = false;
+try { writeFileSync(${JSON.stringify(logFile)}, 'unexpected'); logWritable = true; } catch {}
+writeFileSync('native-home-result.json', JSON.stringify({ native: read(${JSON.stringify(canary)}),
+  aliasHome: read(${JSON.stringify(authFile)}), defaultLog: read(${JSON.stringify(logFile)}),
+  recovery: read(${JSON.stringify(recoveryFile)}), logWritable }));
+`);
+      process.env.HOME = homeAlias;
+      const opts = { isolatedAuth: true, strictIsolatedAuth: true };
+      const run = { agent: "codex", command: process.execPath,
+        args: [script], cwd: workspace, env: { PATH: process.env.PATH, HOME: homeAlias },
+        sandbox: "anthropic" as const, sandboxOptions: opts };
+      const packageRoot = await realpath(fileURLToPath(new URL("../", import.meta.url)));
+      const nativeHome = await realpath(os.userInfo().homedir);
+      const runtimeInNativeHome = [packageRoot, await realpath(process.execPath)].some(file =>
+        file === nativeHome || file.startsWith(nativeHome + path.sep));
+      if (runtimeInNativeHome) {
+        await expect(prepareGuardedRun(store, run)).rejects.toThrow("runtime dependency");
+        return;
+      }
+      const prepared = await prepareGuardedRun(store, run);
+      expect(await runAnthropicSandbox(prepared, store.home, opts)).toBe(0);
+      expect(JSON.parse(await readFile(path.join(workspace, "native-home-result.json"), "utf8"))).toEqual({
+        native: false, aliasHome: false, defaultLog: false, recovery: false, logWritable: false
+      });
+    } finally { await rm(nativeProbe, { recursive: true, force: true }); }
   });
 
   it("refuses isolated Linux mode when Unix socket blocking is unavailable", async () => {

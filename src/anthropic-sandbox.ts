@@ -11,6 +11,7 @@ import type { GuardRunPreparation } from "./guard.js";
 import { linuxCgroupRequired, writableCgroupRoot } from "./linux-cgroup.js";
 import { spawnIsolated, killProcessTree } from "./process-tree.js";
 import { ownedModuleCommand, startSandboxBroker } from "./sandbox-broker.js";
+import { getSgwRecoveryHome } from "./paths.js";
 
 export interface AnthropicSandboxOptions {
   allowHosts?: string[];
@@ -21,6 +22,7 @@ export interface AnthropicSandboxOptions {
   denyKeychain?: boolean;
   allowAgentKeychain?: boolean;
   isolatedAuth?: boolean;
+  strictIsolatedAuth?: boolean;
   strictBrokerEnv?: boolean;
 }
 
@@ -63,9 +65,47 @@ export function anthropicSandboxReadiness(platform = process.platform) {
 }
 
 export function anthropicSandboxConfig(cwd: string, home: string, options: AnthropicSandboxOptions = {}, env: NodeJS.ProcessEnv = process.env, command?: string): SandboxRuntimeConfig {
+  if (options.strictIsolatedAuth && !options.isolatedAuth) throw new Error("Strict isolated authentication requires isolated authentication.");
   if (options.isolatedAuth && options.allowAgentKeychain) throw new Error("Isolated authentication cannot allow the agent login Keychain.");
   const workspace = path.resolve(cwd);
   const userHome = path.resolve(os.homedir());
+  const nativeHome = options.strictIsolatedAuth ? realpathSync(os.userInfo().homedir) : undefined;
+  const realStore = nativeHome ? realpathSync(home) : undefined;
+  const recoveryHome = nativeHome ? getSgwRecoveryHome(home) : undefined;
+  const realRecovery = recoveryHome ? canonicalPath(recoveryHome) : undefined;
+  const runtimeRead = options.isolatedAuth ? trustedRuntimeReadPaths(env, command) : [];
+  if (nativeHome && realStore) {
+    const realWorkspace = realpathSync(workspace);
+    const realPackageRoot = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
+    const sessionRoot = path.join(realpathSync(path.dirname(sandboxSessionRoot())), path.basename(sandboxSessionRoot()));
+    if (pathContains(realWorkspace, nativeHome)) throw new Error("Strict isolated authentication requires a workspace narrower than the native account home.");
+    if (pathsOverlap(realWorkspace, realPackageRoot)) throw new Error("Strict isolated authentication cannot overlap the s-gw runtime package and workspace.");
+    if (pathsOverlap(realWorkspace, realStore)) throw new Error("Strict isolated authentication cannot overlap the s-gw store and workspace.");
+    if (realRecovery && pathsOverlap(realWorkspace, realRecovery)) throw new Error("Strict isolated authentication cannot overlap the s-gw recovery vault and workspace.");
+    if (pathContains(realWorkspace, sessionRoot) || pathContains(sessionRoot, realWorkspace)) {
+      throw new Error("Strict isolated authentication cannot include sandbox session storage in the workspace.");
+    }
+    const protectedFiles = [
+      ...agentAuthenticationPaths(env), ...agentAuthenticationPaths({ HOME: nativeHome }),
+      ...[".ssh", ".gnupg", ".aws", ".azure", ".config/gcloud", "Library/Keychains"].map(file => path.join(nativeHome, file))
+    ];
+    const originalHome = env.HOME ? canonicalPath(env.HOME) : undefined;
+    for (const file of runtimeRead) {
+      const allowed = realpathSync(file);
+      if (pathsOverlap(allowed, realStore) || (realRecovery && pathsOverlap(allowed, realRecovery)) || pathsOverlap(allowed, sessionRoot) ||
+          ((pathsOverlap(allowed, nativeHome) || (originalHome && pathsOverlap(allowed, originalHome))) &&
+            !pathContains(realWorkspace, allowed)) ||
+          protectedFiles.some(secret => pathsOverlap(allowed, canonicalPath(secret)))) {
+        throw new Error("Strict isolated authentication cannot re-allow a credential or broker path as a runtime dependency.");
+      }
+    }
+    for (const file of options.allowWrite || []) {
+      const allowed = path.resolve(cwd, file);
+      if (!pathContains(workspace, allowed) || !pathContains(realWorkspace, realpathSync(allowed))) {
+        throw new Error("Strict isolated authentication permits extra writable paths only inside the workspace.");
+      }
+    }
+  }
   if (options.isolatedAuth && (userHome === workspace || userHome.startsWith(workspace + path.sep))) {
     throw new Error("Isolated authentication requires a workspace narrower than the user home.");
   }
@@ -78,22 +118,53 @@ export function anthropicSandboxConfig(cwd: string, home: string, options: Anthr
   })) {
     throw new Error("Isolated authentication cannot enforce a read denial inside the allowed workspace.");
   }
-  const allowRead = options.isolatedAuth ? [workspace, ...trustedRuntimeReadPaths(env, command)] : [];
+  const allowRead = options.isolatedAuth ? [workspace, ...runtimeRead] : [];
+  const deniedRead = [...sensitiveChildPaths(home), home, ...(realStore ? [realStore] : []),
+    ...(recoveryHome && realRecovery ? [recoveryHome, realRecovery] : []),
+    path.join(os.homedir(), ".config", "op"),
+    path.join(os.homedir(), "Library", "Application Support", "1Password"),
+    ...(options.isolatedAuth ? [userHome, ...(env.HOME ? [path.resolve(env.HOME)] : []), ...(nativeHome ? [nativeHome] : [])] : []),
+    ...(options.denyAgentAuth || options.isolatedAuth ? agentAuthenticationPaths(env).map(file => path.resolve(cwd, file)) : []),
+    ...(options.denyRead || []).map(file => path.resolve(cwd, file))];
+  if (nativeHome) {
+    for (const file of [...deniedRead]) {
+      if (!containsGlobChars(file)) deniedRead.push(canonicalPath(file));
+    }
+  }
   return SandboxRuntimeConfigSchema.parse({
     filesystem: {
-      denyRead: [...new Set([...sensitiveChildPaths(home), home,
-        path.join(os.homedir(), ".config", "op"),
-        path.join(os.homedir(), "Library", "Application Support", "1Password"),
-        ...(options.isolatedAuth ? [userHome, ...(env.HOME ? [path.resolve(env.HOME)] : [])] : []),
-        ...(options.denyAgentAuth || options.isolatedAuth ? agentAuthenticationPaths(env).map(file => path.resolve(cwd, file)) : []),
-        ...(options.denyRead || []).map(file => path.resolve(cwd, file))])],
+      denyRead: [...new Set(deniedRead)],
       ...(allowRead.length ? { allowRead } : {}),
       allowWrite: [path.resolve(cwd), ...(options.allowWrite || []).map(file => path.resolve(cwd, file))],
-      denyWrite: [home, fileURLToPath(new URL("../", import.meta.url)), process.execPath,
+      denyWrite: [home, ...(realStore ? [realStore] : []), ...(recoveryHome && realRecovery ? [recoveryHome, realRecovery] : []),
+        fileURLToPath(new URL("../", import.meta.url)), process.execPath,
         ...(options.allowAgentKeychain && process.platform === "darwin" ? [path.join(os.homedir(), "Library", "Keychains")] : [])]
     },
     network: { allowedDomains: [...(options.strictEgress || options.isolatedAuth ? [] : DEFAULT_GUARD_ALLOWLIST), ...(options.allowHosts || [])], deniedDomains: [] }
   });
+}
+
+function pathContains(root: string, file: string): boolean {
+  return file === root || file.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+
+function pathsOverlap(first: string, second: string): boolean {
+  return pathContains(first, second) || pathContains(second, first);
+}
+
+function canonicalPath(file: string): string {
+  let current = path.resolve(file);
+  const missing: string[] = [];
+  while (true) {
+    try { return path.join(realpathSync(current), ...missing); }
+    catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code || "")) throw error;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error("Could not resolve a protected path.");
+    missing.unshift(path.basename(current));
+    current = parent;
+  }
 }
 
 function trustedRuntimeReadPaths(env: NodeJS.ProcessEnv, command?: string): string[] {
@@ -153,7 +224,7 @@ export function sandboxSessionRoot(platform = process.platform, uid = process.ge
   return path.join(platform === "darwin" ? "/private/tmp" : "/tmp", `s-gw-agent-sessions-${uid}`);
 }
 
-async function createSandboxSession(config: SandboxRuntimeConfig): Promise<string> {
+async function createSandboxSession(config: SandboxRuntimeConfig, strictPaths = false): Promise<string> {
   const root = sandboxSessionRoot();
   try { await mkdir(root, { mode: 0o700 }); }
   catch (error) {
@@ -172,6 +243,7 @@ async function createSandboxSession(config: SandboxRuntimeConfig): Promise<strin
   const readOverlap = (config.filesystem.allowRead || []).some(overlapsRoot);
   const writeOverlap = config.filesystem.allowWrite.some(overlapsRoot);
   if (readOverlap || writeOverlap) {
+    if (strictPaths) throw new Error("Strict isolated authentication cannot allow access to sandbox session storage.");
     process.stderr.write("s-gw warning: an agent file allowance overlaps sandbox session storage; cross-session capability isolation cannot be guaranteed for this workspace.\n");
   }
   const sessionDir = await mkdtemp(path.join(resolvedRoot, "session-"));
@@ -246,7 +318,7 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
   let agentTmp: string | undefined;
   let broker: Awaited<ReturnType<typeof startSandboxBroker>> | undefined;
   try {
-    sessionDir = await createSandboxSession(config);
+    sessionDir = await createSandboxSession(config, options.strictIsolatedAuth);
     agentTmp = await mkdtemp(path.join(prepared.plan.cwd, ".sgw-tmp-"));
     const manifestPath = path.join(sessionDir, "launch.json");
     config.filesystem.denyWrite.push(sessionDir);
@@ -271,7 +343,17 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     const entry = ownedModuleCommand("sandbox-child");
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
     const fixedCommand = [entry.command, ...entry.args, manifestPath].map(quote).join(" ");
-    let wrapped = await SandboxManager.wrapWithSandbox(fixedCommand, "/bin/bash");
+    let wrapped: string;
+    const oldHome = process.env.HOME;
+    // The runtime adds HOME-based write paths; keep those inside this session's temporary home.
+    if (options.strictIsolatedAuth) process.env.HOME = agentTmp;
+    try { wrapped = await SandboxManager.wrapWithSandbox(fixedCommand, "/bin/bash"); }
+    finally {
+      if (options.strictIsolatedAuth) {
+        if (oldHome === undefined) delete process.env.HOME;
+        else process.env.HOME = oldHome;
+      }
+    }
     const loginFile = macAgentKeychainReadPath(prepared.plan.cwd, options);
     if (loginFile) wrapped = allowMacAgentKeychainRead(wrapped, loginFile);
     if ((options.denyAgentAuth || options.denyKeychain || options.isolatedAuth) && process.platform === "darwin") {
