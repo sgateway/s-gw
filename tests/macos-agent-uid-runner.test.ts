@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,52 @@ const macWithCompiler = process.platform === "darwin" &&
   spawnSync("cc", ["--version"], { stdio: "ignore" }).status === 0;
 
 describe.skipIf(!macWithCompiler)("macOS agent UID runner", () => {
+  it("requires a root-owned socket namespace and rejects permissive ACLs", () => {
+    const tmp = mkdtempSync(path.join(os.homedir(), ".sgw-uid-trust-"));
+    try {
+      const clean = path.join(tmp, "clean");
+      const granted = path.join(tmp, "granted");
+      mkdirSync(clean, { mode: 0o700 });
+      mkdirSync(granted, { mode: 0o700 });
+      const acl = spawnSync("chmod", ["+a", "everyone allow read,write,execute", granted], { encoding: "utf8" });
+      expect(acl.status, acl.stderr).toBe(0);
+      const sourceDir = fileURLToPath(new URL("../native/macos-agent-launcher/", import.meta.url));
+      const harness = path.join(tmp, "trust-test.c");
+      const binary = path.join(tmp, "trust-test");
+      writeFileSync(harness, String.raw`
+#define main sgw_uid_runner_entry
+#include "uid-runner.c"
+#undef main
+int main(int argc, char **argv) {
+    if (argc != 5) return 10;
+    if (trusted_parents(argv[1], getuid())) return 11;
+    if (!trusted_parents(argv[2], getuid())) return 12;
+    if (no_acl_allow(argv[3]) == 0) return 13;
+    char socket_path[PATH_MAX];
+    if (snprintf(socket_path, sizeof(socket_path), "%s/control.sock", argv[4]) >= (int)sizeof(socket_path)) return 2;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (fd < 0 || strlen(socket_path) >= sizeof(addr.sun_path)) return 3;
+    strcpy(addr.sun_path, socket_path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || chmod(socket_path, 0600)) return 4;
+    if (trusted_socket_node(socket_path, getuid(), getuid())) return 5;
+    if (trusted_socket_node(socket_path, getuid(), 0) == 0) return 6;
+    close(fd);
+    return 0;
+}
+`);
+      const build = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-I", sourceDir,
+        harness, "-o", binary], { encoding: "utf8" });
+      expect(build.status, build.stderr).toBe(0);
+      const run = spawnSync(binary, [path.join(clean, "launch-plan"), path.join(granted, "launch-plan"), granted, clean], {
+        encoding: "utf8"
+      });
+      expect(run.status, run.stderr).toBe(0);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
   it("builds with strict warnings and rejects an unprivileged caller", () => {
     const tmp = mkdtempSync(path.join(os.tmpdir(), "sgw-uid-runner-"));
     try {

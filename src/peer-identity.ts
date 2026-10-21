@@ -99,6 +99,7 @@ export class PeerSessionRegistry {
 
 export interface VerifiedPeerServer {
   registerSession(session: PeerSession): () => void;
+  assertSocketBinding(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -142,7 +143,8 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
     socket.setTimeout(idleTimeoutMs, () => socket.destroy());
     socket.once("close", () => { sockets.delete(socket); pending.delete(socket); });
     const accepted = registry.snapshot();
-    void readUnixPeer(socket).then(async peer => {
+    void (activated ? checkLinuxActivatedSocket(socketPath, options.activatedFd!, options.socketGid!) : Promise.resolve())
+      .then(() => readUnixPeer(socket)).then(async peer => {
       if (socket.destroyed) return;
       const principal = await registry.authenticate(peer, socket, accepted);
       pending.delete(socket);
@@ -170,6 +172,9 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
 
   return {
     registerSession: session => registry.register(session),
+    assertSocketBinding: () => activated
+      ? checkLinuxActivatedSocket(socketPath, options.activatedFd!, options.socketGid!)
+      : Promise.reject(new Error("This broker listener has no activated socket binding.")),
     close: () => closeServer(server, sockets)
   };
 }

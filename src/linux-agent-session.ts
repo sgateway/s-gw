@@ -9,8 +9,12 @@ export class LinuxAgentSessionLeases {
   constructor(private readonly leaseDir: string, private readonly units: LinuxAgentUnitManager) {}
 
   async launch(plan: LinuxAgentUnitPlan, name: string,
-    registerPeer: (session: PeerSession) => () => void): Promise<() => Promise<void>> {
+    registerPeer: (session: PeerSession) => () => void,
+    assertSocketBinding?: () => Promise<void>): Promise<() => Promise<void>> {
     validateLinuxAgentPlan(plan);
+    if (plan.activatedSocket && !assertSocketBinding) {
+      throw new Error("An activated Linux agent socket needs a live broker FD binding check.");
+    }
     const brokerUid = process.getuid?.();
     const brokerGid = process.getgid?.();
     if (brokerUid === undefined || brokerGid === undefined || plan.uid === brokerUid ||
@@ -37,10 +41,12 @@ export class LinuxAgentSessionLeases {
           state.mainPid < 1 || !/^[a-f0-9]{32}$/.test(state.invocationId)) {
         throw new Error("Linux agent unit identity changed before peer registration.");
       }
+      if (plan.activatedSocket) await assertSocketBinding!();
       stopPeer = registerPeer({ uid: plan.uid, gid: plan.gid, sessionId: plan.sessionId,
         name, linuxCgroup: state.cgroup });
       if (plan.launchGate) {
         if (!this.units.release) throw new Error("Linux agent launch gate cannot be released by this unit manager.");
+        if (plan.activatedSocket) await assertSocketBinding!();
         await this.units.release(plan, state);
       }
       let revoked = false;

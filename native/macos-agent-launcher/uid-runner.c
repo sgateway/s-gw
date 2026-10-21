@@ -20,14 +20,15 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/acl.h>
 #include <time.h>
 #include <unistd.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
 
-#define CONTROL_SOCKET "/private/var/run/s-gw/agent-launch-control.sock"
-#define POLICY_SOCKET "/private/var/run/s-gw/agent-network-policy.sock"
-#define UID_LEASE_DIR "/private/var/run/s-gw/agent-uid-leases"
+#define CONTROL_SOCKET "/private/var/db/s-gw/agent-launch-control.sock"
+#define POLICY_SOCKET "/private/var/db/s-gw/agent-network-policy.sock"
+#define UID_LEASE_DIR "/private/var/db/s-gw/agent-uid-leases"
 #define UID_SCAN_LIMIT 8192
 
 static volatile sig_atomic_t stopping = 0;
@@ -80,16 +81,34 @@ static int socket_peer(int fd, const char *expected_path, int local, uid_t *peer
     return getpeereid(fd, peer_uid, &peer_gid);
 }
 
-static int trusted_socket_node(const char *location, uid_t owner) {
-    struct stat info;
-    if (lstat(location, &info) || !S_ISSOCK(info.st_mode) || info.st_uid != owner) return -1;
-    return (info.st_mode & 0777) == 0600 ? 0 : -1;
-}
-
 static int canonical_path(const char *location) {
     char resolved[PATH_MAX];
     if (location[0] != '/' || !realpath(location, resolved)) return -1;
     return strcmp(location, resolved) == 0 ? 0 : -1;
+}
+
+static int no_acl_allow(const char *location) {
+    errno = 0;
+    acl_t acl = acl_get_file(location, ACL_TYPE_EXTENDED);
+    if (!acl) return errno == ENOENT ? 0 : -1;
+    acl_entry_t entry;
+    int next = ACL_FIRST_ENTRY;
+    int safe = 0;
+    for (;;) {
+        errno = 0;
+        if (acl_get_entry(acl, next, &entry)) {
+            if (errno != EINVAL) safe = -1;
+            break;
+        }
+        acl_tag_t tag;
+        if (acl_get_tag_type(entry, &tag) || tag != ACL_EXTENDED_DENY) {
+            safe = -1;
+            break;
+        }
+        next = ACL_NEXT_ENTRY;
+    }
+    acl_free(acl);
+    return safe;
 }
 
 static int trusted_parents(const char *location, uid_t allowed_owner) {
@@ -102,16 +121,25 @@ static int trusted_parents(const char *location, uid_t allowed_owner) {
         if (slash == current) current[1] = '\0';
         else *slash = '\0';
         struct stat info;
-        if (lstat(current, &info) || !S_ISDIR(info.st_mode) ||
+        if (lstat(current, &info) || !S_ISDIR(info.st_mode) || no_acl_allow(current) ||
             (info.st_uid != 0 && info.st_uid != allowed_owner) || (info.st_mode & 022)) return -1;
         if (!strcmp(current, "/")) return 0;
     }
+}
+
+static int trusted_socket_node(const char *location, uid_t owner, uid_t parent_owner) {
+    struct stat info;
+    if (canonical_path(location) || lstat(location, &info) || !S_ISSOCK(info.st_mode) ||
+        info.st_uid != owner || (info.st_mode & 0777) != 0600 ||
+        no_acl_allow(location) || trusted_parents(location, parent_owner)) return -1;
+    return 0;
 }
 
 static int reserve_uid(uid_t uid, const char *session) {
     struct stat info;
     if (canonical_path(UID_LEASE_DIR) || lstat(UID_LEASE_DIR, &info) ||
         !S_ISDIR(info.st_mode) || info.st_uid != 0 || (info.st_mode & 0777) != 0700 ||
+        no_acl_allow(UID_LEASE_DIR) ||
         trusted_parents(UID_LEASE_DIR, 0)) return -1;
     char location[PATH_MAX], record[128];
     int path_len = snprintf(location, sizeof(location), "%s/%u", UID_LEASE_DIR, uid);
@@ -134,6 +162,7 @@ static int check_uid_lease(uid_t uid, const char *session) {
     struct stat info;
     if (canonical_path(UID_LEASE_DIR) || lstat(UID_LEASE_DIR, &info) ||
         !S_ISDIR(info.st_mode) || info.st_uid != 0 || (info.st_mode & 0777) != 0700 ||
+        no_acl_allow(UID_LEASE_DIR) ||
         trusted_parents(UID_LEASE_DIR, 0)) return -1;
     int dir = open(UID_LEASE_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (dir < 0) return -1;
@@ -271,12 +300,12 @@ static int close_inherited_fds(void) {
 static int checked_workspace(const char *location, uid_t agent_uid) {
     struct stat info;
     if (canonical_path(location) || lstat(location, &info) || !S_ISDIR(info.st_mode) ||
-        info.st_uid != agent_uid || (info.st_mode & 0777) != 0700 ||
+        info.st_uid != agent_uid || (info.st_mode & 0777) != 0700 || no_acl_allow(location) ||
         trusted_parents(location, 0)) return -1;
     char tmp[PATH_MAX];
     if (snprintf(tmp, sizeof(tmp), "%s/tmp", location) >= (int)sizeof(tmp)) return -1;
     if (lstat(tmp, &info) || !S_ISDIR(info.st_mode) || info.st_uid != agent_uid ||
-        (info.st_mode & 0777) != 0700) return -1;
+        (info.st_mode & 0777) != 0700 || no_acl_allow(tmp)) return -1;
     return 0;
 }
 
@@ -285,6 +314,7 @@ static int checked_executable(const char *location, uid_t broker_uid) {
     if (canonical_path(location) || lstat(location, &info) || !S_ISREG(info.st_mode) ||
         (info.st_uid != 0 && info.st_uid != broker_uid) || (info.st_mode & 022) ||
         (info.st_mode & (S_ISUID | S_ISGID)) || !(info.st_mode & 0111) ||
+        no_acl_allow(location) ||
         trusted_parents(location, broker_uid)) return -1;
     return 0;
 }
@@ -293,14 +323,15 @@ static int checked_broker_socket(const char *location, uid_t broker_uid, gid_t a
     struct stat info;
     if (canonical_path(location) || lstat(location, &info) || !S_ISSOCK(info.st_mode) ||
         info.st_uid != broker_uid || info.st_gid != agent_gid ||
-        (info.st_mode & 0777) != 0660 || trusted_parents(location, broker_uid)) return -1;
+        (info.st_mode & 0777) != 0660 || no_acl_allow(location) ||
+        trusted_parents(location, broker_uid)) return -1;
     return 0;
 }
 
 static int policy_ready(uid_t uid, const char *session) {
     uid_t policy_uid;
     if (socket_peer(4, POLICY_SOCKET, 0, &policy_uid) || policy_uid != 0 ||
-        trusted_socket_node(POLICY_SOCKET, 0)) return -1;
+        trusted_socket_node(POLICY_SOCKET, 0, 0)) return -1;
     char request[128];
     int length = snprintf(request, sizeof(request), "CHECK-V1 %u %s\n", uid, session);
     if (length < 1 || length >= (int)sizeof(request) || write(4, request, (size_t)length) != length) return -1;
@@ -359,7 +390,7 @@ int main(int argc, char **argv) {
         uid_t broker_uid;
         if (parse_id(argv[2], &raw_uid) || !valid_session(argv[3]) ||
             socket_peer(3, CONTROL_SOCKET, 1, &broker_uid) || broker_uid == 0 ||
-            trusted_socket_node(CONTROL_SOCKET, broker_uid))
+            trusted_socket_node(CONTROL_SOCKET, broker_uid, 0))
             return fail("untrusted teardown request");
         uid_t uid = (uid_t)raw_uid;
         struct passwd *account = getpwuid(uid);
@@ -376,7 +407,7 @@ int main(int argc, char **argv) {
     gid_t agent_gid = (gid_t)raw_gid;
     uid_t broker_uid;
     if (socket_peer(3, CONTROL_SOCKET, 1, &broker_uid) || broker_uid == 0 ||
-        trusted_socket_node(CONTROL_SOCKET, broker_uid) || agent_uid == broker_uid)
+        trusted_socket_node(CONTROL_SOCKET, broker_uid, 0) || agent_uid == broker_uid)
         return fail("untrusted broker control connection");
     struct passwd *account = getpwuid(agent_uid);
     if (!account || strncmp(account->pw_name, "_sgwagent_", 10) || account->pw_gid != agent_gid)

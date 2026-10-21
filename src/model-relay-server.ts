@@ -26,6 +26,7 @@ export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions,
 
 export interface VerifiedModelRelayServer {
   registerSession(session: PeerSession, grant: ModelRelayGrant): () => void;
+  assertSocketBinding(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -185,10 +186,12 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       });
     }
     try {
+      if (options.activatedFd !== undefined) await peer.assertSocketBinding();
       await assertAuthorized(principal, active);
       const credential = await brokerOperation(() => options.store.revealSecretForLocalUse(active.grant.handle, undefined, {
         cache: false
       }), 30_000);
+      if (options.activatedFd !== undefined) await peer.assertSocketBinding();
       await assertAuthorized(principal, active);
       if (req.destroyed || res.destroyed) throw new Error("Model relay client disconnected.");
       await relayModelRequest(req, res, {
@@ -229,6 +232,7 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
   });
 
   return {
+    assertSocketBinding: () => peer.assertSocketBinding(),
     registerSession(session, input) {
       if (closed) throw new Error("Model relay listener is closed.");
       const grant = checkGrant(input);

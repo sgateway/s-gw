@@ -443,7 +443,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run build
-      - name: Compile one-shot Windows peer helper
+      - name: Compile and test one-shot Windows peer helper
         if: matrix.group == 'acl'
         shell: pwsh
         run: |
@@ -453,9 +453,9 @@ jobs:
           if (-not $vsRoot) { throw 'MSVC C tools are unavailable.' }
           $devCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
           if (-not (Test-Path $devCmd)) { throw 'MSVC environment setup is unavailable.' }
-          $compile = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && npm run build:windows-peer-identity'
+          $compile = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && npm run build:windows-peer-identity && node scripts/test-windows-peer-identity.mjs'
           & cmd.exe /d /s /c $compile
-          if ($LASTEXITCODE -ne 0) { throw 'The one-shot Windows peer helper did not compile.' }
+          if ($LASTEXITCODE -ne 0) { throw 'The one-shot Windows peer helper failed native acceptance tests.' }
       - run: npm run test:windows -- --group ${{ matrix.group }}
 
   windows-preview:

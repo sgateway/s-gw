@@ -153,6 +153,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
 
 export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   private readonly gates = new Map<string, { dev: number; ino: number }>();
+  private readonly launchPaths = new Map<string, string>();
 
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
@@ -178,6 +179,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
         throw new Error("Linux agent launch paths changed while starting the unit.");
       }
       if (plan.launchGate) await checkedGateFiles(plan);
+      if (plan.launchGate && plan.activatedSocket) this.launchPaths.set(plan.sessionId, before);
     } catch (error) {
       try {
         await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
@@ -213,7 +215,10 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async release(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState): Promise<void> {
     this.requireRoot();
     if (!plan.launchGate) throw new Error("This Linux agent unit has no launch gate.");
-    await checkedHostPaths(plan);
+    const currentPaths = await checkedHostPaths(plan);
+    if (plan.activatedSocket && this.launchPaths.get(plan.sessionId) !== currentPaths) {
+      throw new Error("Linux activated socket path changed before launch gate release.");
+    }
     await checkedGateFiles(plan);
     const current = await this.inspect(plan);
     if (current.unit !== expected.unit || current.uid !== expected.uid || current.gid !== expected.gid ||
@@ -264,6 +269,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
     await assertNoUidProcesses(plan.uid);
     if (plan.launchGate) await this.cleanGate(plan);
+    this.launchPaths.delete(plan.sessionId);
   }
 
   private async cleanGate(plan: LinuxAgentUnitPlan): Promise<void> {

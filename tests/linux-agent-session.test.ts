@@ -88,6 +88,47 @@ describe("Linux broker agent leases", () => {
     expect(events.at(-1)).toBe("revoke");
   });
 
+  it("checks an activated listener's live binding before registration and gate release", async () => {
+    const location = await leases();
+    const p = { ...plan(), activatedSocket: true, launchGate: true };
+    const units = manager(p);
+    const events: string[] = [];
+    const check = vi.fn(async () => { events.push("binding"); });
+    units.start.mockImplementation(async () => { events.push("start"); });
+    units.inspect.mockImplementation(async () => { events.push("inspect"); return {
+      unit: linuxAgentUnitName(p.sessionId), uid: p.uid, gid: p.gid,
+      cgroup: `/system.slice/${linuxAgentUnitName(p.sessionId)}`, mainPid: 4567,
+      invocationId: "0123456789abcdef0123456789abcdef"
+    }; });
+    units.release.mockImplementation(async () => { events.push("release"); });
+    const stop = await new LinuxAgentSessionLeases(location, units).launch(p, "A", () => {
+      events.push("register"); return () => { events.push("revoke"); };
+    }, check);
+    expect(events).toEqual(["start", "inspect", "binding", "register", "binding", "release"]);
+    expect(check).toHaveBeenCalledTimes(2);
+    await stop();
+  });
+
+  it("rejects an activated launch without a binding check and revokes after a rebind", async () => {
+    const location = await leases();
+    const p = { ...plan(), activatedSocket: true, launchGate: true };
+    const units = manager(p);
+    await expect(new LinuxAgentSessionLeases(location, units).launch(p, "A", () => () => {}))
+      .rejects.toThrow("live broker FD binding check");
+    expect(units.start).not.toHaveBeenCalled();
+
+    const events: string[] = [];
+    const check = vi.fn()
+      .mockImplementationOnce(async () => { events.push("binding"); })
+      .mockRejectedValueOnce(new Error("socket rebound"));
+    await expect(new LinuxAgentSessionLeases(location, units).launch(p, "A", () => {
+      events.push("register"); return () => { events.push("revoke"); };
+    }, check)).rejects.toThrow("socket rebound");
+    expect(events).toEqual(["binding", "register", "revoke"]);
+    expect(units.release).not.toHaveBeenCalled();
+    expect(units.stop).toHaveBeenCalledOnce();
+  });
+
   it("revokes and stops when a gated launch cannot be released", async () => {
     const location = await leases();
     const p = { ...plan(), launchGate: true };

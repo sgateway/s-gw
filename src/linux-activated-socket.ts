@@ -1,5 +1,7 @@
+import { spawn } from "node:child_process";
 import { lstat, readFile, readlink, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const socketPrefix = "/run/s-gw/agents/";
 
@@ -52,6 +54,41 @@ export async function checkLinuxActivatedSocket(socketPath: string, fd: number, 
   const inode = /^socket:\[(\d+)\]$/.exec(link)?.[1];
   if (!inode || !linuxListenerRecordMatches(unixSockets, inode, socketPath)) {
     throw new Error("Inherited descriptor is not the expected listening Unix socket.");
+  }
+  await verifyCurrentSocketNode(socketPath, fd);
+}
+
+async function verifyCurrentSocketNode(socketPath: string, fd: number): Promise<void> {
+  const helper = await checkedHelper();
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(helper, [socketPath], {
+      stdio: ["ignore", "ignore", "ignore", fd], env: {}, timeout: 1500
+    });
+    child.once("error", reject);
+    child.once("close", code => code === 0 ? resolve() :
+      reject(new Error("Inherited listener no longer matches the current socket node.")));
+  });
+}
+
+async function checkedHelper(): Promise<string> {
+  const helper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-linux-activated-socket`, import.meta.url));
+  const info = await lstat(helper);
+  const brokerUid = process.geteuid!();
+  if (await realpath(helper) !== helper || !info.isFile() || (info.mode & 0o022) !== 0 ||
+      (info.mode & 0o111) === 0 || (info.uid !== brokerUid && info.uid !== 0)) {
+    throw new Error("The Linux activated-socket verifier is not a trusted executable.");
+  }
+  let parent = path.dirname(helper);
+  while (true) {
+    const item = await lstat(parent);
+    const rootSticky = item.uid === 0 && (item.mode & 0o1000) !== 0;
+    if (!item.isDirectory() || (item.uid !== 0 && item.uid !== brokerUid) ||
+        ((item.mode & 0o022) !== 0 && !rootSticky)) {
+      throw new Error("The Linux activated-socket verifier has an untrusted parent directory.");
+    }
+    const next = path.dirname(parent);
+    if (next === parent) return helper;
+    parent = next;
   }
 }
 
