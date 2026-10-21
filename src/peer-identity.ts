@@ -20,6 +20,7 @@ export interface PeerSession {
   sessionId: string;
   name: string;
   linuxCgroup?: string;
+  linuxIdentityGeneration?: string;
 }
 
 interface LiveSession extends PeerSession {
@@ -52,7 +53,7 @@ export class PeerSessionRegistry {
     if (this.sessions.has(session.uid)) throw new Error("This OS identity already has a live agent session.");
     if (this.usedUids.has(session.uid)) throw new Error("This agent OS identity cannot be reused by this broker.");
     if (this.usedSessionIds.has(session.sessionId)) throw new Error("This agent session ID was already registered.");
-    principalForVerifiedPeer(principalId(session.uid), session.name, session.sessionId);
+    principalForVerifiedPeer(principalIdForPeerSession(session), session.name, session.sessionId);
     if (process.platform === "linux" && (!session.linuxCgroup || !validCgroupPath(session.linuxCgroup))) {
       throw new Error("Linux peer sessions require an absolute cgroup v2 path.");
     }
@@ -94,7 +95,7 @@ export class PeerSessionRegistry {
     if (session.sockets.size >= maxSessionConnections) throw new Error("Agent session has too many open connections.");
     session.sockets.add(socket);
     socket.once("close", () => session.sockets.delete(socket));
-    return principalForVerifiedPeer(principalId(peer.uid), session.name, session.sessionId);
+    return principalForVerifiedPeer(principalIdForPeerSession(session), session.name, session.sessionId);
   }
 }
 
@@ -214,8 +215,14 @@ async function checkedPeerHelper(checkAcl: boolean): Promise<string> {
   return helper;
 }
 
-function principalId(uid: number): string {
-  return `${process.platform}:uid:${uid}`;
+export function principalIdForPeerSession(session: PeerSession): string {
+  if (session.linuxIdentityGeneration !== undefined &&
+      (process.platform !== "linux" || typeof session.linuxIdentityGeneration !== "string" ||
+        !/^[a-f0-9]{32}$/.test(session.linuxIdentityGeneration))) {
+    throw new Error("A durable Linux agent identity needs a valid generation.");
+  }
+  if (session.linuxIdentityGeneration) return `linux:managed:${session.linuxIdentityGeneration}`;
+  return `${process.platform}:uid:${session.uid}`;
 }
 
 function validCgroupPath(value: string): boolean {

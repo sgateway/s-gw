@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, realpath, rm, rmdir, writeFile } from "node:fs/promises";
+import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { createServer as createHttpsServer } from "node:https";
 import { createConnection } from "node:net";
 import path from "node:path";
@@ -110,14 +110,18 @@ const storeHome = `/run/s-gw/ci-store-${runId}`;
 const recoveryHome = `/run/s-gw/ci-recovery-${runId}`;
 const envFile = `/run/s-gw/ci-env-${runId}`;
 const planDir = "/run/s-gw/agent-plans";
+const identityDir = "/var/lib/s-gw/agent-identities";
 const installed = `/run/s-gw/ci-control-${runId}`;
 const controlDir = path.join(installed, "control");
 const brokerPackage = path.join(installed, "broker");
 const rootNode = path.join(installed, "node");
+const runtimeVerifier = path.join(installed, "s-gw-linux-broker-runtime");
 const controlEntry = path.join(controlDir, "linux-agent-control.js");
 const operatorEntry = path.join(project, "scripts/linux-managed-mcp-operator.mjs");
 const controlUnit = "s-gw-agent-control.service";
+const controlUnitFile = `/run/systemd/system/${controlUnit}`;
 const controlDescription = `s-gw-ci-control:${runId}`;
+const loaderUnset = "NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF SSL_CERT_FILE SSL_CERT_DIR GLIBC_TUNABLES MALLOC_CHECK_ MALLOC_PERTURB_ TZDIR";
 const agents = [0, 1].map(index => {
   const letter = index === 0 ? "a" : "b";
   const sessionId = `ci-mcp-${runId}-${letter}`;
@@ -135,13 +139,20 @@ const agents = [0, 1].map(index => {
   const claimPaths = [`${planDir}/uid-${agentUid}.used`, `${planDir}/gid-${agentUid}.used`,
     `${planDir}/session-${sessionId}.used`];
   const name = `Native managed MCP agent ${letter.toUpperCase()}`;
+  const identityGeneration = randomBytes(16).toString("hex");
+  const logicalAgentId = sessionId;
   const plan = { sessionId, uid: agentUid, gid: agentUid, brokerUid,
     rootDirectory: root, brokerSocket: socketPath,
     executable: "/usr/bin/managed-mcp-probe", args: [],
     launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
-    serializedLifecycle: true, sealedStdio: true, supervisedControlUnit: true };
+    serializedLifecycle: true, sealedStdio: true, supervisedControlUnit: true,
+    logicalAgentId, identityGeneration };
+  const identityRecord = { logicalAgentId, identityGeneration, uid: agentUid, gid: agentUid };
+  const identityPaths = [`${identityDir}/uid-${agentUid}.json`,
+    `${identityDir}/generation-${identityGeneration}.json`];
   return { sessionId, uid: agentUid, userName, root, socketPath, agentUnit, socketUnit,
-    brokerUnit, socketUnitFile, brokerUnitFile, configPath, planPath, claimPaths, name, plan };
+    brokerUnit, socketUnitFile, brokerUnitFile, configPath, planPath, claimPaths,
+    identityRecord, identityPaths, name, plan };
 });
 const owned = new Map();
 async function remember(filename) {
@@ -226,17 +237,44 @@ async function rememberClaimMarkers(agent) {
 }
 
 function fixtureControl(properties) {
-  const command = `argv[]=${rootNode} ${controlEntry} --serve ${brokerUid} ${brokerGid} ;`;
+  const command = `argv[]=${runtimeVerifier} verify-exec ${installed} ${rootNode} ${controlEntry} ${controlUnitFile} - - -- --serve ${brokerUid} ${brokerGid} ;`;
+  const preflight = `argv[]=${runtimeVerifier} verify ${installed} ${rootNode} ${controlEntry} ${controlUnitFile} - - ;`;
   return properties.get("Id") === controlUnit &&
     properties.get("Description") === controlDescription &&
+    properties.get("FragmentPath") === controlUnitFile &&
     properties.get("ExecStart")?.includes(command) &&
+    properties.get("ExecStartPre")?.includes(preflight) &&
+    loaderUnset.split(" ").every(name => properties.get("UnsetEnvironment")?.split(/\s+/).includes(name)) &&
     properties.get("ControlGroup") === `/system.slice/${controlUnit}`;
 }
+const controlProperties = ["Id", "Description", "FragmentPath", "ExecStart", "ExecStartPre",
+  "UnsetEnvironment", "ControlGroup", "ActiveState", "InvocationID", "MainPID"];
 
 async function fixtureUnitFile(unit, filename) {
   if (!(await assertOwned(filename))) return false;
   const properties = unitProperties(unit, ["Id", "FragmentPath"]);
   return properties.get("Id") === unit && properties.get("FragmentPath") === filename;
+}
+
+async function rejectWritableImport(unit, filename, marker) {
+  const original = await readFile(filename, "utf8");
+  const writeMarker = `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "loaded");\n`;
+  const split = original.startsWith("#!") ? original.indexOf("\n") + 1 : 0;
+  if (original.startsWith("#!") && split === 0) throw new Error("Invalid staged Node entry.");
+  await writeFile(filename, original.slice(0, split) + writeMarker + original.slice(split));
+  await chmod(filename, 0o777);
+  try {
+    const attempt = run("systemctl", ["--system", "start", unit], true);
+    const active = run("systemctl", ["--system", "is-active", unit], true).status === 0;
+    if (active) run("systemctl", ["--system", "stop", unit], true);
+    if (attempt.error || attempt.status === 0 || active || await maybeText(marker) !== undefined) {
+      throw new Error(`Writable import reached Node before the ${unit} pre-exec gate.`);
+    }
+  } finally {
+    await writeFile(filename, original);
+    await chmod(filename, 0o755);
+    run("systemctl", ["--system", "reset-failed", unit], true);
+  }
 }
 
 const accountsCreated = [];
@@ -248,6 +286,7 @@ const socketStartAttempted = new Set();
 const socketStarted = new Set();
 let fixtureOwned = false;
 let planDirCreated = false;
+let identityDirCreated = false;
 let controlInvocation;
 const agentInvocations = new Map();
 const brokerInvocations = new Map();
@@ -263,9 +302,10 @@ try {
       controlSocketExists) {
     throw new Error("A Linux agent control service is already installed on this CI host.");
   }
-  const uniquePaths = [leaseDir, storeHome, recoveryHome, envFile, installed,
+  const uniquePaths = [leaseDir, storeHome, recoveryHome, envFile, installed, controlUnitFile,
     ...agents.flatMap(agent => [agent.root, path.dirname(agent.socketPath), agent.configPath,
-      agent.planPath, agent.socketUnitFile, agent.brokerUnitFile, ...agent.claimPaths])];
+      agent.planPath, agent.socketUnitFile, agent.brokerUnitFile, ...agent.claimPaths,
+      ...agent.identityPaths])];
   for (const filename of uniquePaths) {
     try { await lstat(filename); throw new Error(`Native fixture path already exists: ${filename}`); }
     catch (error) { if (error.code !== "ENOENT") throw error; }
@@ -286,6 +326,62 @@ try {
     await remember(planDir);
     planDirCreated = true;
   }
+  try {
+    const stat = await lstat(identityDir);
+    if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o777) !== 0o700 ||
+        await realpath(identityDir) !== identityDir) {
+      throw new Error("The Linux agent-identity directory is not root-owned mode 0700.");
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    await mkdir(identityDir, { mode: 0o700 });
+    await remember(identityDir);
+    identityDirCreated = true;
+  }
+  for (const agent of agents) {
+    for (const filename of agent.identityPaths) {
+      await writeFile(filename, JSON.stringify(agent.identityRecord) + "\n", { mode: 0o600, flag: "wx" });
+      await remember(filename);
+      await checkedInstalledFile(filename);
+      if (((await lstat(filename)).mode & 0o777) !== 0o600) {
+        throw new Error("Native Linux agent identity record is not root-private.");
+      }
+    }
+  }
+  const { attestDurableLinuxAgentIdentity } = await import(new URL("../dist/linux-agent-identity.js", import.meta.url));
+  for (const agent of agents) await attestDurableLinuxAgentIdentity(agent.plan);
+  const firstIdentity = agents[0];
+  const reassigned = { logicalAgentId: `ci-mcp-${runId}-reassigned`,
+    identityGeneration: randomBytes(16).toString("hex"), uid: firstIdentity.uid, gid: firstIdentity.uid };
+  const newReceipt = `${identityDir}/generation-${reassigned.identityGeneration}.json`;
+  await writeFile(newReceipt, JSON.stringify(reassigned) + "\n", { mode: 0o600, flag: "wx" });
+  await remember(newReceipt);
+  try {
+    await writeFile(firstIdentity.identityPaths[0], JSON.stringify(reassigned) + "\n");
+    let rejected = false;
+    try { await attestDurableLinuxAgentIdentity(firstIdentity.plan); }
+    catch { rejected = true; }
+    if (!rejected) throw new Error("An old Linux identity was accepted after UID reassignment.");
+  } finally {
+    await writeFile(firstIdentity.identityPaths[0], JSON.stringify(firstIdentity.identityRecord) + "\n");
+    await assertOwned(newReceipt);
+    await removeOwned(newReceipt);
+  }
+  await attestDurableLinuxAgentIdentity(firstIdentity.plan);
+  const heldReceipt = `${firstIdentity.identityPaths[1]}.hold-${runId}`;
+  if (await maybeText(heldReceipt) !== undefined) throw new Error("Native identity receipt hold path already exists.");
+  await rename(firstIdentity.identityPaths[1], heldReceipt);
+  await remember(heldReceipt);
+  try {
+    let rejected = false;
+    try { await attestDurableLinuxAgentIdentity(firstIdentity.plan); }
+    catch { rejected = true; }
+    if (!rejected) throw new Error("A missing Linux generation receipt was accepted.");
+  } finally {
+    await assertOwned(heldReceipt);
+    await rename(heldReceipt, firstIdentity.identityPaths[1]);
+  }
+  await attestDurableLinuxAgentIdentity(firstIdentity.plan);
   await mkdir(installed, { mode: 0o755 });
   await remember(installed);
   await mkdir(controlDir, { mode: 0o755 });
@@ -323,20 +419,24 @@ try {
     await chown(`${agent.root}/workspace`, agent.uid, agent.uid);
     await chmod(`${agent.root}/workspace`, 0o700);
   }
-  for (const name of ["linux-agent-control.js", "linux-agent-unit.js", "linux-peer-identity.js"]) {
+  for (const name of ["linux-agent-control.js", "linux-agent-unit.js",
+    "linux-peer-identity.js", "linux-agent-identity.js"]) {
     await copyFile(path.join(project, "dist", name), path.join(controlDir, name));
     await chmod(path.join(controlDir, name), 0o755);
   }
   await writeFile(path.join(controlDir, "package.json"), '{"type":"module"}\n', { mode: 0o644 });
   await copyFile(process.execPath, rootNode);
   await chmod(rootNode, 0o755);
+  run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+    path.join(project, "native/linux-broker-runtime/verify.c"), "-o", runtimeVerifier]);
+  await chmod(runtimeVerifier, 0o755);
   const brokerVerifierDir = path.join(brokerPackage, "dist", "native", `linux-${arch}`);
   await mkdir(brokerVerifierDir, { recursive: true, mode: 0o755 });
   run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/peer-credentials/peer-credentials.c"),
     "-o", path.join(brokerVerifierDir, "s-gw-peer-credentials")]);
   await checkedBrokerTree();
-  for (const filename of [rootNode, path.join(brokerPackage, "dist/linux-managed-mcp.js"),
+  for (const filename of [rootNode, runtimeVerifier, path.join(brokerPackage, "dist/linux-managed-mcp.js"),
     path.join(brokerVerifierDir, "s-gw-peer-credentials")]) {
     await checkedInstalledFile(filename);
   }
@@ -365,7 +465,8 @@ try {
   const tls = { key: await readFile(keyFile), cert: await readFile(certFile) };
   const upstreamAuths = [];
   upstream = createHttpsServer(tls, (request, response) => {
-    upstreamAuths.push(String(request.headers.authorization || ""));
+    upstreamAuths.push({ authorization: String(request.headers.authorization || ""),
+      method: request.method, path: request.url });
     response.end("approved fixture");
   });
   await new Promise((resolve, reject) => {
@@ -400,17 +501,23 @@ try {
   }
   const node = safeUnitValue(rootNode);
   const entry = safeUnitValue(path.join(brokerPackage, "dist/linux-managed-mcp.js"));
+  const verifier = safeUnitValue(runtimeVerifier);
+  const runtimeRoot = safeUnitValue(installed);
   const environmentFile = safeUnitValue(envFile);
   await writeFile(envFile, `CI=true\nSGW_HOME=${storeHome}\nSGW_RECOVERY_HOME=${recoveryHome}\nSGW_MASTER_PASSPHRASE=${secret}\nSGW_DISABLE_KEYCHAIN=1\nSGW_DISABLE_ONEPASSWORD_BACKUP=1\nNODE_EXTRA_CA_CERTS=${certFile}\n`, { mode: 0o600 });
   await remember(envFile);
+  await writeFile(controlUnitFile, `[Unit]\nDescription=${controlDescription}\n[Service]\nType=exec\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - -\nUnsetEnvironment=${loaderUnset} NODE_EXTRA_CA_CERTS\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - - -- --serve ${brokerUid} ${brokerGid}\nRestart=no\n`, { mode: 0o644 });
+  await remember(controlUnitFile);
   for (const agent of agents) {
     const config = safeUnitValue(agent.configPath);
     await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
     await remember(agent.socketUnitFile);
-    await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED\nExecStart=${node} ${entry} ${config}\nRestart=no\n`, { mode: 0o644 });
+    await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=${loaderUnset}\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile}\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile} -- ${config}\nRestart=no\n`, { mode: 0o644 });
     await remember(agent.brokerUnitFile);
     await writeFile(agent.planPath, JSON.stringify({ plan: agent.plan, brokerUnit: agent.brokerUnit,
-      brokerUnitFile: agent.brokerUnitFile, brokerEntry: entry, brokerConfig: config }) + "\n",
+      brokerUnitFile: agent.brokerUnitFile, brokerEntry: entry, brokerConfig: config,
+      brokerNode: node, brokerRuntimeRoot: runtimeRoot, brokerPreflight: verifier,
+      brokerEnvironmentFile: environmentFile, brokerCa: certFile }) + "\n",
       { mode: 0o600 });
     await remember(agent.planPath);
     await checkedInstalledFile(agent.configPath);
@@ -423,19 +530,17 @@ try {
     }
   }
   await checkedInstalledFile(envFile);
+  await checkedInstalledFile(controlUnitFile);
   if (((await lstat(envFile)).mode & 0o777) !== 0o600) {
     throw new Error("Native broker environment file is readable outside root.");
   }
   unitsInstalled = true;
   run("systemctl", ["--system", "daemon-reload"]);
+  await rejectWritableImport(controlUnit, path.join(controlDir, "linux-agent-unit.js"),
+    path.join(installed, "control-preexec-marker"));
   controlStartAttempted = true;
-  run("systemd-run", ["--system", "--no-ask-password", "--unit=s-gw-agent-control",
-    `--description=${controlDescription}`,
-    "--property=Type=exec", "--property=Restart=no",
-    "--property=UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS", "--",
-    rootNode, controlEntry, "--serve", String(brokerUid), String(brokerGid)]);
-  const control = unitProperties(controlUnit,
-    ["Id", "Description", "ExecStart", "ControlGroup", "InvocationID", "MainPID"]);
+  run("systemctl", ["--system", "start", controlUnit]);
+  const control = unitProperties(controlUnit, controlProperties);
   controlInvocation = invocationId(control);
   if (!fixtureControl(control) || !controlInvocation) {
     throw new Error("The started root control unit has no verified fixture invocation.");
@@ -449,6 +554,8 @@ try {
     } catch { return false; }
   }, "root Linux agent control service");
   await remember("/run/s-gw/agent-control.sock");
+  await rejectWritableImport(agents[0].brokerUnit, entry,
+    path.join(installed, "broker-preexec-marker"));
   for (const agent of agents) {
     socketStartAttempted.add(agent.sessionId);
     run("systemctl", ["--system", "start", agent.socketUnit]);
@@ -526,7 +633,7 @@ try {
   }
   for (const agent of agents) {
     agent.requestId = asBroker("approve", [agent.sessionId, String(agent.uid), agent.name,
-      agent.seeded.handle, url]);
+      agent.seeded.handle, url, agent.plan.identityGeneration]);
     if (!/^[A-Za-z0-9_-]{1,256}$/.test(agent.requestId)) {
       throw new Error("Invalid native fixture approved request ID.");
     }
@@ -551,7 +658,8 @@ try {
     if (result !== "owned-https=1\n") throw new Error(`Unexpected verified MCP result: ${result}`);
   }
   if (upstreamAuths.length !== 2 ||
-      agents.some(agent => upstreamAuths.filter(value => value === `Bearer ${agent.seeded.value}`).length !== 1)) {
+      upstreamAuths.some(item => item.method !== "GET" || item.path !== "/operation") ||
+      agents.some(agent => upstreamAuths.filter(item => item.authorization === `Bearer ${agent.seeded.value}`).length !== 1)) {
     throw new Error("The broker did not send each approved synthetic credential exactly once.");
   }
   const fenceRoot = "/run/s-gw/agent-unit-lifecycle";
@@ -585,8 +693,7 @@ try {
   }
   if (fixtureOwned) {
     if (controlStartAttempted && !controlStarted) {
-      const uncertain = unitProperties(controlUnit,
-        ["Id", "Description", "ExecStart", "ControlGroup", "ActiveState", "InvocationID"]);
+      const uncertain = unitProperties(controlUnit, controlProperties);
       if (uncertain.get("ActiveState") === "active" && fixtureControl(uncertain) &&
           invocationId(uncertain)) {
         run("systemctl", ["--system", "stop", controlUnit], true);
@@ -594,8 +701,7 @@ try {
       throw new Error("Root control start was ambiguous; its root-owned fixture tree was preserved.");
     }
     if ([...socketStartAttempted].some(session => !socketStarted.has(session))) {
-      const currentControl = unitProperties(controlUnit,
-        ["Id", "Description", "ExecStart", "ControlGroup", "ActiveState", "InvocationID"]);
+      const currentControl = unitProperties(controlUnit, controlProperties);
       if (currentControl.get("ActiveState") === "active" && fixtureControl(currentControl) &&
           invocationId(currentControl) === controlInvocation) {
         run("systemctl", ["--system", "stop", controlUnit], true);
@@ -610,8 +716,7 @@ try {
       }
       throw new Error("Managed MCP socket start was ambiguous; its fixture paths were preserved.");
     }
-    const currentControl = unitProperties(controlUnit,
-      ["Id", "Description", "ExecStart", "ControlGroup", "ActiveState", "InvocationID"]);
+    const currentControl = unitProperties(controlUnit, controlProperties);
     const controlActive = currentControl.get("ActiveState") === "active";
     const controlOwned = controlStarted && controlInvocation && fixtureControl(currentControl) &&
       invocationId(currentControl) === controlInvocation;
@@ -675,6 +780,7 @@ try {
       await removeOwned(agent.socketUnitFile);
       await removeOwned(agent.brokerUnitFile);
     }
+    await removeOwned(controlUnitFile);
     if (unitsInstalled) run("systemctl", ["--system", "daemon-reload"], true);
     for (const agent of agents) {
       for (const filename of owned.keys()) {
@@ -691,6 +797,14 @@ try {
       await removeOwned(agent.root, true);
       await removeOwned(agent.configPath);
       await removeOwned(agent.planPath);
+      for (const filename of agent.identityPaths) {
+        if (!owned.has(filename)) continue;
+        const value = await readFile(filename, "utf8");
+        if (value !== JSON.stringify(agent.identityRecord) + "\n") {
+          throw new Error(`Native identity record changed before cleanup: ${filename}`);
+        }
+        await removeOwned(filename);
+      }
       for (const filename of agent.claimPaths) {
         if (owned.has(filename)) {
           const value = await readFile(filename, "utf8");
@@ -705,6 +819,10 @@ try {
     if (planDirCreated) {
       await assertOwned(planDir);
       await rmdir(planDir);
+    }
+    if (identityDirCreated) {
+      await assertOwned(identityDir);
+      await rmdir(identityDir);
     }
     await removeOwned(leaseDir, true);
     await removeOwned(storeHome, true);

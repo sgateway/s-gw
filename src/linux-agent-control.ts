@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { lifecyclePlanKey, SystemdRunAgentUnitManager, validateLinuxAgentPlan,
   linuxAgentUnitName, type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
+import { attestDurableLinuxAgentIdentity } from "./linux-agent-identity.js";
 import { verifyLinuxPeerProcess } from "./linux-peer-identity.js";
 
 const controlSocket = "/run/s-gw/agent-control.sock";
@@ -14,6 +15,9 @@ const planDir = "/run/s-gw/agent-plans";
 const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
 const rootPidfdHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-linux-peer-identity`, import.meta.url));
 const maxFrame = 32 * 1024;
+const unsafeStartupEnv = ["NODE_OPTIONS", "NODE_PATH", "NODE_TLS_REJECT_UNAUTHORIZED",
+  "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "OPENSSL_CONF", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "GLIBC_TUNABLES", "MALLOC_CHECK_", "MALLOC_PERTURB_", "TZDIR"];
 
 export interface LinuxManagedPlanRecord {
   plan: LinuxAgentUnitPlan;
@@ -21,6 +25,11 @@ export interface LinuxManagedPlanRecord {
   brokerUnitFile: string;
   brokerEntry: string;
   brokerConfig: string;
+  brokerNode: string;
+  brokerRuntimeRoot: string;
+  brokerPreflight: string;
+  brokerEnvironmentFile: string;
+  brokerCa: string | null;
 }
 
 type Method = "start" | "inspect" | "release" | "stop";
@@ -51,8 +60,14 @@ export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
       !["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"].includes(path.dirname(value.brokerUnitFile || "")) ||
       path.basename(value.brokerUnitFile) !== value.brokerUnit ||
       !canonicalFile(value.brokerEntry) || path.basename(value.brokerEntry) !== "linux-managed-mcp.js" ||
-      !canonicalFile(value.brokerConfig) ||
-      Object.keys(value).sort().join(",") !== "brokerConfig,brokerEntry,brokerUnit,brokerUnitFile,plan") {
+      !canonicalFile(value.brokerConfig) || !canonicalFile(value.brokerNode) ||
+      !canonicalFile(value.brokerRuntimeRoot) || !canonicalFile(value.brokerPreflight) ||
+      !canonicalFile(value.brokerEnvironmentFile) ||
+      (value.brokerCa !== null && !canonicalFile(value.brokerCa)) ||
+      !value.brokerNode.startsWith(`${value.brokerRuntimeRoot}/`) ||
+      !value.brokerEntry.startsWith(`${value.brokerRuntimeRoot}/`) ||
+      !value.brokerPreflight.startsWith(`${value.brokerRuntimeRoot}/`) ||
+      Object.keys(value).sort().join(",") !== "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,plan") {
     throw new Error("Invalid root-provisioned Linux managed plan record.");
   }
   validateLinuxManagedPlan(value.plan, brokerUid, brokerGid);
@@ -87,7 +102,15 @@ async function registeredPlan(sessionId: string, brokerUid: number,
   await checkedRootFile(filename);
   const value = JSON.parse(await readFile(filename, "utf8")) as LinuxManagedPlanRecord;
   validateLinuxManagedPlanRecord(value, sessionId, brokerUid, brokerGid);
+  await attestDurableLinuxAgentIdentity(value.plan);
   await checkedRootFile(value.brokerUnitFile);
+  await checkedBrokerFile(value.brokerNode);
+  await checkedBrokerFile(value.brokerPreflight);
+  await checkedRootFile(value.brokerEnvironmentFile);
+  if ((await lstat(value.brokerEnvironmentFile)).mode & 0o077) {
+    throw new Error("Linux broker environment file is not root-private.");
+  }
+  if (value.brokerCa) await checkedBrokerFile(value.brokerCa);
   const config = await lstat(value.brokerConfig);
   if (!config.isFile() || config.uid !== 0 || config.gid !== brokerGid ||
       (config.mode & 0o777) !== 0o640 || config.nlink !== 1) {
@@ -173,10 +196,25 @@ async function checkedRootRuntime(): Promise<void> {
     throw new Error("The Linux agent control service needs its systemd unit.");
   }
   for (const filename of [fileURLToPath(import.meta.url), path.join(runtimeDir, "linux-agent-unit.js"),
-    path.join(runtimeDir, "linux-peer-identity.js"), path.join(runtimeDir, "package.json"),
+    path.join(runtimeDir, "linux-peer-identity.js"), path.join(runtimeDir, "linux-agent-identity.js"),
+    path.join(runtimeDir, "package.json"),
     rootPidfdHelper, await realpath(process.execPath)]) {
     await checkedRootFile(filename);
   }
+  const runtimeRoot = path.dirname(runtimeDir);
+  const preflight = path.join(runtimeRoot, "s-gw-linux-broker-runtime");
+  const entry = fileURLToPath(import.meta.url);
+  const node = await realpath(process.execPath);
+  const output = await systemctlProperties("s-gw-agent-control.service");
+  const unitFile = parseUnitProperties(output).get("FragmentPath") || "";
+  if (path.basename(unitFile) !== "s-gw-agent-control.service" ||
+      !["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"].includes(path.dirname(unitFile))) {
+    throw new Error("Linux root control has an untrusted systemd unit path.");
+  }
+  await checkedRootFile(unitFile);
+  await checkedRootFile(preflight);
+  assertControlUnitPreflight(output,
+    { unitFile, runtimeRoot, preflight, node, entry, args: process.argv.slice(2) });
   const parent = await lstat(path.dirname(controlSocket));
   if (!parent.isDirectory() || parent.uid !== 0 || (parent.mode & 0o022) !== 0) {
     throw new Error("The Linux control socket directory must be root-owned.");
@@ -244,7 +282,8 @@ function firstFrame(socket: Socket): Promise<unknown> {
 
 async function systemctlProperties(unit: string): Promise<string> {
   const names = ["Id", "ActiveState", "MainPID", "ControlGroup", "InvocationID",
-    "FragmentPath", "BindsTo", "After"];
+    "FragmentPath", "BindsTo", "After", "ExecStart", "ExecStartPre",
+    "EnvironmentFiles", "UnsetEnvironment"];
   return new Promise((resolve, reject) => {
     const child = spawn("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
       ...names.flatMap(name => ["-p", name])], { stdio: ["ignore", "pipe", "pipe"], env: {}, timeout: 3000 });
@@ -267,8 +306,7 @@ async function systemctlProperties(unit: string): Promise<string> {
   });
 }
 
-export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number,
-  output: string, expected?: string): string {
+function parseUnitProperties(output: string): Map<string, string> {
   const values = new Map<string, string>();
   for (const line of output.trimEnd().split("\n")) {
     const index = line.indexOf("=");
@@ -277,6 +315,44 @@ export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number
     }
     values.set(line.slice(0, index), line.slice(index + 1));
   }
+  return values;
+}
+
+function unitCommand(value: string | undefined, executable: string, args: string[]): boolean {
+  if (!value || !/^[\/A-Za-z0-9_.@+-]+$/.test(executable) ||
+      args.some(arg => !/^[\/A-Za-z0-9_.@+-]+$/.test(arg))) return false;
+  const command = `argv[]=${[executable, ...args].join(" ")} ;`;
+  return value.startsWith(`{ path=${executable} ; ${command} ignore_errors=no ;`) &&
+    value.endsWith(" }") && value.match(/\{ path=/g)?.length === 1;
+}
+
+function safeUnitEnvironment(value: string | undefined): boolean {
+  if (!value) return false;
+  const removed = new Set(value.split(/\s+/));
+  return unsafeStartupEnv.every(name => removed.has(name));
+}
+
+export function assertControlUnitPreflight(output: string, runtime: {
+  unitFile: string; runtimeRoot: string; preflight: string;
+  node: string; entry: string; args: string[];
+}): void {
+  const unit = parseUnitProperties(output);
+  if (unit.get("Id") !== "s-gw-agent-control.service" || unit.get("ActiveState") !== "active" ||
+      unit.get("FragmentPath") !== runtime.unitFile || unit.get("EnvironmentFiles") !== "" ||
+      !unitCommand(unit.get("ExecStartPre"), runtime.preflight,
+        ["verify", runtime.runtimeRoot, runtime.node, runtime.entry, runtime.unitFile, "-", "-"]) ||
+      !unitCommand(unit.get("ExecStart"), runtime.preflight,
+        ["verify-exec", runtime.runtimeRoot, runtime.node, runtime.entry,
+          runtime.unitFile, "-", "-", "--", ...runtime.args]) ||
+      !safeUnitEnvironment(unit.get("UnsetEnvironment")) ||
+      !unit.get("UnsetEnvironment")?.split(/\s+/).includes("NODE_EXTRA_CA_CERTS")) {
+    throw new Error("Linux root control did not pass the native pre-exec runtime gate.");
+  }
+}
+
+export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number,
+  output: string, expected?: string): string {
+  const values = parseUnitProperties(output);
   const invocation = values.get("InvocationID") || "";
   if (values.get("Id") !== record.brokerUnit || values.get("ActiveState") !== "active" ||
       values.get("MainPID") !== String(pid) ||
@@ -284,6 +360,15 @@ export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number
       values.get("FragmentPath") !== record.brokerUnitFile ||
       !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
       !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service") ||
+      values.get("EnvironmentFiles") !== `${record.brokerEnvironmentFile} (ignore_errors=no)` ||
+      !safeUnitEnvironment(values.get("UnsetEnvironment")) ||
+      !unitCommand(values.get("ExecStartPre"), record.brokerPreflight,
+        ["verify", record.brokerRuntimeRoot, record.brokerNode, record.brokerEntry,
+          record.brokerConfig, record.brokerCa ?? "-", record.brokerEnvironmentFile]) ||
+      !unitCommand(values.get("ExecStart"), record.brokerPreflight,
+        ["verify-exec", record.brokerRuntimeRoot, record.brokerNode, record.brokerEntry,
+          record.brokerConfig, record.brokerCa ?? "-", record.brokerEnvironmentFile,
+          "--", record.brokerConfig]) ||
       !/^[a-f0-9]{32}$/.test(invocation) || (expected && invocation !== expected)) {
     throw new Error("Linux control peer is not the registered broker unit invocation.");
   }
@@ -306,6 +391,9 @@ async function attestBroker(socket: Socket, record: LinuxManagedPlanRecord,
     throw new Error("Linux broker command does not match its root registration.");
   }
   const executable = await readlink(`/proc/${peer.pid}/exe`);
+  if (executable !== record.brokerNode) {
+    throw new Error("Linux broker Node binary differs from its root registration.");
+  }
   await checkedBrokerFile(executable);
   return invocation;
 }
@@ -430,7 +518,10 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
             if (used) throw new Error("This Linux agent session was already launched.");
             used = true;
             usedSessions.add(sessionId);
+            // A root-owned rotation must be visible both before and after the UID claim.
+            await attestDurableLinuxAgentIdentity(plan);
             await reserveManagedIdentity(plan);
+            await attestDurableLinuxAgentIdentity(plan);
             await startTrackedManagedUnit(manager, plan, state);
             return undefined;
           }

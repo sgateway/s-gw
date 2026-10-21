@@ -21,6 +21,8 @@ export interface LinuxAgentUnitPlan {
   launchAttemptFence?: boolean;
   sealedStdio?: boolean;
   supervisedControlUnit?: boolean;
+  logicalAgentId?: string;
+  identityGeneration?: string;
 }
 
 export interface LinuxAgentUnitState {
@@ -65,6 +67,7 @@ export function linuxAgentUnitName(sessionId: string): string {
 
 export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
   linuxAgentUnitName(plan.sessionId);
+  const durableIdentity = plan.logicalAgentId !== undefined || plan.identityGeneration !== undefined;
   if (!Number.isSafeInteger(plan.uid) || plan.uid < 1 ||
       !Number.isSafeInteger(plan.gid) || plan.gid < 1 ||
       !Number.isSafeInteger(plan.brokerUid) || plan.brokerUid < 1 || plan.uid === plan.brokerUid) {
@@ -89,6 +92,10 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
       (plan.supervisedControlUnit !== undefined && typeof plan.supervisedControlUnit !== "boolean") ||
       (plan.supervisedControlUnit === true && (!plan.launchGate || !plan.activatedSocket ||
         !plan.serializedLifecycle || !plan.sealedStdio || !plan.isolatedSharedMemory)) ||
+      (durableIdentity && (typeof plan.logicalAgentId !== "string" ||
+        !/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(plan.logicalAgentId) ||
+        typeof plan.identityGeneration !== "string" ||
+        !/^[a-f0-9]{32}$/.test(plan.identityGeneration) || !plan.supervisedControlUnit)) ||
       !Array.isArray(plan.args) || plan.args.length > 128 ||
       plan.args.some(arg => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
     throw new Error("Linux agent executable or arguments are invalid.");
@@ -166,12 +173,14 @@ export interface LinuxUnitLaunchFence {
 }
 
 export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
-  return JSON.stringify([plan.sessionId, plan.uid, plan.gid, plan.brokerUid,
+  const fields = [plan.sessionId, plan.uid, plan.gid, plan.brokerUid,
     plan.rootDirectory, plan.brokerSocket, plan.executable, plan.args,
     plan.launchGate === true, plan.activatedSocket === true,
     plan.isolatedSharedMemory === true, plan.serializedLifecycle === true,
     linuxLaunchAttemptFenceEnabled(plan), plan.sealedStdio === true,
-    plan.supervisedControlUnit === true]);
+    plan.supervisedControlUnit === true];
+  if (plan.identityGeneration) fields.push(plan.logicalAgentId!, plan.identityGeneration);
+  return JSON.stringify(fields);
 }
 
 export async function stopOwnedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,

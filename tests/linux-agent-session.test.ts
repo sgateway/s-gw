@@ -88,6 +88,24 @@ describe("Linux broker agent leases", () => {
     expect(events.at(-1)).toBe("revoke");
   });
 
+  it("passes an opted-in generation through the attested Linux launch", async () => {
+    const location = await leases();
+    const p = { ...plan(), launchGate: true, activatedSocket: true,
+      isolatedSharedMemory: true, serializedLifecycle: true, sealedStdio: true,
+      supervisedControlUnit: true, logicalAgentId: "codex-main",
+      identityGeneration: "a".repeat(32) };
+    const units = manager(p);
+    let registered: PeerSession | undefined;
+    const stop = await new LinuxAgentSessionLeases(location, units).launch(p, "Codex", session => {
+      registered = session;
+      return () => {};
+    }, async () => {});
+    expect(registered).toMatchObject({ uid: p.uid, gid: p.gid,
+      linuxIdentityGeneration: p.identityGeneration,
+      linuxCgroup: `/system.slice/${linuxAgentUnitName(p.sessionId)}` });
+    await stop();
+  });
+
   it("checks an activated listener's live binding before registration and gate release", async () => {
     const location = await leases();
     const p = { ...plan(), activatedSocket: true, launchGate: true };

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
+import { assertControlUnitPreflight, brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
   stopTrackedManagedUnit, validateLinuxManagedPlan,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
 import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
@@ -30,7 +30,10 @@ function record(sessionId = "managed-session"): LinuxManagedPlanRecord {
   return { plan: agentPlan, brokerUnit,
     brokerUnitFile: `/run/systemd/system/${brokerUnit}`,
     brokerEntry: "/opt/s-gw/dist/linux-managed-mcp.js",
-    brokerConfig: `/run/s-gw/${sessionId}.json` };
+    brokerConfig: `/run/s-gw/${sessionId}.json`,
+    brokerNode: "/opt/s-gw/node", brokerRuntimeRoot: "/opt/s-gw",
+    brokerPreflight: "/opt/s-gw/s-gw-linux-broker-runtime",
+    brokerEnvironmentFile: "/run/s-gw/broker.env", brokerCa: "/opt/s-gw/ca.crt" };
 }
 
 function brokerState(item: LinuxManagedPlanRecord, pid = 4123,
@@ -38,7 +41,26 @@ function brokerState(item: LinuxManagedPlanRecord, pid = 4123,
   return [`Id=${item.brokerUnit}`, "ActiveState=active", `MainPID=${pid}`,
     `ControlGroup=/system.slice/${item.brokerUnit}`, `InvocationID=${invocation}`,
     `FragmentPath=${item.brokerUnitFile}`, "BindsTo=s-gw-agent-control.service",
-    "After=network.target s-gw-agent-control.service"].join("\n") + "\n";
+    "After=network.target s-gw-agent-control.service",
+    `EnvironmentFiles=${item.brokerEnvironmentFile} (ignore_errors=no)`,
+    "UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF SSL_CERT_FILE SSL_CERT_DIR GLIBC_TUNABLES MALLOC_CHECK_ MALLOC_PERTURB_ TZDIR",
+    `ExecStartPre={ path=${item.brokerPreflight} ; argv[]=${item.brokerPreflight} verify ${item.brokerRuntimeRoot} ${item.brokerNode} ${item.brokerEntry} ${item.brokerConfig} ${item.brokerCa} ${item.brokerEnvironmentFile} ; ignore_errors=no ; status=0 }`,
+    `ExecStart={ path=${item.brokerPreflight} ; argv[]=${item.brokerPreflight} verify-exec ${item.brokerRuntimeRoot} ${item.brokerNode} ${item.brokerEntry} ${item.brokerConfig} ${item.brokerCa} ${item.brokerEnvironmentFile} -- ${item.brokerConfig} ; ignore_errors=no ; status=0 }`].join("\n") + "\n";
+}
+
+const rootRuntime = {
+  unitFile: "/run/systemd/system/s-gw-agent-control.service",
+  runtimeRoot: "/opt/s-gw", preflight: "/opt/s-gw/s-gw-linux-broker-runtime",
+  node: "/opt/s-gw/node", entry: "/opt/s-gw/control/linux-agent-control.js",
+  args: ["--serve", "1000", "1000"]
+};
+
+function controlState(): string {
+  return ["Id=s-gw-agent-control.service", "ActiveState=active",
+    `FragmentPath=${rootRuntime.unitFile}`, "EnvironmentFiles=",
+    "UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF SSL_CERT_FILE SSL_CERT_DIR GLIBC_TUNABLES MALLOC_CHECK_ MALLOC_PERTURB_ TZDIR NODE_EXTRA_CA_CERTS",
+    `ExecStartPre={ path=${rootRuntime.preflight} ; argv[]=${rootRuntime.preflight} verify ${rootRuntime.runtimeRoot} ${rootRuntime.node} ${rootRuntime.entry} ${rootRuntime.unitFile} - - ; ignore_errors=no ; status=0 }`,
+    `ExecStart={ path=${rootRuntime.preflight} ; argv[]=${rootRuntime.preflight} verify-exec ${rootRuntime.runtimeRoot} ${rootRuntime.node} ${rootRuntime.entry} ${rootRuntime.unitFile} - - -- --serve 1000 1000 ; ignore_errors=no ; status=0 }`].join("\n") + "\n";
 }
 
 describe("Linux managed MCP control", () => {
@@ -78,6 +100,10 @@ describe("Linux managed MCP control", () => {
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, plan: { ...first.plan, uid: first.plan.brokerUid } },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
+    expect(() => validateLinuxManagedPlanRecord({ ...first, brokerPreflight: "/tmp/verify" },
+      first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
+    expect(() => validateLinuxManagedPlanRecord({ ...first, brokerNode: "/tmp/node" },
+      first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
   });
 
   it("rejects broker unit replacement, a foreign PID, and a new invocation", () => {
@@ -91,11 +117,34 @@ describe("Linux managed MCP control", () => {
       attested.replace(`FragmentPath=${item.brokerUnitFile}`, "FragmentPath=/tmp/forged.service"),
       attested.replace(`ControlGroup=/system.slice/${item.brokerUnit}`, "ControlGroup=/user.slice/other"),
       attested.replace("BindsTo=s-gw-agent-control.service", "BindsTo="),
+      attested.replace("ExecStartPre={ path=", "ExecStartPre={ path=/tmp/"),
+      attested.replace("ignore_errors=no ; status=0 }", "ignore_errors=yes ; status=0 }"),
+      attested.replace("NODE_OPTIONS NODE_PATH", "NODE_PATH"),
+      attested.replace("EnvironmentFiles=/run/s-gw/broker.env", "EnvironmentFiles=/tmp/agent.env"),
+      attested.replace("/opt/s-gw/ca.crt /run/s-gw/broker.env", "/opt/s-gw/ca.crt /tmp/agent.env"),
+      attested.replace("verify-exec /opt/s-gw /opt/s-gw/node", "verify-exec /opt/s-gw /tmp/node"),
+      attested.replace("GLIBC_TUNABLES ", ""),
       attested + "MainPID=4123\n"
     ]) {
       expect(() => brokerUnitInvocation(item, 4123, changed, id)).toThrow();
     }
     expect(() => brokerUnitInvocation(item, 4123, brokerState(item, 4123, "b".repeat(32)), id)).toThrow();
+  });
+
+  it("requires a native pre-exec gate for the root control unit", () => {
+    const attested = controlState();
+    expect(() => assertControlUnitPreflight(attested, rootRuntime)).not.toThrow();
+    for (const changed of [
+      attested.replace("ExecStartPre={ path=", "ExecStartPre={ path=/tmp/"),
+      attested.replace("ignore_errors=no ; status=0 }", "ignore_errors=yes ; status=0 }"),
+      attested.replace("NODE_OPTIONS NODE_PATH", "NODE_PATH"),
+      attested.replace("NODE_EXTRA_CA_CERTS", ""),
+      attested.replace("verify-exec /opt/s-gw /opt/s-gw/node", "verify-exec /opt/s-gw /tmp/node"),
+      attested.replace("EnvironmentFiles=", "EnvironmentFiles=/tmp/agent.env (ignore_errors=no)"),
+      attested.replace(`FragmentPath=${rootRuntime.unitFile}`, "FragmentPath=/tmp/control.service")
+    ]) {
+      expect(() => assertControlUnitPreflight(changed, rootRuntime)).toThrow();
+    }
   });
 
   it("reserves UID and GID independently and rolls back only new pre-launch markers", async () => {

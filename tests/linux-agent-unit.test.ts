@@ -96,6 +96,33 @@ describe("Linux systemd agent unit plan", () => {
     expect(() => validateLinuxAgentPlan({ ...managed, isolatedSharedMemory: false })).toThrow();
   });
 
+  it("uses a new policy identity generation when a managed UID is reassigned", () => {
+    const legacy = plan();
+    expect(lifecyclePlanKey(legacy)).toBe(JSON.stringify([
+      legacy.sessionId, legacy.uid, legacy.gid, legacy.brokerUid,
+      legacy.rootDirectory, legacy.brokerSocket, legacy.executable, legacy.args,
+      false, false, false, false, false, false, false
+    ]));
+    const managed = { ...legacy, launchGate: true, activatedSocket: true,
+      isolatedSharedMemory: true, serializedLifecycle: true, sealedStdio: true,
+      supervisedControlUnit: true, logicalAgentId: "codex-main",
+      identityGeneration: "a".repeat(32) };
+    validateLinuxAgentPlan(managed);
+    expect(lifecyclePlanKey({ ...managed, sessionId: "session-next",
+      rootDirectory: "/var/lib/s-gw/agent-roots/session-next",
+      brokerSocket: "/run/s-gw/agents/session-next/broker.sock" })).not.toBe(lifecyclePlanKey(managed));
+    expect(lifecyclePlanKey({ ...managed, logicalAgentId: "replacement",
+      identityGeneration: "b".repeat(32) })).not.toBe(lifecyclePlanKey(managed));
+    for (const broken of [
+      { ...managed, identityGeneration: undefined },
+      { ...managed, logicalAgentId: undefined },
+      { ...managed, identityGeneration: "A".repeat(32) },
+      { ...managed, identityGeneration: "0".repeat(31) },
+      { ...managed, logicalAgentId: "../other" },
+      { ...managed, supervisedControlUnit: false }
+    ]) expect(() => validateLinuxAgentPlan(broken)).toThrow("invalid");
+  });
+
   it("keeps POSIX shared memory usable but private in the isolated profile", () => {
     const ordinary = plan();
     const isolated = { ...ordinary, launchGate: true, isolatedSharedMemory: true };

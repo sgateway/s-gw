@@ -43,7 +43,8 @@ export class LinuxAgentSessionLeases {
       }
       if (plan.activatedSocket) await assertSocketBinding!();
       stopPeer = registerPeer({ uid: plan.uid, gid: plan.gid, sessionId: plan.sessionId,
-        name, linuxCgroup: state.cgroup });
+        name, linuxCgroup: state.cgroup,
+        ...(plan.identityGeneration ? { linuxIdentityGeneration: plan.identityGeneration } : {}) });
       if (plan.launchGate) {
         if (!this.units.release) throw new Error("Linux agent launch gate cannot be released by this unit manager.");
         if (plan.activatedSocket) await assertSocketBinding!();

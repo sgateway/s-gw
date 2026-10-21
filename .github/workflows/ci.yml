@@ -507,4 +507,5 @@ jobs:
         run: |
           test "$(id -u)" -ne 0
           node_path="$(command -v node)"
+          sudo "$node_path" scripts/test-linux-broker-runtime-static.mjs
           sudo CI=true "$node_path" scripts/test-linux-managed-mcp-native.mjs --root "$(id -u)" "$(id -g)"

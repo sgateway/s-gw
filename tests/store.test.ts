@@ -3511,6 +3511,31 @@ describe("SecretStore", () => {
     })).state).toBe("pending");
   });
 
+  it("keeps a managed policy with the same logical generation across sessions but not UID reassignment", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({ name: "generated managed policy token",
+      type: "api-token", value: fakeOpenAiToken("generated_managed_policy"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] } });
+    const action = buildEnvCommandAction({ command: process.execPath,
+      args: ["-e", "process.stdout.write('ok')"], injectEnv: "TOKEN" });
+    const generation = "a".repeat(32);
+    const first = await store.createRequest(secret.handle, action, "first generation", {
+      managedPrincipal: principalForVerifiedPeer(`linux:managed:${generation}`, "Codex", "old-session"), env: {}
+    });
+    expect(first.state).toBe("pending");
+    await store.approveRequestWithScopedPolicy(first.id);
+    const same = await store.createRequest(secret.handle, action, "same agent after restart", {
+      managedPrincipal: principalForVerifiedPeer(`linux:managed:${generation}`, "Codex", "new-session"), env: {}
+    });
+    expect(same.state).toBe("approved");
+    for (const principalId of [`linux:managed:${"b".repeat(32)}`, "linux:uid:231001"]) {
+      const reassigned = await store.createRequest(secret.handle, action, "reassigned UID", {
+        managedPrincipal: principalForVerifiedPeer(principalId, "Codex", "replacement-session"), env: {}
+      });
+      expect(reassigned.state).toBe("pending");
+    }
+  });
+
   it("keeps legacy name policies stored without allowing unattended use", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({

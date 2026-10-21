@@ -105,6 +105,30 @@ describe.skipIf(!unix || !hasCompiler)("native Unix peer identity", () => {
     });
   });
 
+  it.skipIf(process.platform !== "linux")("uses the generation without accepting an agent's claimed identity", async () => {
+    const session = await ownSession();
+    if (session.linuxCgroup === "/") return;
+    const location = await socketPath();
+    const first = await startVerifiedPeerServer({ socketPath: location,
+      onConnection(socket, principal) {
+        socket.end(JSON.stringify(requestAgentIdentity("claim", {
+          managedPrincipal: principal, env: { SGW_AGENT_NAME: "Replacement" }
+        })));
+      }
+    });
+    servers.push(first);
+    registerOwnSession(first.registerSession, { ...session,
+      linuxIdentityGeneration: "a".repeat(32) });
+    const identity = JSON.parse(await connectAndRead(location));
+    expect(identity).toMatchObject({ name: "Codex", source: "managed-peer",
+      principalId: `linux:managed:${"a".repeat(32)}`, agentSessionId: session.sessionId });
+    expect(identity.principalId).not.toBe(`linux:uid:${session.uid}`);
+
+    const invalid = new PeerSessionRegistry();
+    expect(() => registerOwnSession(item => invalid.register(item), { ...session,
+      linuxIdentityGeneration: "forged" })).toThrow("valid generation");
+  });
+
   it("denies an unregistered peer and ends an active peer when its session ends", async () => {
     if (process.platform === "linux" && (await ownSession()).linuxCgroup === "/") return;
     const location = await socketPath();

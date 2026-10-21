@@ -1,7 +1,7 @@
 import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-context.js";
 import { normalizeModelRelayGrant, type ModelRelayGrant } from "./model-relay-action.js";
 import type { ModelRelayApproval, VerifiedModelRelayServer } from "./model-relay-server.js";
-import type { PeerSession } from "./peer-identity.js";
+import { principalIdForPeerSession, type PeerSession } from "./peer-identity.js";
 import type { SecretStore } from "./store.js";
 
 interface ClaimedRelay {
@@ -27,7 +27,7 @@ export class StoreBackedModelRelayApprovals implements ModelRelayApproval {
     }
     this.claiming.add(sessionId);
     try {
-      const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, sessionId);
+      const principal = principalForVerifiedPeer(principalIdForPeerSession(session), session.name, sessionId);
       const grant = await this.store.claimApprovedModelRelayRequest(requestId, principal);
       this.active.set(sessionId, { requestId, principal, grant, uid: session.uid });
       return grant;
@@ -47,12 +47,12 @@ export class StoreBackedModelRelayApprovals implements ModelRelayApproval {
 
   async onSessionEnded(session: PeerSession): Promise<void> {
     const claimed = this.active.get(session.sessionId);
-    if (claimed && claimed.uid === session.uid) {
+    if (claimed && claimed.uid === session.uid && claimed.principal.id === principalIdForPeerSession(session)) {
       this.active.delete(session.sessionId);
       this.pendingEnds.set(session.sessionId, claimed);
     }
     const pending = this.pendingEnds.get(session.sessionId);
-    if (!pending || pending.uid !== session.uid) return;
+    if (!pending || pending.uid !== session.uid || pending.principal.id !== principalIdForPeerSession(session)) return;
     await this.store.finishModelRelayRequest(pending.requestId);
     this.pendingEnds.delete(session.sessionId);
   }
@@ -72,7 +72,8 @@ export class StoreBackedModelRelayApprovals implements ModelRelayApproval {
 
   async abandon(session: PeerSession): Promise<void> {
     const claimed = this.active.get(session.sessionId);
-    if (!claimed || claimed.uid !== session.uid) return;
+    if (!claimed || claimed.uid !== session.uid ||
+        claimed.principal.id !== principalIdForPeerSession(session)) return;
     this.active.delete(session.sessionId);
     this.pendingFailures.set(session.sessionId, claimed);
     await this.failAbandoned(session.sessionId, claimed);

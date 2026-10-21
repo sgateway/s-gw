@@ -14,7 +14,7 @@ import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { registerDurableModelRelaySession, StoreBackedModelRelayApprovals } from "../src/model-relay-approval.js";
 import { normalizeModelRelayGrant } from "../src/model-relay-action.js";
 import type { ModelUpstreamRequest } from "../src/model-relay-transport.js";
-import type { PeerSession } from "../src/peer-identity.js";
+import { principalIdForPeerSession, type PeerSession } from "../src/peer-identity.js";
 import { SecretStore } from "../src/store.js";
 import { httpsFixture } from "./helpers/https-fixture.js";
 
@@ -133,6 +133,26 @@ async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
 }
 
 describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay listener", () => {
+  it.skipIf(process.platform !== "linux")("claims a generated principal without a UID policy alias", async () => {
+    const handle = (await store.addSecret({ name: "Generated relay identity fixture",
+      type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
+    const session = { ...await ownSession(), linuxIdentityGeneration: "a".repeat(32) };
+    const principal = principalForVerifiedPeer(principalIdForPeerSession(session), session.name, session.sessionId);
+    const request = await store.createModelRelayRequest({ provider: "openai", handle,
+      ttlMs: 20_000, routes: ["POST /v1/responses"] }, principal);
+    await store.approveRequest(request.id, { mode: "per-transaction" });
+    const approvals = new StoreBackedModelRelayApprovals(store);
+    await expect(approvals.claim(request.id, { ...session,
+      linuxIdentityGeneration: "b".repeat(32) })).rejects.toThrow(/different verified agent/);
+    const grant = await approvals.claim(request.id, session);
+    await approvals.assertAuthorized(principal, grant);
+    await approvals.onSessionEnded({ ...session, linuxIdentityGeneration: "b".repeat(32) });
+    expect((await store.getRequest(request.id)).state).toBe("executing");
+    await approvals.onSessionEnded(session);
+    expect((await store.getRequest(request.id)).state).toBe("executed");
+  });
+
   it("closes a request whose headers never finish", async () => {
     server = await startVerifiedModelRelayServer({ socketPath, store,
       headerDeadlineMs: 200, approval: { async assertAuthorized() {} } });
