@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,9 +52,59 @@ static int read_field(const char *filename, char *out, size_t capacity) {
     return 0;
 }
 
+static int canary_denied(const char *filename) {
+    int fd = open(filename, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { close(fd); return 0; }
+    fd = open(filename, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd >= 0) { close(fd); return 0; }
+    return 1;
+}
+
+static int own_canary_readable(void) {
+    int fd = open("/workspace/private-canary", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char marker = 0;
+    int readable = read(fd, &marker, 1) == 1 && marker == 'p';
+    close(fd);
+    return readable;
+}
+
+static int port_number(const char *value) {
+    char *end = NULL;
+    errno = 0;
+    long port = strtol(value, &end, 10);
+    return errno == 0 && end && *end == 0 && port > 0 && port <= 65535 ? (int)port : -1;
+}
+
+static int network_probe(int family, int kind, const char *host, int port) {
+    int fd = socket(family, kind | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct timeval deadline = { .tv_sec = 2, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0) {
+        close(fd);
+        return 0;
+    }
+    int result;
+    if (family == AF_INET) {
+        struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port) };
+        if (inet_pton(AF_INET, host, &address.sin_addr) != 1) { close(fd); return 0; }
+        result = kind == SOCK_STREAM
+            ? connect(fd, (struct sockaddr *)&address, sizeof(address))
+            : sendto(fd, "probe", 5, 0, (struct sockaddr *)&address, sizeof(address));
+    } else {
+        struct sockaddr_in6 address = { .sin6_family = AF_INET6, .sin6_port = htons((uint16_t)port) };
+        if (inet_pton(AF_INET6, host, &address.sin6_addr) != 1) { close(fd); return 0; }
+        result = kind == SOCK_STREAM
+            ? connect(fd, (struct sockaddr *)&address, sizeof(address))
+            : sendto(fd, "probe", 5, 0, (struct sockaddr *)&address, sizeof(address));
+    }
+    close(fd);
+    return kind == SOCK_STREAM ? result != 0 : 1;
+}
+
 int main(int argc, char **argv) {
     int claimant = argc == 2 && strcmp(argv[1], "--out-of-cgroup") == 0;
-    if (argc != 1 && !claimant) return 1;
+    if (argc != 11 && !claimant) return 1;
     signal(SIGPIPE, SIG_IGN);
     const char *socket_path = getenv("SGW_BROKER_SOCKET");
     if (!socket_path || strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 2;
@@ -69,6 +121,30 @@ int main(int argc, char **argv) {
     if (claimant) {
         return receive_line(fd, reply, sizeof(reply)) == -2 ? 0 : 10;
     }
+    const int port_args[6] = { 4, 5, 7, 8, 9, 10 };
+    int ports[6];
+    for (int index = 0; index < 6; index++) {
+        ports[index] = port_number(argv[port_args[index]]);
+        if (ports[index] < 0) return 20;
+    }
+    int files = own_canary_readable() && canary_denied(argv[1]) &&
+        canary_denied(argv[2]) && canary_denied(argv[3]);
+    int tcp4 = network_probe(AF_INET, SOCK_STREAM, "127.0.0.1", ports[0]);
+    int tcp6 = network_probe(AF_INET6, SOCK_STREAM, "::1", ports[1]);
+    int tcp_host = network_probe(AF_INET, SOCK_STREAM, argv[6], ports[2]);
+    int udp4 = network_probe(AF_INET, SOCK_DGRAM, "127.0.0.1", ports[3]);
+    int udp6 = network_probe(AF_INET6, SOCK_DGRAM, "::1", ports[4]);
+    int udp_host = network_probe(AF_INET, SOCK_DGRAM, argv[6], ports[5]);
+    char boundary[128];
+    int boundary_size = snprintf(boundary, sizeof(boundary),
+        "files=%d tcp4=%d tcp6=%d tcphost=%d udp4=%d udp6=%d udphost=%d\n",
+        files, tcp4, tcp6, tcp_host, udp4, udp6, udp_host);
+    if (boundary_size < 0 || (size_t)boundary_size >= sizeof(boundary)) return 21;
+    int boundary_fd = open("/workspace/boundary", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ssize_t boundary_written = boundary_fd < 0 ? -1 : write(boundary_fd, boundary, (size_t)boundary_size);
+    int boundary_closed = boundary_fd < 0 ? -1 : close(boundary_fd);
+    if (boundary_written != boundary_size || boundary_closed != 0) return 21;
+    if (!files || !tcp4 || !tcp6 || !tcp_host || !udp4 || !udp6 || !udp_host) return 22;
     char handle[256], url[256], request_id[256], foreign_id[256], call[1024];
     if (read_field("/workspace/handle", handle, sizeof(handle)) != 0 ||
         read_field("/workspace/url", url, sizeof(url)) != 0) return 11;

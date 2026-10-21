@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { createSocket } from "node:dgram";
 import { createServer as createHttpsServer } from "node:https";
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
+import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -39,6 +41,57 @@ async function until(probe, label, timeout = 30_000) {
 async function maybeText(filename) {
   try { return await readFile(filename, "utf8"); }
   catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+}
+
+function hostIpv4Address() {
+  for (const interfaces of Object.values(networkInterfaces())) {
+    for (const item of interfaces || []) {
+      if (item.family === "IPv4" && !item.internal) return item.address;
+    }
+  }
+  throw new Error("No non-loopback IPv4 address is available for the native egress probe.");
+}
+
+async function tcpCanary(host) {
+  let hits = 0;
+  const server = createServer(socket => { hits++; socket.destroy(); });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, host, () => { server.off("error", reject); resolve(); });
+  });
+  return { host, port: server.address().port, hits: () => hits,
+    close: () => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }) };
+}
+
+async function udpCanary(host, family) {
+  let hits = 0;
+  const server = createSocket(family);
+  server.on("message", () => { hits++; });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.bind(0, host, () => { server.off("error", reject); resolve(); });
+  });
+  return { host, port: server.address().port, hits: () => hits,
+    close: () => new Promise(resolve => server.close(resolve)) };
+}
+
+async function positiveTcp(canary) {
+  await new Promise((resolve, reject) => {
+    const socket = createConnection(canary.port, canary.host);
+    socket.once("error", reject);
+    socket.once("connect", () => { socket.destroy(); resolve(); });
+  });
+}
+
+async function positiveUdp(canary, family) {
+  const socket = createSocket(family);
+  try {
+    await new Promise((resolve, reject) => {
+      socket.send("positive", canary.port, canary.host, error => error ? reject(error) : resolve());
+    });
+  } finally {
+    socket.close();
+  }
 }
 
 function availableUid() {
@@ -108,6 +161,8 @@ const arch = process.arch;
 const leaseDir = `/run/s-gw/ci-lease-${runId}`;
 const storeHome = `/run/s-gw/ci-store-${runId}`;
 const recoveryHome = `/run/s-gw/ci-recovery-${runId}`;
+const storeCanary = path.join(storeHome, "boundary-canary");
+const recoveryCanary = path.join(recoveryHome, "boundary-canary");
 const envFile = `/run/s-gw/ci-env-${runId}`;
 const planDir = "/run/s-gw/agent-plans";
 const identityDir = "/var/lib/s-gw/agent-identities";
@@ -128,6 +183,7 @@ const agents = [0, 1].map(index => {
   const agentUid = uid + index;
   const userName = `sgwmcp${runId.slice(0, 7)}${letter}`;
   const root = `/var/lib/s-gw/agent-roots/${sessionId}`;
+  const privateCanary = `${root}/workspace/private-canary`;
   const socketPath = `/run/s-gw/agents/${sessionId}/broker.sock`;
   const agentUnit = `s-gw-agent-${sessionId}.service`;
   const socketUnit = `s-gw-managed-mcp-${sessionId}.socket`;
@@ -150,7 +206,7 @@ const agents = [0, 1].map(index => {
   const identityRecord = { logicalAgentId, identityGeneration, uid: agentUid, gid: agentUid };
   const identityPaths = [`${identityDir}/uid-${agentUid}.json`,
     `${identityDir}/generation-${identityGeneration}.json`];
-  return { sessionId, uid: agentUid, userName, root, socketPath, agentUnit, socketUnit,
+  return { sessionId, uid: agentUid, userName, root, privateCanary, socketPath, agentUnit, socketUnit,
     brokerUnit, socketUnitFile, brokerUnitFile, configPath, planPath, claimPaths,
     identityRecord, identityPaths, name, plan };
 });
@@ -289,8 +345,10 @@ let planDirCreated = false;
 let identityDirCreated = false;
 let controlInvocation;
 const agentInvocations = new Map();
+const agentMainPids = new Map();
 const brokerInvocations = new Map();
 let upstream;
+const networkCanaries = [];
 let passed = false;
 try {
   let controlSocketExists = false;
@@ -410,6 +468,23 @@ try {
   await mkdir(recoveryHome, { mode: 0o700 });
   await remember(recoveryHome);
   await chown(recoveryHome, brokerUid, brokerGid);
+  for (const [filename, value] of [[storeCanary, `store-${runId}\n`],
+    [recoveryCanary, `recovery-${runId}\n`]]) {
+    await writeFile(filename, value, { mode: 0o600, flag: "wx" });
+    await chown(filename, brokerUid, brokerGid);
+    const info = await lstat(filename);
+    if (!info.isFile() || info.uid !== brokerUid || (info.mode & 0o777) !== 0o600) {
+      throw new Error(`Synthetic broker canary is not private: ${filename}`);
+    }
+    const check = 'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"r+");' +
+      'const byte=Buffer.alloc(1);if(fs.readSync(fd,byte,0,1,0)!==1)process.exit(1);' +
+      'if(fs.writeSync(fd,byte,0,1,0)!==1)process.exit(1);fs.closeSync(fd)';
+    run("runuser", ["-u", brokerUser, "--", process.execPath, "-e", check, filename],
+      false, { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
+    if (await readFile(filename, "utf8") !== value) {
+      throw new Error(`Broker canary positive control changed its content: ${filename}`);
+    }
+  }
   for (const agent of agents) {
     run("groupadd", ["--gid", String(agent.uid), agent.userName]);
     groupsCreated.push(agent.userName);
@@ -418,6 +493,13 @@ try {
     accountsCreated.push(agent.userName);
     await chown(`${agent.root}/workspace`, agent.uid, agent.uid);
     await chmod(`${agent.root}/workspace`, 0o700);
+    await writeFile(agent.privateCanary, `private-${agent.sessionId}\n`,
+      { mode: 0o600, flag: "wx" });
+    await chown(agent.privateCanary, agent.uid, agent.uid);
+    const info = await lstat(agent.privateCanary);
+    if (!info.isFile() || info.uid !== agent.uid || (info.mode & 0o777) !== 0o600) {
+      throw new Error(`Agent workspace canary has the wrong identity: ${agent.privateCanary}`);
+    }
   }
   for (const name of ["linux-agent-control.js", "linux-agent-unit.js",
     "linux-peer-identity.js", "linux-agent-identity.js"]) {
@@ -479,6 +561,30 @@ try {
   }
   const upstreamPort = upstreamAddress.port;
   const url = `https://127.0.0.1:${upstreamPort}/operation`;
+  const hostIp = hostIpv4Address();
+  const direct = { tcp4: await tcpCanary("127.0.0.1") };
+  networkCanaries.push(direct.tcp4);
+  direct.tcp6 = await tcpCanary("::1");
+  networkCanaries.push(direct.tcp6);
+  direct.tcpHost = await tcpCanary(hostIp);
+  networkCanaries.push(direct.tcpHost);
+  direct.udp4 = await udpCanary("127.0.0.1", "udp4");
+  networkCanaries.push(direct.udp4);
+  direct.udp6 = await udpCanary("::1", "udp6");
+  networkCanaries.push(direct.udp6);
+  direct.udpHost = await udpCanary(hostIp, "udp4");
+  networkCanaries.push(direct.udpHost);
+  for (const canary of [direct.tcp4, direct.tcp6, direct.tcpHost]) await positiveTcp(canary);
+  await positiveUdp(direct.udp4, "udp4");
+  await positiveUdp(direct.udp6, "udp6");
+  await positiveUdp(direct.udpHost, "udp4");
+  await until(() => networkCanaries.every(item => item.hits() === 1),
+    "six broker-reachable native network canaries", 3000);
+  for (let index = 0; index < agents.length; index++) {
+    agents[index].plan.args = [storeCanary, recoveryCanary, agents[1 - index].privateCanary,
+      String(direct.tcp4.port), String(direct.tcp6.port), hostIp, String(direct.tcpHost.port),
+      String(direct.udp4.port), String(direct.udp6.port), String(direct.udpHost.port)];
+  }
   const secret = `synthetic-${randomUUID()}`;
   const operatorEnv = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", CI: "true", SGW_HOME: storeHome,
     SGW_RECOVERY_HOME: recoveryHome, SGW_MASTER_PASSPHRASE: secret,
@@ -608,19 +714,44 @@ try {
       throw new Error("The protected agent unit stopped before control-service revocation.");
     }
     const live = unitProperties(agent.agentUnit, ["Id", "Description", "User", "RootDirectory",
-      "ControlGroup", "InvocationID"]);
+      "ControlGroup", "InvocationID", "MainPID"]);
     const agentInvocation = invocationId(live);
+    const mainPid = Number(live.get("MainPID"));
     if (live.get("Id") !== agent.agentUnit ||
         !/^s-gw-agent-start:[a-f0-9]{32}$/.test(live.get("Description") ?? "") ||
         live.get("User") !== String(agent.uid) || live.get("RootDirectory") !== agent.root ||
-        live.get("ControlGroup") !== `/system.slice/${agent.agentUnit}` || !agentInvocation) {
+        live.get("ControlGroup") !== `/system.slice/${agent.agentUnit}` || !agentInvocation ||
+        !Number.isSafeInteger(mainPid) || mainPid < 1) {
       throw new Error("The protected agent has no verified fixture invocation or cgroup.");
     }
     agentInvocations.set(agent.sessionId, agentInvocation);
+    agentMainPids.set(agent.sessionId, mainPid);
   }
   if (new Set(agents.map(agent => agent.uid)).size !== 2 ||
       new Set(agents.map(agent => unitProperties(agent.agentUnit, ["ControlGroup"]).get("ControlGroup"))).size !== 2) {
     throw new Error("The two native agents did not have distinct UIDs and cgroups.");
+  }
+  const netNamespaces = [await readlink("/proc/self/ns/net"),
+    ...await Promise.all(agents.map(agent => readlink(`/proc/${agentMainPids.get(agent.sessionId)}/ns/net`)))];
+  if (new Set(netNamespaces).size !== 3) {
+    throw new Error("An agent retained the host or another agent's network namespace.");
+  }
+  for (const agent of agents) {
+    const result = await until(() => maybeText(`${agent.root}/workspace/boundary`),
+      `${agent.sessionId} direct-egress and canary result`);
+    if (result !== "files=1 tcp4=1 tcp6=1 tcphost=1 udp4=1 udp6=1 udphost=1\n") {
+      throw new Error(`${agent.sessionId} reached a direct service or another private file: ${result}`);
+    }
+  }
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  if (networkCanaries.some(item => item.hits() !== 1)) {
+    throw new Error("An agent reached a broker-only IPv4, IPv6, or UDP listener.");
+  }
+  if (await readFile(storeCanary, "utf8") !== `store-${runId}\n` ||
+      await readFile(recoveryCanary, "utf8") !== `recovery-${runId}\n` ||
+      (await Promise.all(agents.map(agent => readFile(agent.privateCanary, "utf8"))))
+        .some((value, index) => value !== `private-${agents[index].sessionId}\n`)) {
+    throw new Error("A synthetic broker or peer workspace canary changed during agent probes.");
   }
   for (const agent of agents) {
     const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
@@ -831,7 +962,8 @@ try {
     for (const name of accountsCreated.reverse()) run("userdel", [name]);
     for (const name of groupsCreated.reverse()) run("groupdel", [name]);
   }
+  for (const canary of networkCanaries.reverse()) await canary.close();
 }
 if (passed) {
-  console.log("Native Linux managed MCP passed: two UIDs/cgroups, out-of-cgroup denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.");
+  console.log("Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, out-of-cgroup denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.");
 }

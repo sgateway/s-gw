@@ -140,7 +140,7 @@ function requestFrame(child) {
 }
 
 async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
-  { intruderProfile, stopJob = false, sameProfileOutOfJob = false, borrowedHandleProbe = false } = {}) {
+  { intruderProfile, stopJob = false, sameProfileOutOfJob = false, transferTo = null } = {}) {
   const name = pipeName();
   const job = jobName();
   let run;
@@ -162,8 +162,8 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
       assert.equal(loopbackHits[family], 1, `The host ${family} control did not reach its listener.`);
       loopbackHits[family] = 0;
     }
-    let transferTargetPid;
-    if (borrowedHandleProbe) {
+    let transferTargetPid = transferTo === "host" ? process.pid : undefined;
+    if (transferTo === "same-profile") {
       transferTarget = launch(["launch-paused", profile.name, pipeName(),
         String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
         profile.canaryPath, jobName()], profile.executable);
@@ -173,7 +173,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
       assert.ok(Number.isInteger(transferTargetPid) && transferTargetPid > 0,
         "The same-profile target process ID was not reported.");
     }
-    const launchMode = borrowedHandleProbe ? "launch-transfer-paused"
+    const launchMode = transferTo ? "launch-transfer-paused"
       : stopJob ? "launch-stop-paused" : "launch-paused";
     const clientArgs = [launchMode, profile.name, name,
       String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
@@ -243,7 +243,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
       assert.match(probeResult.output.toString(), /^PROCESS-DUP-DENIED\r?\n$/,
         "The AppContainer process-handle probe did not run.");
     }
-    if (borrowedHandleProbe) {
+    if (transferTo === "same-profile") {
       const connectedPid = await deadline(client.processPid, 10_000, "connected client PID");
       assert.ok(Number.isInteger(connectedPid) && connectedPid > 0,
         "The connected AppContainer process ID was not reported.");
@@ -283,9 +283,9 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
     ]);
     assert.equal(broker.code, 0, broker.stderr || "The broker did not complete the verified exchange.");
     assert.equal(agent.code, 0, agent.stderr || "The AppContainer client did not receive the broker reply.");
-    if (borrowedHandleProbe) {
+    if (transferTo) {
       assert.match(agent.output.toString(), /(?:^|\n)CONNECTED-PIPE-TRANSFER-DENIED\r?\n/,
-        "The connected client did not prove a denied handle transfer to the same-profile target.");
+        `The connected client did not prove a denied handle transfer to the ${transferTo} target.`);
     }
     assert.deepEqual(loopbackHits, { ipv4: 0, ipv6: 0 },
       "The AppContainer reached host loopback without a network capability.");
@@ -401,7 +401,9 @@ try {
     await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
       { intruderProfile: profiles[0] });
     await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
-      { borrowedHandleProbe: true });
+      { transferTo: "same-profile" });
+    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
+      { transferTo: "host" });
     await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { stopJob: true });
     for (const profile of profiles) {
       assert.equal(readFileSync(profile.canaryPath, "utf8"), "broker-only fixture data\n",
@@ -415,7 +417,7 @@ try {
       assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
     }
   }
-  console.log("Native Windows two-agent pipe, same-profile out-of-Job and connected-handle transfer denials, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
+  console.log("Native Windows two-agent pipe, same-profile out-of-Job and connected-handle transfer denials to same-profile and host targets, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

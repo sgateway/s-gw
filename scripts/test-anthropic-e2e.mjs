@@ -32,7 +32,8 @@ const env = {
   SGW_HOME: storeHome, SGW_MASTER_PASSPHRASE: randomUUID(), SGW_DISABLE_KEYCHAIN: '1',
   SGW_DISABLE_ONEPASSWORD_BACKUP: '1', SGW_DISABLE_UPDATE_CHECK: '1', SGW_ALLOW_TOKEN_FILE: '1',
   SGW_ALLOW_NO_CGROUP: process.argv.includes('--require-cgroup') ? undefined : '1',
-  SGW_DISABLE_PROCESS_AGENT_DETECTION: '1', SGW_SKIP_HOOK_INSTALL: '1'
+  SGW_DISABLE_PROCESS_AGENT_DETECTION: '1', SGW_SKIP_HOOK_INSTALL: '1',
+  npm_config_unclassified: 'q7', SGW_E2E_UNCLASSIFIED: 'z4'
 };
 
 function run(command, args, options = {}) {
@@ -304,6 +305,7 @@ try {
     consoleApproval: true, pendingDenied: true, changedActionDenied: true, replayDenied: true,
     unverifiedRepeatRequiresManualApproval: true, freshRunStillPending: true, credentialsRedacted: true, cleanup: true,
     cgroupRequired: process.platform === 'linux' && process.argv.includes('--require-cgroup'), isolatedAuth,
+    unknownInheritedEnvDenied: isolatedAuth,
     realAgent: realAgent || 'not requested' }));
 } catch (error) {
   let message = error instanceof Error ? error.stack : String(error);

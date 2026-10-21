@@ -10,7 +10,11 @@ const fixture = JSON.parse(readFileSync('fixture.json', 'utf8'));
 assert.equal(process.env.SGW_MASTER_PASSPHRASE, undefined);
 assert.equal(process.env.SGW_ALLOW_NONINTERACTIVE_OPERATOR, undefined);
 assert.throws(() => readFileSync(fixture.storeHome + '/store.json'), /EPERM|EACCES|ENOENT/);
-if (fixture.isolatedAuth) assert.throws(() => readFileSync(fixture.syntheticAuthPath), /EPERM|EACCES|ENOENT/);
+if (fixture.isolatedAuth) {
+  assert.throws(() => readFileSync(fixture.syntheticAuthPath), /EPERM|EACCES|ENOENT/);
+  assert.equal(process.env.npm_config_unclassified, undefined);
+  assert.equal(process.env.SGW_E2E_UNCLASSIFIED, undefined);
+}
 assert.throws(() => writeFileSync(configPath, '{}'), /EPERM|EACCES|EROFS/);
 const consolePort = Number(new URL(fixture.consoleUrl).port);
 const consoleReachable = await new Promise(resolve => {
