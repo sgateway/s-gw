@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, request as httpsRequest, type Server as HttpsServer } from "node:https";
+import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -227,5 +228,84 @@ describe("model relay transport", () => {
     authorized = false;
     expect((await request()).status).toBe(403);
     expect(hits).toBe(2);
+  });
+
+  it("does not forward a credential reflected in an upstream header name", async () => {
+    const fixture = await startFixture("anthropic", (_req, res) => {
+      res.writeHead(200, { [`x-ratelimit-${key}`]: "1", "x-ratelimit-limit-requests": "20" }).end("{}");
+    });
+    const response = await fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get(`x-ratelimit-${key}`)).toBeNull();
+    expect(response.headers.get("x-ratelimit-limit-requests")).toBe("20");
+  });
+
+  it("closes a stalled partial request after authorization is revoked", async () => {
+    let authorized = true;
+    let checks = 0;
+    const fixture = await startFixture("anthropic", (_req, res) => res.end("unexpected"), async () => {
+      checks++;
+      if (!authorized) throw new Error("revoked");
+    });
+    const port = Number(new URL(fixture.url).port);
+    const socket = connect(port, "127.0.0.1");
+    try {
+      await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+      socket.write("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{");
+      const deadline = Date.now() + 1000;
+      while (checks === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(checks).toBeGreaterThan(0);
+      const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+      authorized = false;
+      await Promise.race([closed, new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("Revoked partial request stayed open.")), 2500))]);
+      expect(fixture.outbound).toEqual([]);
+    } finally { socket.destroy(); }
+  });
+
+  it("bounds simultaneous request bodies and admits another after stalled clients leave", async () => {
+    const fixture = await startFixture("anthropic", async (req, res) => {
+      let bytes = 0;
+      for await (const chunk of req) bytes += chunk.length;
+      res.writeHead(200, { "content-type": "text/plain" }).end(String(bytes));
+    });
+    const endpoint = fixture.url + "/v1/messages";
+    const fullBody = Buffer.alloc(32 * 1024 * 1024, 0x20);
+    const full = await fetch(endpoint, {
+      method: "POST", headers: { "content-type": "application/json" }, body: fullBody
+    });
+    expect(full.status).toBe(200);
+    expect(await full.text()).toBe(String(fullBody.length));
+
+    const port = Number(new URL(fixture.url).port);
+    const stalled: ReturnType<typeof connect>[] = [];
+    const partial = Buffer.alloc(31 * 1024 * 1024, 0x20);
+    try {
+      for (let i = 0; i < 2; i++) {
+        const socket = connect(port, "127.0.0.1");
+        socket.on("error", () => {});
+        stalled.push(socket);
+        await new Promise<void>((resolve, reject) => {
+          socket.once("connect", resolve); socket.once("error", reject);
+        });
+        socket.write(`POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${fullBody.length}\r\n\r\n`);
+        await new Promise<void>((resolve, reject) => socket.write(partial, error => error ? reject(error) : resolve()));
+      }
+      const crowded = await fetch(endpoint, {
+        method: "POST", headers: { "content-type": "application/json" }, body: Buffer.alloc(3 * 1024 * 1024, 0x20)
+      });
+      expect(crowded.status).toBe(503);
+      expect(fixture.outbound).toHaveLength(1);
+    } finally {
+      for (const socket of stalled) socket.destroy();
+    }
+
+    const recovered = await fetch(endpoint, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    });
+    expect(recovered.status).toBe(200);
+    expect(await recovered.text()).toBe("2");
   });
 });

@@ -24,8 +24,15 @@ const destinations: Record<ModelProvider, string> = {
   openai: "api.openai.com"
 };
 const maxBodyBytes = 32 * 1024 * 1024;
+const maxBufferedBodyBytes = 2 * maxBodyBytes;
 const maxResponseBytes = 64 * 1024 * 1024;
 const marker = Buffer.from("[s-gw withheld credential]");
+let bufferedBodyBytes = 0;
+
+interface BufferedBody {
+  data?: Buffer;
+  release(): void;
+}
 
 class RelayError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
@@ -107,23 +114,40 @@ function upstreamHeaders(req: IncomingMessage, authority: ModelRelayAuthority, b
   return headers;
 }
 
-async function requestBody(req: IncomingMessage, signal: AbortSignal): Promise<Buffer> {
+async function requestBody(req: IncomingMessage, signal: AbortSignal): Promise<BufferedBody> {
   if (req.method === "GET") {
     if (req.headers["transfer-encoding"] || (req.headers["content-length"] && req.headers["content-length"] !== "0")) {
       throw new RelayError(400, "GET model requests cannot have a body.");
     }
-    return Buffer.alloc(0);
+    return { data: Buffer.alloc(0), release() {} };
   }
   const parts: Buffer[] = [];
   let size = 0;
-  for await (const part of req) {
+  let reserved = 0;
+  const release = () => { bufferedBodyBytes -= reserved; reserved = 0; };
+  const onAbort = () => req.destroy(signal.reason instanceof Error ? signal.reason : new Error("Model request ended."));
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
     signal.throwIfAborted();
-    const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
-    size += chunk.length;
-    if (size > maxBodyBytes) throw new RelayError(413, "Model request exceeds 32 MiB.");
-    parts.push(chunk);
+    for await (const part of req) {
+      signal.throwIfAborted();
+      const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
+      size += chunk.length;
+      if (size > maxBodyBytes) throw new RelayError(413, "Model request exceeds 32 MiB.");
+      if (bufferedBodyBytes + chunk.length > maxBufferedBodyBytes) {
+        throw new RelayError(503, "Model relay request buffer is full.");
+      }
+      bufferedBodyBytes += chunk.length;
+      reserved += chunk.length;
+      parts.push(chunk);
+    }
+    return { data: Buffer.concat(parts, size), release };
+  } catch (error) {
+    release();
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
-  return Buffer.concat(parts, size);
 }
 
 class StreamRedactor {
@@ -170,10 +194,10 @@ function responseHeaders(upstream: IncomingMessage, credential: string): Record<
   const headers: Record<string, string> = {};
   const variants = secretVariants(credential).map(value => value.toString());
   for (const [name, value] of Object.entries(upstream.headers)) {
-    if (typeof value !== "string" || variants.some(secret => value.includes(secret))) continue;
+    if (typeof value !== "string" || variants.some(secret => name.includes(secret) || value.includes(secret))) continue;
+    const rateLimit = /^(?:anthropic-ratelimit-(?:requests|tokens|input-tokens|output-tokens)-(?:limit|remaining|reset)|x-ratelimit-(?:limit|remaining|reset)-(?:requests|tokens))$/.test(name);
     if (name === "content-type" || name === "retry-after" || name === "x-should-retry" ||
-        name === "x-request-id" || name.startsWith("anthropic-ratelimit-") ||
-        name.startsWith("x-ratelimit-")) {
+        name === "x-request-id" || rateLimit) {
       validateHeaderValue(name, value);
       headers[name] = value;
     }
@@ -189,9 +213,12 @@ async function writeChunk(res: ServerResponse, chunk: Buffer, signal: AbortSigna
   await new Promise<void>((resolve, reject) => {
     const onDrain = () => { cleanup(); resolve(); };
     const onClose = () => { cleanup(); reject(new Error("Model relay client disconnected.")); };
-    const cleanup = () => { res.off("drain", onDrain); res.off("close", onClose); };
+    const onAbort = () => { cleanup(); reject(signal.reason); };
+    const cleanup = () => { res.off("drain", onDrain); res.off("close", onClose); signal.removeEventListener("abort", onAbort); };
     res.once("drain", onDrain);
     res.once("close", onClose);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
 }
 
@@ -214,14 +241,16 @@ export async function relayModelRequest(
     await checking;
   };
   const monitor = setInterval(() => { void check(); }, 1000);
+  let buffered: BufferedBody | undefined;
+  let outbound: ClientRequest | undefined;
   try {
     if (!authority.credential || authority.credential.length > 16_384) throw new RelayError(403, "Model relay credential is unavailable.");
     validateHeaderValue("authorization", authority.credential);
     const route = modelRoute(authority.provider, req.method, req.url);
     await check();
     abort.signal.throwIfAborted();
-    const body = await requestBody(req, abort.signal);
-    const headers = upstreamHeaders(req, authority, body.length);
+    buffered = await requestBody(req, abort.signal);
+    const headers = upstreamHeaders(req, authority, buffered.data!.length);
     await check();
     abort.signal.throwIfAborted();
 
@@ -240,8 +269,12 @@ export async function relayModelRequest(
           }).catch(error => callback(error, "", 4));
         }
       }, resolve);
+      outbound = call;
+      call.once("finish", buffered!.release);
+      call.once("close", buffered!.release);
       call.once("error", reject);
-      call.end(body);
+      call.end(buffered!.data);
+      buffered!.data = undefined;
     });
     if (upstream.statusCode && upstream.statusCode >= 300 && upstream.statusCode < 400) {
       upstream.destroy();
@@ -253,20 +286,27 @@ export async function relayModelRequest(
     }
     await check();
     abort.signal.throwIfAborted();
+    const onAbortUpstream = () => upstream.destroy(abort.signal.reason instanceof Error ? abort.signal.reason : new Error("Model relay ended."));
+    abort.signal.addEventListener("abort", onAbortUpstream, { once: true });
     res.writeHead(upstream.statusCode || 502, responseHeaders(upstream, authority.credential));
-    const redactor = new StreamRedactor(authority.credential);
-    let received = 0;
-    for await (const part of upstream) {
-      abort.signal.throwIfAborted();
-      received += part.length;
-      if (received > maxResponseBytes) throw new RelayError(502, "Model response exceeded 64 MiB.");
-      await check();
-      abort.signal.throwIfAborted();
-      await writeChunk(res, redactor.push(part), abort.signal);
+    try {
+      const redactor = new StreamRedactor(authority.credential);
+      let received = 0;
+      for await (const part of upstream) {
+        abort.signal.throwIfAborted();
+        received += part.length;
+        if (received > maxResponseBytes) throw new RelayError(502, "Model response exceeded 64 MiB.");
+        await check();
+        abort.signal.throwIfAborted();
+        await writeChunk(res, redactor.push(part), abort.signal);
+      }
+      await writeChunk(res, redactor.push(Buffer.alloc(0), true), abort.signal);
+      res.end();
+    } finally {
+      abort.signal.removeEventListener("abort", onAbortUpstream);
     }
-    await writeChunk(res, redactor.push(Buffer.alloc(0), true), abort.signal);
-    res.end();
   } catch (error) {
+    outbound?.destroy();
     if (res.headersSent) { res.destroy(); return; }
     const status = error instanceof RelayError ? error.status
       : abort.signal.aborted && abort.signal.reason instanceof Error && abort.signal.reason.message.includes("timed out") ? 504
@@ -277,6 +317,7 @@ export async function relayModelRequest(
     res.writeHead(status, { "content-type": "text/plain", "cache-control": "no-store" });
     res.end(message);
   } finally {
+    buffered?.release();
     clearTimeout(timeout);
     clearInterval(monitor);
     req.off("aborted", onClose);
