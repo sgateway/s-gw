@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, realpath, rm, rmdir, writeFile } from "node:fs/promises";
+import { createServer as createHttpsServer } from "node:https";
 import { createConnection } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,8 +18,8 @@ if (!Number.isSafeInteger(brokerUid) || brokerUid < 1 || !Number.isSafeInteger(b
   throw new Error("Invalid native fixture broker identity.");
 }
 
-function run(command, args, allowFailure = false) {
-  const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000 });
+function run(command, args, allowFailure = false, env = process.env) {
+  const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000, env });
   if (!allowFailure && (result.error || result.status !== 0)) {
     throw new Error(`${command} failed: ${result.error?.message || result.stderr || result.stdout || result.status}`);
   }
@@ -41,11 +42,13 @@ async function maybeText(filename) {
 }
 
 function availableUid() {
-  for (let uid = 232000; uid < 232999; uid++) {
+  for (let uid = 232000; uid < 232998; uid++) {
     if (run("getent", ["passwd", String(uid)], true).status === 2 &&
-        run("getent", ["group", String(uid)], true).status === 2) return uid;
+        run("getent", ["group", String(uid)], true).status === 2 &&
+        run("getent", ["passwd", String(uid + 1)], true).status === 2 &&
+        run("getent", ["group", String(uid + 1)], true).status === 2) return uid;
   }
-  throw new Error("No disposable Linux UID is available.");
+  throw new Error("No disposable Linux UID pair is available.");
 }
 
 function safeUnitValue(value) {
@@ -80,36 +83,66 @@ function invocationId(properties) {
   return /^[0-9a-f]{32}$/.test(value ?? "") ? value : undefined;
 }
 
+async function assertSafeNodeEnv(properties, caFile) {
+  const pid = Number(properties.get("MainPID"));
+  if (!Number.isSafeInteger(pid) || pid < 1) {
+    throw new Error("The native broker or root control has no live main PID.");
+  }
+  const environment = (await readFile(`/proc/${pid}/environ`)).toString("utf8").split("\0");
+  if (environment.some(value => value.startsWith("NODE_OPTIONS=") ||
+      value.startsWith("NODE_PATH=") || value.startsWith("NODE_TLS_REJECT_UNAUTHORIZED="))) {
+    throw new Error("A native broker or root control inherited an unsafe Node override.");
+  }
+  const caSettings = environment.filter(value => value.startsWith("NODE_EXTRA_CA_CERTS="));
+  if (caSettings.length !== (caFile ? 1 : 0) ||
+      (caFile && caSettings[0] !== `NODE_EXTRA_CA_CERTS=${caFile}`)) {
+    throw new Error("Native Node CA bundle does not match the root-owned fixture certificate.");
+  }
+}
+
 const runId = randomBytes(5).toString("hex");
-const sessionId = `ci-mcp-${runId}`;
 const uid = availableUid();
-const groupName = `sgwmcp${runId.slice(0, 7)}`;
-const userName = groupName;
 const brokerUser = run("id", ["-nu", String(brokerUid)]).stdout.trim();
 const brokerGroup = run("getent", ["group", String(brokerGid)]).stdout.split(":")[0];
 const arch = process.arch;
-const root = `/var/lib/s-gw/agent-roots/${sessionId}`;
-const socketPath = `/run/s-gw/agents/${sessionId}/broker.sock`;
 const leaseDir = `/run/s-gw/ci-lease-${runId}`;
 const storeHome = `/run/s-gw/ci-store-${runId}`;
-const configPath = `/run/s-gw/ci-config-${runId}.json`;
+const recoveryHome = `/run/s-gw/ci-recovery-${runId}`;
+const envFile = `/run/s-gw/ci-env-${runId}`;
+const planDir = "/run/s-gw/agent-plans";
 const installed = `/run/s-gw/ci-control-${runId}`;
 const controlDir = path.join(installed, "control");
+const brokerPackage = path.join(installed, "broker");
 const rootNode = path.join(installed, "node");
 const controlEntry = path.join(controlDir, "linux-agent-control.js");
+const operatorEntry = path.join(project, "scripts/linux-managed-mcp-operator.mjs");
 const controlUnit = "s-gw-agent-control.service";
 const controlDescription = `s-gw-ci-control:${runId}`;
-const agentUnit = `s-gw-agent-${sessionId}.service`;
-const socketUnit = `s-gw-managed-mcp-${sessionId}.socket`;
-const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
-const socketUnitFile = `/run/systemd/system/${socketUnit}`;
-const brokerUnitFile = `/run/systemd/system/${brokerUnit}`;
-const plan = {
-  sessionId, uid, gid: uid, brokerUid, rootDirectory: root, brokerSocket: socketPath,
-  executable: "/usr/bin/managed-mcp-probe", args: [],
-  launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
-  serializedLifecycle: true, sealedStdio: true, supervisedControlUnit: true
-};
+const agents = [0, 1].map(index => {
+  const letter = index === 0 ? "a" : "b";
+  const sessionId = `ci-mcp-${runId}-${letter}`;
+  const agentUid = uid + index;
+  const userName = `sgwmcp${runId.slice(0, 7)}${letter}`;
+  const root = `/var/lib/s-gw/agent-roots/${sessionId}`;
+  const socketPath = `/run/s-gw/agents/${sessionId}/broker.sock`;
+  const agentUnit = `s-gw-agent-${sessionId}.service`;
+  const socketUnit = `s-gw-managed-mcp-${sessionId}.socket`;
+  const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
+  const socketUnitFile = `/run/systemd/system/${socketUnit}`;
+  const brokerUnitFile = `/run/systemd/system/${brokerUnit}`;
+  const configPath = `/run/s-gw/ci-config-${runId}-${letter}.json`;
+  const planPath = `${planDir}/${sessionId}.json`;
+  const claimPaths = [`${planDir}/uid-${agentUid}.used`, `${planDir}/gid-${agentUid}.used`,
+    `${planDir}/session-${sessionId}.used`];
+  const name = `Native managed MCP agent ${letter.toUpperCase()}`;
+  const plan = { sessionId, uid: agentUid, gid: agentUid, brokerUid,
+    rootDirectory: root, brokerSocket: socketPath,
+    executable: "/usr/bin/managed-mcp-probe", args: [],
+    launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
+    serializedLifecycle: true, sealedStdio: true, supervisedControlUnit: true };
+  return { sessionId, uid: agentUid, userName, root, socketPath, agentUnit, socketUnit,
+    brokerUnit, socketUnitFile, brokerUnitFile, configPath, planPath, claimPaths, name, plan };
+});
 const owned = new Map();
 async function remember(filename) {
   const info = await lstat(filename);
@@ -138,6 +171,60 @@ async function assertOwned(filename) {
   return true;
 }
 
+async function checkedBrokerTree() {
+  const pending = [brokerPackage];
+  while (pending.length) {
+    const filename = pending.pop();
+    const stat = await lstat(filename);
+    if (stat.isSymbolicLink()) {
+      const target = await realpath(filename);
+      if (!target.startsWith(`${brokerPackage}/`)) {
+        throw new Error(`Native broker package symlink escapes its root: ${filename}`);
+      }
+      continue;
+    }
+    if (stat.uid !== 0 || (stat.mode & 0o022) !== 0 ||
+        (!stat.isFile() && !stat.isDirectory())) {
+      throw new Error(`Native broker package is writable or not root-owned: ${filename}`);
+    }
+    if (stat.isDirectory()) {
+      for (const name of await readdir(filename)) pending.push(path.join(filename, name));
+    }
+  }
+}
+
+async function checkedInstalledFile(filename) {
+  const item = await lstat(filename);
+  if (!item.isFile() || item.uid !== 0 || item.nlink !== 1 ||
+      (item.mode & 0o022) !== 0 || await realpath(filename) !== filename) {
+    throw new Error(`Native fixture file is not root controlled: ${filename}`);
+  }
+  let parent = path.dirname(filename);
+  while (true) {
+    const dir = await lstat(parent);
+    if (!dir.isDirectory() || dir.uid !== 0 || (dir.mode & 0o022) !== 0 ||
+        await realpath(parent) !== parent) {
+      throw new Error(`Native fixture parent is not root controlled: ${parent}`);
+    }
+    const next = path.dirname(parent);
+    if (next === parent) return;
+    parent = next;
+  }
+}
+
+async function rememberClaimMarkers(agent) {
+  const expected = `${agent.sessionId} ${agent.uid} ${agent.plan.gid}\n`;
+  for (const filename of agent.claimPaths) {
+    const value = await until(() => maybeText(filename), `${agent.sessionId} identity claim`);
+    const info = await lstat(filename);
+    if (value !== expected || !info.isFile() || info.uid !== 0 ||
+        (info.mode & 0o777) !== 0o600 || info.nlink !== 1) {
+      throw new Error(`The root identity claim changed: ${filename}`);
+    }
+    await remember(filename);
+  }
+}
+
 function fixtureControl(properties) {
   const command = `argv[]=${rootNode} ${controlEntry} --serve ${brokerUid} ${brokerGid} ;`;
   return properties.get("Id") === controlUnit &&
@@ -152,17 +239,20 @@ async function fixtureUnitFile(unit, filename) {
   return properties.get("Id") === unit && properties.get("FragmentPath") === filename;
 }
 
-let accountCreated = false;
-let groupCreated = false;
+const accountsCreated = [];
+const groupsCreated = [];
 let unitsInstalled = false;
 let controlStarted = false;
 let controlStartAttempted = false;
-let socketStartAttempted = false;
-let socketStarted = false;
+const socketStartAttempted = new Set();
+const socketStarted = new Set();
 let fixtureOwned = false;
+let planDirCreated = false;
 let controlInvocation;
-let agentInvocation;
-let brokerInvocation;
+const agentInvocations = new Map();
+const brokerInvocations = new Map();
+let upstream;
+let passed = false;
 try {
   let controlSocketExists = false;
   try { await lstat("/run/s-gw/agent-control.sock"); controlSocketExists = true; }
@@ -173,8 +263,10 @@ try {
       controlSocketExists) {
     throw new Error("A Linux agent control service is already installed on this CI host.");
   }
-  for (const filename of [root, path.dirname(socketPath), leaseDir, storeHome, configPath,
-    installed, socketUnitFile, brokerUnitFile]) {
+  const uniquePaths = [leaseDir, storeHome, recoveryHome, envFile, installed,
+    ...agents.flatMap(agent => [agent.root, path.dirname(agent.socketPath), agent.configPath,
+      agent.planPath, agent.socketUnitFile, agent.brokerUnitFile, ...agent.claimPaths])];
+  for (const filename of uniquePaths) {
     try { await lstat(filename); throw new Error(`Native fixture path already exists: ${filename}`); }
     catch (error) { if (error.code !== "ENOENT") throw error; }
   }
@@ -183,14 +275,35 @@ try {
     "/run/s-gw/agents", "/run/s-gw/launch-gates"]) {
     await mkdir(directory, { recursive: true, mode: 0o755 });
   }
+  try {
+    const stat = await lstat(planDir);
+    if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o777) !== 0o700) {
+      throw new Error("The Linux agent-plan directory is not root-owned mode 0700.");
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    await mkdir(planDir, { mode: 0o700 });
+    await remember(planDir);
+    planDirCreated = true;
+  }
   await mkdir(installed, { mode: 0o755 });
   await remember(installed);
   await mkdir(controlDir, { mode: 0o755 });
-  await mkdir(root, { mode: 0o755 });
-  await remember(root);
-  for (const relative of ["usr", "usr/bin", "usr/libexec", "usr/libexec/s-gw",
-    "run", "run/s-gw", "run/s-gw/launch-gate", "dev", "dev/shm", "workspace"]) {
-    await mkdir(path.join(root, relative), { recursive: true, mode: 0o755 });
+  await mkdir(brokerPackage, { mode: 0o755 });
+  run("cp", ["-R", path.join(project, "dist"), brokerPackage]);
+  run("cp", ["-R", path.join(project, "node_modules"), brokerPackage]);
+  await mkdir(path.join(brokerPackage, "tools"), { mode: 0o755 });
+  run("cp", ["-R", path.join(project, "tools/desktop-packager"),
+    path.join(brokerPackage, "tools")]);
+  await copyFile(path.join(project, "package.json"), path.join(brokerPackage, "package.json"));
+  run("chmod", ["-R", "go-w", brokerPackage]);
+  for (const agent of agents) {
+    await mkdir(agent.root, { mode: 0o755 });
+    await remember(agent.root);
+    for (const relative of ["usr", "usr/bin", "usr/libexec", "usr/libexec/s-gw",
+      "run", "run/s-gw", "run/s-gw/launch-gate", "dev", "dev/shm", "workspace"]) {
+      await mkdir(path.join(agent.root, relative), { recursive: true, mode: 0o755 });
+    }
   }
   await mkdir(leaseDir, { mode: 0o700 });
   await remember(leaseDir);
@@ -198,13 +311,18 @@ try {
   await mkdir(storeHome, { mode: 0o700 });
   await remember(storeHome);
   await chown(storeHome, brokerUid, brokerGid);
-  run("groupadd", ["--gid", String(uid), groupName]);
-  groupCreated = true;
-  run("useradd", ["--system", "--uid", String(uid), "--gid", groupName,
-    "--no-create-home", "--shell", "/usr/sbin/nologin", userName]);
-  accountCreated = true;
-  await chown(`${root}/workspace`, uid, uid);
-  await chmod(`${root}/workspace`, 0o700);
+  await mkdir(recoveryHome, { mode: 0o700 });
+  await remember(recoveryHome);
+  await chown(recoveryHome, brokerUid, brokerGid);
+  for (const agent of agents) {
+    run("groupadd", ["--gid", String(agent.uid), agent.userName]);
+    groupsCreated.push(agent.userName);
+    run("useradd", ["--system", "--uid", String(agent.uid), "--gid", agent.userName,
+      "--no-create-home", "--shell", "/usr/sbin/nologin", agent.userName]);
+    accountsCreated.push(agent.userName);
+    await chown(`${agent.root}/workspace`, agent.uid, agent.uid);
+    await chmod(`${agent.root}/workspace`, 0o700);
+  }
   for (const name of ["linux-agent-control.js", "linux-agent-unit.js", "linux-peer-identity.js"]) {
     await copyFile(path.join(project, "dist", name), path.join(controlDir, name));
     await chmod(path.join(controlDir, name), 0o755);
@@ -212,44 +330,117 @@ try {
   await writeFile(path.join(controlDir, "package.json"), '{"type":"module"}\n', { mode: 0o644 });
   await copyFile(process.execPath, rootNode);
   await chmod(rootNode, 0o755);
+  const brokerVerifierDir = path.join(brokerPackage, "dist", "native", `linux-${arch}`);
+  await mkdir(brokerVerifierDir, { recursive: true, mode: 0o755 });
   run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/peer-credentials/peer-credentials.c"),
-    "-o", path.join(installed, "peer-credentials")]);
-  const gate = `${root}/usr/libexec/s-gw/agent-launch-gate`;
-  const probe = `${root}/usr/bin/managed-mcp-probe`;
-  run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
-    path.join(project, "native/linux-agent-gate/launch-gate.c"), "-o", gate]);
-  run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
-    path.join(project, "scripts/linux-managed-mcp-probe.c"), "-o", probe]);
-  await chmod(gate, 0o755);
-  await chmod(probe, 0o755);
-  await writeFile(configPath, JSON.stringify({ name: "Native managed MCP agent", leaseDir, plan }) + "\n",
-    { mode: 0o640 });
-  await chown(configPath, 0, brokerGid);
-  await chmod(configPath, 0o640);
-  await remember(configPath);
-  const node = safeUnitValue(process.execPath);
-  const entry = safeUnitValue(path.join(project, "dist/linux-managed-mcp.js"));
-  const config = safeUnitValue(configPath);
-  const fixtureHome = safeUnitValue(storeHome);
+    "-o", path.join(brokerVerifierDir, "s-gw-peer-credentials")]);
+  await checkedBrokerTree();
+  for (const filename of [rootNode, path.join(brokerPackage, "dist/linux-managed-mcp.js"),
+    path.join(brokerVerifierDir, "s-gw-peer-credentials")]) {
+    await checkedInstalledFile(filename);
+  }
+  const verifierDir = path.join(installed, "dist", "native", `linux-${arch}`);
+  await mkdir(verifierDir, { recursive: true, mode: 0o755 });
+  run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+    path.join(project, "native/linux-peer-identity/verify.c"),
+    "-o", path.join(verifierDir, "s-gw-linux-peer-identity")]);
+  for (const agent of agents) {
+    const gate = `${agent.root}/usr/libexec/s-gw/agent-launch-gate`;
+    const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
+    run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+      path.join(project, "native/linux-agent-gate/launch-gate.c"), "-o", gate]);
+    run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+      path.join(project, "scripts/linux-managed-mcp-probe.c"), "-o", probe]);
+    await chmod(gate, 0o755);
+    await chmod(probe, 0o755);
+  }
+  const keyFile = path.join(installed, "upstream.key");
+  const certFile = path.join(installed, "upstream.crt");
+  run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyFile,
+    "-out", certFile, "-days", "1", "-subj", "/CN=localhost",
+    "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"]);
+  await chmod(certFile, 0o644);
+  await checkedInstalledFile(certFile);
+  const tls = { key: await readFile(keyFile), cert: await readFile(certFile) };
+  const upstreamAuths = [];
+  upstream = createHttpsServer(tls, (request, response) => {
+    upstreamAuths.push(String(request.headers.authorization || ""));
+    response.end("approved fixture");
+  });
+  await new Promise((resolve, reject) => {
+    upstream.once("error", reject);
+    upstream.listen(0, "127.0.0.1", () => { upstream.off("error", reject); resolve(); });
+  });
+  const upstreamAddress = upstream.address();
+  if (!upstreamAddress || typeof upstreamAddress === "string") {
+    throw new Error("Native HTTPS fixture has no loopback port.");
+  }
+  const upstreamPort = upstreamAddress.port;
+  const url = `https://127.0.0.1:${upstreamPort}/operation`;
   const secret = `synthetic-${randomUUID()}`;
-  await writeFile(socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${socketPath}\nSocketUser=root\nSocketGroup=${groupName}\nSocketMode=0660\nDirectoryMode=0711\nFileDescriptorName=s-gw-agent-${sessionId}\nAccept=no\nRemoveOnStop=no\nService=${brokerUnit}\n`, { mode: 0o644 });
-  await remember(socketUnitFile);
-  await writeFile(brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironment=SGW_HOME=${fixtureHome}\nEnvironment=SGW_MASTER_PASSPHRASE=${secret}\nEnvironment=SGW_DISABLE_KEYCHAIN=1\nExecStart=${node} ${entry} ${config}\nRestart=no\n`, { mode: 0o644 });
-  await remember(brokerUnitFile);
+  const operatorEnv = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", CI: "true", SGW_HOME: storeHome,
+    SGW_RECOVERY_HOME: recoveryHome, SGW_MASTER_PASSPHRASE: secret,
+    SGW_DISABLE_KEYCHAIN: "1", SGW_DISABLE_ONEPASSWORD_BACKUP: "1" };
+  const asBroker = (mode, args) => run("runuser", ["-u", brokerUser, "--", process.execPath,
+    operatorEntry, mode, ...args], false, operatorEnv).stdout.trim();
+  for (const agent of agents) {
+    agent.seeded = JSON.parse(asBroker("seed", [String(upstreamPort)]));
+    if (!/^s-gw:api-token:[A-Za-z0-9_-]+$/.test(agent.seeded.handle) ||
+        !/^synthetic-managed-mcp-[A-Za-z0-9-]+$/.test(agent.seeded.value)) {
+      throw new Error("Invalid native fixture handle or synthetic value.");
+    }
+    await writeFile(`${agent.root}/workspace/handle`, `${agent.seeded.handle}\n`, { mode: 0o644 });
+    await writeFile(`${agent.root}/workspace/url`, `${url}\n`, { mode: 0o644 });
+    await writeFile(agent.configPath, JSON.stringify({ name: agent.name, leaseDir, plan: agent.plan }) + "\n",
+      { mode: 0o640 });
+    await chown(agent.configPath, 0, brokerGid);
+    await chmod(agent.configPath, 0o640);
+    await remember(agent.configPath);
+  }
+  const node = safeUnitValue(rootNode);
+  const entry = safeUnitValue(path.join(brokerPackage, "dist/linux-managed-mcp.js"));
+  const environmentFile = safeUnitValue(envFile);
+  await writeFile(envFile, `CI=true\nSGW_HOME=${storeHome}\nSGW_RECOVERY_HOME=${recoveryHome}\nSGW_MASTER_PASSPHRASE=${secret}\nSGW_DISABLE_KEYCHAIN=1\nSGW_DISABLE_ONEPASSWORD_BACKUP=1\nNODE_EXTRA_CA_CERTS=${certFile}\n`, { mode: 0o600 });
+  await remember(envFile);
+  for (const agent of agents) {
+    const config = safeUnitValue(agent.configPath);
+    await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
+    await remember(agent.socketUnitFile);
+    await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED\nExecStart=${node} ${entry} ${config}\nRestart=no\n`, { mode: 0o644 });
+    await remember(agent.brokerUnitFile);
+    await writeFile(agent.planPath, JSON.stringify({ plan: agent.plan, brokerUnit: agent.brokerUnit,
+      brokerUnitFile: agent.brokerUnitFile, brokerEntry: entry, brokerConfig: config }) + "\n",
+      { mode: 0o600 });
+    await remember(agent.planPath);
+    await checkedInstalledFile(agent.configPath);
+    await checkedInstalledFile(agent.planPath);
+    const configInfo = await lstat(agent.configPath);
+    const planInfo = await lstat(agent.planPath);
+    if (configInfo.gid !== brokerGid || (configInfo.mode & 0o777) !== 0o640 ||
+        (planInfo.mode & 0o777) !== 0o600) {
+      throw new Error("Native broker config or root plan has unsafe ownership or mode.");
+    }
+  }
+  await checkedInstalledFile(envFile);
+  if (((await lstat(envFile)).mode & 0o777) !== 0o600) {
+    throw new Error("Native broker environment file is readable outside root.");
+  }
   unitsInstalled = true;
   run("systemctl", ["--system", "daemon-reload"]);
   controlStartAttempted = true;
   run("systemd-run", ["--system", "--no-ask-password", "--unit=s-gw-agent-control",
     `--description=${controlDescription}`,
-    "--property=Type=exec", "--property=Restart=no", "--",
+    "--property=Type=exec", "--property=Restart=no",
+    "--property=UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS", "--",
     rootNode, controlEntry, "--serve", String(brokerUid), String(brokerGid)]);
   const control = unitProperties(controlUnit,
-    ["Id", "Description", "ExecStart", "ControlGroup", "InvocationID"]);
+    ["Id", "Description", "ExecStart", "ControlGroup", "InvocationID", "MainPID"]);
   controlInvocation = invocationId(control);
   if (!fixtureControl(control) || !controlInvocation) {
     throw new Error("The started root control unit has no verified fixture invocation.");
   }
+  await assertSafeNodeEnv(control);
   controlStarted = true;
   await until(async () => {
     try {
@@ -258,51 +449,140 @@ try {
     } catch { return false; }
   }, "root Linux agent control service");
   await remember("/run/s-gw/agent-control.sock");
-  socketStartAttempted = true;
-  run("systemctl", ["--system", "start", socketUnit]);
-  socketStarted = true;
-  await remember(path.dirname(socketPath));
-  await new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    socket.once("error", reject);
-    socket.once("connect", () => { socket.destroy(); resolve(); });
-  });
-  const result = await until(() => maybeText(`${root}/workspace/result`), "verified MCP agent request");
-  if (result !== "verified-mcp=1\n") throw new Error(`Unexpected verified MCP result: ${result}`);
-  const broker = unitProperties(brokerUnit, ["Id", "FragmentPath", "InvocationID"]);
-  brokerInvocation = invocationId(broker);
-  if (broker.get("Id") !== brokerUnit || broker.get("FragmentPath") !== brokerUnitFile ||
-      !brokerInvocation) {
-    throw new Error("The managed MCP broker has no verified fixture invocation.");
+  for (const agent of agents) {
+    socketStartAttempted.add(agent.sessionId);
+    run("systemctl", ["--system", "start", agent.socketUnit]);
+    socketStarted.add(agent.sessionId);
+    await remember(path.dirname(agent.socketPath));
+    await new Promise((resolve, reject) => {
+      const socket = createConnection(agent.socketPath);
+      socket.once("error", reject);
+      socket.once("connect", () => { socket.destroy(); resolve(); });
+    });
   }
-  if (run("systemctl", ["--system", "is-active", agentUnit], true).status !== 0) {
-    throw new Error("The protected agent unit stopped before control-service revocation.");
+  for (const agent of agents) await rememberClaimMarkers(agent);
+  const { claimIdentityMarkers } = await import(new URL("../dist/linux-agent-control.js", import.meta.url));
+  for (const plan of [
+    { ...agents[0].plan, sessionId: `ci-mcp-${runId}-duplicate-uid`, gid: uid + 2 },
+    { ...agents[0].plan, sessionId: `ci-mcp-${runId}-duplicate-gid`, uid: uid + 2 }
+  ]) {
+    const unused = [`${planDir}/uid-${uid + 2}.used`, `${planDir}/gid-${uid + 2}.used`,
+      `${planDir}/session-${plan.sessionId}.used`];
+    for (const filename of unused) {
+      if (await maybeText(filename) !== undefined) {
+        throw new Error(`Native collision probe path already exists: ${filename}`);
+      }
+    }
+    try {
+      await claimIdentityMarkers(plan, planDir);
+      throw new Error("A duplicate Linux agent identity was accepted.");
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    for (const filename of unused) {
+      if (await maybeText(filename) !== undefined) {
+        throw new Error(`Rejected Linux identity left a marker: ${filename}`);
+      }
+    }
   }
-  const agent = unitProperties(agentUnit, ["Id", "Description", "User", "RootDirectory",
-    "ControlGroup", "InvocationID"]);
-  agentInvocation = invocationId(agent);
-  if (agent.get("Id") !== agentUnit ||
-      !/^s-gw-agent-start:[a-f0-9]{32}$/.test(agent.get("Description") ?? "") ||
-      agent.get("User") !== String(uid) || agent.get("RootDirectory") !== root ||
-      agent.get("ControlGroup") !== `/system.slice/${agentUnit}` || !agentInvocation) {
-    throw new Error("The protected agent has no verified fixture invocation or cgroup.");
+  for (const agent of agents) {
+    const requested = await until(() => maybeText(`${agent.root}/workspace/requested`),
+      `${agent.sessionId} verified MCP HTTPS request`);
+    if (requested !== "pending\n") throw new Error(`Unexpected HTTPS request marker: ${requested}`);
+    const broker = unitProperties(agent.brokerUnit, ["Id", "FragmentPath", "InvocationID", "MainPID"]);
+    const brokerInvocation = invocationId(broker);
+    if (broker.get("Id") !== agent.brokerUnit || broker.get("FragmentPath") !== agent.brokerUnitFile ||
+        !brokerInvocation) {
+      throw new Error("The managed MCP broker has no verified fixture invocation.");
+    }
+    await assertSafeNodeEnv(broker, certFile);
+    brokerInvocations.set(agent.sessionId, brokerInvocation);
+    if (run("systemctl", ["--system", "is-active", agent.agentUnit], true).status !== 0) {
+      throw new Error("The protected agent unit stopped before control-service revocation.");
+    }
+    const live = unitProperties(agent.agentUnit, ["Id", "Description", "User", "RootDirectory",
+      "ControlGroup", "InvocationID"]);
+    const agentInvocation = invocationId(live);
+    if (live.get("Id") !== agent.agentUnit ||
+        !/^s-gw-agent-start:[a-f0-9]{32}$/.test(live.get("Description") ?? "") ||
+        live.get("User") !== String(agent.uid) || live.get("RootDirectory") !== agent.root ||
+        live.get("ControlGroup") !== `/system.slice/${agent.agentUnit}` || !agentInvocation) {
+      throw new Error("The protected agent has no verified fixture invocation or cgroup.");
+    }
+    agentInvocations.set(agent.sessionId, agentInvocation);
   }
-  await remember(`/run/s-gw/launch-gates/${sessionId}`);
-  await remember(`/run/s-gw/agent-unit-lifecycle/${agentUnit}`);
+  if (new Set(agents.map(agent => agent.uid)).size !== 2 ||
+      new Set(agents.map(agent => unitProperties(agent.agentUnit, ["ControlGroup"]).get("ControlGroup"))).size !== 2) {
+    throw new Error("The two native agents did not have distinct UIDs and cgroups.");
+  }
+  for (const agent of agents) {
+    const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
+    const claimant = run("runuser", ["-u", agent.userName, "--", "/usr/bin/env",
+      `SGW_BROKER_SOCKET=${agent.socketPath}`, probe, "--out-of-cgroup"], true,
+      { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
+    if (claimant.error || claimant.status !== 0) {
+      throw new Error(`The same-UID out-of-cgroup process reached ${agent.sessionId}: ${claimant.stderr || claimant.status}`);
+    }
+  }
+  for (const agent of agents) {
+    agent.requestId = asBroker("approve", [agent.sessionId, String(agent.uid), agent.name,
+      agent.seeded.handle, url]);
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(agent.requestId)) {
+      throw new Error("Invalid native fixture approved request ID.");
+    }
+  }
+  for (let index = 0; index < agents.length; index++) {
+    const agent = agents[index];
+    const other = agents[1 - index];
+    await writeFile(`${agent.root}/workspace/foreign-id`, `${other.requestId}\n`, { mode: 0o644 });
+    await writeFile(`${agent.root}/workspace/approved-id`, `${agent.requestId}\n`, { mode: 0o644 });
+  }
+  for (const agent of agents) {
+    const denied = await until(() => maybeText(`${agent.root}/workspace/foreign-denied`),
+      `${agent.sessionId} cross-session claim denial`);
+    if (denied !== "denied\n") throw new Error(`Unexpected cross-session result: ${denied}`);
+  }
+  for (const agent of agents) {
+    await writeFile(`${agent.root}/workspace/execute-go`, "go\n", { mode: 0o644 });
+  }
+  for (const agent of agents) {
+    const result = await until(() => maybeText(`${agent.root}/workspace/result`),
+      `${agent.sessionId} broker-owned HTTPS result`);
+    if (result !== "owned-https=1\n") throw new Error(`Unexpected verified MCP result: ${result}`);
+  }
+  if (upstreamAuths.length !== 2 ||
+      agents.some(agent => upstreamAuths.filter(value => value === `Bearer ${agent.seeded.value}`).length !== 1)) {
+    throw new Error("The broker did not send each approved synthetic credential exactly once.");
+  }
   const fenceRoot = "/run/s-gw/agent-unit-lifecycle";
-  for (const name of await readdir(fenceRoot)) {
-    if (name.startsWith(`${agentUnit}.launch-`)) await remember(path.join(fenceRoot, name));
+  for (const agent of agents) {
+    await remember(`/run/s-gw/launch-gates/${agent.sessionId}`);
+    await remember(`${fenceRoot}/${agent.agentUnit}`);
+    for (const name of await readdir(fenceRoot)) {
+      if (name.startsWith(`${agent.agentUnit}.launch-`)) await remember(path.join(fenceRoot, name));
+    }
+  }
+  run("systemctl", ["--system", "stop", agents[0].socketUnit]);
+  run("systemctl", ["--system", "stop", agents[0].brokerUnit]);
+  await until(() => run("systemctl", ["--system", "is-active", agents[0].agentUnit], true).status !== 0,
+    "first agent teardown after its broker stopped");
+  if (run("systemctl", ["--system", "is-active", agents[1].agentUnit], true).status !== 0) {
+    throw new Error("Stopping one broker also stopped the other agent.");
   }
   run("systemctl", ["--system", "kill", "--signal=SIGKILL", "--kill-who=main",
     controlUnit]);
-  await until(() => run("systemctl", ["--system", "is-active", agentUnit], true).status !== 0,
-    "BindsTo teardown after root control death");
-  console.log("Native Linux managed MCP passed: root-owned control code, systemd socket activation, dedicated UID/cgroup, verified MCP request, and BindsTo teardown after root-service death.");
+  await until(() => run("systemctl", ["--system", "is-active", agents[1].agentUnit], true).status !== 0,
+    "second agent teardown after root control death");
+  passed = true;
 } catch (error) {
   const logs = run("journalctl", ["--no-pager", "-n", "80", "-u", "s-gw-agent-control.service",
-    "-u", brokerUnit], true).stdout;
+    ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
   throw new Error(`${String(error)}\n${logs}`);
 } finally {
+  if (upstream) {
+    upstream.closeAllConnections();
+    await new Promise(resolve => upstream.close(resolve));
+  }
   if (fixtureOwned) {
     if (controlStartAttempted && !controlStarted) {
       const uncertain = unitProperties(controlUnit,
@@ -313,18 +593,20 @@ try {
       }
       throw new Error("Root control start was ambiguous; its root-owned fixture tree was preserved.");
     }
-    if (socketStartAttempted && !socketStarted) {
+    if ([...socketStartAttempted].some(session => !socketStarted.has(session))) {
       const currentControl = unitProperties(controlUnit,
         ["Id", "Description", "ExecStart", "ControlGroup", "ActiveState", "InvocationID"]);
       if (currentControl.get("ActiveState") === "active" && fixtureControl(currentControl) &&
           invocationId(currentControl) === controlInvocation) {
         run("systemctl", ["--system", "stop", controlUnit], true);
       }
-      if (await fixtureUnitFile(socketUnit, socketUnitFile)) {
-        run("systemctl", ["--system", "stop", socketUnit], true);
-      }
-      if (await fixtureUnitFile(brokerUnit, brokerUnitFile)) {
-        run("systemctl", ["--system", "stop", brokerUnit], true);
+      for (const agent of agents) {
+        if (await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile)) {
+          run("systemctl", ["--system", "stop", agent.socketUnit], true);
+        }
+        if (await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile)) {
+          run("systemctl", ["--system", "stop", agent.brokerUnit], true);
+        }
       }
       throw new Error("Managed MCP socket start was ambiguous; its fixture paths were preserved.");
     }
@@ -336,60 +618,102 @@ try {
     if (controlActive && !controlOwned) {
       throw new Error("Root control unit changed; native fixture state was preserved.");
     }
-    const agentState = unitProperties(agentUnit, ["Id", "Description", "ActiveState", "User",
-      "RootDirectory", "InvocationID"]);
-    const agentActive = agentState.get("ActiveState") === "active";
-    if (agentActive && (agentState.get("Id") !== agentUnit ||
-        !/^s-gw-agent-start:[a-f0-9]{32}$/.test(agentState.get("Description") ?? "") ||
-        agentState.get("User") !== String(uid) || agentState.get("RootDirectory") !== root ||
-        !agentInvocation || invocationId(agentState) !== agentInvocation)) {
-      if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
-      throw new Error("Agent unit changed; native fixture state was preserved.");
+    const states = [];
+    for (const agent of agents) {
+      const agentState = unitProperties(agent.agentUnit, ["Id", "Description", "ActiveState", "User",
+        "RootDirectory", "InvocationID"]);
+      const agentActive = agentState.get("ActiveState") === "active";
+      if (agentActive && (agentState.get("Id") !== agent.agentUnit ||
+          !/^s-gw-agent-start:[a-f0-9]{32}$/.test(agentState.get("Description") ?? "") ||
+          agentState.get("User") !== String(agent.uid) || agentState.get("RootDirectory") !== agent.root ||
+          !agentInvocations.get(agent.sessionId) ||
+          invocationId(agentState) !== agentInvocations.get(agent.sessionId))) {
+        if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
+        throw new Error("Agent unit changed; native fixture state was preserved.");
+      }
+      const brokerState = unitProperties(agent.brokerUnit,
+        ["Id", "FragmentPath", "ActiveState", "InvocationID"]);
+      const brokerActive = brokerState.get("ActiveState") === "active";
+      const brokerOwned = await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile);
+      if (brokerActive && (!brokerOwned || !brokerInvocations.get(agent.sessionId) ||
+          invocationId(brokerState) !== brokerInvocations.get(agent.sessionId))) {
+        if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
+        throw new Error("Broker unit changed; native fixture state was preserved.");
+      }
+      const socketState = unitProperties(agent.socketUnit, ["Id", "FragmentPath", "ActiveState"]);
+      const socketActive = socketState.get("ActiveState") === "active";
+      const socketOwned = await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile);
+      if (socketActive && !socketOwned) {
+        if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
+        throw new Error("Socket unit changed; native fixture state was preserved.");
+      }
+      states.push({ agent, agentActive, brokerActive, socketActive });
     }
-    const brokerState = unitProperties(brokerUnit, ["Id", "FragmentPath", "ActiveState", "InvocationID"]);
-    const brokerActive = brokerState.get("ActiveState") === "active";
-    const brokerOwned = await fixtureUnitFile(brokerUnit, brokerUnitFile);
-    if (brokerActive && (!brokerOwned || !brokerInvocation ||
-        invocationId(brokerState) !== brokerInvocation)) {
-      if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
-      throw new Error("Broker unit changed; native fixture state was preserved.");
+    for (const { agent, socketActive } of states) {
+      if (socketActive) run("systemctl", ["--system", "stop", agent.socketUnit], true);
     }
-    const socketState = unitProperties(socketUnit, ["Id", "FragmentPath", "ActiveState"]);
-    const socketActive = socketState.get("ActiveState") === "active";
-    const socketOwned = await fixtureUnitFile(socketUnit, socketUnitFile);
-    if (socketActive && !socketOwned) {
-      if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
-      throw new Error("Socket unit changed; native fixture state was preserved.");
+    for (const { agent, brokerActive } of states) {
+      if (brokerActive) run("systemctl", ["--system", "stop", agent.brokerUnit], true);
     }
-    if (socketActive) run("systemctl", ["--system", "stop", socketUnit], true);
-    if (brokerActive) run("systemctl", ["--system", "stop", brokerUnit], true);
-    if (agentActive) run("systemctl", ["--system", "stop", agentUnit], true);
+    for (const { agent, agentActive } of states) {
+      if (agentActive) run("systemctl", ["--system", "stop", agent.agentUnit], true);
+    }
     if (controlActive) run("systemctl", ["--system", "stop", controlUnit], true);
-    for (const unit of [socketUnit, brokerUnit, agentUnit, ...(controlStarted ? [controlUnit] : [])]) {
+    const allUnits = agents.flatMap(agent => [agent.socketUnit, agent.brokerUnit, agent.agentUnit]);
+    if (controlStarted) allUnits.push(controlUnit);
+    for (const unit of allUnits) {
       if (run("systemctl", ["--system", "is-active", unit], true).status === 0) {
         throw new Error(`Native fixture unit is still active; paths preserved: ${unit}`);
       }
     }
-    const alive = run("pgrep", ["-u", String(uid)], true).status === 0;
-    if (alive) throw new Error("Native Linux agent UID still has processes; fixture paths were preserved.");
-    await removeOwned(socketUnitFile);
-    await removeOwned(brokerUnitFile);
-    if (unitsInstalled) run("systemctl", ["--system", "daemon-reload"], true);
-    for (const filename of owned.keys()) {
-      if (filename.startsWith(`/run/s-gw/agent-unit-lifecycle/${agentUnit}.launch-`)) {
-        await removeOwned(filename);
+    for (const agent of agents) {
+      if (run("pgrep", ["-u", String(agent.uid)], true).status === 0) {
+        throw new Error(`Native Linux agent ${agent.sessionId} still has processes; paths preserved.`);
       }
     }
-    await removeOwned(`/run/s-gw/agent-unit-lifecycle/${agentUnit}`, true);
-    await removeOwned(`/run/s-gw/launch-gates/${sessionId}`, true);
+    for (const agent of agents) {
+      await removeOwned(agent.socketUnitFile);
+      await removeOwned(agent.brokerUnitFile);
+    }
+    if (unitsInstalled) run("systemctl", ["--system", "daemon-reload"], true);
+    for (const agent of agents) {
+      for (const filename of owned.keys()) {
+        if (filename.startsWith(`/run/s-gw/agent-unit-lifecycle/${agent.agentUnit}.launch-`)) {
+          await removeOwned(filename);
+        }
+      }
+      await removeOwned(`/run/s-gw/agent-unit-lifecycle/${agent.agentUnit}`, true);
+      await removeOwned(`/run/s-gw/launch-gates/${agent.sessionId}`, true);
+    }
     await removeOwned("/run/s-gw/agent-control.sock");
-    await removeOwned(path.dirname(socketPath), true);
-    await removeOwned(root, true);
-    await removeOwned(configPath);
+    for (const agent of agents) {
+      await removeOwned(path.dirname(agent.socketPath), true);
+      await removeOwned(agent.root, true);
+      await removeOwned(agent.configPath);
+      await removeOwned(agent.planPath);
+      for (const filename of agent.claimPaths) {
+        if (owned.has(filename)) {
+          const value = await readFile(filename, "utf8");
+          if (value !== `${agent.sessionId} ${agent.uid} ${agent.plan.gid}\n`) {
+            throw new Error(`Native identity claim changed before cleanup: ${filename}`);
+          }
+          await removeOwned(filename);
+        }
+      }
+    }
+    await removeOwned(envFile);
+    if (planDirCreated) {
+      await assertOwned(planDir);
+      await rmdir(planDir);
+    }
     await removeOwned(leaseDir, true);
     await removeOwned(storeHome, true);
+    await removeOwned(recoveryHome, true);
     await removeOwned(installed, true);
-    if (accountCreated) run("userdel", [userName], true);
-    if (groupCreated) run("groupdel", [groupName], true);
+    for (const name of accountsCreated.reverse()) run("userdel", [name]);
+    for (const name of groupsCreated.reverse()) run("groupdel", [name]);
   }
+}
+if (passed) {
+  console.log("Native Linux managed MCP passed: two UIDs/cgroups, out-of-cgroup denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.");
 }

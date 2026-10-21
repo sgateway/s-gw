@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +25,11 @@ static int receive_line(int fd, char *out, size_t capacity) {
     size_t used = 0;
     while (used + 1 < capacity) {
         ssize_t count = read(fd, out + used, 1);
-        if (count != 1) return -1;
+        if (count == 0) return -2;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return errno == ECONNRESET ? -2 : -1;
+        }
         if (out[used++] == '\n') {
             out[used] = 0;
             return 0;
@@ -32,19 +38,40 @@ static int receive_line(int fd, char *out, size_t capacity) {
     return -1;
 }
 
-int main(void) {
+static int read_field(const char *filename, char *out, size_t capacity) {
+    FILE *file = fopen(filename, "r");
+    if (!file) return -1;
+    char *line = fgets(out, (int)capacity, file);
+    if (fclose(file) != 0 || !line) return -1;
+    size_t length = strlen(out);
+    if (length < 2 || out[length - 1] != '\n') return -1;
+    out[length - 1] = 0;
+    if (strspn(out, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.:/") != length - 1) return -1;
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int claimant = argc == 2 && strcmp(argv[1], "--out-of-cgroup") == 0;
+    if (argc != 1 && !claimant) return 1;
+    signal(SIGPIPE, SIG_IGN);
     const char *socket_path = getenv("SGW_BROKER_SOCKET");
     if (!socket_path || strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 2;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 3;
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) return 3;
-    struct timeval deadline = { .tv_sec = 12, .tv_usec = 0 };
+    struct timeval deadline = { .tv_sec = claimant ? 8 : 12, .tv_usec = 0 };
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0 ||
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0) return 4;
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, socket_path);
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) return 5;
     char reply[16384];
+    if (claimant) {
+        return receive_line(fd, reply, sizeof(reply)) == -2 ? 0 : 10;
+    }
+    char handle[256], url[256], request_id[256], foreign_id[256], call[1024];
+    if (read_field("/workspace/handle", handle, sizeof(handle)) != 0 ||
+        read_field("/workspace/url", url, sizeof(url)) != 0) return 11;
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"forged-agent\",\"version\":\"1\"}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":1") ||
         !strstr(reply, "\"result\"")) return 6;
@@ -54,8 +81,46 @@ int main(void) {
         strstr(reply, "sgw_scan_file")) return 7;
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":3") ||
-        !strstr(reply, "\"result\"")) return 8;
+        !strstr(reply, "\"result\"") || !strstr(reply, handle)) return 8;
+    int size = snprintf(call, sizeof(call), "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_request_http\",\"arguments\":{\"handle\":\"%s\",\"url\":\"%s\",\"method\":\"GET\",\"auth\":{\"kind\":\"bearer\"},\"reason\":\"Native managed MCP fixture\"}}}\n", handle, url);
+    if (size < 0 || (size_t)size >= sizeof(call) || send_line(fd, call) != 0 ||
+        receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":4") ||
+        !strstr(reply, "\"result\"") || !strstr(reply, "approvalRequired")) return 12;
+    int marker = open("/workspace/requested", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (marker < 0 || write(marker, "pending\n", 8) != 8 || close(marker) != 0) return 13;
+    int approved = 0;
+    for (int attempt = 0; attempt < 300; attempt++) {
+        if (read_field("/workspace/approved-id", request_id, sizeof(request_id)) == 0) {
+            approved = 1;
+            break;
+        }
+        usleep(100000);
+    }
+    if (!approved) return 14;
+    if (read_field("/workspace/foreign-id", foreign_id, sizeof(foreign_id)) != 0) return 16;
+    size = snprintf(call, sizeof(call), "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_execute_request\",\"arguments\":{\"requestId\":\"%s\"}}}\n", foreign_id);
+    if (size < 0 || (size_t)size >= sizeof(call) || send_line(fd, call) != 0 ||
+        receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":5") ||
+        !strstr(reply, "isError\":true") || !strstr(reply, "different verified agent")) return 17;
+    int denied = open("/workspace/foreign-denied", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (denied < 0 || write(denied, "denied\n", 7) != 7 || close(denied) != 0) return 18;
+    int go = 0;
+    char gate[256];
+    for (int attempt = 0; attempt < 300; attempt++) {
+        if (read_field("/workspace/execute-go", gate, sizeof(gate)) == 0 &&
+            strcmp(gate, "go") == 0) {
+            go = 1;
+            break;
+        }
+        usleep(100000);
+    }
+    if (!go) return 19;
+    size = snprintf(call, sizeof(call), "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_execute_request\",\"arguments\":{\"requestId\":\"%s\"}}}\n", request_id);
+    if (size < 0 || (size_t)size >= sizeof(call) || send_line(fd, call) != 0 ||
+        receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":6") ||
+        !strstr(reply, "\"result\"") || !strstr(reply, "approved fixture") ||
+        !strstr(reply, "\\\"exitCode\\\": 0")) return 15;
     int result = open("/workspace/result", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (result < 0 || write(result, "verified-mcp=1\n", 15) != 15 || close(result) != 0) return 9;
+    if (result < 0 || write(result, "owned-https=1\n", 14) != 14 || close(result) != 0) return 9;
     for (;;) pause();
 }

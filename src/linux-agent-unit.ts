@@ -287,6 +287,11 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   private readonly lifecycleLeases = new Map<string, LinuxUnitLifecycleLease>();
   private readonly launchFences = new Map<string, { fence: LinuxUnitLaunchFence; planKey: string }>();
 
+  hasActiveLease(sessionId: string): boolean {
+    linuxAgentUnitName(sessionId);
+    return this.lifecycleLeases.has(sessionId);
+  }
+
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);

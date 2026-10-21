@@ -179,10 +179,37 @@ static int process_handle_denied(const wchar_t *pid_text, const char *target) {
     return 0;
 }
 
+static int connected_pipe_transfer_denied(HANDLE pipe, const wchar_t *pid_text) {
+    wchar_t *end = NULL;
+    errno = 0;
+    unsigned long pid = wcstoul(pid_text, &end, 10);
+    if (errno == ERANGE || end == pid_text || *end || !pid) return 0;
+    HANDLE target = OpenProcess(PROCESS_DUP_HANDLE, FALSE, (DWORD)pid);
+    if (!target) {
+        DWORD error = GetLastError();
+        if (error == ERROR_ACCESS_DENIED) return 1;
+        fprintf(stderr, "Connected-pipe transfer target could not be opened: %lu\n", error);
+        return 0;
+    }
+    HANDLE copy = NULL;
+    BOOL transferred = DuplicateHandle(GetCurrentProcess(), pipe, target, &copy, 0,
+        FALSE, DUPLICATE_SAME_ACCESS);
+    DWORD error = transferred ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(target);
+    if (transferred) {
+        fputs("AppContainer copied its connected broker pipe outside the Job.\n", stderr);
+        return 0;
+    }
+    if (error == ERROR_ACCESS_DENIED) return 1;
+    fprintf(stderr, "Connected-pipe duplication failed unexpectedly: %lu\n", error);
+    return 0;
+}
+
 static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     const wchar_t *ipv6_port, const wchar_t *shared_path,
     const wchar_t *canary_path, const wchar_t *profile,
-    const wchar_t *other_agent_pid, const wchar_t *broker_pid) {
+    const wchar_t *other_agent_pid, const wchar_t *broker_pid,
+    const wchar_t *transfer_target_pid) {
     PSID expected_sid = NULL;
     if (FAILED(DeriveAppContainerSidFromAppContainerName(profile, &expected_sid))) return 1;
     HANDLE token = NULL;
@@ -229,6 +256,10 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
         fprintf(stderr, "AppContainer pipe open failed: %lu\n", GetLastError());
         return 1;
     }
+    if (transfer_target_pid && !connected_pipe_transfer_denied(pipe, transfer_target_pid)) {
+        CloseHandle(pipe);
+        return 1;
+    }
     const char request[] = "appcontainer probe";
     const char expected[] = "broker reply";
     char response[sizeof(expected)];
@@ -248,7 +279,8 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
     const wchar_t *shared_path, const wchar_t *canary_path, const wchar_t *job_name,
     int stop_job, int pause_start, int without_job,
-    const wchar_t *other_agent_pid, const wchar_t *broker_pid) {
+    const wchar_t *other_agent_pid, const wchar_t *broker_pid,
+    const wchar_t *transfer_target_pid) {
     wchar_t parent_canary[64];
     DWORD canary_size = GetEnvironmentVariableW(L"SGW_WIN_FIXTURE_PARENT_CANARY",
         parent_canary, sizeof(parent_canary) / sizeof(parent_canary[0]));
@@ -304,6 +336,11 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
             L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" %ls %ls",
             executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path,
             name, other_agent_pid, broker_pid) < 0) goto done;
+    } else if (transfer_target_pid) {
+        if (swprintf(command, sizeof(command) / sizeof(command[0]),
+            L"\"%ls\" client-transfer \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" %ls",
+            executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path,
+            name, transfer_target_pid) < 0) goto done;
     } else if (swprintf(command, sizeof(command) / sizeof(command[0]),
         L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\"",
         executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path, name) < 0) goto done;
@@ -400,6 +437,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     }
     if (result) fprintf(stderr, "AppContainer child failed: %lu\n", (unsigned long)exit_code);
     if (other_agent_pid && !result) puts("PROCESS-DUP-DENIED");
+    if (transfer_target_pid && !result) puts("CONNECTED-PIPE-TRANSFER-DENIED");
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     if (job) CloseHandle(job);
@@ -449,19 +487,25 @@ int wmain(int argc, wchar_t **argv) {
         return hold_empty_job(argv[2], 0);
     if ((argc == 8 || argc == 10) && wcscmp(argv[1], L"client") == 0)
         return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
-            argc == 10 ? argv[8] : NULL, argc == 10 ? argv[9] : NULL);
+            argc == 10 ? argv[8] : NULL, argc == 10 ? argv[9] : NULL, NULL);
+    if (argc == 9 && wcscmp(argv[1], L"client-transfer") == 0)
+        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+            NULL, NULL, argv[8]);
     if (argc == 9 && wcscmp(argv[1], L"launch") == 0)
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
-            0, 0, 0, NULL, NULL);
+            0, 0, 0, NULL, NULL, NULL);
     if (argc == 9 && (wcscmp(argv[1], L"launch-paused") == 0 ||
         wcscmp(argv[1], L"launch-stop-paused") == 0))
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
-            wcscmp(argv[1], L"launch-stop-paused") == 0, 1, 0, NULL, NULL);
+            wcscmp(argv[1], L"launch-stop-paused") == 0, 1, 0, NULL, NULL, NULL);
     if (argc == 9 && wcscmp(argv[1], L"launch-unassigned") == 0)
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
-            0, 0, 1, NULL, NULL);
+            0, 0, 1, NULL, NULL, NULL);
     if (argc == 11 && wcscmp(argv[1], L"launch-process-probe") == 0)
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
-            0, 0, 0, argv[9], argv[10]);
+            0, 0, 0, argv[9], argv[10], NULL);
+    if (argc == 10 && wcscmp(argv[1], L"launch-transfer-paused") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            0, 1, 0, NULL, NULL, argv[9]);
     return 1;
 }

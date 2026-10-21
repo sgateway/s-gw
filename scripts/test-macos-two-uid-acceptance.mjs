@@ -3,9 +3,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createSocket } from "node:dgram";
-import { access, lstat, readFile, realpath, readdir } from "node:fs/promises";
+import { access, lstat, open, readFile, realpath, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
-import { createConnection, createServer, isIP } from "node:net";
+import { BlockList, createConnection, createServer, isIP } from "node:net";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -17,6 +17,11 @@ const policyControl = "/private/var/db/s-gw/agent-network-policy.sock";
 const runnerLeases = "/private/var/db/s-gw/agent-uid-leases";
 const scriptPath = fileURLToPath(import.meta.url);
 const sessionPattern = /^[A-Za-z0-9_-]{1,64}$/;
+const nonRemote = new BlockList();
+nonRemote.addSubnet("127.0.0.0", 8, "ipv4");
+nonRemote.addAddress("0.0.0.0", "ipv4");
+nonRemote.addAddress("::1", "ipv6");
+nonRemote.addAddress("::", "ipv6");
 
 function requireValue(ok, message) {
   if (!ok) throw new Error(message);
@@ -25,6 +30,25 @@ function requireValue(ok, message) {
 function isFixturePath(value) {
   return typeof value === "string" && path.isAbsolute(value) &&
     path.resolve(value) === value && value.startsWith(`${fixtureRoot}/`);
+}
+
+function validTcpCanary(value) {
+  return value && typeof value === "object" && typeof value.host === "string" &&
+    isIP(value.host) !== 0 &&
+    Number.isSafeInteger(value.port) && value.port > 0 && value.port <= 65535;
+}
+
+function validRemoteTcpCanary(value) {
+  if (!validTcpCanary(value)) return false;
+  const family = isIP(value.host) === 4 ? "ipv4" : "ipv6";
+  return !nonRemote.check(value.host, family);
+}
+
+function validProtectedCanaries(value) {
+  return value && typeof value === "object" &&
+    Object.keys(value).sort().join(",") === "recovery,store" &&
+    isFixturePath(value.store) && isFixturePath(value.recovery) &&
+    value.store !== value.recovery;
 }
 
 function parsePlan(raw) {
@@ -39,6 +63,21 @@ function parsePlan(raw) {
   if (plan.hostIpv4Probe !== undefined) {
     requireValue(typeof plan.hostIpv4Probe === "string" && isIP(plan.hostIpv4Probe) === 4 &&
       !plan.hostIpv4Probe.startsWith("127."), "The host IPv4 probe must use a non-loopback address.");
+  }
+  if (plan.protectedCanaries !== undefined) {
+    requireValue(validProtectedCanaries(plan.protectedCanaries) &&
+      plan.protectedCanaries.store !== plan.brokerCanary &&
+      plan.protectedCanaries.recovery !== plan.brokerCanary,
+    "Protected store and recovery canaries must be distinct fixture files.");
+  }
+  if (plan.consoleCanary !== undefined) {
+    requireValue(plan.consoleCanary === true, "The synthetic console canary must be enabled with true.");
+  }
+  if (plan.remoteTcpCanaries !== undefined) {
+    requireValue(Array.isArray(plan.remoteTcpCanaries) &&
+      plan.remoteTcpCanaries.length > 0 && plan.remoteTcpCanaries.length <= 4 &&
+      plan.remoteTcpCanaries.every(validRemoteTcpCanary),
+    "Remote TCP canaries need numeric IP addresses and ports.");
   }
   requireValue(Array.isArray(plan.agents) && plan.agents.length === 2, "Exactly two agent accounts are required.");
   const uids = new Set();
@@ -66,6 +105,12 @@ function parsePlan(raw) {
   requireValue(!sockets.has(plan.leaseDir) && !sockets.has(plan.stagedAgentScript) &&
     !sockets.has(plan.brokerCanary),
     "Fixture paths must not overlap.");
+  if (plan.protectedCanaries) {
+    for (const file of Object.values(plan.protectedCanaries)) {
+      requireValue(!sockets.has(file) && file !== plan.leaseDir && file !== plan.stagedAgentScript,
+        "Protected canary paths must not overlap other fixture paths.");
+    }
+  }
   if (plan.fdTransferProbe !== undefined) {
     const probe = plan.fdTransferProbe;
     requireValue(isFixturePath(probe?.helperExecutable) && isFixturePath(probe?.rendezvousPath) &&
@@ -139,6 +184,16 @@ async function preflight(plan) {
   requireValue(process.platform === "darwin" && typeof process.getuid === "function" &&
     process.getuid() !== 0, "Run the broker fixture as a non-root macOS account.");
   const brokerGroups = new Set(process.getgroups?.() ?? []);
+  if (plan.remoteTcpCanaries) {
+    const localAddresses = new BlockList();
+    for (const item of Object.values(networkInterfaces()).flat()) {
+      if (!item || isIP(item.address) === 0) continue;
+      localAddresses.addAddress(item.address, isIP(item.address) === 4 ? "ipv4" : "ipv6");
+    }
+    requireValue(plan.remoteTcpCanaries.every(item =>
+      !localAddresses.check(item.host, isIP(item.host) === 4 ? "ipv4" : "ipv6")),
+      "A remote TCP canary cannot use an address assigned to this Mac.");
+  }
   if (plan.hostIpv4Probe) {
     const addresses = Object.values(networkInterfaces()).flat();
     requireValue(addresses.some(address => address?.family === "IPv4" &&
@@ -160,6 +215,15 @@ async function preflight(plan) {
   const canaryParent = path.dirname(plan.brokerCanary);
   await checkedPath(canaryParent, "directory", process.getuid(), 0o700);
   await checkedRootParents(canaryParent);
+  if (plan.protectedCanaries) {
+    for (const file of Object.values(plan.protectedCanaries)) {
+      await checkedPath(file, "file", process.getuid(), 0o600);
+      await access(file, constants.R_OK | constants.W_OK);
+      const parent = path.dirname(file);
+      await checkedPath(parent, "directory", process.getuid(), 0o700);
+      await checkedRootParents(parent);
+    }
+  }
   const node = await lstat(plan.nodeExecutable);
   requireValue(await realpath(plan.nodeExecutable) === plan.nodeExecutable && node.isFile() &&
     (node.uid === 0 || node.uid === process.getuid()) && (node.mode & 0o6022) === 0 &&
@@ -258,6 +322,24 @@ function canConnect(host, port) {
     socket.once("connect", () => finish(true));
     socket.once("error", () => finish(false));
   });
+}
+
+async function checkTcpCanaries(plan) {
+  for (const canary of plan.remoteTcpCanaries || []) {
+    requireValue(await canConnect(canary.host, canary.port),
+      `The broker cannot reach remote TCP canary ${canary.host}:${canary.port}.`);
+  }
+}
+
+async function deniedFileOpen(location, flags) {
+  let file;
+  try {
+    file = await open(location, flags);
+  } catch (error) {
+    return error?.code === "EACCES" || error?.code === "EPERM";
+  }
+  await file.close();
+  return false;
 }
 
 function sendUdpProbe(host, port) {
@@ -395,6 +477,7 @@ async function runBroker(plan) {
   let udp6;
   let hostIpv4Tcp;
   let hostIpv4Udp;
+  let consoleCanary;
   let deadlineTimer;
   function interrupted() { failed.resolve(new Error("Native acceptance was interrupted.")); }
   process.once("SIGINT", interrupted);
@@ -408,6 +491,8 @@ async function runBroker(plan) {
       hostIpv4Tcp = await startLoopback(plan.hostIpv4Probe);
       hostIpv4Udp = await startUdpLoopback(plan.hostIpv4Probe);
     }
+    if (plan.consoleCanary) consoleCanary = await startLoopback("127.0.0.1");
+    await checkTcpCanaries(plan);
     for (const agent of plan.agents) {
       launchSeen.set(agent.uid, deferred());
       reports.set(agent.uid, deferred());
@@ -475,6 +560,19 @@ async function runBroker(plan) {
                 result.ownAccepted === true && result.ipv4Denied === true && result.ipv6Denied === true &&
                 result.brokerCanaryDenied === true && result.otherWorkspaceDenied === true,
               `Agent ${agent.uid} failed a native isolation probe.`);
+              if (plan.protectedCanaries) {
+                requireValue(result.storeReadDenied === true && result.storeWriteDenied === true &&
+                  result.recoveryReadDenied === true && result.recoveryWriteDenied === true,
+                `Agent ${agent.uid} reached a protected store or recovery canary.`);
+              }
+              if (plan.consoleCanary) {
+                requireValue(result.consoleDenied === true,
+                  `Agent ${agent.uid} reached the synthetic console canary.`);
+              }
+              if (plan.remoteTcpCanaries) {
+                requireValue(result.remoteTcpDenied === true,
+                  `Agent ${agent.uid} reached a remote TCP canary.`);
+              }
               if (plan.hostIpv4Probe) {
                 requireValue(result.hostIpv4Denied === true,
                   `Agent ${agent.uid} reached the host's non-loopback IPv4 address.`);
@@ -521,6 +619,11 @@ async function runBroker(plan) {
     }
     const launchPlans = plan.agents.map((agent, i) => {
       const other = plan.agents[1 - i];
+      const extraChecks = {
+        ...(plan.protectedCanaries ? { protectedCanaries: plan.protectedCanaries } : {}),
+        ...(plan.consoleCanary ? { consoleCanary: { host: "127.0.0.1", port: consoleCanary.port } } : {}),
+        ...(plan.remoteTcpCanaries ? { remoteTcpCanaries: plan.remoteTcpCanaries } : {})
+      };
       return {
         account: agent.account,
         runnerArgv: [String(agent.uid), String(agent.gid), agent.sessionId, agent.workspace,
@@ -530,6 +633,8 @@ async function runBroker(plan) {
           String(ipv4.port), String(ipv6.port), String(udp4.port), String(udp6.port),
           plan.brokerCanary, other.workspace,
           ...(plan.hostIpv4Probe ? [`--host-ipv4=${plan.hostIpv4Probe},${hostIpv4Tcp.port},${hostIpv4Udp.port}`] : []),
+          ...(Object.keys(extraChecks).length ?
+            [`--checks=${Buffer.from(JSON.stringify(extraChecks)).toString("base64url")}`] : []),
           ...(plan.fdTransferProbe ? [i === 0 ? "send" : "recv",
             plan.fdTransferProbe.helperExecutable, plan.fdTransferProbe.rendezvousPath] : [])]
       };
@@ -567,6 +672,19 @@ async function runBroker(plan) {
       requireValue(hostIpv4Tcp.hits() === 0 && hostIpv4Udp.hits() === 0,
         "An agent reached the host's non-loopback IPv4 listener directly.");
     }
+    if (plan.consoleCanary) {
+      requireValue(consoleCanary.hits() === 0,
+        "An agent reached the synthetic console canary.");
+      requireValue(await canConnect("127.0.0.1", consoleCanary.port),
+        "The broker lost its synthetic console canary listener.");
+    }
+    await checkTcpCanaries(plan);
+    if (plan.protectedCanaries) {
+      for (const file of Object.values(plan.protectedCanaries)) {
+        await checkedPath(file, "file", process.getuid(), 0o600);
+        await access(file, constants.R_OK | constants.W_OK);
+      }
+    }
     for (const stop of stops) stop();
     await Promise.all(plan.agents.map(async agent => {
       try {
@@ -581,6 +699,9 @@ async function runBroker(plan) {
       brokerLeasesRetained: true, livePeerRevocation: true,
       hostLoopbackDenied: true, udpHostLoopbackDenied: true,
       ...(plan.hostIpv4Probe ? { hostIpv4Denied: true } : {}),
+      ...(plan.protectedCanaries ? { protectedStoreAndRecoveryDenied: true } : {}),
+      ...(plan.consoleCanary ? { syntheticConsoleCanaryDenied: true } : {}),
+      ...(plan.remoteTcpCanaries ? { configuredRemoteTcpDenied: true } : {}),
       ...(plan.fdTransferProbe ? { crossAgentDescriptorTransferDenied: true } : {}) })}\n`);
   } finally {
     clearTimeout(deadlineTimer);
@@ -594,6 +715,7 @@ async function runBroker(plan) {
     await udp6?.close();
     await hostIpv4Tcp?.close();
     await hostIpv4Udp?.close();
+    await consoleCanary?.close();
   }
 }
 
@@ -639,6 +761,38 @@ function waitForHeldProbeClose(location) {
 }
 
 async function selfTestReport() {
+  const samplePlan = {
+    purpose: "s-gw-macos-two-uid-acceptance", dedicatedTestHost: true,
+    leaseDir: `${fixtureRoot}/leases`, stagedAgentScript: `${fixtureRoot}/agent.mjs`,
+    brokerCanary: `${fixtureRoot}/broker/canary`, nodeExecutable: "/usr/bin/node",
+    protectedCanaries: {
+      store: `${fixtureRoot}/store/canary`, recovery: `${fixtureRoot}/recovery/canary`
+    },
+    consoleCanary: true,
+    remoteTcpCanaries: [{ host: "203.0.113.10", port: 443 }, { host: "2001:db8::10", port: 443 }],
+    agents: [1, 2].map(i => ({
+      account: `_sgwagent_test${i}`, uid: 231000 + i, gid: 232000 + i,
+      sessionId: `test-${i}`, workspace: `${fixtureRoot}/work-${i}`,
+      socketPath: `${fixtureRoot}/socket-${i}`, reportSocketPath: `${fixtureRoot}/report-${i}`
+    }))
+  };
+  const invalid = run => { try { run(); return false; } catch { return true; } };
+  parsePlan(JSON.stringify(samplePlan));
+  requireValue(invalid(() => parsePlan(JSON.stringify({ ...samplePlan, consoleCanary: { host: "127.0.0.1", port: 80 } }))) &&
+    invalid(() => parsePlan(JSON.stringify({ ...samplePlan, remoteTcpCanaries: [{ host: "localhost", port: 443 }] }))) &&
+    invalid(() => parsePlan(JSON.stringify({ ...samplePlan, remoteTcpCanaries: [{ host: "203.0.113.10", port: 0 }] }))) &&
+    invalid(() => parsePlan(JSON.stringify({ ...samplePlan, remoteTcpCanaries: [{ host: "::ffff:127.0.0.1", port: 443 }] }))) &&
+    invalid(() => parsePlan(JSON.stringify({ ...samplePlan, protectedCanaries: {
+      store: `${fixtureRoot}/store/canary`, recovery: "/Users/example/live-store"
+    } }))),
+  "Malformed optional fixture canaries were accepted.");
+  const encoded = Buffer.from(JSON.stringify({ consoleCanary: { host: "127.0.0.1", port: 12345 } })).toString("base64url");
+  requireValue(parseAgentChecks(encoded).consoleCanary.port === 12345 &&
+    invalid(() => parseAgentChecks("not-base64!")) &&
+    invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ consoleCanary: { host: "localhost", port: 12345 } })).toString("base64url"))) &&
+    invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ remoteTcpCanaries: [{ host: "127.0.0.1", port: 80 }] })).toString("base64url"))) &&
+    invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ unexpected: true })).toString("base64url"))),
+  "Malformed optional agent check payloads were accepted.");
   const udp4 = await startUdpLoopback("127.0.0.1");
   const udp6 = await startUdpLoopback("::1");
   try {
@@ -748,6 +902,30 @@ function runTransferHelper(role, helperExecutable, rendezvousPath, reportSocket)
   return status;
 }
 
+function parseAgentChecks(encoded) {
+  requireValue(/^[A-Za-z0-9_-]{1,8192}$/.test(encoded), "Malformed optional agent checks.");
+  const bytes = Buffer.from(encoded, "base64url");
+  requireValue(bytes.toString("base64url") === encoded, "Malformed optional agent checks.");
+  const checks = JSON.parse(bytes.toString("utf8"));
+  requireValue(checks && typeof checks === "object" && !Array.isArray(checks) &&
+    Object.keys(checks).length > 0 &&
+    Object.keys(checks).every(key => ["protectedCanaries", "consoleCanary", "remoteTcpCanaries"].includes(key)),
+  "Unknown optional agent check.");
+  if (checks.protectedCanaries !== undefined) {
+    requireValue(validProtectedCanaries(checks.protectedCanaries), "Malformed protected agent canaries.");
+  }
+  if (checks.consoleCanary !== undefined) {
+    requireValue(validTcpCanary(checks.consoleCanary) && checks.consoleCanary.host === "127.0.0.1",
+      "Malformed synthetic console canary.");
+  }
+  if (checks.remoteTcpCanaries !== undefined) {
+    requireValue(Array.isArray(checks.remoteTcpCanaries) &&
+      checks.remoteTcpCanaries.length > 0 && checks.remoteTcpCanaries.length <= 4 &&
+      checks.remoteTcpCanaries.every(validRemoteTcpCanary), "Malformed remote agent canaries.");
+  }
+  return checks;
+}
+
 async function runAgent(args) {
   requireValue(process.platform === "darwin" && args.length >= 14,
     "Invalid native agent fixture arguments.");
@@ -764,6 +942,8 @@ async function runAgent(args) {
       Number.isSafeInteger(hostIpv4Probe.udpPort) && hostIpv4Probe.udpPort > 0,
     "Malformed host IPv4 probe ports.");
   }
+  const checks = extras[0]?.startsWith("--checks=")
+    ? parseAgentChecks(extras.shift().slice("--checks=".length)) : {};
   requireValue(extras.length === 0 || extras.length === 3, "Malformed optional agent fixture arguments.");
   const [transferRole, transferHelper, transferRendezvous] = extras;
   const uid = Number(uidText);
@@ -803,6 +983,10 @@ async function runAgent(args) {
   catch (error) { brokerCanaryDenied = error?.code === "EACCES" || error?.code === "EPERM"; }
   try { await readdir(otherWorkspace); }
   catch (error) { otherWorkspaceDenied = error?.code === "EACCES" || error?.code === "EPERM"; }
+  let remoteTcpDenied = true;
+  for (const canary of checks.remoteTcpCanaries || []) {
+    if (await canConnect(canary.host, canary.port)) remoteTcpDenied = false;
+  }
   const result = {
     phase: "initial", uid, sessionId,
     wrongClaimDenied: wrongSessionReply === "" && wrongUidReply === "",
@@ -811,7 +995,15 @@ async function runAgent(args) {
     ipv4Denied: !await canConnect("127.0.0.1", ipv4Port),
     ipv6Denied: !await canConnect("::1", ipv6Port),
     ...(hostIpv4Probe ? { hostIpv4Denied: !await canConnect(hostIpv4Probe.address, hostIpv4Probe.tcpPort) } : {}),
-    brokerCanaryDenied, otherWorkspaceDenied
+    brokerCanaryDenied, otherWorkspaceDenied,
+    ...(checks.protectedCanaries ? {
+      storeReadDenied: await deniedFileOpen(checks.protectedCanaries.store, constants.O_RDONLY),
+      storeWriteDenied: await deniedFileOpen(checks.protectedCanaries.store, constants.O_WRONLY),
+      recoveryReadDenied: await deniedFileOpen(checks.protectedCanaries.recovery, constants.O_RDONLY),
+      recoveryWriteDenied: await deniedFileOpen(checks.protectedCanaries.recovery, constants.O_WRONLY)
+    } : {}),
+    ...(checks.consoleCanary ? { consoleDenied: !await canConnect(checks.consoleCanary.host, checks.consoleCanary.port) } : {}),
+    ...(checks.remoteTcpCanaries ? { remoteTcpDenied } : {})
   };
   await sendReport(reportSocket, result);
   requireValue(Object.values(result).slice(3).every(value => value === true),

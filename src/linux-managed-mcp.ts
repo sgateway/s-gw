@@ -73,7 +73,7 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
   let mcp: VerifiedMcpServer | undefined;
   let stopAgent: (() => Promise<void>) | undefined;
   try {
-    control = await connectLinuxAgentControl(process.getgid!());
+    control = await connectLinuxAgentControl(config.plan);
     mcp = await startVerifiedMcpServer({ store, socketPath: config.plan.brokerSocket,
       socketGid: config.plan.gid, activatedFd: fd });
     const leases = new LinuxAgentSessionLeases(config.leaseDir, control);

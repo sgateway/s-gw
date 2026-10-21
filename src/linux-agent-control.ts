@@ -1,16 +1,27 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { chmod, chown, lstat, readFile, realpath, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, chown, lstat, open, readFile, readlink, realpath, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { lifecyclePlanKey, SystemdRunAgentUnitManager, validateLinuxAgentPlan,
-  type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
+  linuxAgentUnitName, type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
+import { verifyLinuxPeerProcess } from "./linux-peer-identity.js";
 
 const controlSocket = "/run/s-gw/agent-control.sock";
+const planDir = "/run/s-gw/agent-plans";
 const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
-const rootPeerHelper = path.join(path.dirname(runtimeDir), "peer-credentials");
+const rootPidfdHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-linux-peer-identity`, import.meta.url));
 const maxFrame = 32 * 1024;
+
+export interface LinuxManagedPlanRecord {
+  plan: LinuxAgentUnitPlan;
+  brokerUnit: string;
+  brokerUnitFile: string;
+  brokerEntry: string;
+  brokerConfig: string;
+}
 
 type Method = "start" | "inspect" | "release" | "stop";
 interface ControlCall {
@@ -29,6 +40,108 @@ export function validateLinuxManagedPlan(plan: LinuxAgentUnitPlan, brokerUid: nu
       plan.isolatedSharedMemory !== true || plan.serializedLifecycle !== true ||
       plan.sealedStdio !== true || plan.supervisedControlUnit !== true) {
     throw new Error("Managed Linux MCP needs the dedicated, supervised agent profile.");
+  }
+}
+
+export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
+  sessionId: string, brokerUid: number, brokerGid: number): void {
+  if (!value || typeof value !== "object" || !value.plan ||
+      value.plan.sessionId !== sessionId ||
+      value.brokerUnit !== `s-gw-managed-mcp-${sessionId}.service` ||
+      !["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"].includes(path.dirname(value.brokerUnitFile || "")) ||
+      path.basename(value.brokerUnitFile) !== value.brokerUnit ||
+      !canonicalFile(value.brokerEntry) || path.basename(value.brokerEntry) !== "linux-managed-mcp.js" ||
+      !canonicalFile(value.brokerConfig) ||
+      Object.keys(value).sort().join(",") !== "brokerConfig,brokerEntry,brokerUnit,brokerUnitFile,plan") {
+    throw new Error("Invalid root-provisioned Linux managed plan record.");
+  }
+  validateLinuxManagedPlan(value.plan, brokerUid, brokerGid);
+}
+
+function canonicalFile(value: unknown): value is string {
+  return typeof value === "string" && path.isAbsolute(value) && path.resolve(value) === value &&
+    !value.includes("\0");
+}
+
+async function checkedBrokerFile(filename: string): Promise<void> {
+  await checkedRootFile(filename);
+  if ((await lstat(filename)).nlink !== 1) {
+    throw new Error(`Untrusted Linux broker file: ${filename}`);
+  }
+}
+
+async function registeredPlan(sessionId: string, brokerUid: number,
+  brokerGid: number): Promise<LinuxManagedPlanRecord> {
+  linuxAgentUnitName(sessionId);
+  const directory = await lstat(planDir);
+  if (!directory.isDirectory() || directory.uid !== 0 ||
+      (directory.mode & 0o777) !== 0o700 || await realpath(planDir) !== planDir) {
+    throw new Error("Linux agent plan registry is not root-private.");
+  }
+  const filename = path.join(planDir, `${sessionId}.json`);
+  const item = await lstat(filename);
+  if (!item.isFile() || item.uid !== 0 || (item.mode & 0o777) !== 0o600 ||
+      item.nlink !== 1 || item.size > maxFrame || await realpath(filename) !== filename) {
+    throw new Error("Linux agent plan registration is not root-private.");
+  }
+  await checkedRootFile(filename);
+  const value = JSON.parse(await readFile(filename, "utf8")) as LinuxManagedPlanRecord;
+  validateLinuxManagedPlanRecord(value, sessionId, brokerUid, brokerGid);
+  await checkedRootFile(value.brokerUnitFile);
+  const config = await lstat(value.brokerConfig);
+  if (!config.isFile() || config.uid !== 0 || config.gid !== brokerGid ||
+      (config.mode & 0o777) !== 0o640 || config.nlink !== 1) {
+    throw new Error("Linux broker config is not root-provisioned.");
+  }
+  await checkedRootFile(value.brokerConfig);
+  const brokerConfig = JSON.parse(await readFile(value.brokerConfig, "utf8")) as { plan?: LinuxAgentUnitPlan };
+  if (!brokerConfig?.plan || lifecyclePlanKey(brokerConfig.plan) !== lifecyclePlanKey(value.plan)) {
+    throw new Error("Linux broker config differs from its root plan registration.");
+  }
+  await checkedBrokerFile(value.brokerEntry);
+  return value;
+}
+
+async function reserveManagedIdentity(plan: LinuxAgentUnitPlan): Promise<void> {
+  const directory = await lstat(planDir);
+  if (!directory.isDirectory() || directory.uid !== 0 ||
+      (directory.mode & 0o777) !== 0o700 || await realpath(planDir) !== planDir) {
+    throw new Error("Linux agent plan registry changed before identity reservation.");
+  }
+  await claimIdentityMarkers(plan, planDir);
+}
+
+export async function claimIdentityMarkers(plan: LinuxAgentUnitPlan, directory: string): Promise<void> {
+  const created: { name: string; dev: number; ino: number }[] = [];
+  try {
+    for (const name of [`uid-${plan.uid}.used`, `gid-${plan.gid}.used`,
+      `session-${plan.sessionId}.used`]) {
+      const file = await open(path.join(directory, name),
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try {
+        const info = await file.stat();
+        created.push({ name, dev: info.dev, ino: info.ino });
+        await file.chmod(0o600);
+        await file.writeFile(`${plan.sessionId} ${plan.uid} ${plan.gid}\n`);
+        await file.sync();
+      } finally { await file.close(); }
+    }
+    const dir = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await dir.sync(); }
+    finally { await dir.close(); }
+  } catch (error) {
+    for (const marker of created.reverse()) {
+      const filename = path.join(directory, marker.name);
+      const current = await lstat(filename);
+      if (!current.isFile() || current.dev !== marker.dev || current.ino !== marker.ino) {
+        throw new Error(`Linux identity marker changed during rollback: ${filename}`);
+      }
+      await unlink(filename);
+    }
+    const dir = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await dir.sync(); }
+    finally { await dir.close(); }
+    throw error;
   }
 }
 
@@ -61,7 +174,7 @@ async function checkedRootRuntime(): Promise<void> {
   }
   for (const filename of [fileURLToPath(import.meta.url), path.join(runtimeDir, "linux-agent-unit.js"),
     path.join(runtimeDir, "linux-peer-identity.js"), path.join(runtimeDir, "package.json"),
-    rootPeerHelper, await realpath(process.execPath)]) {
+    rootPidfdHelper, await realpath(process.execPath)]) {
     await checkedRootFile(filename);
   }
   const parent = await lstat(path.dirname(controlSocket));
@@ -92,6 +205,111 @@ async function readPeer(socket: Socket, helper: string): Promise<{ uid: number; 
   });
 }
 
+function firstFrame(socket: Socket): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let pending = Buffer.alloc(0);
+    const done = (error?: Error, value?: unknown) => {
+      socket.pause();
+      socket.setTimeout(0);
+      socket.off("data", onData);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onClose = () => done(new Error("Linux control handshake closed."));
+    const onError = (error: Error) => done(error);
+    const onData = (chunk: Buffer) => {
+      if (chunk.length > 512) {
+        done(new Error("Invalid Linux control handshake frame."));
+        return;
+      }
+      pending = Buffer.concat([pending, chunk]);
+      const end = pending.indexOf(10);
+      if (pending.length > 512 || (end >= 0 && end !== pending.length - 1)) {
+        done(new Error("Invalid Linux control handshake frame."));
+        return;
+      }
+      if (end < 0) return;
+      try { done(undefined, JSON.parse(pending.subarray(0, end).toString("utf8"))); }
+      catch { done(new Error("Invalid Linux control handshake JSON.")); }
+    };
+    socket.setTimeout(1500, () => done(new Error("Linux control handshake timed out.")));
+    socket.on("data", onData);
+    socket.once("close", onClose);
+    socket.once("error", onError);
+    socket.resume();
+  });
+}
+
+async function systemctlProperties(unit: string): Promise<string> {
+  const names = ["Id", "ActiveState", "MainPID", "ControlGroup", "InvocationID",
+    "FragmentPath", "BindsTo", "After"];
+  return new Promise((resolve, reject) => {
+    const child = spawn("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
+      ...names.flatMap(name => ["-p", name])], { stdio: ["ignore", "pipe", "pipe"], env: {}, timeout: 3000 });
+    let output = "";
+    let errorOutput = "";
+    child.stdout!.on("data", chunk => {
+      output += String(chunk);
+      if (output.length > 16_384) child.kill();
+    });
+    child.stderr!.on("data", chunk => {
+      errorOutput += String(chunk);
+      if (errorOutput.length > 4096) child.kill();
+    });
+    child.once("error", reject);
+    child.once("close", code => {
+      if (code !== 0 || output.length > 16_384 || errorOutput.length > 4096) {
+        reject(new Error("Could not attest Linux broker unit."));
+      } else resolve(output);
+    });
+  });
+}
+
+export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number,
+  output: string, expected?: string): string {
+  const values = new Map<string, string>();
+  for (const line of output.trimEnd().split("\n")) {
+    const index = line.indexOf("=");
+    if (index < 1 || values.has(line.slice(0, index))) {
+      throw new Error("Invalid Linux broker unit attestation.");
+    }
+    values.set(line.slice(0, index), line.slice(index + 1));
+  }
+  const invocation = values.get("InvocationID") || "";
+  if (values.get("Id") !== record.brokerUnit || values.get("ActiveState") !== "active" ||
+      values.get("MainPID") !== String(pid) ||
+      values.get("ControlGroup") !== `/system.slice/${record.brokerUnit}` ||
+      values.get("FragmentPath") !== record.brokerUnitFile ||
+      !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
+      !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service") ||
+      !/^[a-f0-9]{32}$/.test(invocation) || (expected && invocation !== expected)) {
+    throw new Error("Linux control peer is not the registered broker unit invocation.");
+  }
+  return invocation;
+}
+
+async function attestBroker(socket: Socket, record: LinuxManagedPlanRecord,
+  brokerUid: number, brokerGid: number, expected?: string): Promise<string> {
+  const cgroup = `/system.slice/${record.brokerUnit}`;
+  const peer = await verifyLinuxPeerProcess(socket, cgroup);
+  if (peer.uid !== brokerUid || peer.gid !== brokerGid) {
+    throw new Error("Linux control peer has the wrong broker identity.");
+  }
+  const invocation = brokerUnitInvocation(record, peer.pid,
+    await systemctlProperties(record.brokerUnit), expected);
+  const command = (await readFile(`/proc/${peer.pid}/cmdline`)).toString("utf8").split("\0");
+  if (command.at(-1) === "") command.pop();
+  if (command.length !== 3 || command[1] !== record.brokerEntry ||
+      command[2] !== record.brokerConfig) {
+    throw new Error("Linux broker command does not match its root registration.");
+  }
+  const executable = await readlink(`/proc/${peer.pid}/exe`);
+  await checkedBrokerFile(executable);
+  return invocation;
+}
+
 function readFrames(socket: Socket, onFrame: (value: unknown) => void): void {
   let pending = Buffer.alloc(0);
   socket.on("data", chunk => {
@@ -116,6 +334,17 @@ function sendFrame(socket: Socket, value: unknown): void {
   socket.write(frame);
 }
 
+export function sendControlReply(socket: Socket, id: unknown,
+  result: { ok: true; value: unknown } | { ok: false; error: string }): void {
+  if (socket.destroyed) return;
+  if (!Number.isSafeInteger(id) || (id as number) < 1) {
+    socket.destroy();
+    return;
+  }
+  try { sendFrame(socket, { id, ...result }); }
+  catch { socket.destroy(); }
+}
+
 function controlCall(value: unknown): ControlCall {
   if (!value || typeof value !== "object") throw new Error("Invalid Linux control call.");
   const call = value as ControlCall;
@@ -130,6 +359,24 @@ export interface LinuxAgentControlService {
   close(): Promise<void>;
 }
 
+export async function startTrackedManagedUnit(manager: Pick<SystemdRunAgentUnitManager, "start" | "hasActiveLease">,
+  plan: LinuxAgentUnitPlan, state: { started: boolean }): Promise<void> {
+  try {
+    await manager.start(plan);
+    state.started = true;
+  } catch (error) {
+    state.started = manager.hasActiveLease(plan.sessionId);
+    throw error;
+  }
+}
+
+export async function stopTrackedManagedUnit(manager: Pick<SystemdRunAgentUnitManager, "stop">,
+  plan: LinuxAgentUnitPlan, state: { started: boolean }): Promise<void> {
+  if (!state.started) return;
+  await manager.stop(plan);
+  state.started = false;
+}
+
 export async function startLinuxAgentControlService(brokerUid: number, brokerGid: number): Promise<LinuxAgentControlService> {
   await checkedRootRuntime();
   if (!Number.isSafeInteger(brokerUid) || brokerUid < 1 ||
@@ -137,68 +384,88 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
     throw new Error("A dedicated broker UID and GID are required.");
   }
   const manager = new SystemdRunAgentUnitManager();
-  let owner: Socket | undefined;
-  let draining = false;
-  let cleanup = Promise.resolve();
-  const plans = new Map<string, LinuxAgentUnitPlan>();
+  const owners = new Map<string, Socket>();
+  const draining = new Set<string>();
+  const usedSessions = new Set<string>();
+  const connections = new Set<Socket>();
+  const cleanups = new Set<Promise<void>>();
+  let closing = false;
   const server = createServer(socket => {
+    if (closing || connections.size >= 32) { socket.destroy(); return; }
+    connections.add(socket);
     socket.pause();
     socket.on("error", () => socket.destroy());
-    void readPeer(socket, rootPeerHelper).then(peer => {
-      if (socket.destroyed || owner || draining || peer.uid !== brokerUid || peer.gid !== brokerGid) {
-        socket.destroy();
-        return;
+    socket.once("close", () => connections.delete(socket));
+    void firstFrame(socket).then(async raw => {
+      const hello = raw as { sessionId?: unknown };
+      if (!hello || typeof hello !== "object" || Object.keys(hello).length !== 1 ||
+          typeof hello.sessionId !== "string") {
+        throw new Error("Linux control needs one registered session ID.");
       }
-      owner = socket;
+      const sessionId = hello.sessionId;
+      const record = await registeredPlan(sessionId, brokerUid, brokerGid);
+      const invocation = await attestBroker(socket, record, brokerUid, brokerGid);
+      if (closing || socket.destroyed || owners.has(sessionId) || draining.has(sessionId) ||
+          usedSessions.has(sessionId)) {
+        throw new Error("Linux control session is already owned or ended.");
+      }
+      owners.set(sessionId, socket);
+      const plan = record.plan;
+      const state = { started: false };
+      let used = false;
       let queued = 0;
       let chain = Promise.resolve();
       readFrames(socket, raw => {
         if (++queued > 8) { socket.destroy(); return; }
         chain = chain.then(async () => {
           const call = controlCall(raw);
-          validateLinuxManagedPlan(call.plan, brokerUid, brokerGid);
-          const old = plans.get(call.plan.sessionId);
+          if (call.plan.sessionId !== sessionId ||
+              lifecyclePlanKey(call.plan) !== lifecyclePlanKey(plan)) {
+            throw new Error("Linux control plan differs from its root registration.");
+          }
+          if (closing) throw new Error("Linux root control service is stopping.");
+          await attestBroker(socket, record, brokerUid, brokerGid, invocation);
+          if (closing || socket.destroyed) throw new Error("Linux root control service is stopping.");
           if (call.method === "start") {
-            if (old) throw new Error("This Linux agent session was already launched.");
-            plans.set(call.plan.sessionId, call.plan);
-            await manager.start(call.plan);
+            if (used) throw new Error("This Linux agent session was already launched.");
+            used = true;
+            usedSessions.add(sessionId);
+            await reserveManagedIdentity(plan);
+            await startTrackedManagedUnit(manager, plan, state);
             return undefined;
           }
-          if (!old || lifecyclePlanKey(old) !== lifecyclePlanKey(call.plan)) {
-            throw new Error("Linux control plan changed after launch.");
-          }
-          if (call.method === "inspect") return manager.inspect(old);
+          if (!state.started) throw new Error("This Linux agent session has not started.");
+          if (call.method === "inspect") return manager.inspect(plan);
           if (call.method === "release") {
             if (!call.state) throw new Error("Linux gate release needs its attested unit state.");
-            await manager.release!(old, call.state);
+            await manager.release!(plan, call.state);
           } else {
-            await manager.stop(old);
-            plans.delete(call.plan.sessionId);
+            await stopTrackedManagedUnit(manager, plan, state);
           }
           return undefined;
         }).then(value => {
           const id = (raw as ControlCall)?.id;
-          if (!socket.destroyed) sendFrame(socket, { id, ok: true, value });
+          sendControlReply(socket, id, { ok: true, value });
         }).catch(error => {
           const id = (raw as ControlCall)?.id;
-          if (!socket.destroyed) sendFrame(socket, { id, ok: false, error: String(error) });
+          sendControlReply(socket, id, { ok: false, error: String(error) });
         }).finally(() => { queued--; });
       });
       socket.once("close", () => {
-        if (owner !== socket) return;
-        owner = undefined;
-        draining = true;
-        cleanup = chain.then(async () => {
-          for (const plan of [...plans.values()].reverse()) {
-            await manager.stop(plan);
-            plans.delete(plan.sessionId);
-          }
-          draining = false;
+        if (owners.get(sessionId) !== socket) return;
+        draining.add(sessionId);
+        const cleanup = chain.then(async () => {
+          await stopTrackedManagedUnit(manager, plan, state);
+          owners.delete(sessionId);
+          draining.delete(sessionId);
         }).catch(error => {
           process.stderr.write(`Linux control teardown failed: ${String(error)}\n`);
           process.exit(1);
         });
+        cleanups.add(cleanup);
+        void cleanup.finally(() => cleanups.delete(cleanup));
       });
+      sendFrame(socket, { sessionId, ok: true });
       socket.resume();
     }).catch(() => socket.destroy());
   });
@@ -212,25 +479,26 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
   await chown(controlSocket, 0, brokerGid);
   await chmod(controlSocket, 0o660);
   const node = await lstat(controlSocket);
+  let closed: Promise<void> | undefined;
   return {
-    async close() {
-      if (owner) {
-        const socket = owner;
-        const ended = new Promise<void>(resolve => socket.once("close", resolve));
-        socket.destroy();
-        await ended;
-      }
-      await cleanup;
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-      try {
-        const current = await lstat(controlSocket);
-        if (current.dev !== node.dev || current.ino !== node.ino) {
-          throw new Error("Linux control socket changed before cleanup.");
+    close() {
+      if (closed) return closed;
+      closing = true;
+      closed = (async () => {
+        for (const socket of connections) socket.destroy();
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+        await Promise.all([...cleanups]);
+        try {
+          const current = await lstat(controlSocket);
+          if (current.dev !== node.dev || current.ino !== node.ino) {
+            throw new Error("Linux control socket changed before cleanup.");
+          }
+          await unlink(controlSocket);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
-        await unlink(controlSocket);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
+      })();
+      return closed;
     }
   };
 }
@@ -240,11 +508,14 @@ export interface LinuxAgentControlClient extends LinuxAgentUnitManager {
   close(): Promise<void>;
 }
 
-export async function connectLinuxAgentControl(brokerGid: number): Promise<LinuxAgentControlClient> {
+export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promise<LinuxAgentControlClient> {
+  const brokerGid = process.getgid?.();
   if (process.platform !== "linux" || process.geteuid?.() === 0 ||
-      process.getgid?.() !== brokerGid) {
+      brokerGid === undefined || process.getuid?.() !== plan.brokerUid) {
     throw new Error("A separate Linux broker identity is required.");
   }
+  validateLinuxManagedPlan(plan, plan.brokerUid, brokerGid);
+  const admittedPlan = { ...plan, args: [...plan.args] };
   const node = await lstat(controlSocket);
   if (!node.isSocket() || node.uid !== 0 || node.gid !== brokerGid ||
       (node.mode & 0o777) !== 0o660) {
@@ -278,6 +549,14 @@ export async function connectLinuxAgentControl(brokerGid: number): Promise<Linux
     const peer = await readPeer(socket, helper);
     if (peer.uid !== 0 || peer.gid !== 0) throw new Error("Linux control server is not root.");
   } catch (error) { socket.destroy(); throw error; }
+  try {
+    sendFrame(socket, { sessionId: plan.sessionId });
+    const hello = await firstFrame(socket) as { sessionId?: unknown; ok?: unknown };
+    if (!hello || typeof hello !== "object" || Object.keys(hello).length !== 2 ||
+        hello.sessionId !== plan.sessionId || hello.ok !== true) {
+      throw new Error("Linux root control did not admit this broker session.");
+    }
+  } catch (error) { socket.destroy(); throw error; }
   let nextId = 0;
   const lost = new AbortController();
   let pending: { id: number; resolve(value: unknown): void; reject(error: Error): void } | undefined;
@@ -300,6 +579,10 @@ export async function connectLinuxAgentControl(brokerGid: number): Promise<Linux
   socket.resume();
   const call = async (method: Method, plan: LinuxAgentUnitPlan, state?: LinuxAgentUnitState): Promise<unknown> => {
     if (socket.destroyed || pending) throw new Error("Linux root control service is unavailable or busy.");
+    if (plan.sessionId !== admittedPlan.sessionId ||
+        lifecyclePlanKey(plan) !== lifecyclePlanKey(admittedPlan)) {
+      throw new Error("Linux control plan differs from the admitted broker session.");
+    }
     const id = ++nextId;
     return new Promise((resolve, reject) => {
       pending = { id, resolve, reject };
