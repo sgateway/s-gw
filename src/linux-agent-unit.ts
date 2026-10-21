@@ -84,6 +84,7 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan): string[] {
     `User=${plan.uid}`, `Group=${plan.gid}`,
     `RootDirectory=${plan.rootDirectory}`,
     "WorkingDirectory=/workspace",
+    `ReadWritePaths=${plan.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${bindReadOnlyPaths(plan)}`,
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock"
   ];
@@ -129,6 +130,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       !matches("User", String(plan.uid)) || !matches("Group", String(plan.gid)) ||
       !matches("SupplementaryGroups", "") ||
       !matches("RootDirectory", plan.rootDirectory) || !matches("WorkingDirectory", "/workspace") ||
+      !matches("ReadWritePaths", `${plan.rootDirectory}/workspace`) ||
       !attestedReadOnlyPaths(plan, fields.get("BindReadOnlyPaths")) ||
       !matches("BindPaths", "") ||
       !matches("Environment", "SGW_BROKER_SOCKET=/run/s-gw/broker.sock") ||
@@ -197,7 +199,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     validateLinuxAgentPlan(plan);
     const output = await run("/usr/bin/systemctl", ["--system", "--no-pager", "show", linuxAgentUnitName(plan.sessionId),
       "-p", "Id", "-p", "ActiveState", "-p", "Type", "-p", "User", "-p", "Group",
-      "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
+      "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "ReadWritePaths", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
       "-p", "Environment", "-p", "Restart", "-p", "KillMode", "-p", "SendSIGKILL",
       "-p", "Delegate", "-p", "DynamicUser", "-p", "PrivateUsers", "-p", "PrivateNetwork",
       "-p", "SupplementaryGroups",

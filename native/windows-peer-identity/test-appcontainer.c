@@ -57,13 +57,24 @@ static int loopback_blocked(const wchar_t *port_text) {
     return blocked;
 }
 
-static int run_client(const wchar_t *pipe_name, const wchar_t *probe_port) {
+static int run_client(const wchar_t *pipe_name, const wchar_t *probe_port, const wchar_t *profile) {
+    PSID expected_sid = NULL;
+    if (FAILED(DeriveAppContainerSidFromAppContainerName(profile, &expected_sid))) return 1;
     HANDLE token = NULL;
     DWORD is_appcontainer = 0, size = 0;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 1;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        FreeSid(expected_sid);
+        return 1;
+    }
     int isolated = GetTokenInformation(token, TokenIsAppContainer, &is_appcontainer,
         sizeof(is_appcontainer), &size) && is_appcontainer == 1;
+    GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &size);
+    TOKEN_APPCONTAINER_INFORMATION *package = size && size <= 4096 ? malloc(size) : NULL;
+    isolated = isolated && package && GetTokenInformation(token, TokenAppContainerSid, package, size, &size) &&
+        package->TokenAppContainer && EqualSid(package->TokenAppContainer, expected_sid);
+    free(package);
     CloseHandle(token);
+    FreeSid(expected_sid);
     if (!isolated) return 1;
     if (!loopback_blocked(probe_port)) {
         fputs("AppContainer reached forbidden host loopback.\n", stderr);
@@ -91,7 +102,8 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *probe_port) {
     return result;
 }
 
-static int launch_client(const wchar_t *name, const wchar_t *pipe_name, const wchar_t *probe_port) {
+static int launch_client(const wchar_t *name, const wchar_t *pipe_name, const wchar_t *probe_port,
+    int stop_job) {
     PSID sid = NULL;
     HRESULT status = DeriveAppContainerSidFromAppContainerName(name, &sid);
     if (FAILED(status)) return 1;
@@ -117,8 +129,8 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name, const wc
     DWORD length = GetModuleFileNameW(NULL, executable, MAX_PATH);
     if (!length || length >= MAX_PATH) goto done;
     wchar_t command[MAX_PATH + 256];
-    if (swprintf(command, sizeof(command) / sizeof(command[0]), L"\"%ls\" client \"%ls\" %ls",
-        executable, pipe_name, probe_port) < 0) goto done;
+    if (swprintf(command, sizeof(command) / sizeof(command[0]), L"\"%ls\" client \"%ls\" %ls \"%ls\"",
+        executable, pipe_name, probe_port, name) < 0) goto done;
 
     STARTUPINFOEXW startup = { 0 };
     startup.StartupInfo.cb = sizeof(startup);
@@ -150,14 +162,28 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name, const wc
         CloseHandle(job);
         goto done;
     }
-    DWORD waited = WaitForSingleObject(process.hProcess, 30000);
     DWORD exit_code = 1;
-    if (waited != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
-    else if (GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0) result = 0;
+    if (stop_job) {
+        char signal = 0;
+        DWORD amount = 0;
+        HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+        if (input != INVALID_HANDLE_VALUE && ReadFile(input, &signal, 1, &amount, NULL) &&
+            amount == 1 && signal == 'K' && WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
+            CloseHandle(job);
+            job = NULL;
+            if (WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0 &&
+                GetExitCodeProcess(process.hProcess, &exit_code) && exit_code != 0) result = 0;
+        }
+        if (result) TerminateProcess(process.hProcess, 1);
+    } else {
+        DWORD waited = WaitForSingleObject(process.hProcess, 30000);
+        if (waited != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
+        else if (GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0) result = 0;
+    }
     if (result) fprintf(stderr, "AppContainer child failed: %lu\n", (unsigned long)exit_code);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
-    CloseHandle(job);
+    if (job) CloseHandle(job);
 
 done:
     if (initialized) DeleteProcThreadAttributeList(attrs);
@@ -173,7 +199,8 @@ int wmain(int argc, wchar_t **argv) {
         if (FAILED(status)) fprintf(stderr, "DeleteAppContainerProfile failed: 0x%08lx\n", (unsigned long)status);
         return FAILED(status) ? 1 : 0;
     }
-    if (argc == 4 && wcscmp(argv[1], L"client") == 0) return run_client(argv[2], argv[3]);
-    if (argc == 5 && wcscmp(argv[1], L"launch") == 0) return launch_client(argv[2], argv[3], argv[4]);
+    if (argc == 5 && wcscmp(argv[1], L"client") == 0) return run_client(argv[2], argv[3], argv[4]);
+    if (argc == 5 && wcscmp(argv[1], L"launch") == 0) return launch_client(argv[2], argv[3], argv[4], 0);
+    if (argc == 5 && wcscmp(argv[1], L"launch-stop") == 0) return launch_client(argv[2], argv[3], argv[4], 1);
     return 1;
 }

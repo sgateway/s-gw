@@ -119,12 +119,13 @@ function requestFrame(child) {
   });
 }
 
-async function acceptsAppContainer(executable, profile, packageSid, brokerSid, logonLuid, sessionId) {
+async function acceptsAppContainer(executable, profile, packageSid, brokerSid, logonLuid, sessionId,
+  { intruderProfile, stopJob = false } = {}) {
   const name = pipeName();
   const run = launch([name, brokerSid, brokerSid, packageSid, logonLuid, sessionId]);
   const loopback = net.createServer(socket => { loopbackHits++; socket.destroy(); });
   let loopbackHits = 0;
-  let client;
+  let client, intruder;
   try {
     await deadline(new Promise((resolveListen, rejectListen) => {
       loopback.once("error", rejectListen);
@@ -139,8 +140,18 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
     loopbackHits = 0;
     assert.equal(await deadline(run.ready, 30_000, "AppContainer pipe"), true,
       "The AppContainer pipe was not ready.");
+    if (intruderProfile) {
+      intruder = launch(["launch", intruderProfile, name, String(loopback.address().port)], executable);
+      const denied = await deadline(intruder.done, 35_000, "cross-agent pipe attempt");
+      assert.equal(denied.spawnError, undefined, denied.spawnError?.message);
+      assert.notEqual(denied.code, 0, "The other AppContainer opened this agent's pipe.");
+      assert.match(denied.stderr, /AppContainer pipe open failed: 5\r?\n/,
+        "The other AppContainer was not denied by the pipe ACL.");
+      assert.equal(run.child.exitCode, null, "The other AppContainer consumed the broker's pipe instance.");
+    }
     const request = requestFrame(run.child);
-    client = launch(["launch", profile, name, String(loopback.address().port)], executable);
+    client = launch([stopJob ? "launch-stop" : "launch", profile, name,
+      String(loopback.address().port)], executable);
     const forwarded = await deadline(Promise.race([
       request,
       client.done.then(result => {
@@ -148,6 +159,17 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
       })
     ]), 35_000, "AppContainer request");
     assert.equal(forwarded.toString(), "appcontainer probe");
+
+    if (stopJob) {
+      client.child.stdin.end("K");
+      const stopped = await deadline(client.done, 15_000, "AppContainer job teardown");
+      assert.equal(stopped.code, 0, stopped.stderr || "Closing the Job Object did not stop its child.");
+      run.child.stdin.end();
+      const broker = await deadline(run.done, 10_000, "broker after agent teardown");
+      assert.notEqual(broker.code, 0, "The broker completed a request after the agent was killed.");
+      assert.equal(loopbackHits, 0, "The AppContainer reached host loopback without a network capability.");
+      return;
+    }
 
     const reply = Buffer.from("broker reply");
     const header = Buffer.alloc(5);
@@ -163,8 +185,9 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
     assert.equal(agent.code, 0, agent.stderr || "The AppContainer client did not receive the broker reply.");
     assert.equal(loopbackHits, 0, "The AppContainer reached host loopback without a network capability.");
   } finally {
-    client?.child.kill();
-    run.child.kill();
+    const processes = [intruder, client, run].filter(Boolean);
+    for (const item of processes) item.child.kill();
+    await Promise.allSettled(processes.map(item => deadline(item.done, 5_000, "fixture cleanup")));
     await new Promise(resolveClose => loopback.close(() => resolveClose()));
   }
 }
@@ -208,25 +231,37 @@ try {
   await rejectsClient([pipeName(), brokerSid, brokerSid, "S-1-15-2-1", logonLuid, sessionId],
     "ordinary client without the required AppContainer");
 
-  const profileName = `sgw-pipe-test-${randomBytes(8).toString("hex")}`;
-  const created = spawnSync(appContainerFixture, ["create", profileName],
-    { encoding: "utf8", windowsHide: true });
-  assert.equal(created.status, 0, created.stderr || "Could not create the temporary AppContainer profile.");
+  const profiles = [];
   try {
-    const packageSid = created.stdout.trim();
-    assert.match(packageSid, /^S-1-15-2-(?:\d+-)*\d+$/);
-    for (const [path, permission] of [[tmp, `(OI)(CI)RX`], [appContainerFixture, "RX"]]) {
-      const acl = spawnSync("icacls", [path, "/grant", `*${packageSid}:${permission}`],
+    for (let i = 0; i < 2; i++) {
+      const name = `sgw-pipe-test-${randomBytes(8).toString("hex")}`;
+      const created = spawnSync(appContainerFixture, ["create", name],
         { encoding: "utf8", windowsHide: true });
-      assert.equal(acl.status, 0, acl.stderr || acl.stdout);
+      assert.equal(created.status, 0, created.stderr || "Could not create a temporary AppContainer profile.");
+      const sid = created.stdout.trim();
+      profiles.push({ name, sid });
+      assert.match(sid, /^S-1-15-2-(?:\d+-)*\d+$/);
+      for (const [path, permission] of [[tmp, "(OI)(CI)RX"], [appContainerFixture, "RX"]]) {
+        const acl = spawnSync("icacls", [path, "/grant", `*${sid}:${permission}`],
+          { encoding: "utf8", windowsHide: true });
+        assert.equal(acl.status, 0, acl.stderr || acl.stdout);
+      }
     }
-    await acceptsAppContainer(appContainerFixture, profileName, packageSid, brokerSid, logonLuid, sessionId);
+    assert.notEqual(profiles[0].sid, profiles[1].sid, "The two agents need distinct package identities.");
+    await acceptsAppContainer(appContainerFixture, profiles[0].name, profiles[0].sid,
+      brokerSid, logonLuid, sessionId, { intruderProfile: profiles[1].name });
+    await acceptsAppContainer(appContainerFixture, profiles[1].name, profiles[1].sid,
+      brokerSid, logonLuid, sessionId, { intruderProfile: profiles[0].name });
+    await acceptsAppContainer(appContainerFixture, profiles[0].name, profiles[0].sid,
+      brokerSid, logonLuid, sessionId, { stopJob: true });
   } finally {
-    const deleted = spawnSync(appContainerFixture, ["delete", profileName],
-      { encoding: "utf8", windowsHide: true });
-    assert.equal(deleted.status, 0, deleted.stderr || "Could not delete the temporary AppContainer profile.");
+    for (const { name } of profiles.reverse()) {
+      const deleted = spawnSync(appContainerFixture, ["delete", name],
+        { encoding: "utf8", windowsHide: true });
+      assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
+    }
   }
-  console.log("Native Windows peer-pipe identity rejection and AppContainer exchange passed.");
+  console.log("Native Windows two-agent pipe isolation, Job teardown, and AppContainer exchange passed.");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

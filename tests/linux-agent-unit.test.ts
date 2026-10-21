@@ -18,6 +18,7 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `Id=${linuxAgentUnitName(p.sessionId)}`, "ActiveState=active", "Type=exec",
     `User=${p.uid}`, `Group=${p.gid}`, "SupplementaryGroups=",
     `RootDirectory=${p.rootDirectory}`, "WorkingDirectory=/workspace",
+    `ReadWritePaths=${p.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${binds}`, "BindPaths=",
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
@@ -42,6 +43,7 @@ describe("Linux systemd agent unit plan", () => {
     expect(args).toContain("--property=PrivateIPC=yes");
     expect(args).toContain("--property=PrivateTmp=yes");
     expect(args).toContain("--property=RootDirectory=/var/lib/s-gw/agent-roots/session-123");
+    expect(args).toContain("--property=ReadWritePaths=/var/lib/s-gw/agent-roots/session-123/workspace");
     expect(args).toContain("--property=BindReadOnlyPaths=/run/s-gw/agents/session-123/broker.sock:/run/s-gw/broker.sock");
     expect(args).toContain("--property=KillMode=control-group");
     expect(args).toContain("--property=Restart=no");
@@ -96,6 +98,7 @@ describe("Linux systemd agent unit plan", () => {
       ["User=231001", "User=1000"],
       ["SupplementaryGroups=\n", "SupplementaryGroups=docker\n"],
       ["RootDirectory=/var/lib/s-gw/agent-roots/session-123", "RootDirectory=/"],
+      [`ReadWritePaths=${p.rootDirectory}/workspace`, "ReadWritePaths=/"],
       ["ControlGroup=/system.slice/s-gw-agent-session-123.service", "ControlGroup=/system.slice/other.service"],
       ["Restart=no", "Restart=always"],
       ["ActiveState=active", "ActiveState=failed"],
