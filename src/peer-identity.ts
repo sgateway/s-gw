@@ -23,18 +23,30 @@ interface LiveSession extends PeerSession {
   sockets: Set<Socket>;
 }
 
+const maxSessionConnections = 8;
+const maxPendingConnections = 32;
+const defaultIdleTimeoutMs = 35 * 60_000;
+
 export class PeerSessionRegistry {
   private readonly sessions = new Map<number, LiveSession>();
+  private readonly usedSessionIds = new Set<string>();
+  private readonly usedUids = new Set<number>();
 
   register(session: PeerSession): () => void {
     if (!Number.isSafeInteger(session.uid) || session.uid < 0 ||
         (session.gid !== undefined && (!Number.isSafeInteger(session.gid) || session.gid < 0))) {
       throw new Error("A managed peer needs a valid OS UID and GID.");
     }
-    if (this.sessions.has(session.uid)) throw new Error("This OS identity already has a live agent session.");
-    if ([...this.sessions.values()].some(item => item.sessionId === session.sessionId)) {
-      throw new Error("This agent session ID is already registered.");
+    if ((typeof process.getuid === "function" && session.uid === process.getuid()) ||
+        (typeof process.geteuid === "function" && session.uid === process.geteuid())) {
+      throw new Error("A managed peer cannot use the broker's OS identity.");
     }
+    if (typeof session.sessionId !== "string" || !session.sessionId.trim()) {
+      throw new Error("A managed peer needs a nonempty session ID.");
+    }
+    if (this.sessions.has(session.uid)) throw new Error("This OS identity already has a live agent session.");
+    if (this.usedUids.has(session.uid)) throw new Error("This agent OS identity cannot be reused by this broker.");
+    if (this.usedSessionIds.has(session.sessionId)) throw new Error("This agent session ID was already registered.");
     principalForVerifiedPeer(principalId(session.uid), session.name, session.sessionId);
     if (process.platform === "linux" && (!session.linuxCgroup || !validCgroupPath(session.linuxCgroup))) {
       throw new Error("Linux peer sessions require an absolute cgroup v2 path.");
@@ -45,6 +57,8 @@ export class PeerSessionRegistry {
 
     const live: LiveSession = { ...session, sockets: new Set() };
     this.sessions.set(session.uid, live);
+    this.usedUids.add(session.uid);
+    this.usedSessionIds.add(session.sessionId);
     return () => {
       if (this.sessions.get(session.uid) !== live) return;
       this.sessions.delete(session.uid);
@@ -64,6 +78,8 @@ export class PeerSessionRegistry {
       throw new Error("Agent process is outside its registered cgroup.");
     }
     if (this.sessions.get(peer.uid) !== session) throw new Error("Agent session ended during peer verification.");
+    if (socket.destroyed) throw new Error("Agent socket closed during peer verification.");
+    if (session.sockets.size >= maxSessionConnections) throw new Error("Agent session has too many open connections.");
     session.sockets.add(socket);
     socket.once("close", () => session.sockets.delete(socket));
     return principalForVerifiedPeer(principalId(peer.uid), session.name, session.sessionId);
@@ -79,6 +95,7 @@ export interface VerifiedPeerServerOptions {
   socketPath: string;
   socketMode?: 0o600 | 0o660;
   socketGid?: number;
+  idleTimeoutMs?: number;
   onConnection(socket: Socket, principal: VerifiedAgentPrincipal, peer: UnixPeer): void | Promise<void>;
 }
 
@@ -88,17 +105,27 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   }
   await checkedPeerHelper();
   const socketPath = await checkedSocketPath(options.socketPath);
+  const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs;
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 35 * 60_000) {
+    throw new Error("Invalid broker connection idle deadline.");
+  }
+  const socketMode = options.socketMode ?? 0o600;
+  if (socketMode !== 0o600 && socketMode !== 0o660) throw new Error("Invalid broker socket mode.");
   const registry = new PeerSessionRegistry();
   const sockets = new Set<Socket>();
+  const pending = new Set<Socket>();
   const server = createServer(socket => {
-    if (sockets.size >= 32) { socket.destroy(); return; }
+    if (pending.size >= maxPendingConnections) { socket.destroy(); return; }
     socket.pause();
     sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
+    pending.add(socket);
+    socket.setTimeout(idleTimeoutMs, () => socket.destroy());
+    socket.once("close", () => { sockets.delete(socket); pending.delete(socket); });
     const accepted = registry.snapshot();
     void readUnixPeer(socket).then(async peer => {
       if (socket.destroyed) return;
       const principal = await registry.authenticate(peer, socket, accepted);
+      pending.delete(socket);
       if (socket.destroyed) return;
       await options.onConnection(socket, principal, peer);
     }).catch(() => socket.destroy());
@@ -110,7 +137,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
       if (!Number.isSafeInteger(options.socketGid) || options.socketGid < 0) throw new Error("Invalid broker socket GID.");
       await chown(socketPath, process.getuid!(), options.socketGid);
     }
-    await chmod(socketPath, options.socketMode ?? 0o600);
+    await chmod(socketPath, socketMode);
   } catch (error) {
     await closeServer(server, sockets);
     throw error;
