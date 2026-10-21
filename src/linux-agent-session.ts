@@ -26,6 +26,7 @@ export class LinuxAgentSessionLeases {
     finally { await dir.close(); }
 
     let started = false;
+    let stopPeer: (() => void) | undefined;
     try {
       await this.units.start(plan);
       started = true;
@@ -36,18 +37,23 @@ export class LinuxAgentSessionLeases {
           state.mainPid < 1 || !/^[a-f0-9]{32}$/.test(state.invocationId)) {
         throw new Error("Linux agent unit identity changed before peer registration.");
       }
-      const stopPeer = registerPeer({ uid: plan.uid, gid: plan.gid, sessionId: plan.sessionId,
+      stopPeer = registerPeer({ uid: plan.uid, gid: plan.gid, sessionId: plan.sessionId,
         name, linuxCgroup: state.cgroup });
+      if (plan.launchGate) {
+        if (!this.units.release) throw new Error("Linux agent launch gate cannot be released by this unit manager.");
+        await this.units.release(plan, state);
+      }
       let revoked = false;
       let stopping: Promise<void> | undefined;
       return async () => {
-        if (!revoked) { revoked = true; stopPeer(); }
+        if (!revoked) { revoked = true; stopPeer!(); }
         if (!stopping) {
           stopping = this.units.stop(plan).catch(error => { stopping = undefined; throw error; });
         }
         await stopping;
       };
     } catch (error) {
+      stopPeer?.();
       if (started) {
         try { await this.units.stop(plan); }
         catch (stopError) { throw new AggregateError([error, stopError], "Linux agent launch and teardown failed."); }

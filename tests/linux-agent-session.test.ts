@@ -36,6 +36,7 @@ function manager(p: LinuxAgentUnitPlan) {
     invocationId: "0123456789abcdef0123456789abcdef"
   };
   return { start: vi.fn(async () => {}), inspect: vi.fn(async () => state),
+    release: vi.fn(async () => {}),
     stop: vi.fn(async () => {}) } satisfies LinuxAgentUnitManager;
 }
 
@@ -64,6 +65,54 @@ describe("Linux broker agent leases", () => {
     expect(units.stop).toHaveBeenCalledOnce();
     await expect(new LinuxAgentSessionLeases(location, units).launch(p, "Test agent", () => () => {}))
       .rejects.toThrow("already used");
+  });
+
+  it("registers the attested peer before releasing the gated executable", async () => {
+    const location = await leases();
+    const p = { ...plan(), launchGate: true };
+    const units = manager(p);
+    const events: string[] = [];
+    units.start.mockImplementation(async () => { events.push("start"); });
+    units.inspect.mockImplementation(async () => { events.push("inspect"); return {
+      unit: linuxAgentUnitName(p.sessionId), uid: p.uid, gid: p.gid,
+      cgroup: `/system.slice/${linuxAgentUnitName(p.sessionId)}`, mainPid: 4567,
+      invocationId: "0123456789abcdef0123456789abcdef"
+    }; });
+    units.release.mockImplementation(async () => { events.push("release"); });
+    const stop = await new LinuxAgentSessionLeases(location, units).launch(p, "A", () => {
+      events.push("register"); return () => { events.push("revoke"); };
+    });
+    expect(events).toEqual(["start", "inspect", "register", "release"]);
+    expect(units.release).toHaveBeenCalledWith(p, expect.objectContaining({ mainPid: 4567 }));
+    await stop();
+    expect(events.at(-1)).toBe("revoke");
+  });
+
+  it("revokes and stops when a gated launch cannot be released", async () => {
+    const location = await leases();
+    const p = { ...plan(), launchGate: true };
+    const units = manager(p);
+    const events: string[] = [];
+    units.release.mockRejectedValue(new Error("gate marker not written"));
+    units.stop.mockImplementation(async () => { events.push("stop"); });
+    await expect(new LinuxAgentSessionLeases(location, units).launch(p, "A", () => {
+      events.push("register"); return () => { events.push("revoke"); };
+    })).rejects.toThrow("gate marker not written");
+    expect(events).toEqual(["register", "revoke", "stop"]);
+    await expect(new LinuxAgentSessionLeases(location, units).launch(p, "A", () => () => {}))
+      .rejects.toThrow("already used");
+  });
+
+  it("fails closed if a gated unit manager has no release method", async () => {
+    const location = await leases();
+    const p = { ...plan(), launchGate: true };
+    const units = manager(p);
+    const withoutRelease: LinuxAgentUnitManager = { start: units.start, inspect: units.inspect, stop: units.stop };
+    const revoke = vi.fn();
+    await expect(new LinuxAgentSessionLeases(location, withoutRelease).launch(p, "A", () => revoke))
+      .rejects.toThrow("cannot be released");
+    expect(revoke).toHaveBeenCalledOnce();
+    expect(units.stop).toHaveBeenCalledOnce();
   });
 
   it("only one concurrent launch reserves the same identity", async () => {

@@ -12,11 +12,13 @@ function plan(): LinuxAgentUnitPlan {
 }
 
 function attestation(p: LinuxAgentUnitPlan): string {
+  const binds = `${p.brokerSocket}:/run/s-gw/broker.sock` +
+    (p.launchGate ? ` /run/s-gw/launch-gates/${p.sessionId}:/run/s-gw/launch-gate` : "");
   return [
     `Id=${linuxAgentUnitName(p.sessionId)}`, "ActiveState=active", "Type=exec",
     `User=${p.uid}`, `Group=${p.gid}`, "SupplementaryGroups=",
     `RootDirectory=${p.rootDirectory}`, "WorkingDirectory=/workspace",
-    `BindReadOnlyPaths=${p.brokerSocket}:/run/s-gw/broker.sock`, "BindPaths=",
+    `BindReadOnlyPaths=${binds}`, "BindPaths=",
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
     "DynamicUser=no", "PrivateUsers=no",
@@ -47,6 +49,20 @@ describe("Linux systemd agent unit plan", () => {
     expect(args).toContain("--property=CapabilityBoundingSet=");
     expect(args).not.toContain("--property=DynamicUser=yes");
     expect(args.slice(-4)).toEqual(["/usr/bin/node", "/app/agent.js", "--prompt", "a b"]);
+  });
+
+  it("runs the opt-in launch gate with a read-only root-owned release mount", () => {
+    const p = { ...plan(), launchGate: true };
+    const args = systemdRunArgs(p);
+    expect(args).toContain("--property=BindReadOnlyPaths=/run/s-gw/agents/session-123/broker.sock:/run/s-gw/broker.sock /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate");
+    expect(args.slice(-6)).toEqual(["/usr/libexec/s-gw/agent-launch-gate", "--", "/usr/bin/node", "/app/agent.js", "--prompt", "a b"]);
+    expect(parseSystemdAgentState(p, attestation(p)).mainPid).toBe(1234);
+    expect(parseSystemdAgentState(p, attestation(p).replace(
+      "BindReadOnlyPaths=/run/s-gw/agents/session-123/broker.sock:/run/s-gw/broker.sock /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate",
+      "BindReadOnlyPaths=/run/s-gw/agents/session-123/broker.sock:/run/s-gw/broker.sock:rbind /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate:rbind"))
+      .mainPid).toBe(1234);
+    expect(() => parseSystemdAgentState(p, attestation(p).replace(
+      " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
   });
 
   it("rejects identity reuse, path traversal, shell interpolation, and unmanaged roots", () => {

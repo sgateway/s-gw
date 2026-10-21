@@ -1,7 +1,9 @@
-import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { requirePassphrase } from "../src/crypto.js";
 import {
@@ -43,6 +45,7 @@ afterEach(async () => {
   delete process.env.SGW_FAKE_INSPECTOR_FAILURE;
   delete process.env.SGW_ALLOW_SECURITY_CLI;
   delete process.env.SGW_FAKE_KEYCHAIN_DB;
+  delete process.env.SGW_TEST_KEYCHAIN_REPAIR_LOCK_TIMEOUT_MS;
   delete process.env.SGW_HOME;
   delete process.env.SGW_RECOVERY_HOME;
   if (tmpDir) {
@@ -351,6 +354,151 @@ describe("unlock passphrase provider", () => {
     expect(repaired.items[`com.s-gw.sgw.keychain-repair\u0000${backupAccount}`]).toBeUndefined();
   });
 
+  it("keeps an old live repair owner locked while another process waits", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:concurrent" };
+    await installRepairHarness({ ...ref, value: "concurrent-value" });
+    const paused = path.join(tmpDir, "helper-paused");
+    const child = await startRepairChild(ref, {
+      SGW_FAKE_KEYCHAIN_HOLD_MS: "1000",
+      SGW_FAKE_KEYCHAIN_HOLD_MARKER: paused
+    });
+    try {
+      await waitForFile(paused);
+      const lockPath = path.join(process.env.SGW_HOME!, ".keychain-repair.lock");
+      const entries = await readdir(lockPath);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatch(/^owner-[0-9a-f-]{36}\.json$/u);
+      const stale = new Date(Date.now() - 60_000);
+      await utimes(lockPath, stale, stale);
+      process.env.SGW_TEST_KEYCHAIN_REPAIR_LOCK_TIMEOUT_MS = "150";
+
+      expect(() => repairMacKeychainItemAccess(ref)).toThrow(/Timed out waiting for Keychain repair lock/u);
+      expect(await readdir(lockPath)).toEqual(entries);
+      expect((await child.exit).code).toBe(0);
+      expect(getMacKeychainItem(ref)).toBe("concurrent-value");
+    } finally {
+      child.process.kill("SIGKILL");
+    }
+  }, 10_000);
+
+  it("reclaims a repair lock left by a crashed owner", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:crashed" };
+    await installRepairHarness({ ...ref, value: "crash-value" });
+    const paused = path.join(tmpDir, "crashed-helper-paused");
+    const child = await startRepairChild(ref, {
+      SGW_FAKE_KEYCHAIN_HOLD_MS: "5000",
+      SGW_FAKE_KEYCHAIN_HOLD_MARKER: paused
+    });
+    try {
+      await waitForFile(paused);
+      child.process.kill("SIGKILL");
+      await child.exit;
+      const helperPid = Number(await readFile(paused, "utf8"));
+      try { process.kill(helperPid, "SIGKILL"); } catch { /* The fake helper already exited. */ }
+
+      expect(repairMacKeychainItemAccess(ref).state).toBe("migrated");
+      expect(getMacKeychainItem(ref)).toBe("crash-value");
+      await expect(stat(path.join(process.env.SGW_HOME!, ".keychain-repair.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      child.process.kill("SIGKILL");
+    }
+  }, 10_000);
+
+  it("reclaims a dead marked owner and a stale legacy empty lock", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:stale" };
+    await installRepairHarness({ ...ref, value: "stale-value" });
+    const lockPath = path.join(process.env.SGW_HOME!, ".keychain-repair.lock");
+    const dead = spawnSync(process.execPath, ["-e", ""]);
+    expect(dead.status).toBe(0);
+    const token = randomUUID();
+    await mkdir(lockPath);
+    await writeFile(path.join(lockPath, `owner-${token}.json`), JSON.stringify({ version: 1, pid: dead.pid, token }));
+    expect(repairMacKeychainItemAccess(ref).state).toBe("migrated");
+
+    await mkdir(lockPath);
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(lockPath, stale, stale);
+    expect(getMacKeychainItem(ref)).toBe("stale-value");
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses a symlink at the repair lock path", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:symlink" };
+    await installRepairHarness({ ...ref, value: "symlink-value" });
+    const lockPath = path.join(process.env.SGW_HOME!, ".keychain-repair.lock");
+    const outside = path.join(tmpDir, "outside");
+    await mkdir(outside);
+    await writeFile(path.join(outside, "sentinel"), "keep");
+    await symlink(outside, lockPath);
+
+    expect(() => repairMacKeychainItemAccess(ref)).toThrow(/repair lock is not a directory/u);
+    expect(await readFile(path.join(outside, "sentinel"), "utf8")).toBe("keep");
+  });
+
+  it("does not release a replacement repair lock", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:replaced" };
+    await installRepairHarness({ ...ref, value: "replacement-value" });
+    const paused = path.join(tmpDir, "replacement-helper-paused");
+    const child = await startRepairChild(ref, {
+      SGW_FAKE_KEYCHAIN_HOLD_MS: "650",
+      SGW_FAKE_KEYCHAIN_HOLD_MARKER: paused
+    });
+    try {
+      await waitForFile(paused);
+      const lockPath = path.join(process.env.SGW_HOME!, ".keychain-repair.lock");
+      await rename(lockPath, `${lockPath}.old`);
+      await mkdir(lockPath);
+      const token = randomUUID();
+      const marker = path.join(lockPath, `owner-${token}.json`);
+      await writeFile(marker, JSON.stringify({ version: 1, pid: process.pid, token }));
+
+      const result = await child.exit;
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(/Keychain repair lock ownership was lost/u);
+      expect(JSON.parse(await readFile(marker, "utf8"))).toMatchObject({ token, pid: process.pid });
+    } finally {
+      child.process.kill("SIGKILL");
+    }
+  }, 10_000);
+
+  it("does not release a replayed owner marker", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:replayed" };
+    await installRepairHarness({ ...ref, value: "replay-value" });
+    const paused = path.join(tmpDir, "replayed-helper-paused");
+    const child = await startRepairChild(ref, {
+      SGW_FAKE_KEYCHAIN_HOLD_MS: "650",
+      SGW_FAKE_KEYCHAIN_HOLD_MARKER: paused
+    });
+    try {
+      await waitForFile(paused);
+      const lockPath = path.join(process.env.SGW_HOME!, ".keychain-repair.lock");
+      const marker = path.join(lockPath, (await readdir(lockPath))[0]);
+      const copy = `${marker}.old`;
+      const contents = await readFile(marker);
+      await rename(marker, copy);
+      await writeFile(marker, contents);
+
+      const result = await child.exit;
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(/Keychain repair lock ownership was lost/u);
+      expect(await readFile(marker)).toEqual(contents);
+    } finally {
+      child.process.kill("SIGKILL");
+    }
+  }, 10_000);
+
   it("stops before running a helper when no trusted application can be verified", async () => {
     if (process.platform !== "darwin") return;
 
@@ -413,6 +561,36 @@ access: 1 entries
     expect(() => requirePassphrase()).toThrow(/unlock passphrase/i);
   }, process.platform === "win32" ? 60_000 : 5_000);
 });
+
+async function startRepairChild(ref: { service: string; account: string }, extraEnv: Record<string, string>) {
+  const script = path.join(tmpDir, `repair-${randomUUID()}.ts`);
+  const source = pathToFileURL(path.resolve("src/unlock.ts")).href;
+  await writeFile(script, `import { getMacKeychainItem } from ${JSON.stringify(source)};\ngetMacKeychainItem(${JSON.stringify(ref)});\n`);
+  const child = spawn(process.execPath, ["--import", "tsx", script], {
+    env: { ...process.env, ...extraEnv },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += String(data); });
+  const exit = new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    child.once("close", (code) => resolve({ code, stderr }));
+  });
+  return { process: child, exit };
+}
+
+async function waitForFile(filePath: string): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 5_000) {
+    try {
+      await stat(filePath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for disposable test marker ${filePath}.`);
+}
 
 async function installFakeHelper(passphrase: string): Promise<void> {
   process.env.SGW_FAKE_KEYCHAIN_VALUE = passphrase;
@@ -590,6 +768,10 @@ const ownIdentity = crypto.createHash("sha256").update(fs.readFileSync(process.a
 if (command === "get") {
   if (!item) process.exit(44);
   if (item.trustedIdentity !== ownIdentity) process.exit(70);
+  if (process.env.SGW_FAKE_KEYCHAIN_HOLD_MARKER) {
+    fs.writeFileSync(process.env.SGW_FAKE_KEYCHAIN_HOLD_MARKER, String(process.pid));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SGW_FAKE_KEYCHAIN_HOLD_MS || 0));
+  }
   process.stdout.write(item.value + "\\n");
   process.exit(0);
 }

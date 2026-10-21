@@ -1,19 +1,26 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
   chmodSync,
+  closeSync,
   constants,
   copyFileSync,
   existsSync,
+  fstatSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
-  statSync
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -585,6 +592,21 @@ interface TrustedHelperResolution {
 let keychainAclDumpCache: string | undefined;
 const keychainRepairWait = new Int32Array(new SharedArrayBuffer(4));
 
+interface KeychainRepairLockOwner {
+  version: 1;
+  pid: number;
+  token: string;
+}
+
+interface KeychainRepairLockIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface KeychainRepairLockMarker extends KeychainRepairLockIdentity {
+  owner: KeychainRepairLockOwner;
+}
+
 function managedMacKeychainAccessEnabled(): boolean {
   return process.platform === "darwin" && !testOnlyHelperOverride("SGW_KEYCHAIN_HELPER");
 }
@@ -921,24 +943,41 @@ function untrustedKeychainItemError(ref: MacKeychainItemRef): Error {
 function withKeychainRepairLock<T>(body: () => T): T {
   const lockPath = path.join(path.resolve(getSgwHome()), ".keychain-repair.lock");
   mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const owner: KeychainRepairLockOwner = { version: 1, pid: process.pid, token: randomUUID() };
+  const markerPath = path.join(lockPath, `owner-${owner.token}.json`);
   const started = Date.now();
+  let lockIdentity: KeychainRepairLockIdentity | undefined;
+  let marker: KeychainRepairLockMarker | undefined;
 
   while (true) {
+    let created = false;
     try {
       mkdirSync(lockPath, { mode: 0o700 });
+      created = true;
+      let wroteMarker = false;
+      try {
+        const info = lstatSync(lockPath);
+        lockIdentity = { dev: info.dev, ino: info.ino };
+        writeKeychainRepairOwner(markerPath, owner);
+        wroteMarker = true;
+        marker = readKeychainRepairOwner(markerPath);
+        if (!marker || marker.owner.token !== owner.token) {
+          throw new Error(`Could not verify Keychain repair lock at ${lockPath}.`);
+        }
+      } catch (error) {
+        if (marker) removeKeychainRepairMarker(lockPath, markerPath, marker, lockIdentity);
+        else if (wroteMarker && lockIdentity && sameKeychainRepairInode(lockPath, lockIdentity)) {
+          try { unlinkSync(markerPath); } catch { /* Keep the original failure. */ }
+        }
+        try { rmdirSync(lockPath); } catch { /* Keep the original failure. */ }
+        throw error;
+      }
       break;
     } catch (error) {
+      if (created) throw error;
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(lockPath).mtimeMs > staleKeychainRepairMs) {
-          rmSync(lockPath, { recursive: true, force: true });
-          continue;
-        }
-      } catch (statError) {
-        if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
-        throw statError;
-      }
-      if (Date.now() - started > keychainRepairTimeoutMs) {
+      if (removeAbandonedKeychainRepairLock(lockPath)) continue;
+      if (Date.now() - started > keychainRepairLockTimeoutMs()) {
         throw new Error(`Timed out waiting for Keychain repair lock at ${lockPath}.`);
       }
       Atomics.wait(keychainRepairWait, 0, 0, 25);
@@ -948,7 +987,149 @@ function withKeychainRepairLock<T>(body: () => T): T {
   try {
     return body();
   } finally {
-    rmSync(lockPath, { recursive: true, force: true });
+    releaseKeychainRepairLock(lockPath, markerPath, marker!, lockIdentity!);
+  }
+}
+
+function writeKeychainRepairOwner(markerPath: string, owner: KeychainRepairLockOwner): void {
+  const fd = openSync(markerPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  try {
+    writeFileSync(fd, `${JSON.stringify(owner)}\n`);
+    fsyncSync(fd);
+  } catch (error) {
+    closeSync(fd);
+    try { unlinkSync(markerPath); } catch { /* Keep the write failure. */ }
+    throw error;
+  }
+  closeSync(fd);
+}
+
+function keychainRepairLockTimeoutMs(): number {
+  if (process.env.SGW_TEST_MODE !== "1") return keychainRepairTimeoutMs;
+  const value = Number(process.env.SGW_TEST_KEYCHAIN_REPAIR_LOCK_TIMEOUT_MS);
+  return Number.isInteger(value) && value > 0 && value <= keychainRepairTimeoutMs
+    ? value
+    : keychainRepairTimeoutMs;
+}
+
+function removeAbandonedKeychainRepairLock(lockPath: string): boolean {
+  let info;
+  try {
+    info = lstatSync(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(`Keychain repair lock is not a directory: ${lockPath}`);
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+  if (entries.length === 0) {
+    // Older s-gw builds used an empty directory. Keep their stale recovery path for now.
+    if (Date.now() - info.mtimeMs <= staleKeychainRepairMs) return false;
+    return removeEmptyKeychainRepairLock(lockPath, info);
+  }
+  if (entries.length !== 1 || !/^owner-[0-9a-f-]{36}\.json$/u.test(entries[0])) return false;
+
+  const markerPath = path.join(lockPath, entries[0]);
+  const marker = readKeychainRepairOwner(markerPath);
+  if (!marker || entries[0] !== `owner-${marker.owner.token}.json`) return false;
+  try {
+    process.kill(marker.owner.pid, 0);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+  }
+
+  if (!removeKeychainRepairMarker(lockPath, markerPath, marker, info)) return false;
+  return removeEmptyKeychainRepairLock(lockPath, info);
+}
+
+function readKeychainRepairOwner(markerPath: string): KeychainRepairLockMarker | undefined {
+  let fd: number;
+  try {
+    fd = openSync(markerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+    throw error;
+  }
+  try {
+    const info = fstatSync(fd);
+    const atPath = lstatSync(markerPath);
+    if (!info.isFile() || !atPath.isFile() || info.dev !== atPath.dev || info.ino !== atPath.ino ||
+        info.size > 512) return undefined;
+    const value = JSON.parse(readFileSync(fd, "utf8")) as Partial<KeychainRepairLockOwner>;
+    if (value.version !== 1 || !Number.isSafeInteger(value.pid) || (value.pid || 0) <= 0 ||
+        typeof value.token !== "string" || !/^[0-9a-f-]{36}$/u.test(value.token)) return undefined;
+    return { owner: value as KeychainRepairLockOwner, dev: info.dev, ino: info.ino };
+  } catch {
+    return undefined;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function removeKeychainRepairMarker(
+  lockPath: string,
+  markerPath: string,
+  marker: KeychainRepairLockMarker,
+  directory?: KeychainRepairLockIdentity
+): boolean {
+  if (!directory || !sameKeychainRepairInode(lockPath, directory)) return false;
+  const current = readKeychainRepairOwner(markerPath);
+  if (!current || current.owner.pid !== marker.owner.pid || current.owner.token !== marker.owner.token ||
+      current.dev !== marker.dev || current.ino !== marker.ino) return false;
+  try {
+    unlinkSync(markerPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function sameKeychainRepairInode(filePath: string, expected: KeychainRepairLockIdentity): boolean {
+  try {
+    const current = lstatSync(filePath);
+    return current.dev === expected.dev && current.ino === expected.ino;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function removeEmptyKeychainRepairLock(lockPath: string, directory: KeychainRepairLockIdentity): boolean {
+  if (!sameKeychainRepairInode(lockPath, directory)) return false;
+  try {
+    rmdirSync(lockPath);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return true;
+    if (code === "ENOTEMPTY" || code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+function releaseKeychainRepairLock(
+  lockPath: string,
+  markerPath: string,
+  marker: KeychainRepairLockMarker,
+  directory: KeychainRepairLockIdentity
+): void {
+  if (!removeKeychainRepairMarker(lockPath, markerPath, marker, directory)) {
+    throw new Error(`Keychain repair lock ownership was lost at ${lockPath}.`);
+  }
+  if (!removeEmptyKeychainRepairLock(lockPath, directory)) {
+    throw new Error(`Keychain repair lock contains unexpected files at ${lockPath}.`);
   }
 }
 
