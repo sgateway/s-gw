@@ -3152,6 +3152,12 @@ function ApprovalSheet({
                 <div>Provider: {request.action.model.provider}</div>
                 <div>Allowed routes: {Array.isArray(request.action.model.routes) ? request.action.model.routes.join(", ") : "Unavailable"}</div>
                 <div>Lifetime after launch: {Math.ceil(request.action.model.ttlMs / 60_000)} minute(s)</div>
+                <div>Payload profile: {request.action.model.payloadProfile === "strict" ? "Strict" : "Unrestricted JSON"}</div>
+                {request.action.model.maxRequests !== undefined ? <div>Maximum requests: {request.action.model.maxRequests}</div> : null}
+                {request.action.model.allowedModels ? <div>Allowed models: {request.action.model.allowedModels.join(", ")}</div> : null}
+                {request.action.model.payloadProfile === "strict" ? (
+                  <div className="text-xs text-muted-foreground">Blocks background work, provider-run tools, remote MCP servers, recognized URL inputs, and provider resource references. OpenAI responses use store: false. Prompt text and other provider behavior are not inspected.</div>
+                ) : null}
                 {request.action.model.workspaceId ? <div>Workspace: {request.action.model.workspaceId}</div> : null}
                 {request.action.model.organizationId ? <div>Organization: {request.action.model.organizationId}</div> : null}
                 {request.action.model.projectId ? <div>Project: {request.action.model.projectId}</div> : null}

@@ -286,6 +286,54 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     stop?.();
   });
 
+  it("carries a strict payload grant through durable approval to the verified listener", async () => {
+    const requestUpstream = await startProvider(async (req, res) => {
+      for await (const _chunk of req) {}
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    const handle = (await store.addSecret({ name: "Strict relay fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.anthropic.com:443"] } })).handle;
+    const session = await ownSession();
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    const request = await store.createModelRelayRequest({ provider: "anthropic", handle, ttlMs: 30_000,
+      routes: ["POST /v1/messages"], payloadProfile: "strict", maxRequests: 3,
+      allowedModels: ["claude-fixture"] }, principal);
+    expect(request.action.model?.payloadProfile).toBe("strict");
+    expect(request.action.model?.maxRequests).toBe(3);
+    expect(request.action.model?.allowedModels).toEqual(["claude-fixture"]);
+    await store.approveRequest(request.id, { mode: "per-transaction" });
+
+    const reopened = new SecretStore(path.join(root, "store"));
+    const approvals = new StoreBackedModelRelayApprovals(reopened);
+    expect((await reopened.getRequest(request.id)).action.model?.payloadProfile).toBe("strict");
+    server = await startVerifiedModelRelayServer({ socketPath, store: reopened, requestUpstream, approval: approvals });
+    const brokerUid = process.getuid!();
+    const fake = brokerUid === 0 ? 1 : 0;
+    const uid = vi.spyOn(process, "getuid").mockReturnValue(fake);
+    const euid = vi.spyOn(process, "geteuid").mockReturnValue(fake);
+    let stop: (() => void) | undefined;
+    try {
+      stop = await registerDurableModelRelaySession(server, approvals, session, request.id);
+    } finally {
+      uid.mockRestore();
+      euid.mockRestore();
+    }
+
+    const local = { model: "claude-fixture", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const remote = { ...local,
+      mcp_servers: [{ type: "url", url: "https://example.invalid/mcp", name: "outside" }] };
+    expect((await send("/v1/messages", JSON.stringify(remote))).status).toBe(403);
+    expect(upstreamCalls).toBe(0);
+    const wrongModel = { ...local, model: "claude-other" };
+    expect((await send("/v1/messages", JSON.stringify(wrongModel))).status).toBe(403);
+    expect(upstreamCalls).toBe(0);
+    expect((await send("/v1/messages", JSON.stringify(local))).status).toBe(200);
+    expect(upstreamCalls).toBe(1);
+    expect((await send("/v1/messages", JSON.stringify(local))).status).toBe(429);
+    expect(upstreamCalls).toBe(1);
+    stop?.();
+  });
+
   it("keeps a model relay approval durable across store reads and denies reuse after completion", async () => {
     const handle = (await store.addSecret({ name: "Persistent model fixture", type: "api-token", value: credential,
       policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
@@ -324,6 +372,46 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     await approvals.retryPendingSessionEnds();
     expect((await store.getRequest(request.id)).state).toBe("executed");
     await approvals.retryPendingSessionEnds();
+  });
+
+  it("retains a failed registration cleanup for retry and reports both errors", async () => {
+    const handle = (await store.addSecret({ name: "Rejected registration fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
+    const session = await ownSession();
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    const request = await store.createModelRelayRequest({ provider: "openai", handle, ttlMs: 20_000,
+      routes: ["POST /v1/responses"] }, principal);
+    await store.approveRequest(request.id);
+    const approvals = new StoreBackedModelRelayApprovals(store);
+    const listenerError = new Error("synthetic listener rejection");
+    const writeError = new Error("synthetic audit write failure");
+    const listener: VerifiedModelRelayServer = {
+      registerSession() { throw listenerError; },
+      async assertSocketBinding() {},
+      async close() {}
+    };
+    const failedWrite = vi.spyOn(store, "markFailed").mockRejectedValueOnce(writeError);
+
+    let failure: unknown;
+    try { await registerDurableModelRelaySession(listener, approvals, session, request.id); }
+    catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([listenerError, writeError]);
+    expect((await store.getRequest(request.id)).state).toBe("executing");
+    await expect(approvals.assertAuthorized(principal, {
+      provider: "openai", handle, ttlMs: 20_000, routes: ["POST /v1/responses"]
+    })).rejects.toThrow(/no matching durable approval/);
+    const next = await store.createModelRelayRequest({ provider: "openai", handle, ttlMs: 20_000,
+      routes: ["POST /v1/responses"] }, principal);
+    await store.approveRequest(next.id);
+    await expect(approvals.claim(next.id, session)).rejects.toThrow(/already claimed/);
+
+    failedWrite.mockRestore();
+    await approvals.retryPendingSessionEnds();
+    expect((await store.getRequest(request.id)).state).toBe("failed");
+    await approvals.retryPendingSessionEnds();
+    await approvals.claim(next.id, session);
+    await approvals.abandon(session);
   });
 
   it("rejects unverified request identities and expires a claimed relay", async () => {

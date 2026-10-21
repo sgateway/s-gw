@@ -14,13 +14,15 @@ interface ClaimedRelay {
 export class StoreBackedModelRelayApprovals implements ModelRelayApproval {
   private readonly active = new Map<string, ClaimedRelay>();
   private readonly pendingEnds = new Map<string, ClaimedRelay>();
+  private readonly pendingFailures = new Map<string, ClaimedRelay>();
   private readonly claiming = new Set<string>();
 
   constructor(private readonly store: SecretStore) {}
 
   async claim(requestId: string, session: PeerSession): Promise<ModelRelayGrant> {
     const sessionId = session.sessionId;
-    if (!sessionId || this.active.has(sessionId) || this.claiming.has(sessionId)) {
+    if (!sessionId || this.active.has(sessionId) || this.claiming.has(sessionId) ||
+        this.pendingEnds.has(sessionId) || this.pendingFailures.has(sessionId)) {
       throw new Error("Model relay session is already claimed.");
     }
     this.claiming.add(sessionId);
@@ -60,6 +62,9 @@ export class StoreBackedModelRelayApprovals implements ModelRelayApproval {
       await this.store.finishModelRelayRequest(pending.requestId);
       this.pendingEnds.delete(sessionId);
     });
+    for (const [sessionId, pending] of this.pendingFailures) {
+      attempts.push(this.failAbandoned(sessionId, pending));
+    }
     const results = await Promise.allSettled(attempts);
     const errors = results.filter(result => result.status === "rejected").map(result => result.reason);
     if (errors.length) throw new AggregateError(errors, "Model relay session-end audit retry failed.");
@@ -69,7 +74,19 @@ export class StoreBackedModelRelayApprovals implements ModelRelayApproval {
     const claimed = this.active.get(session.sessionId);
     if (!claimed || claimed.uid !== session.uid) return;
     this.active.delete(session.sessionId);
-    await this.store.markFailed(claimed.requestId, "Verified model relay listener rejected the agent session.");
+    this.pendingFailures.set(session.sessionId, claimed);
+    await this.failAbandoned(session.sessionId, claimed);
+  }
+
+  private async failAbandoned(sessionId: string, claimed: ClaimedRelay): Promise<void> {
+    const reason = "Verified model relay listener rejected the agent session.";
+    try {
+      await this.store.markFailed(claimed.requestId, reason);
+    } catch (error) {
+      const request = await this.store.getRequest(claimed.requestId).catch(() => undefined);
+      if (request?.state !== "failed" || request.error !== reason) throw error;
+    }
+    this.pendingFailures.delete(sessionId);
   }
 }
 
@@ -83,7 +100,10 @@ export async function registerDurableModelRelaySession(
   try {
     return server.registerSession(session, grant);
   } catch (error) {
-    await approval.abandon(session).catch(() => {});
+    try { await approval.abandon(session); }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Model relay registration and durable cleanup failed.");
+    }
     throw error;
   }
 }

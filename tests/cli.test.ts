@@ -110,6 +110,44 @@ describe("desktop instance identity command", () => {
   });
 });
 
+describe("CLI verified-only automatic approval", () => {
+  it("persists the explicit opt-in, preserves it on ordinary settings changes, and requires an explicit opt-out", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-verified-approval-"));
+    const env = {
+      ...process.env,
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
+      SGW_MASTER_PASSPHRASE: "cli-verified-approval-test-passphrase",
+      SGW_DISABLE_KEYCHAIN: "1",
+      SGW_DISABLE_ONEPASSWORD_BACKUP: "1",
+      SGW_DISABLE_UPDATE_CHECK: "1"
+    };
+    const run = (args: string[]) => runCliSync(["src/cli.ts", "approval", ...args], {
+      cwd: repoRoot, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    try {
+      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBeUndefined();
+      expect(JSON.parse(run(["set", "--require-verified-agent", "--mode", "per-transaction"])))
+        .toMatchObject({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
+      expect(JSON.parse(run(["set", "--mode", "login-session"])).requireVerifiedAgentForAutoApproval).toBe(true);
+      expect(() => run(["set", "--mode", "per-transaction", "--require-verified-agent", "--allow-unverified-agent"]))
+        .toThrow(/either --require-verified-agent or --allow-unverified-agent/i);
+      expect(() => run(["set", "--mode", "per-transaction", "--require-verified-agent=false"]))
+        .toThrow(/do not take values/i);
+      expect(() => run(["set", "--mode", "per-transaction", "--require-verified-agent", "false"]))
+        .toThrow(/do not take values/i);
+      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBe(true);
+      expect(JSON.parse(run(["set", "--mode", "per-transaction", "--allow-unverified-agent"]))
+        .requireVerifiedAgentForAutoApproval).toBeUndefined();
+      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBeUndefined();
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("CLI unknown-command behavior (end to end)", () => {
   it.each(["--help", "-h"])("prints setup help for %s without running setup", async (helpFlag) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-setup-help-"));

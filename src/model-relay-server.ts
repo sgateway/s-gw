@@ -39,6 +39,7 @@ interface ActiveGrant {
   grant: Readonly<ModelRelayGrant>;
   expiresAt: number;
   active: number;
+  requestsStarted: number;
   stopPeer: () => void;
   expiry?: ReturnType<typeof setTimeout>;
 }
@@ -73,6 +74,7 @@ function checkGrant(grant: ModelRelayGrant): Readonly<ModelRelayGrant> {
   return Object.freeze({
     ...checked,
     routes: Object.freeze([...checked.routes]),
+    ...(checked.allowedModels ? { allowedModels: Object.freeze([...checked.allowedModels]) } : {}),
     allowedBetaValues: Object.freeze([...checked.allowedBetaValues!])
   });
 }
@@ -182,6 +184,10 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       deny(res, active ? 429 : 403, active ? "Model relay is busy." : "Model relay authorization unavailable.");
       return;
     }
+    if (active.grant.maxRequests !== undefined && active.requestsStarted >= active.grant.maxRequests) {
+      deny(res, 429, "Model relay request limit reached.");
+      return;
+    }
     try {
       const route = modelRoute(active.grant.provider, req.method, req.url);
       if (!active.grant.routes?.includes(`${req.method} ${route.pathname}`)) {
@@ -191,6 +197,7 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       deny(res, 404, "Unsupported model relay route.");
       return;
     }
+    active.requestsStarted++;
     active.active++;
     activeRequests++;
     res.setHeader("connection", "close");
@@ -222,6 +229,8 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
         projectId: active.grant.projectId,
         anthropicVersion: active.grant.anthropicVersion,
         allowedBetaValues: active.grant.allowedBetaValues,
+        payloadProfile: active.grant.payloadProfile,
+        allowedModels: active.grant.allowedModels,
         bufferOwner: principal.sessionId
       }, options.requestUpstream);
     } catch {
@@ -263,7 +272,8 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       const grant = checkGrant(input);
       if (grants.has(session.sessionId)) throw new Error("This model relay session is already registered.");
       const stopPeer = peer.registerSession(session);
-      const active: ActiveGrant = { session, grant, expiresAt: Date.now() + grant.ttlMs, active: 0, stopPeer };
+      const active: ActiveGrant = { session, grant, expiresAt: Date.now() + grant.ttlMs,
+        active: 0, requestsStarted: 0, stopPeer };
       const stop = () => {
         if (grants.get(session.sessionId) !== active) return;
         grants.delete(session.sessionId);

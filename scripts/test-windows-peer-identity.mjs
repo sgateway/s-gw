@@ -38,19 +38,24 @@ function launch(args, executable = helper) {
   const ready = new Promise(resolve => { readyDone = resolve; });
   let finish;
   const done = new Promise(resolve => { finish = resolve; });
+  let reportPid;
+  const processPid = new Promise(resolve => { reportPid = resolve; });
   let spawnError;
 
   child.stdout.on("data", chunk => {
     output = Buffer.concat([output, chunk]);
+    const match = /^CHILD-PID=(\d+)\r?\n/.exec(output.toString("ascii"));
+    if (match) reportPid(Number(match[1]));
     if (output.length) readyDone(output[0] === 0x52);
   });
   child.stderr.on("data", chunk => { stderr += chunk.toString(); });
   child.once("error", error => { spawnError = error; });
   child.once("close", (code, signal) => {
     readyDone(false);
+    reportPid(null);
     finish({ code, signal, output, stderr, spawnError });
   });
-  return { child, ready, done };
+  return { child, ready, done, processPid };
 }
 
 function pipeName() {
@@ -130,7 +135,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
   const loopbackHits = { ipv4: 0, ipv6: 0 };
   const ipv4 = net.createServer(socket => { loopbackHits.ipv4++; socket.destroy(); });
   const ipv6 = net.createServer(socket => { loopbackHits.ipv6++; socket.destroy(); });
-  let client, intruder;
+  let client, intruder, processProbe;
   try {
     for (const [server, address, family] of [[ipv4, "127.0.0.1", "ipv4"], [ipv6, "::1", "ipv6"]]) {
       await deadline(new Promise((resolveListen, rejectListen) => {
@@ -170,6 +175,24 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
     ]), 35_000, "AppContainer request");
     assert.equal(forwarded.toString(), "appcontainer probe");
 
+    if (intruderProfile) {
+      const targetPid = await deadline(client.processPid, 10_000, "AppContainer child PID");
+      assert.ok(Number.isInteger(targetPid) && targetPid > 0,
+        "The live AppContainer child process ID was not reported.");
+      assert.equal(client.child.exitCode, null, "The target AppContainer exited before the handle probe.");
+      assert.equal(run.child.exitCode, null, "The pipe broker exited before the handle probe.");
+      processProbe = launch(["launch-process-probe", intruderProfile.name, name,
+        String(ipv4.address().port), String(ipv6.address().port),
+        intruderProfile.sharedPath, intruderProfile.canaryPath,
+        String(targetPid), String(run.child.pid)], intruderProfile.executable);
+      const probeResult = await deadline(processProbe.done, 35_000, "cross-agent process-handle attempt");
+      assert.equal(probeResult.spawnError, undefined, probeResult.spawnError?.message);
+      assert.equal(probeResult.code, 0,
+        probeResult.stderr || "The other AppContainer could open a protected process handle.");
+      assert.match(probeResult.output.toString(), /^PROCESS-DUP-DENIED\r?\n$/,
+        "The AppContainer process-handle probe did not run.");
+    }
+
     if (stopJob) {
       client.child.stdin.end("K");
       const stopped = await deadline(client.done, 15_000, "AppContainer job teardown");
@@ -197,7 +220,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
     assert.deepEqual(loopbackHits, { ipv4: 0, ipv6: 0 },
       "The AppContainer reached host loopback without a network capability.");
   } finally {
-    const processes = [intruder, client, run].filter(Boolean);
+    const processes = [processProbe, intruder, client, run].filter(Boolean);
     for (const item of processes) item.child.kill();
     await Promise.allSettled(processes.map(item => deadline(item.done, 5_000, "fixture cleanup")));
     for (const server of [ipv4, ipv6]) {
@@ -293,7 +316,7 @@ try {
       assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
     }
   }
-  console.log("Native Windows two-agent pipe, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
+  console.log("Native Windows two-agent pipe, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

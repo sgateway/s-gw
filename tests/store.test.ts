@@ -3484,6 +3484,76 @@ describe("SecretStore", () => {
     })).state).toBe("pending");
   });
 
+  it("can require a verified peer before an allow policy approves automatically", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "verified-only policy token", type: "api-token", value: fakeOpenAiToken("verified_only_policy"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "process.stdout.write('policy')"], injectEnv: "TOKEN"
+    });
+    await store.addApprovalPolicyRule({ decision: "allow", conditions: {
+      handles: [secret.handle], agents: ["Codex"], commands: [process.execPath],
+      resolvedCommands: [resolvedNodeExecutable]
+    } });
+    const claimed = { mcpClientName: "Codex", env: {} };
+    const oldApproval = await store.createRequest(secret.handle, action, "ordinary MCP", claimed);
+    expect(oldApproval.state).toBe("approved");
+
+    await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
+    await store.setApprovalSettings({ mode: "per-transaction" });
+    expect((await new SecretStore(tmpHome).getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
+    const pending = await store.createRequest(secret.handle, action, "claimed name", claimed);
+    expect(pending.state).toBe("pending");
+    expect((await store.prepareOneShotExecution(secret.handle, action, "claimed name", claimed)).kind).toBe("request");
+    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/verified agent/i);
+    await expect(executeApprovedRequest(store, oldApproval.id, { caller: claimed, engine: "typescript" }))
+      .rejects.toThrow(/approval policy.*changed/i);
+
+    await store.approveRequest(pending.id);
+    expect((await executeApprovedRequest(store, pending.id, { caller: claimed, engine: "typescript" })).stdout).toBe("policy");
+    for (const context of [
+      { agentName: "Codex", env: {} },
+      { env: { CODEX_SHELL: "1" } },
+      { env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } }
+    ]) {
+      expect((await store.createRequest(secret.handle, action, "Codex requested this", context)).state).toBe("pending");
+    }
+    await store.addApprovalPolicyRule({ decision: "allow", conditions: {
+      handles: [secret.handle], principalIds: ["linux:codex"], commands: [process.execPath],
+      resolvedCommands: [resolvedNodeExecutable]
+    } });
+    const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
+    expect((await store.createRequest(secret.handle, action, "verified peer", verified)).state).toBe("approved");
+    await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: false });
+    expect((await store.createRequest(secret.handle, action, "claimed name after opt-out", claimed)).state).toBe("approved");
+  });
+
+  it("can require a verified peer before a reusable grant approves automatically", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "verified-only grant token", type: "api-token", value: fakeOpenAiToken("verified_only_grant"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "process.stdout.write('grant')"], injectEnv: "TOKEN"
+    });
+    await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
+    const claimed = { mcpClientName: "Codex", env: {} };
+    const first = await store.createRequest(secret.handle, action, "claimed name", claimed);
+    const manuallyApproved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
+    expect(manuallyApproved.approvalGrantId).toBeUndefined();
+    expect((await store.createRequest(secret.handle, action, "claimed name again", claimed)).state).toBe("pending");
+
+    const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
+    const peerRequest = await store.createRequest(secret.handle, action, "verified peer", verified);
+    await store.approveRequest(peerRequest.id, { mode: "timed-session", agentScope: "any-agent" });
+    expect((await store.prepareOneShotExecution(secret.handle, action, "verified repeat", verified)).kind).toBe("reusable");
+    expect((await store.prepareOneShotExecution(secret.handle, action, "name spoof", claimed)).kind).toBe("request");
+    expect((await store.listApprovalGrants())).toHaveLength(1);
+  });
+
   it("binds managed reusable grants and one-shot permits to the verified principal", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({

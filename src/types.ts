@@ -23,6 +23,7 @@ export type AgentIdentitySource = "managed-peer" | "configured" | "mcp-client" |
 export interface ApprovalSettings {
   mode: ApprovalMode;
   durationMs: number;
+  requireVerifiedAgentForAutoApproval?: boolean;
 }
 
 export interface ApprovalGrant {
@@ -185,6 +186,9 @@ export interface ModelRelaySpec {
   provider: "anthropic" | "openai";
   routes: string[];
   ttlMs: number;
+  payloadProfile?: "strict";
+  maxRequests?: number;
+  allowedModels?: readonly string[];
   workspaceId?: string;
   organizationId?: string;
   projectId?: string;

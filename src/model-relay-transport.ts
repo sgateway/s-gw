@@ -15,6 +15,8 @@ export interface ModelRelayAuthority {
   projectId?: string;
   anthropicVersion?: string;
   allowedBetaValues?: readonly string[];
+  payloadProfile?: "strict";
+  allowedModels?: readonly string[];
   bufferOwner?: string;
   ca?: string;
 }
@@ -146,6 +148,82 @@ function upstreamHeaders(req: IncomingMessage, authority: ModelRelayAuthority, b
 
   for (const [name, value] of Object.entries(headers)) validateHeaderValue(name, value);
   return headers;
+}
+
+function objectValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function checkedModelBody(provider: ModelProvider, body: Buffer, strict: boolean, allowedModels?: readonly string[]): Buffer {
+  let parsed: unknown;
+  try { parsed = JSON.parse(body.toString("utf8")); }
+  catch { throw new RelayError(400, "Model requests with payload restrictions must contain JSON."); }
+  if (!objectValue(parsed)) throw new RelayError(400, "Model requests with payload restrictions need a JSON object.");
+  if (allowedModels && (typeof parsed.model !== "string" || !allowedModels.includes(parsed.model))) {
+    throw new RelayError(403, "Model is outside this grant.");
+  }
+  if (strict && provider === "openai") {
+    if (parsed.background !== undefined && parsed.background !== false) {
+      throw new RelayError(403, "Background model work is outside this grant.");
+    }
+    if ([parsed.previous_response_id, parsed.conversation, parsed.prompt].some(value => value != null)) {
+      throw new RelayError(403, "Stored model context is outside this grant.");
+    }
+    if (parsed.tools !== undefined && (!Array.isArray(parsed.tools) || parsed.tools.some(tool =>
+      !objectValue(tool) || (tool.type !== "function" && tool.type !== "custom")))) {
+      throw new RelayError(403, "Provider-run model tools are outside this grant.");
+    }
+    parsed.store = false;
+  } else if (strict) {
+    if (parsed.mcp_servers !== undefined) {
+      throw new RelayError(403, "Remote model MCP servers are outside this grant.");
+    }
+    if (parsed.container != null || objectValue(parsed.diagnostics) && parsed.diagnostics.previous_message_id != null) {
+      throw new RelayError(403, "Stored model context is outside this grant.");
+    }
+    if (parsed.tools !== undefined && (!Array.isArray(parsed.tools) || parsed.tools.some(tool =>
+      !objectValue(tool) || (tool.type !== undefined && tool.type !== "custom")))) {
+      throw new RelayError(403, "Provider-run model tools are outside this grant.");
+    }
+  }
+
+  const queue: unknown[] = [parsed];
+  let visited = 0;
+  while (queue.length) {
+    const value = queue.pop();
+    if (!value || typeof value !== "object") continue;
+    if (++visited > 100_000) throw new RelayError(413, "Model request is too complex.");
+    if (Array.isArray(value)) {
+      for (const item of value) queue.push(item);
+      continue;
+    }
+    const item = value as Record<string, unknown>;
+    if (strict) {
+      if (item.type === "item_reference" || ["file_id", "file_ids", "container_id", "comparison_response_id"].some(name => name in item)) {
+        throw new RelayError(403, "Provider resource references are outside this grant.");
+      }
+      if (item.type === "url" && "url" in item) {
+        throw new RelayError(403, "Remote model input URLs are outside this grant.");
+      }
+      for (const name of ["image_url", "file_url", "audio_url", "video_url"]) {
+        if (!(name in item)) continue;
+        const source = item[name];
+        const address = objectValue(source) ? source.url : source;
+        if (typeof address !== "string" || !address.startsWith("data:")) {
+          throw new RelayError(403, "Remote model input URLs are outside this grant.");
+        }
+      }
+    }
+    for (const key of Object.keys(item)) {
+      queue.push(item[key]);
+      if (queue.length > 100_000) throw new RelayError(413, "Model request is too complex.");
+    }
+  }
+
+  // Forward the same parsed object we inspected; duplicate JSON keys cannot change its meaning upstream.
+  const normalized = Buffer.from(JSON.stringify(parsed));
+  if (normalized.length > maxBodyBytes) throw new RelayError(413, "Model request exceeds 32 MiB.");
+  return normalized;
 }
 
 async function requestBody(req: IncomingMessage, signal: AbortSignal, owner?: string): Promise<BufferedBody> {
@@ -327,6 +405,10 @@ export async function relayModelRequest(
     await check();
     abort.signal.throwIfAborted();
     buffered = await requestBody(req, abort.signal, authority.bufferOwner);
+    if (req.method !== "GET" && (authority.payloadProfile === "strict" || authority.allowedModels)) {
+      buffered.data = checkedModelBody(authority.provider, buffered.data!,
+        authority.payloadProfile === "strict", authority.allowedModels);
+    }
     const headers = upstreamHeaders(req, authority, buffered.data!.length);
     await check();
     abort.signal.throwIfAborted();

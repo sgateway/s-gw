@@ -167,6 +167,7 @@ export interface ManagedSshRequestInput {
 export interface SetApprovalSettingsInput {
   mode: ApprovalMode;
   durationMs?: number;
+  requireVerifiedAgentForAutoApproval?: boolean;
 }
 
 export interface AddApprovalPolicyRuleInput {
@@ -774,11 +775,20 @@ export class SecretStore {
 
   async setApprovalSettings(input: SetApprovalSettingsInput): Promise<ApprovalSettings> {
     return this.mutate((store) => {
-      const settings = normalizeApprovalSettings(input);
+      const previouslyRequired = Boolean(store.approvalSettings?.requireVerifiedAgentForAutoApproval);
+      const settings = normalizeApprovalSettings({
+        ...input,
+        requireVerifiedAgentForAutoApproval: input.requireVerifiedAgentForAutoApproval ??
+          store.approvalSettings?.requireVerifiedAgentForAutoApproval
+      });
       store.approvalSettings = settings;
       store.approvalGrants = [];
       clearOnePasswordCaches(store);
-      store.audit.push(audit("approval.settings.updated", `Approval mode changed to ${settings.mode}.`));
+      const verifiedOnlyChanged = previouslyRequired !== Boolean(settings.requireVerifiedAgentForAutoApproval);
+      const message = verifiedOnlyChanged
+        ? `Verified-only automatic approval ${settings.requireVerifiedAgentForAutoApproval ? "enabled" : "disabled"}; approval mode is ${settings.mode}.`
+        : `Approval mode changed to ${settings.mode}.`;
+      store.audit.push(audit("approval.settings.updated", message));
       return settings;
     });
   }
@@ -1207,6 +1217,9 @@ export class SecretStore {
         throw new Error(`Unknown secret handle: ${request.handle}`);
       }
       const agent = identityFromRequest(request);
+      if (!canAutoApproveAgent(store, agent)) {
+        throw new Error("An allow policy requires a verified agent while verified-only automatic approval is enabled. Approve this request once instead.");
+      }
       const agentName = agent.principalId ? agent.name : durablePolicyAgentName(request);
       let rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
       let created = false;
@@ -2986,11 +2999,21 @@ function credentialStoreProvider(): string {
 }
 
 function normalizeApprovalSettings(input?: Partial<ApprovalSettings>): ApprovalSettings {
+  if (input?.requireVerifiedAgentForAutoApproval !== undefined &&
+      typeof input.requireVerifiedAgentForAutoApproval !== "boolean") {
+    throw new Error("requireVerifiedAgentForAutoApproval must be a boolean.");
+  }
   const mode = isApprovalMode(input?.mode) ? input.mode : defaultApprovalSettings.mode;
   return {
     mode,
-    durationMs: clampApprovalDuration(input?.durationMs)
+    durationMs: clampApprovalDuration(input?.durationMs),
+    ...(input?.requireVerifiedAgentForAutoApproval ? { requireVerifiedAgentForAutoApproval: true } : {})
   };
+}
+
+function canAutoApproveAgent(store: StoreFile, agent: AgentIdentity): boolean {
+  if (!store.approvalSettings?.requireVerifiedAgentForAutoApproval) return true;
+  return agent.source === "managed-peer" && Boolean(agent.principalId);
 }
 
 function isApprovalMode(value: unknown): value is ApprovalMode {
@@ -3127,6 +3150,7 @@ function activeApprovalGrant(
 ): ApprovalGrant | undefined {
   const settings = normalizeApprovalSettings(store.approvalSettings);
   store.approvalSettings = settings;
+  if (!canAutoApproveAgent(store, agent)) return undefined;
 
   const actionKey = approvalActionKey(handle, action);
   return store.approvalGrants.find((grant) => {
@@ -3158,6 +3182,17 @@ function createApprovalGrant(
   store.approvalSettings = settings;
   const mode = options.mode && isApprovalMode(options.mode) ? options.mode : settings.mode;
   if (mode === "per-transaction") {
+    return undefined;
+  }
+
+  if (!canAutoApproveAgent(store, identityFromRequest(request))) {
+    store.audit.push(audit(
+      "approval.grant.skipped",
+      `Approved request ${request.id} once because reusable approval requires a verified agent.`,
+      request.handle,
+      request.id,
+      request
+    ));
     return undefined;
   }
 
@@ -3903,6 +3938,9 @@ function matchingApprovalPolicyRule(
       continue;
     }
     if (rule.expiresAt && rule.expiresAt <= nowIso) {
+      continue;
+    }
+    if (rule.decision === "allow" && !canAutoApproveAgent(store, agent)) {
       continue;
     }
     if (approvalPolicyMatches(rule, secret, action, agent, envBindings)) {

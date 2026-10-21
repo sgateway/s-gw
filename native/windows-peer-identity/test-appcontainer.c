@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <errno.h>
 
 #define PIPE_CLIENT_RIGHTS (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE)
 
@@ -158,9 +159,30 @@ static int agent_environment_is_clean(void) {
     return 1;
 }
 
+static int process_handle_denied(const wchar_t *pid_text, const char *target) {
+    wchar_t *end = NULL;
+    errno = 0;
+    unsigned long pid = wcstoul(pid_text, &end, 10);
+    if (errno == ERANGE || end == pid_text || *end || !pid) {
+        fprintf(stderr, "Invalid %s process ID.\n", target);
+        return 0;
+    }
+    HANDLE process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, (DWORD)pid);
+    if (process) {
+        CloseHandle(process);
+        fprintf(stderr, "AppContainer acquired PROCESS_DUP_HANDLE for %s.\n", target);
+        return 0;
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED) return 1;
+    fprintf(stderr, "AppContainer %s process probe failed unexpectedly: %lu\n", target, error);
+    return 0;
+}
+
 static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     const wchar_t *ipv6_port, const wchar_t *shared_path,
-    const wchar_t *canary_path, const wchar_t *profile) {
+    const wchar_t *canary_path, const wchar_t *profile,
+    const wchar_t *other_agent_pid, const wchar_t *broker_pid) {
     PSID expected_sid = NULL;
     if (FAILED(DeriveAppContainerSidFromAppContainerName(profile, &expected_sid))) return 1;
     HANDLE token = NULL;
@@ -180,6 +202,11 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     FreeSid(expected_sid);
     if (!isolated) return 1;
     if (!agent_environment_is_clean()) return 1;
+    if (other_agent_pid) {
+        int other_denied = process_handle_denied(other_agent_pid, "other agent");
+        int broker_denied = process_handle_denied(broker_pid, "broker");
+        return other_denied && broker_denied ? 0 : 1;
+    }
     if (!loopback_blocked(ipv4_port, AF_INET) || !loopback_blocked(ipv6_port, AF_INET6)) {
         fputs("AppContainer reached forbidden IPv4 or IPv6 host loopback.\n", stderr);
         return 1;
@@ -219,7 +246,8 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
 
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
-    const wchar_t *shared_path, const wchar_t *canary_path, int stop_job) {
+    const wchar_t *shared_path, const wchar_t *canary_path, int stop_job,
+    const wchar_t *other_agent_pid, const wchar_t *broker_pid) {
     wchar_t parent_canary[64];
     DWORD canary_size = GetEnvironmentVariableW(L"SGW_WIN_FIXTURE_PARENT_CANARY",
         parent_canary, sizeof(parent_canary) / sizeof(parent_canary[0]));
@@ -270,7 +298,12 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     environment[root_size + windir_size + 2] = 0;
 
     wchar_t command[MAX_PATH * 4 + 256];
-    if (swprintf(command, sizeof(command) / sizeof(command[0]),
+    if (other_agent_pid) {
+        if (swprintf(command, sizeof(command) / sizeof(command[0]),
+            L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" %ls %ls",
+            executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path,
+            name, other_agent_pid, broker_pid) < 0) goto done;
+    } else if (swprintf(command, sizeof(command) / sizeof(command[0]),
         L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\"",
         executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path, name) < 0) goto done;
 
@@ -305,6 +338,10 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         CloseHandle(job);
         goto done;
     }
+    if (!other_agent_pid && !stop_job) {
+        printf("CHILD-PID=%lu\n", (unsigned long)process.dwProcessId);
+        fflush(stdout);
+    }
     DWORD exit_code = 1;
     if (stop_job) {
         char signal = 0;
@@ -324,6 +361,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         else if (GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0) result = 0;
     }
     if (result) fprintf(stderr, "AppContainer child failed: %lu\n", (unsigned long)exit_code);
+    if (other_agent_pid && !result) puts("PROCESS-DUP-DENIED");
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     if (job) CloseHandle(job);
@@ -342,11 +380,15 @@ int wmain(int argc, wchar_t **argv) {
         if (FAILED(status)) fprintf(stderr, "DeleteAppContainerProfile failed: 0x%08lx\n", (unsigned long)status);
         return FAILED(status) ? 1 : 0;
     }
-    if (argc == 8 && wcscmp(argv[1], L"client") == 0)
-        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+    if ((argc == 8 || argc == 10) && wcscmp(argv[1], L"client") == 0)
+        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+            argc == 10 ? argv[8] : NULL, argc == 10 ? argv[9] : NULL);
     if (argc == 8 && wcscmp(argv[1], L"launch") == 0)
-        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 0);
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 0, NULL, NULL);
     if (argc == 8 && wcscmp(argv[1], L"launch-stop") == 0)
-        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 1);
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 1, NULL, NULL);
+    if (argc == 10 && wcscmp(argv[1], L"launch-process-probe") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+            0, argv[8], argv[9]);
     return 1;
 }

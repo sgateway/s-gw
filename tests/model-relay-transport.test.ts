@@ -31,7 +31,9 @@ async function startFixture(
   authorized: () => Promise<void> = async () => {},
   allowedBetaValues: readonly string[] = [],
   bufferOwner?: string,
-  credential = key
+  credential = key,
+  payloadProfile?: "strict",
+  allowedModels?: readonly string[]
 ) {
   home = await mkdtemp(path.join(os.tmpdir(), "sgw-model-relay-"));
   const tls = await httpsFixture(home);
@@ -53,6 +55,8 @@ async function startFixture(
       assertAuthorized: authorized,
       allowedBetaValues,
       bufferOwner,
+      payloadProfile,
+      allowedModels,
       workspaceId: modelProvider === "anthropic" ? "wrkspc_test" : undefined,
       projectId: modelProvider === "openai" ? "proj_test" : undefined
     }, transport);
@@ -164,6 +168,120 @@ describe("model relay transport", () => {
     expect(received[0]["openai-project"]).toBe("proj_test");
     expect(received[0]["openai-organization"]).toBeUndefined();
     expect(received[0]["openai-beta"]).toBe("responses=v1");
+    expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses"]);
+  });
+
+  it("blocks background work, provider tools, and remote inputs in strict OpenAI grants", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("openai", async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received.push(Buffer.concat(chunks).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, "strict");
+    const send = (body: string) => fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    const blocked = [
+      { model: "gpt-fixture", input: "hi", background: true },
+      { model: "gpt-fixture", input: "hi", tools: [{ type: "mcp", server_label: "outside",
+        server_url: "https://example.invalid/mcp", require_approval: "never" }] },
+      { model: "gpt-fixture", input: "hi", tools: [{ type: "web_search" }] },
+      { model: "gpt-fixture", input: "hi", previous_response_id: "resp_other_session" },
+      { model: "gpt-fixture", input: "hi", conversation: "conv_other_session" },
+      { model: "gpt-fixture", input: "hi", prompt: { id: "pmpt_other_session" } },
+      { model: "gpt-fixture", input: [{ type: "item_reference", id: "item_other_session" }] },
+      { model: "gpt-fixture", input: [{ role: "user", content: [
+        { type: "input_file", file_id: "file_other_session" }] }] },
+      { model: "gpt-fixture", input: "hi", prompt_cache_options: { comparison_response_id: "resp_other_session" } },
+      { model: "gpt-fixture", input: "hi", context: { container_id: "cntr_other_session" } },
+      { model: "gpt-fixture", input: [{ role: "user", content: [
+        { type: "input_image", image_url: "https://example.invalid/image.png" }] }] },
+      { model: "gpt-fixture", input: [{ role: "user", content: [
+        { type: "input_file", file_url: "https://example.invalid/file.pdf" }] }] }
+    ];
+    for (const payload of blocked) {
+      const response = await send(JSON.stringify(payload));
+      expect(response.status, JSON.stringify(payload)).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    const allowed = { model: "gpt-fixture", input: "hi", background: false, store: true,
+      tools: [{ type: "function", name: "local_calculation", parameters: { type: "object" } }] };
+    expect((await send(JSON.stringify(allowed))).status).toBe(200);
+    const withoutStore = { model: "gpt-fixture", input: "hi" };
+    expect((await send(JSON.stringify(withoutStore))).status).toBe(200);
+    expect(received).toEqual([
+      JSON.stringify({ ...allowed, store: false }), JSON.stringify({ ...withoutStore, store: false })
+    ]);
+    expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses", "https://api.openai.com/v1/responses"]);
+  });
+
+  it("blocks remote MCP and URL media in strict Anthropic grants", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("anthropic", async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received.push(Buffer.concat(chunks).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, "strict");
+    const send = (body: string) => fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    const base = { model: "claude-fixture", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const blocked = [
+      { ...base, mcp_servers: [{ type: "url", url: "https://example.invalid/mcp", name: "outside" }] },
+      { ...base, tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      { ...base, messages: [{ role: "user", content: [
+        { type: "document", source: { type: "file", file_id: "file_other_session" } }] }] },
+      { ...base, container: { id: "container_other_session" } },
+      { ...base, diagnostics: { previous_message_id: "msg_other_session" } },
+      { ...base, messages: [{ role: "user", content: [
+        { type: "image", source: { type: "url", url: "https://example.invalid/image.png" } }] }] }
+    ];
+    for (const payload of blocked) {
+      const response = await send(JSON.stringify(payload));
+      expect(response.status, JSON.stringify(payload)).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    expect((await send(JSON.stringify(base))).status).toBe(200);
+    expect(received).toEqual([JSON.stringify(base)]);
+    expect(fixture.outbound).toEqual(["https://api.anthropic.com/v1/messages"]);
+  });
+
+  it("keeps ordinary grants byte-for-byte compatible when strict profile is absent", async () => {
+    let received = "";
+    const fixture = await startFixture("openai", async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received = Buffer.concat(chunks).toString();
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    const body = '{ "model": "gpt-fixture", "background": true, "tools": [{ "type": "mcp", ' +
+      '"server_url": "https://example.invalid/mcp" }] }';
+    const response = await fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    expect(response.status).toBe(200);
+    expect(received).toBe(body);
+    expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses"]);
+  });
+
+  it("binds an optional model allowlist to the canonicalized POST body", async () => {
+    let received = "";
+    const fixture = await startFixture("openai", async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received = Buffer.concat(chunks).toString();
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, undefined, ["gpt-fixture"]);
+    const send = (body: string) => fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    expect((await send('{"model":"gpt-other","input":"hi"}')).status).toBe(403);
+    expect((await send('{"model":"gpt-fixture","model":"gpt-other","input":"hi"}')).status).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+    expect((await send('{ "model": "gpt-fixture", "input": "hi" }')).status).toBe(200);
+    expect(received).toBe('{"model":"gpt-fixture","input":"hi"}');
     expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses"]);
   });
 

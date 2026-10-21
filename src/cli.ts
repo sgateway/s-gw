@@ -669,6 +669,10 @@ function parseArgs(args: string[]): ParsedArgs {
     }
 
     const key = item.slice(2);
+    if (key === "require-verified-agent" || key === "allow-unverified-agent") {
+      addFlag(flags, key, true);
+      continue;
+    }
     const next = args[i + 1];
     if (next !== undefined && flagTakesValue(key) && (!next.startsWith("--") || key === "arg")) {
       addFlag(flags, key, next);
@@ -2150,10 +2154,23 @@ async function handleApprovalCommand(
   if (action === "set") {
     const mode = approvalMode(requireFlag(flags, "mode"));
     const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
+    const requireVerified = flags["require-verified-agent"];
+    const allowUnverified = flags["allow-unverified-agent"];
+    if ((requireVerified !== undefined && requireVerified !== true) ||
+        (allowUnverified !== undefined && allowUnverified !== true)) {
+      throw new Error("--require-verified-agent and --allow-unverified-agent do not take values.");
+    }
+    if (target && (requireVerified || allowUnverified)) {
+      throw new Error("--require-verified-agent and --allow-unverified-agent do not take values.");
+    }
+    if (requireVerified && allowUnverified) {
+      throw new Error("Use either --require-verified-agent or --allow-unverified-agent, not both.");
+    }
     printJson(
       await store.setApprovalSettings({
         mode,
-        durationMs: duration ? parseDurationMs(duration) : undefined
+        durationMs: duration ? parseDurationMs(duration) : undefined,
+        requireVerifiedAgentForAutoApproval: requireVerified ? true : allowUnverified ? false : undefined
       })
     );
     return;
@@ -2696,7 +2713,7 @@ Commands:
   s-gw ssh run --request-id REQUEST_ID
   s-gw ssh close HANDLE --target user@host [--port 22]
   s-gw approval settings
-  s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m]
+  s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m] [--require-verified-agent|--allow-unverified-agent]
   s-gw approval grants
   s-gw approval policy list
   s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session|http_request|model_relay] [--duration 8h]

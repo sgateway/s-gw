@@ -29,6 +29,19 @@ function normalizeModelRelaySpec(input: Omit<ModelRelayGrant, "handle">): ModelR
   if (!Number.isSafeInteger(input.ttlMs) || input.ttlMs < 1 || input.ttlMs > maxGrantMs) {
     throw new Error("A model relay grant needs a finite lifetime of at most 30 minutes.");
   }
+  if (input.payloadProfile !== undefined && input.payloadProfile !== "strict") {
+    throw new Error("Invalid model relay payload profile.");
+  }
+  if (input.maxRequests !== undefined &&
+      (!Number.isSafeInteger(input.maxRequests) || input.maxRequests < 1 || input.maxRequests > 10_000)) {
+    throw new Error("Invalid model relay request count limit.");
+  }
+  if (input.allowedModels !== undefined && (!Array.isArray(input.allowedModels) ||
+      input.allowedModels.length < 1 || input.allowedModels.length > 64 ||
+      input.allowedModels.some(model => typeof model !== "string" || model.length < 1 || model.length > 256 ||
+        /[\x00-\x1f\x7f]/.test(model)) || new Set(input.allowedModels).size !== input.allowedModels.length)) {
+    throw new Error("Invalid model relay model allowlist.");
+  }
 
   const permitted: readonly string[] = modelRelayRoutes[input.provider];
   const requested = input.routes ?? [...permitted];
@@ -65,6 +78,9 @@ function normalizeModelRelaySpec(input: Omit<ModelRelayGrant, "handle">): ModelR
     provider: input.provider,
     routes,
     ttlMs: input.ttlMs,
+    ...(input.payloadProfile ? { payloadProfile: input.payloadProfile } : {}),
+    ...(input.maxRequests !== undefined ? { maxRequests: input.maxRequests } : {}),
+    ...(input.allowedModels ? { allowedModels: [...input.allowedModels] } : {}),
     ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
     ...(input.organizationId ? { organizationId: input.organizationId } : {}),
     ...(input.projectId ? { projectId: input.projectId } : {}),

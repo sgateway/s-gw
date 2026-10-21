@@ -114,7 +114,8 @@ export interface RequestRecord {
     kind: "env_command" | "ssh_session" | "http_request" | string;
     owned?: boolean;
     http?: { url: string; method: string; headers: Record<string, string>; body?: string; auth: { kind: string; username?: string; name?: string } };
-    model?: { provider: "anthropic" | "openai"; routes: string[]; ttlMs: number;
+    model?: { provider: "anthropic" | "openai"; routes: string[]; ttlMs: number; payloadProfile?: "strict";
+      maxRequests?: number; allowedModels?: string[];
       workspaceId?: string; organizationId?: string; projectId?: string;
       anthropicVersion?: string; allowedBetaValues?: string[] };
     command: string;
