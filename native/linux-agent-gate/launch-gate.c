@@ -16,8 +16,8 @@
 #include <unistd.h>
 
 #ifdef __linux__
+#include <dirent.h>
 #include <sys/prctl.h>
-#include <sys/resource.h>
 #include <sys/syscall.h>
 #endif
 
@@ -35,16 +35,44 @@
 
 #ifdef __linux__
 static int close_inherited_fds(void) {
-#ifdef SYS_close_range
+#if defined(SYS_close_range) && !defined(SGW_GATE_FORCE_FD_FALLBACK)
   if (syscall(SYS_close_range, 3u, ~0u, 0) == 0) return 0;
 #endif
-  struct rlimit limit;
-  if (getrlimit(RLIMIT_NOFILE, &limit) != 0 ||
-      limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT_MAX) return -1;
-  for (int fd = 3; (rlim_t)fd < limit.rlim_cur; fd++) {
-    if (close(fd) != 0 && errno != EBADF) return -1;
+
+  DIR *fds = opendir("/proc/self/fd");
+  if (!fds) return -1;
+  int self_fd = dirfd(fds);
+  if (self_fd < 0) {
+    closedir(fds);
+    return -1;
   }
-  return 0;
+
+  for (;;) {
+    errno = 0;
+    struct dirent *entry = readdir(fds);
+    if (!entry) {
+      if (errno != 0) {
+        closedir(fds);
+        return -1;
+      }
+      break;
+    }
+    if (entry->d_name[0] == '.') continue;
+    char *end;
+    errno = 0;
+    long value = strtol(entry->d_name, &end, 10);
+    if (errno != 0 || *end != '\0' || value < 0 || value > INT_MAX) {
+      closedir(fds);
+      return -1;
+    }
+    int fd = (int)value;
+    if (fd < 3 || fd == self_fd) continue;
+    if (close(fd) != 0 && errno != EBADF) {
+      closedir(fds);
+      return -1;
+    }
+  }
+  return closedir(fds);
 }
 #endif
 

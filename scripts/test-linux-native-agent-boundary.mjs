@@ -304,15 +304,15 @@ async function rootRun() {
     }
     for (const item of plans) {
       const ready = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer-ready")),
-        `${item.sessionId} descriptor-transfer listener`);
-      if (ready !== "ready\n") throw new Error(`${item.sessionId} did not prepare its transfer listeners.`);
+        `${item.sessionId} Unix rendezvous listener`);
+      if (ready !== "ready\n") throw new Error(`${item.sessionId} did not prepare its Unix listeners.`);
     }
     for (const item of plans) process.kill(states.get(item.sessionId).mainPid, "SIGUSR2");
     for (const item of plans) {
       const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer")),
-        `${item.sessionId} descriptor-transfer result`);
+        `${item.sessionId} peer Unix socket result`);
       if (result !== "rights=1 ownfs=1 ownabstract=1 fs=1 hostfs=1 abstract=1\n") {
-        throw new Error(`${item.sessionId} reached a cross-agent descriptor-transfer channel: ${result}`);
+        throw new Error(`${item.sessionId} failed a peer Unix socket or local SCM_RIGHTS probe: ${result}`);
       }
     }
     await until(() => mailbox.events.filter(event => event.kind === "accepted").length >= 2 ? true : undefined,
@@ -403,7 +403,7 @@ async function rootRun() {
         "Native Linux agent teardown failed; its dedicated account and root were preserved for investigation.");
     }
   }
-  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, cross-session and descriptor-transfer denial, revocation, and socket rebind. The listener was manually staged; an installed systemd socket unit and production MCP/model relay remain untested.");
+  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, tested peer pathname/abstract Unix socket denial, local SCM_RIGHTS, revocation, and socket rebind. The listener was manually staged; cross-agent descriptor transfer, an installed systemd socket unit, and production MCP/model relay remain untested.");
 }
 
 async function peer(socket) {
