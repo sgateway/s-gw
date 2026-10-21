@@ -17,6 +17,8 @@ export interface ModelRelayAuthority {
   allowedBetaValues?: readonly string[];
   payloadProfile?: "strict";
   allowedModels?: readonly string[];
+  maxInputBytes?: number;
+  maxOutputTokens?: number;
   bufferOwner?: string;
   ca?: string;
 }
@@ -154,13 +156,23 @@ function objectValue(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function checkedModelBody(provider: ModelProvider, body: Buffer, strict: boolean, allowedModels?: readonly string[]): Buffer {
+function checkedModelBody(provider: ModelProvider, route: URL, body: Buffer, strict: boolean,
+  allowedModels?: readonly string[], maxOutputTokens?: number): Buffer {
   let parsed: unknown;
   try { parsed = JSON.parse(body.toString("utf8")); }
   catch { throw new RelayError(400, "Model requests with payload restrictions must contain JSON."); }
   if (!objectValue(parsed)) throw new RelayError(400, "Model requests with payload restrictions need a JSON object.");
   if (allowedModels && (typeof parsed.model !== "string" || !allowedModels.includes(parsed.model))) {
     throw new RelayError(403, "Model is outside this grant.");
+  }
+  if (maxOutputTokens !== undefined && (provider === "openai" || route.pathname === "/v1/messages")) {
+    const name = provider === "openai" ? "max_output_tokens" : "max_tokens";
+    const requested = parsed[name];
+    if (requested === undefined || (provider === "openai" && requested === null)) parsed[name] = maxOutputTokens;
+    else if (typeof requested !== "number" || !Number.isSafeInteger(requested) ||
+        requested < (provider === "openai" ? 16 : 0) || requested > maxOutputTokens) {
+      throw new RelayError(403, "Model output tokens are outside this grant.");
+    }
   }
   if (strict && provider === "openai") {
     if (parsed.background !== undefined && parsed.background !== false) {
@@ -226,7 +238,8 @@ function checkedModelBody(provider: ModelProvider, body: Buffer, strict: boolean
   return normalized;
 }
 
-async function requestBody(req: IncomingMessage, signal: AbortSignal, owner?: string): Promise<BufferedBody> {
+async function requestBody(req: IncomingMessage, signal: AbortSignal, owner?: string,
+  maxInputBytes = maxBodyBytes): Promise<BufferedBody> {
   if (req.method === "GET") {
     if (req.headers["transfer-encoding"] || (req.headers["content-length"] && req.headers["content-length"] !== "0")) {
       throw new RelayError(400, "GET model requests cannot have a body.");
@@ -253,7 +266,10 @@ async function requestBody(req: IncomingMessage, signal: AbortSignal, owner?: st
       signal.throwIfAborted();
       const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
       size += chunk.length;
-      if (size > maxBodyBytes) throw new RelayError(413, "Model request exceeds 32 MiB.");
+      if (size > maxInputBytes) {
+        throw new RelayError(413, maxInputBytes === maxBodyBytes
+          ? "Model request exceeds 32 MiB." : "Model request exceeds approved input-body limit.");
+      }
       if (bufferedBodyBytes + chunk.length > maxBufferedBodyBytes) {
         throw new RelayError(503, "Model relay request buffer is full.");
       }
@@ -404,10 +420,13 @@ export async function relayModelRequest(
     const route = modelRoute(authority.provider, req.method, req.url);
     await check();
     abort.signal.throwIfAborted();
-    buffered = await requestBody(req, abort.signal, authority.bufferOwner);
-    if (req.method !== "GET" && (authority.payloadProfile === "strict" || authority.allowedModels)) {
-      buffered.data = checkedModelBody(authority.provider, buffered.data!,
-        authority.payloadProfile === "strict", authority.allowedModels);
+    buffered = await requestBody(req, abort.signal, authority.bufferOwner, authority.maxInputBytes);
+    if (req.method !== "GET" && (authority.payloadProfile === "strict" || authority.allowedModels || authority.maxOutputTokens !== undefined)) {
+      buffered.data = checkedModelBody(authority.provider, route, buffered.data!,
+        authority.payloadProfile === "strict", authority.allowedModels, authority.maxOutputTokens);
+    }
+    if (authority.maxInputBytes !== undefined && buffered.data!.length > authority.maxInputBytes) {
+      throw new RelayError(413, "Model request exceeds approved input-body limit.");
     }
     const headers = upstreamHeaders(req, authority, buffered.data!.length);
     await check();

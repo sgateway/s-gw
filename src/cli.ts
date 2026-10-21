@@ -214,6 +214,16 @@ async function main(): Promise<void> {
       throw error;
     }
 
+    const boundAddress = running.server.address();
+    if (!protectedOperator && boundAddress && typeof boundAddress !== "string") {
+      const address = boundAddress.address;
+      if (address !== "::1" && !address.startsWith("127.") && !address.startsWith("::ffff:127.")) {
+        process.stderr.write(
+          `WARNING: s-gw console is bound to non-loopback ${address}. Any client that can reach it can fetch the console API token and control approvals. Restrict network access or bind to 127.0.0.1.\n`
+        );
+      }
+    }
+
     if (!hasFlag(parsed.flags, "no-open")) {
       await openBrowser(running.url);
     }

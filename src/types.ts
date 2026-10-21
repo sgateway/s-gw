@@ -188,6 +188,8 @@ export interface ModelRelaySpec {
   ttlMs: number;
   payloadProfile?: "strict";
   maxRequests?: number;
+  maxInputBytes?: number;
+  maxOutputTokens?: number;
   allowedModels?: readonly string[];
   workspaceId?: string;
   organizationId?: string;

@@ -36,6 +36,15 @@ function normalizeModelRelaySpec(input: Omit<ModelRelayGrant, "handle">): ModelR
       (!Number.isSafeInteger(input.maxRequests) || input.maxRequests < 1 || input.maxRequests > 10_000)) {
     throw new Error("Invalid model relay request count limit.");
   }
+  if (input.maxInputBytes !== undefined &&
+      (!Number.isSafeInteger(input.maxInputBytes) || input.maxInputBytes < 1 || input.maxInputBytes > 32 * 1024 * 1024)) {
+    throw new Error("Invalid model relay input-body byte limit.");
+  }
+  if (input.maxOutputTokens !== undefined &&
+      (!Number.isSafeInteger(input.maxOutputTokens) ||
+        input.maxOutputTokens < (input.provider === "openai" ? 16 : 0) || input.maxOutputTokens > 1_000_000)) {
+    throw new Error("Invalid model relay output token limit.");
+  }
   if (input.allowedModels !== undefined && (!Array.isArray(input.allowedModels) ||
       input.allowedModels.length < 1 || input.allowedModels.length > 64 ||
       input.allowedModels.some(model => typeof model !== "string" || model.length < 1 || model.length > 256 ||
@@ -80,6 +89,8 @@ function normalizeModelRelaySpec(input: Omit<ModelRelayGrant, "handle">): ModelR
     ttlMs: input.ttlMs,
     ...(input.payloadProfile ? { payloadProfile: input.payloadProfile } : {}),
     ...(input.maxRequests !== undefined ? { maxRequests: input.maxRequests } : {}),
+    ...(input.maxInputBytes !== undefined ? { maxInputBytes: input.maxInputBytes } : {}),
+    ...(input.maxOutputTokens !== undefined ? { maxOutputTokens: input.maxOutputTokens } : {}),
     ...(input.allowedModels ? { allowedModels: [...input.allowedModels] } : {}),
     ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
     ...(input.organizationId ? { organizationId: input.organizationId } : {}),

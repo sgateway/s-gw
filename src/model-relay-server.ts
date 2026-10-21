@@ -231,6 +231,8 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
         allowedBetaValues: active.grant.allowedBetaValues,
         payloadProfile: active.grant.payloadProfile,
         allowedModels: active.grant.allowedModels,
+        maxInputBytes: active.grant.maxInputBytes,
+        maxOutputTokens: active.grant.maxOutputTokens,
         bufferOwner: principal.sessionId
       }, options.requestUpstream);
     } catch {

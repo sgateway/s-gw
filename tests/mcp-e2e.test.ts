@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, realpathSync } from "node:fs";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -221,6 +221,82 @@ describe("MCP end-to-end flow", () => {
       await client.close();
     }
   }, 20_000);
+
+  it("requires a verified peer for automatic MCP approval while preserving manual approval", async () => {
+    runCli(["init"]);
+    const secret = JSON.parse(runCli([
+      "secret", "add", "--name", "verified MCP fixture", "--type", "api-token", "--value-stdin",
+      "--inject-env", "TOKEN", "--allow-command", process.execPath
+    ], "synthetic-verified-mcp-secret-value"));
+    runCli([
+      "approval", "policy", "add", "--name", "Codex fixture allow", "--decision", "allow",
+      "--handle", secret.handle, "--agent", "Codex", "--action-kind", "env_command",
+      "--command", process.execPath, "--resolved-command", realpathSync.native(process.execPath)
+    ]);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+      env: testEnv as Record<string, string>, stderr: "pipe"
+    });
+    const client = new Client({ name: "Codex", version: "0.0.1" });
+    await client.connect(transport);
+    const args = {
+      handle: secret.handle, command: process.execPath,
+      args: ["-e", "process.stdout.write('approved')"], injectEnv: "TOKEN",
+      reason: "ordinary MCP verified-only check"
+    };
+    try {
+      const allowed = await client.callTool({ name: "sgw_request_execution", arguments: args });
+      expect(allowed.isError).not.toBe(true);
+      expect(JSON.parse(allowed.content[0].text).request.state).toBe("approved");
+
+      runCli(["approval", "set", "--mode", "per-transaction", "--require-verified-agent"]);
+      const oldApproval = JSON.parse(allowed.content[0].text).request.id;
+      const revoked = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: oldApproval } });
+      expect(revoked.isError).toBe(true);
+      expect(revoked.content[0].text).toMatch(/approval policy.*changed/i);
+
+      const pending = await client.callTool({ name: "sgw_request_execution", arguments: args });
+      expect(pending.isError).not.toBe(true);
+      const request = JSON.parse(pending.content[0].text).request;
+      expect(request).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "mcp-client" });
+
+      const reusable = await client.callTool({ name: "sgw_run_execution", arguments: args });
+      expect(reusable.isError).not.toBe(true);
+      expect(JSON.parse(reusable.content[0].text)).toMatchObject({ approvalRequired: true, request: { state: "pending" } });
+
+      const manual = JSON.parse(runCli(["approve", request.id, "--mode", "timed-session"]));
+      expect(manual.approvalSource).toBe("manual");
+      expect(manual.approvalGrantId).toBeUndefined();
+      expect(JSON.parse(runCli(["approval", "grants", "list"]))).toEqual([]);
+      const executed = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(executed.isError).not.toBe(true);
+      expect(JSON.parse(executed.content[0].text)).toMatchObject({ exitCode: 0, stdout: "approved" });
+
+      const repeat = await client.callTool({ name: "sgw_request_execution", arguments: args });
+      const repeatRequest = JSON.parse(repeat.content[0].text).request;
+      expect(repeatRequest.state).toBe("pending");
+
+      runCli(["approve", repeatRequest.id]);
+      const otherTransport = new StdioClientTransport({
+        command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+        env: testEnv as Record<string, string>, stderr: "pipe"
+      });
+      const otherClient = new Client({ name: "Claude", version: "0.0.1" });
+      await otherClient.connect(otherTransport);
+      try {
+        const claimed = await otherClient.callTool({
+          name: "sgw_execute_request", arguments: { requestId: repeatRequest.id }
+        });
+        expect(claimed.isError).not.toBe(true);
+        expect(JSON.parse(claimed.content[0].text)).toMatchObject({ exitCode: 0, stdout: "approved" });
+      } finally {
+        await otherClient.close();
+      }
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
 
   it("does not let ordinary MCP execute a managed request ID", async () => {
     runCli(["init"]);

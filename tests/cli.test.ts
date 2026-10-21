@@ -1,4 +1,4 @@
-import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
+import { execFileSync, spawn, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -587,6 +587,61 @@ describe("CLI unknown-command behavior (end to end)", () => {
     // The friendly message must replace, not include, the raw Node listen error.
     expect(stderr).not.toContain("EADDRINUSE");
   });
+
+  it("warns when the ordinary console binds all interfaces without refusing the bind", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-wide-console-"));
+    const child = spawn(process.execPath, [tsxCli, "src/cli.ts", "console", "--host", "0.0.0.0", "--port", "0", "--no-open"], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        SGW_HOME: home,
+        SGW_RECOVERY_HOME: `${home}-recovery`,
+        SGW_MASTER_PASSPHRASE: "throwaway-console-warning-test",
+        SGW_DISABLE_KEYCHAIN: "1",
+        SGW_SECRET_BACKEND: "local",
+        SGW_DISABLE_UPDATE_CHECK: "1"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Console did not start: ${stderr}`)), 12_000);
+        const started = () => {
+          if (!stdout.includes("Press Ctrl+C to stop.") || !stderr.includes("WARNING: s-gw console")) return;
+          clearTimeout(timer);
+          resolve();
+        };
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdout += chunk.toString();
+          started();
+        });
+        child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); started(); });
+        child.once("error", (error) => { clearTimeout(timer); reject(error); });
+        child.once("exit", (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Console exited before startup (${code}): ${stderr}`));
+        });
+      });
+
+      expect(stderr).toContain("WARNING: s-gw console is bound to non-loopback 0.0.0.0");
+      expect(stderr).toContain("Any client that can reach it can fetch the console API token");
+      expect(stdout).not.toContain("WARNING");
+      const url = /s-gw console running at (http:\/\/\S+)/u.exec(stdout)?.[1];
+      expect(url).toBeTruthy();
+      expect((await fetch(url!)).status).toBe(200);
+    } finally {
+      child.kill("SIGTERM");
+      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 2_000))]);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("preserves hyphenated --arg values and secondary env bindings in env-command requests", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-args-"));

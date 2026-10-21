@@ -12,6 +12,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { SGW_MODEL_RELAY_COMMAND, startVerifiedModelRelayServer, type VerifiedModelRelayServer } from "../src/model-relay-server.js";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { registerDurableModelRelaySession, StoreBackedModelRelayApprovals } from "../src/model-relay-approval.js";
+import { normalizeModelRelayGrant } from "../src/model-relay-action.js";
 import type { ModelUpstreamRequest } from "../src/model-relay-transport.js";
 import type { PeerSession } from "../src/peer-identity.js";
 import { SecretStore } from "../src/store.js";
@@ -104,6 +105,17 @@ function send(route: string, body = "{}", headers: Record<string, string> = {}):
     req.end(body);
   });
 }
+
+it("rejects invalid model relay input and output limits", () => {
+  const base = { provider: "openai" as const, handle: "s-gw:api-token:fixture", ttlMs: 1000 };
+  for (const maxInputBytes of [0, 32 * 1024 * 1024 + 1, 1.5]) {
+    expect(() => normalizeModelRelayGrant({ ...base, maxInputBytes })).toThrow(/input-body byte limit/);
+  }
+  for (const maxOutputTokens of [0, 15, 1_000_001, 2.5]) {
+    expect(() => normalizeModelRelayGrant({ ...base, maxOutputTokens })).toThrow(/output token limit/);
+  }
+  expect(normalizeModelRelayGrant({ ...base, provider: "anthropic", maxOutputTokens: 0 }).maxOutputTokens).toBe(0);
+});
 
 async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
   const tls = await httpsFixture(root);
@@ -296,16 +308,21 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     const session = await ownSession();
     const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
     const request = await store.createModelRelayRequest({ provider: "anthropic", handle, ttlMs: 30_000,
-      routes: ["POST /v1/messages"], payloadProfile: "strict", maxRequests: 3,
+      routes: ["POST /v1/messages"], payloadProfile: "strict", maxRequests: 5,
+      maxInputBytes: 512, maxOutputTokens: 20,
       allowedModels: ["claude-fixture"] }, principal);
     expect(request.action.model?.payloadProfile).toBe("strict");
-    expect(request.action.model?.maxRequests).toBe(3);
+    expect(request.action.model?.maxRequests).toBe(5);
+    expect(request.action.model?.maxInputBytes).toBe(512);
+    expect(request.action.model?.maxOutputTokens).toBe(20);
     expect(request.action.model?.allowedModels).toEqual(["claude-fixture"]);
     await store.approveRequest(request.id, { mode: "per-transaction" });
 
     const reopened = new SecretStore(path.join(root, "store"));
     const approvals = new StoreBackedModelRelayApprovals(reopened);
     expect((await reopened.getRequest(request.id)).action.model?.payloadProfile).toBe("strict");
+    expect((await reopened.getRequest(request.id)).action.model?.maxOutputTokens).toBe(20);
+    expect((await reopened.getRequest(request.id)).action.model?.maxInputBytes).toBe(512);
     server = await startVerifiedModelRelayServer({ socketPath, store: reopened, requestUpstream, approval: approvals });
     const brokerUid = process.getuid!();
     const fake = brokerUid === 0 ? 1 : 0;
@@ -326,6 +343,10 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     expect(upstreamCalls).toBe(0);
     const wrongModel = { ...local, model: "claude-other" };
     expect((await send("/v1/messages", JSON.stringify(wrongModel))).status).toBe(403);
+    expect(upstreamCalls).toBe(0);
+    expect((await send("/v1/messages", JSON.stringify({ ...local, max_tokens: 21 }))).status).toBe(403);
+    expect(upstreamCalls).toBe(0);
+    expect((await send("/v1/messages", JSON.stringify({ ...local, messages: [{ role: "user", content: "x".repeat(512) }] }))).status).toBe(413);
     expect(upstreamCalls).toBe(0);
     expect((await send("/v1/messages", JSON.stringify(local))).status).toBe(200);
     expect(upstreamCalls).toBe(1);

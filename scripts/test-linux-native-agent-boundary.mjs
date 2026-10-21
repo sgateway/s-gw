@@ -8,7 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkLinuxActivatedSocket } from "../dist/linux-activated-socket.js";
 import { LinuxAgentSessionLeases } from "../dist/linux-agent-session.js";
-import { SystemdRunAgentUnitManager } from "../dist/linux-agent-unit.js";
+import { linuxAgentUnitName, rejectUnresolvedUnitLaunchFences,
+  SystemdRunAgentUnitManager } from "../dist/linux-agent-unit.js";
 import { PeerSessionRegistry } from "../dist/peer-identity.js";
 
 const project = fileURLToPath(new URL("..", import.meta.url));
@@ -296,6 +297,16 @@ async function rootRun() {
         states.get(ids[0]).cgroup === states.get(ids[1]).cgroup) {
       throw new Error("The two agents did not attest distinct UIDs and cgroups.");
     }
+    for (const item of plans) {
+      let fenced = false;
+      try {
+        await rejectUnresolvedUnitLaunchFences("/run/s-gw/agent-unit-lifecycle",
+          linuxAgentUnitName(item.sessionId));
+      } catch (error) {
+        fenced = /unresolved prior launch attempt/.test(String(error));
+      }
+      if (!fenced) throw new Error("A running Linux agent lacked its durable launch fence.");
+    }
     const legacyUnits = new SystemdRunAgentUnitManager();
     for (const item of plans) {
       let blocked = false;
@@ -384,6 +395,10 @@ async function rootRun() {
     broker.send({ kind: "stop" });
     const stopped = await mailbox.next("stopped");
     if (stopped.error) throw new Error(stopped.error);
+    for (const item of plans) {
+      await rejectUnresolvedUnitLaunchFences("/run/s-gw/agent-unit-lifecycle",
+        linuxAgentUnitName(item.sessionId));
+    }
     broker.send({ kind: "reuse" });
     const reuse = await mailbox.next("reuse");
     if (!reuse.leaseRejected || !reuse.registryRejected) {

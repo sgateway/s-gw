@@ -18,6 +18,7 @@ export interface LinuxAgentUnitPlan {
   activatedSocket?: boolean;
   isolatedSharedMemory?: boolean;
   serializedLifecycle?: boolean;
+  launchAttemptFence?: boolean;
   sealedStdio?: boolean;
 }
 
@@ -80,12 +81,19 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
       (plan.isolatedSharedMemory === true && plan.launchGate !== true) ||
       (plan.serializedLifecycle !== undefined && typeof plan.serializedLifecycle !== "boolean") ||
       (plan.serializedLifecycle === true && plan.launchGate !== true) ||
+      (plan.launchAttemptFence !== undefined && typeof plan.launchAttemptFence !== "boolean") ||
+      (plan.serializedLifecycle === true && plan.launchAttemptFence === false) ||
       (plan.sealedStdio !== undefined && typeof plan.sealedStdio !== "boolean") ||
       (plan.sealedStdio === true && plan.launchGate !== true) ||
       !Array.isArray(plan.args) || plan.args.length > 128 ||
       plan.args.some(arg => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
     throw new Error("Linux agent executable or arguments are invalid.");
   }
+}
+
+export function linuxLaunchAttemptFenceEnabled(plan: LinuxAgentUnitPlan): boolean {
+  validateLinuxAgentPlan(plan);
+  return plan.serializedLifecycle === true || plan.launchAttemptFence === true;
 }
 
 export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): string[] {
@@ -144,12 +152,20 @@ interface LinuxUnitLifecycleLease {
   invocationId?: string;
 }
 
-function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
+export interface LinuxUnitLaunchFence {
+  filename: string;
+  marker: string;
+  attemptId: string;
+  dev: number;
+  ino: number;
+}
+
+export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
   return JSON.stringify([plan.sessionId, plan.uid, plan.gid, plan.brokerUid,
     plan.rootDirectory, plan.brokerSocket, plan.executable, plan.args,
     plan.launchGate === true, plan.activatedSocket === true,
     plan.isolatedSharedMemory === true, plan.serializedLifecycle === true,
-    plan.sealedStdio === true]);
+    linuxLaunchAttemptFenceEnabled(plan), plan.sealedStdio === true]);
 }
 
 export async function stopOwnedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,
@@ -261,6 +277,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   private readonly gates = new Map<string, { dev: number; ino: number }>();
   private readonly launchPaths = new Map<string, string>();
   private readonly lifecycleLeases = new Map<string, LinuxUnitLifecycleLease>();
+  private readonly launchFences = new Map<string, { fence: LinuxUnitLaunchFence; planKey: string }>();
 
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
@@ -269,6 +286,9 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   }
 
   private async startLocked(plan: LinuxAgentUnitPlan): Promise<void> {
+    this.rejectLaunchFenceDowngrade(plan);
+    const fenced = linuxLaunchAttemptFenceEnabled(plan);
+    if (fenced) await rejectUnresolvedUnitLaunchFences(lifecycleRoot, linuxAgentUnitName(plan.sessionId));
     if (plan.serializedLifecycle) await assertUnitNotPresent(plan);
     else await rejectExistingUnitLifecycleLease(plan);
     if (this.lifecycleLeases.has(plan.sessionId)) {
@@ -283,14 +303,18 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     const lease = plan.serializedLifecycle ? await acquireUnitLifecycleLease(plan, attemptId) : undefined;
     if (lease) this.lifecycleLeases.set(plan.sessionId, lease);
     let launchAttempted = false;
+    let launchSucceeded = false;
     let safeTeardown = false;
+    let fence: LinuxUnitLaunchFence | undefined;
     try {
       if (plan.launchGate) this.gates.set(plan.sessionId, await prepareGate(plan));
       await startPreparedLinuxAgentUnit(plan, attemptId, {
         launch: async () => {
           if (!lease) await rejectExistingUnitLifecycleLease(plan);
+          fence = await beginLinuxUnitLaunchAttempt(plan, attemptId, lifecycleRoot, 0);
           launchAttempted = true;
           await run("/usr/bin/systemd-run", args);
+          launchSucceeded = true;
         },
         inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
           "-p", "Id", "-p", "Description", "-p", "User", "-p", "Group", "-p", "RootDirectory"]),
@@ -310,7 +334,14 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
           safeTeardown = true;
         }
       });
+      if (fence) this.launchFences.set(plan.sessionId, { fence, planKey: lifecyclePlanKey(plan) });
     } catch (error) {
+      if (fence && launchSucceeded && safeTeardown) {
+        try { await releaseLinuxUnitLaunchFence(fence, 0); }
+        catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], "Linux agent start and launch-fence cleanup failed.");
+        }
+      }
       if (lease && (!launchAttempted || safeTeardown)) {
         try {
           await releaseUnitLifecycleLease(lease);
@@ -333,6 +364,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
 
   private async inspectLocked(plan: LinuxAgentUnitPlan): Promise<LinuxAgentUnitState> {
     this.rejectLifecycleDowngrade(plan);
+    this.rejectLaunchFenceDowngrade(plan);
     if (!plan.serializedLifecycle) {
       await rejectExistingUnitLifecycleLease(plan);
       return this.inspectUnit(plan);
@@ -363,6 +395,10 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     if (lease && !linuxUnitOwnedByStartAttempt(plan, lease.attemptId, output)) {
       throw new Error("Linux agent unit changed after its leased start.");
     }
+    const activeFence = this.launchFences.get(plan.sessionId);
+    if (activeFence && !linuxUnitOwnedByStartAttempt(plan, activeFence.fence.attemptId, output)) {
+      throw new Error("Linux agent unit changed after its fenced start.");
+    }
     const state = parseSystemdAgentState(plan, output);
     if (lease?.invocationId && lease.invocationId !== state.invocationId) {
       throw new Error("Linux agent invocation changed during its lifecycle lease.");
@@ -380,6 +416,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
 
   private async releaseLocked(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState): Promise<void> {
     this.rejectLifecycleDowngrade(plan);
+    this.rejectLaunchFenceDowngrade(plan);
     if (!plan.serializedLifecycle) {
       await rejectExistingUnitLifecycleLease(plan);
       return this.releaseUnit(plan, expected);
@@ -451,11 +488,23 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
 
   private async stopLocked(plan: LinuxAgentUnitPlan): Promise<void> {
     this.rejectLifecycleDowngrade(plan);
+    this.rejectLaunchFenceDowngrade(plan);
     if (!plan.serializedLifecycle) {
       await rejectExistingUnitLifecycleLease(plan);
-      await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
+      const activeFence = this.launchFences.get(plan.sessionId);
+      if (activeFence) {
+        const unit = linuxAgentUnitName(plan.sessionId);
+        await stopOwnedLinuxAgentUnit(plan, activeFence.fence.attemptId, undefined, {
+          inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
+            "-p", "Id", "-p", "Description", "-p", "User", "-p", "Group", "-p", "RootDirectory"]),
+          stopOwned: async () => { await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", unit]); }
+        });
+      } else {
+        await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
+      }
       await assertNoUidProcesses(plan.uid);
       if (plan.launchGate) await this.cleanGate(plan);
+      await this.releaseLaunchFence(plan);
       this.launchPaths.delete(plan.sessionId);
       return;
     }
@@ -477,6 +526,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       if (plan.launchGate) await this.cleanGate(plan);
       await releaseUnitLifecycleLease(lease);
       this.lifecycleLeases.delete(plan.sessionId);
+      await this.releaseLaunchFence(plan);
       this.launchPaths.delete(plan.sessionId);
     } finally { lease.busy = false; }
   }
@@ -496,6 +546,13 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     }
   }
 
+  private rejectLaunchFenceDowngrade(plan: LinuxAgentUnitPlan): void {
+    const active = this.launchFences.get(plan.sessionId);
+    if (active && active.planKey !== lifecyclePlanKey(plan)) {
+      throw new Error("Linux agent launch fence belongs to a different unit plan.");
+    }
+  }
+
   private async withUnitOperationLock<T>(plan: LinuxAgentUnitPlan, action: () => Promise<T>): Promise<T> {
     await checkedLifecycleRoot();
     const filename = path.join(lifecycleRoot, `${linuxAgentUnitName(plan.sessionId)}.lock`);
@@ -507,6 +564,14 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     if (!identity) return;
     await cleanupGate(plan, identity);
     this.gates.delete(plan.sessionId);
+  }
+
+  private async releaseLaunchFence(plan: LinuxAgentUnitPlan): Promise<void> {
+    const active = this.launchFences.get(plan.sessionId);
+    if (!active) return;
+    this.rejectLaunchFenceDowngrade(plan);
+    await releaseLinuxUnitLaunchFence(active.fence, 0);
+    this.launchFences.delete(plan.sessionId);
   }
 
   private requireRoot(): void {
@@ -527,6 +592,89 @@ async function checkedLifecycleRoot(): Promise<void> {
       await realpath(lifecycleRoot) !== lifecycleRoot) {
     throw new Error("Linux agent lifecycle lock root is not private to the privileged manager.");
   }
+}
+
+function launchFenceName(unit: string, attemptId: string): string {
+  const sessionId = /^s-gw-agent-(.+)\.service$/.exec(unit)?.[1];
+  if (!sessionId || linuxAgentUnitName(sessionId) !== unit || !/^[a-f0-9]{32}$/.test(attemptId)) {
+    throw new Error("Linux agent launch-fence identity is invalid.");
+  }
+  return `${unit}.launch-${attemptId}`;
+}
+
+async function checkedLaunchFenceDirectory(directory: string, ownerUid: number): Promise<void> {
+  if (!path.isAbsolute(directory) || path.resolve(directory) !== directory ||
+      !Number.isSafeInteger(ownerUid) || ownerUid < 0) {
+    throw new Error("Linux agent launch-fence directory or owner is invalid.");
+  }
+  const info = await lstat(directory);
+  if (!info.isDirectory() || info.uid !== ownerUid || (info.mode & 0o077) !== 0 ||
+      await realpath(directory) !== directory) {
+    throw new Error("Linux agent launch-fence directory is not private to its owner.");
+  }
+}
+
+export async function rejectUnresolvedUnitLaunchFences(directory: string, unit: string,
+  ownerUid = 0): Promise<void> {
+  launchFenceName(unit, "0".repeat(32));
+  await checkedLaunchFenceDirectory(directory, ownerUid);
+  if ((await readdir(directory)).some(name => name.startsWith(`${unit}.launch-`))) {
+    throw new Error("Linux agent unit has an unresolved prior launch attempt.");
+  }
+}
+
+export async function beginLinuxUnitLaunchAttempt(plan: LinuxAgentUnitPlan, attemptId: string,
+  directory: string, ownerUid: number): Promise<LinuxUnitLaunchFence | undefined> {
+  if (!linuxLaunchAttemptFenceEnabled(plan)) return undefined;
+  const unit = linuxAgentUnitName(plan.sessionId);
+  await rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid);
+  return reserveLinuxUnitLaunchFence(directory, unit, attemptId, ownerUid);
+}
+
+export async function reserveLinuxUnitLaunchFence(directory: string, unit: string, attemptId: string,
+  ownerUid: number): Promise<LinuxUnitLaunchFence> {
+  const name = launchFenceName(unit, attemptId);
+  await checkedLaunchFenceDirectory(directory, ownerUid);
+  const filename = path.join(directory, name);
+  const marker = `${unit} ${attemptId}\n`;
+  const file = await open(filename, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  let dev: number;
+  let ino: number;
+  try {
+    await file.chmod(0o600);
+    await file.writeFile(marker);
+    await file.sync();
+    const info = await file.stat();
+    dev = info.dev;
+    ino = info.ino;
+  } finally { await file.close(); }
+  const dir = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { await dir.sync(); }
+  finally { await dir.close(); }
+  return { filename, marker, attemptId, dev, ino };
+}
+
+export async function releaseLinuxUnitLaunchFence(fence: LinuxUnitLaunchFence,
+  ownerUid: number): Promise<void> {
+  const directory = path.dirname(fence.filename);
+  await checkedLaunchFenceDirectory(directory, ownerUid);
+  const before = await lstat(fence.filename);
+  if (!before.isFile() || before.uid !== ownerUid || (before.mode & 0o077) !== 0 ||
+      before.nlink !== 1 || before.dev !== fence.dev || before.ino !== fence.ino) {
+    throw new Error("Linux agent launch fence changed before release.");
+  }
+  const file = await open(fence.filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const current = await file.stat();
+    if (current.dev !== fence.dev || current.ino !== fence.ino ||
+        await file.readFile({ encoding: "utf8" }) !== fence.marker) {
+      throw new Error("Linux agent launch fence changed before release.");
+    }
+  } finally { await file.close(); }
+  await unlink(fence.filename);
+  const dir = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { await dir.sync(); }
+  finally { await dir.close(); }
 }
 
 export async function withLinuxUnitOperationLock<T>(filename: string, ownerUid: number,

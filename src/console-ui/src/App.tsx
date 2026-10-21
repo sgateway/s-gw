@@ -3154,6 +3154,8 @@ function ApprovalSheet({
                 <div>Lifetime after launch: {Math.ceil(request.action.model.ttlMs / 60_000)} minute(s)</div>
                 <div>Payload profile: {request.action.model.payloadProfile === "strict" ? "Strict" : "Unrestricted JSON"}</div>
                 {request.action.model.maxRequests !== undefined ? <div>Maximum requests: {request.action.model.maxRequests}</div> : null}
+                {request.action.model.maxInputBytes !== undefined ? <div>Maximum input bytes per request: {request.action.model.maxInputBytes}</div> : null}
+                {request.action.model.maxOutputTokens !== undefined ? <div>Maximum output tokens per request: {request.action.model.maxOutputTokens}</div> : null}
                 {request.action.model.allowedModels ? <div>Allowed models: {request.action.model.allowedModels.join(", ")}</div> : null}
                 {request.action.model.payloadProfile === "strict" ? (
                   <div className="text-xs text-muted-foreground">Blocks background work, provider-run tools, remote MCP servers, recognized URL inputs, and provider resource references. OpenAI responses use store: false. Prompt text and other provider behavior are not inspected.</div>

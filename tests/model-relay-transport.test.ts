@@ -33,7 +33,9 @@ async function startFixture(
   bufferOwner?: string,
   credential = key,
   payloadProfile?: "strict",
-  allowedModels?: readonly string[]
+  allowedModels?: readonly string[],
+  maxOutputTokens?: number,
+  maxInputBytes?: number
 ) {
   home = await mkdtemp(path.join(os.tmpdir(), "sgw-model-relay-"));
   const tls = await httpsFixture(home);
@@ -57,6 +59,8 @@ async function startFixture(
       bufferOwner,
       payloadProfile,
       allowedModels,
+      maxOutputTokens,
+      maxInputBytes,
       workspaceId: modelProvider === "anthropic" ? "wrkspc_test" : undefined,
       projectId: modelProvider === "openai" ? "proj_test" : undefined
     }, transport);
@@ -283,6 +287,85 @@ describe("model relay transport", () => {
     expect((await send('{ "model": "gpt-fixture", "input": "hi" }')).status).toBe(200);
     expect(received).toBe('{"model":"gpt-fixture","input":"hi"}');
     expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses"]);
+  });
+
+  it("enforces the approved Anthropic output-token cap before upstream", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("anthropic", async (req, res) => {
+      const parts: Buffer[] = [];
+      for await (const part of req) parts.push(part);
+      received.push(Buffer.concat(parts).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, undefined, undefined, 20);
+    const send = (body: string) => fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    for (const body of [
+      '{"model":"claude-fixture","max_tokens":21}',
+      '{"model":"claude-fixture","max_tokens":"10"}',
+      '{"model":"claude-fixture","max_tokens":null}',
+      '{"model":"claude-fixture","max_tokens":10.5}',
+      '{"model":"claude-fixture","max_tokens":10,"max_tokens":21}'
+    ]) expect((await send(body)).status, body).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+    expect((await send('{ "model": "claude-fixture" }')).status).toBe(200);
+    expect((await send('{"model":"claude-fixture","max_tokens":10}')).status).toBe(200);
+    expect((await send('{"model":"claude-fixture","max_tokens":0}')).status).toBe(200);
+    const count = '{"model":"claude-fixture","messages":[]}';
+    expect((await fetch(fixture.url + "/v1/messages/count_tokens", {
+      method: "POST", headers: { "content-type": "application/json" }, body: count
+    })).status).toBe(200);
+    expect(received).toEqual([
+      '{"model":"claude-fixture","max_tokens":20}',
+      '{"model":"claude-fixture","max_tokens":10}',
+      '{"model":"claude-fixture","max_tokens":0}',
+      count
+    ]);
+  });
+
+  it("enforces the approved OpenAI output-token cap before upstream", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("openai", async (req, res) => {
+      const parts: Buffer[] = [];
+      for await (const part of req) parts.push(part);
+      received.push(Buffer.concat(parts).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, undefined, undefined, 64);
+    const send = (body: string) => fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    for (const body of [
+      '{"model":"gpt-fixture","max_output_tokens":65}',
+      '{"model":"gpt-fixture","max_output_tokens":15}',
+      '{"model":"gpt-fixture","max_output_tokens":"32"}',
+      '{"model":"gpt-fixture","max_output_tokens":32,"max_output_tokens":65}'
+    ]) expect((await send(body)).status, body).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+    expect((await send('{ "model": "gpt-fixture", "input": "hi" }')).status).toBe(200);
+    expect((await send('{"model":"gpt-fixture","max_output_tokens":32}')).status).toBe(200);
+    expect(received).toEqual([
+      '{"model":"gpt-fixture","input":"hi","max_output_tokens":64}',
+      '{"model":"gpt-fixture","max_output_tokens":32}'
+    ]);
+  });
+
+  it("enforces an approved input-body byte cap without rewriting in-range bytes", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("openai", async (req, res) => {
+      const parts: Buffer[] = [];
+      for await (const part of req) parts.push(part);
+      received.push(Buffer.concat(parts).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, undefined, undefined, undefined, 32);
+    const send = (body: string) => fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    expect((await send('{"input":"this is over the approved byte limit"}')).status).toBe(413);
+    expect(fixture.outbound).toEqual([]);
+    const raw = ' { "model": "gpt-fixture" } ';
+    expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(32);
+    expect((await send(raw)).status).toBe(200);
+    expect(received).toEqual([raw]);
   });
 
   it("redacts common URL and base64url renderings of a reflected credential", async () => {

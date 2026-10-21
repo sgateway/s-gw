@@ -3,11 +3,14 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { linuxAgentUnitName, linuxPrivateSharedMemoryMount, linuxProcessGroupsAreDedicated, linuxUnitIsAbsent,
-  linuxUnitOwnedByStartAttempt,
-  parseSystemdAgentState, reserveLinuxUnitLifecycleDirectory, startPreparedLinuxAgentUnit,
-  stopOwnedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan, withLinuxUnitOperationLock,
-  type LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
+import { beginLinuxUnitLaunchAttempt, linuxAgentUnitName, linuxLaunchAttemptFenceEnabled, linuxPrivateSharedMemoryMount,
+  linuxProcessGroupsAreDedicated, linuxUnitIsAbsent,
+  linuxUnitOwnedByStartAttempt, lifecyclePlanKey, rejectUnresolvedUnitLaunchFences,
+  parseSystemdAgentState, releaseLinuxUnitLaunchFence, reserveLinuxUnitLaunchFence,
+  reserveLinuxUnitLifecycleDirectory, startPreparedLinuxAgentUnit,
+  stopOwnedLinuxAgentUnit, systemdRunArgs, SystemdRunAgentUnitManager,
+  validateLinuxAgentPlan, withLinuxUnitOperationLock,
+  type LinuxAgentUnitPlan, type LinuxUnitLaunchFence } from "../src/linux-agent-unit.js";
 
 function plan(): LinuxAgentUnitPlan {
   return {
@@ -118,6 +121,20 @@ describe("Linux systemd agent unit plan", () => {
     expect(parseSystemdAgentState(sealed, attestation(sealed)).mainPid).toBe(1234);
   });
 
+  it("leaves ordinary legacy launches unchanged and fences only opted-in or serialized plans", () => {
+    const ordinary = plan();
+    const fenced = { ...ordinary, launchAttemptFence: true };
+    const strict = { ...ordinary, launchGate: true, serializedLifecycle: true };
+    expect(linuxLaunchAttemptFenceEnabled(ordinary)).toBe(false);
+    expect(linuxLaunchAttemptFenceEnabled(fenced)).toBe(true);
+    expect(linuxLaunchAttemptFenceEnabled(strict)).toBe(true);
+    expect(systemdRunArgs(fenced)).toEqual(systemdRunArgs(ordinary));
+    expect(() => validateLinuxAgentPlan({ ...ordinary, launchAttemptFence: "yes" as never }))
+      .toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...strict, launchAttemptFence: false }))
+      .toThrow("arguments");
+  });
+
   it("rejects a host shared-memory bind despite matching tmpfs mount flags", () => {
     const mount = "51 30 0:44 / /dev/shm rw,nosuid,nodev,noexec - tmpfs tmpfs rw,mode=1777\n";
     expect(linuxPrivateSharedMemoryMount(mount, 44, 43)).toBe(true);
@@ -210,6 +227,95 @@ describe("Linux systemd agent unit plan", () => {
     await expect(result).rejects.toThrow("Linux agent start and teardown failed");
     expect(stopUnit).toHaveBeenCalledOnce();
     expect(gateCleaned).toBe(false);
+  });
+
+  it("keeps an ambiguous legacy start fenced if systemd publishes it after the failed query", async () => {
+    const p = { ...plan(), launchAttemptFence: true };
+    const unit = linuxAgentUnitName(p.sessionId);
+    const attempt = "0123456789abcdef0123456789abcdef";
+    const ownerUid = process.getuid?.();
+    if (ownerUid === undefined) throw new Error("Linux launch-fence test needs a local UID.");
+    const directory = await realpath(await mkdtemp(path.join(tmpdir(), "s-gw-launch-fence-")));
+    try {
+      const fence = await beginLinuxUnitLaunchAttempt(p, attempt, directory, ownerUid);
+      if (!fence) throw new Error("Opted-in Linux launch did not create a fence.");
+      let lateUnit = false;
+      const inspectOwnership = async () => lateUnit ?
+        `Id=${unit}\nDescription=s-gw-agent-start:${attempt}\nUser=${p.uid}\nGroup=${p.gid}\nRootDirectory=${p.rootDirectory}\n` :
+        `Id=${unit}\nLoadState=not-found\nActiveState=inactive\n`;
+      await expect(startPreparedLinuxAgentUnit(p, attempt, {
+        launch: async () => { throw new Error("systemd-run timed out"); },
+        inspectOwnership,
+        verify: async () => { throw new Error("unexpected verification"); },
+        stopOwned: async () => { throw new Error("unexpected stop"); }
+      })).rejects.toThrow("systemd-run timed out");
+      await expect(rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid))
+        .rejects.toThrow("unresolved prior launch attempt");
+      lateUnit = true;
+      expect(linuxUnitOwnedByStartAttempt(p, attempt, await inspectOwnership())).toBe(true);
+      await expect(rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid))
+        .rejects.toThrow("unresolved prior launch attempt");
+      await expect(beginLinuxUnitLaunchAttempt(p, "fedcba9876543210fedcba9876543210",
+        directory, ownerUid)).rejects.toThrow("unresolved prior launch attempt");
+      await expect(beginLinuxUnitLaunchAttempt({ ...p, launchGate: true, serializedLifecycle: true },
+        "fedcba9876543210fedcba9876543210", directory, ownerUid))
+        .rejects.toThrow("unresolved prior launch attempt");
+      expect(await beginLinuxUnitLaunchAttempt(plan(), attempt, directory, ownerUid)).toBeUndefined();
+      await releaseLinuxUnitLaunchFence(fence, ownerUid);
+      await expect(rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid)).resolves.toBeUndefined();
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("treats any prior per-unit launch fence as unresolved until its exact owner releases it", async () => {
+    const ownerUid = process.getuid?.();
+    if (ownerUid === undefined) throw new Error("Linux launch-fence test needs a local UID.");
+    const directory = await realpath(await mkdtemp(path.join(tmpdir(), "s-gw-launch-fence-")));
+    const unit = linuxAgentUnitName("session-123");
+    const other = linuxAgentUnitName("session-124");
+    try {
+      const first = await reserveLinuxUnitLaunchFence(directory, unit,
+        "0123456789abcdef0123456789abcdef", ownerUid);
+      const second = await reserveLinuxUnitLaunchFence(directory, unit,
+        "fedcba9876543210fedcba9876543210", ownerUid);
+      await expect(rejectUnresolvedUnitLaunchFences(directory, other, ownerUid)).resolves.toBeUndefined();
+      await expect(rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid))
+        .rejects.toThrow("unresolved prior launch attempt");
+      await releaseLinuxUnitLaunchFence(first, ownerUid);
+      await expect(rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid))
+        .rejects.toThrow("unresolved prior launch attempt");
+      await releaseLinuxUnitLaunchFence(second, ownerUid);
+      await expect(rejectUnresolvedUnitLaunchFences(directory, unit, ownerUid)).resolves.toBeUndefined();
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("rejects a changed plan before any fenced manager start, inspect, release, or stop", async () => {
+    const p = { ...plan(), launchAttemptFence: true };
+    const manager = new SystemdRunAgentUnitManager();
+    const internal = manager as unknown as {
+      launchFences: Map<string, { fence: LinuxUnitLaunchFence; planKey: string }>;
+      requireRoot: () => void;
+      withUnitOperationLock: <T>(plan: LinuxAgentUnitPlan, action: () => Promise<T>) => Promise<T>;
+      rejectLaunchFenceDowngrade: (plan: LinuxAgentUnitPlan) => void;
+    };
+    internal.launchFences.set(p.sessionId, {
+      fence: {} as LinuxUnitLaunchFence, planKey: lifecyclePlanKey(p)
+    });
+    internal.requireRoot = () => {};
+    internal.withUnitOperationLock = async <T>(_plan: LinuxAgentUnitPlan,
+      action: () => Promise<T>): Promise<T> => action();
+    expect(() => internal.rejectLaunchFenceDowngrade(p)).not.toThrow();
+    const expected = parseSystemdAgentState(p, attestation(p));
+    for (const changed of [
+      { ...p, launchAttemptFence: false },
+      { ...p, uid: p.uid + 1 },
+      { ...p, launchGate: true },
+      { ...p, executable: "/usr/bin/python3" }
+    ]) {
+      await expect(manager.start(changed)).rejects.toThrow("different unit plan");
+      await expect(manager.inspect(changed)).rejects.toThrow("different unit plan");
+      await expect(manager.release(changed, expected)).rejects.toThrow("different unit plan");
+      await expect(manager.stop(changed)).rejects.toThrow("different unit plan");
+    }
   });
 
   it("refuses a leased stop when the attempt or invocation changed", async () => {
