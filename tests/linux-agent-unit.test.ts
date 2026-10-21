@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { linuxAgentUnitName, linuxPrivateSharedMemoryMount, linuxProcessGroupsAreDedicated, linuxUnitOwnedByStartAttempt,
+import { linuxAgentUnitName, linuxPrivateSharedMemoryMount, linuxProcessGroupsAreDedicated, linuxUnitIsAbsent,
+  linuxUnitOwnedByStartAttempt,
   parseSystemdAgentState, reserveLinuxUnitLifecycleDirectory, startPreparedLinuxAgentUnit,
-  stopOwnedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan,
+  stopOwnedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan, withLinuxUnitOperationLock,
   type LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
 
 function plan(): LinuxAgentUnitPlan {
@@ -258,6 +260,58 @@ describe("Linux systemd agent unit plan", () => {
       await symlink(stale, link);
       await expect(reserveLinuxUnitLifecycleDirectory(link, ownerUid))
         .rejects.toThrow("active or unreconciled lifecycle lease");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("requires an absent unit before a serialized start", () => {
+    const p = { ...plan(), launchGate: true, serializedLifecycle: true };
+    const unit = linuxAgentUnitName(p.sessionId);
+    const absent = `Id=${unit}\nLoadState=not-found\nActiveState=inactive\n`;
+    expect(linuxUnitIsAbsent(p, absent)).toBe(true);
+    for (const output of [
+      absent.replace("LoadState=not-found", "LoadState=loaded"),
+      absent.replace("ActiveState=inactive", "ActiveState=active"),
+      absent.replace(`Id=${unit}`, "Id=other.service"),
+      absent.replace("Id=", "Other="),
+      absent + "LoadState=not-found\n",
+      absent + "Description=other\n",
+      ""
+    ]) expect(linuxUnitIsAbsent(p, output)).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")("holds the per-unit operation lock across processes until close", async () => {
+    const ownerUid = process.getuid?.();
+    if (ownerUid === undefined) throw new Error("Linux UID is unavailable.");
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "s-gw-unit-operation-")));
+    const filename = path.join(root, `${linuxAgentUnitName("session-123")}.lock`);
+    let entered!: () => void;
+    let leave!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { leave = resolve; });
+    try {
+      const running = withLinuxUnitOperationLock(filename, ownerUid, async () => {
+        entered();
+        await hold;
+      });
+      try {
+        await Promise.race([ready, running]);
+        const contender = () => spawnSync("/usr/bin/flock", ["--nonblock", filename, "/usr/bin/true"],
+          { timeout: 3000 });
+        const refused = contender();
+        expect(refused.error).toBeUndefined();
+        expect(refused.status).toBe(1);
+        await expect(withLinuxUnitOperationLock(filename, ownerUid, async () => {}))
+          .rejects.toThrow("unavailable or busy");
+        leave();
+        await running;
+        const accepted = contender();
+        expect(accepted.error).toBeUndefined();
+        expect(accepted.status).toBe(0);
+        await withLinuxUnitOperationLock(filename, ownerUid, async () => {});
+      } finally {
+        leave();
+        await running.catch(() => {});
+      }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

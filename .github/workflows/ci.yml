@@ -72,6 +72,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test -- --no-file-parallelism
+      - run: node scripts/test-macos-fd-transfer-helper.mjs
 
   desktop-apps:
     name: Desktop app (${{ matrix.name }})

@@ -16,6 +16,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = resolve(root, "dist/native", `win32-${process.arch}`, "s-gw-windows-peer-identity.exe");
 const tokenSource = resolve(root, "native/windows-peer-identity/test-token.c");
 const appContainerSource = resolve(root, "native/windows-peer-identity/test-appcontainer.c");
+const parentEnvCanary = randomBytes(16).toString("hex");
 assert.ok(existsSync(helper), "The native peer helper must be built before its acceptance test.");
 
 function deadline(promise, ms, label) {
@@ -27,7 +28,10 @@ function deadline(promise, ms, label) {
 }
 
 function launch(args, executable = helper) {
-  const child = spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  const child = spawn(executable, args, {
+    stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    env: { ...process.env, SGW_WIN_FIXTURE_PARENT_CANARY: parentEnvCanary }
+  });
   let output = Buffer.alloc(0);
   let stderr = "";
   let readyDone;

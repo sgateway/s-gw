@@ -120,6 +120,44 @@ static int canary_delete_denied(const wchar_t *path) {
     return 0;
 }
 
+static int system_path_matches(const wchar_t *key, const wchar_t *system_dir) {
+    wchar_t value[MAX_PATH];
+    DWORD size = GetEnvironmentVariableW(key, value, MAX_PATH);
+    return size && size < MAX_PATH && _wcsicmp(value, system_dir) == 0;
+}
+
+static int agent_environment_is_clean(void) {
+    wchar_t value[MAX_PATH];
+    wchar_t system_dir[MAX_PATH];
+    DWORD system_size = GetSystemWindowsDirectoryW(system_dir, MAX_PATH);
+    if (!system_size || system_size >= MAX_PATH) return 0;
+
+    if (!system_path_matches(L"SystemRoot", system_dir) ||
+        !system_path_matches(L"WINDIR", system_dir)) {
+        fputs("AppContainer lost a required trusted system path.\n", stderr);
+        return 0;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if (GetEnvironmentVariableW(L"SGW_WIN_FIXTURE_PARENT_CANARY", value, MAX_PATH) != 0 ||
+        GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+        fputs("AppContainer inherited the broker environment canary.\n", stderr);
+        return 0;
+    }
+
+    wchar_t current_dir[MAX_PATH], executable[MAX_PATH];
+    DWORD current_size = GetCurrentDirectoryW(MAX_PATH, current_dir);
+    DWORD executable_size = GetModuleFileNameW(NULL, executable, MAX_PATH);
+    if (!current_size || current_size >= MAX_PATH || !executable_size || executable_size >= MAX_PATH) return 0;
+    wchar_t *last_slash = wcsrchr(executable, L'\\');
+    if (!last_slash) return 0;
+    *last_slash = 0;
+    if (_wcsicmp(current_dir, executable) != 0) {
+        fputs("AppContainer inherited the broker working directory.\n", stderr);
+        return 0;
+    }
+    return 1;
+}
+
 static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     const wchar_t *ipv6_port, const wchar_t *shared_path,
     const wchar_t *canary_path, const wchar_t *profile) {
@@ -141,6 +179,7 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     CloseHandle(token);
     FreeSid(expected_sid);
     if (!isolated) return 1;
+    if (!agent_environment_is_clean()) return 1;
     if (!loopback_blocked(ipv4_port, AF_INET) || !loopback_blocked(ipv6_port, AF_INET6)) {
         fputs("AppContainer reached forbidden IPv4 or IPv6 host loopback.\n", stderr);
         return 1;
@@ -181,6 +220,13 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
     const wchar_t *shared_path, const wchar_t *canary_path, int stop_job) {
+    wchar_t parent_canary[64];
+    DWORD canary_size = GetEnvironmentVariableW(L"SGW_WIN_FIXTURE_PARENT_CANARY",
+        parent_canary, sizeof(parent_canary) / sizeof(parent_canary[0]));
+    if (canary_size != 32) {
+        fputs("The fixture launcher has no parent environment canary.\n", stderr);
+        return 1;
+    }
     PSID sid = NULL;
     HRESULT status = DeriveAppContainerSidFromAppContainerName(name, &sid);
     if (FAILED(status)) return 1;
@@ -205,6 +251,24 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     wchar_t executable[MAX_PATH];
     DWORD length = GetModuleFileNameW(NULL, executable, MAX_PATH);
     if (!length || length >= MAX_PATH) goto done;
+    wchar_t agent_dir[MAX_PATH];
+    wmemcpy(agent_dir, executable, length + 1);
+    wchar_t *last_slash = wcsrchr(agent_dir, L'\\');
+    if (!last_slash) goto done;
+    *last_slash = 0;
+
+    wchar_t system_dir[MAX_PATH];
+    DWORD system_size = GetSystemWindowsDirectoryW(system_dir, MAX_PATH);
+    if (!system_size || system_size >= MAX_PATH) goto done;
+    wchar_t environment[MAX_PATH * 2 + 32];
+    size_t environment_size = sizeof(environment) / sizeof(environment[0]);
+    int root_size = swprintf(environment, environment_size, L"SystemRoot=%ls", system_dir);
+    if (root_size < 0 || (size_t)root_size + 2 >= environment_size) goto done;
+    int windir_size = swprintf(environment + root_size + 1,
+        environment_size - (size_t)root_size - 1, L"WINDIR=%ls", system_dir);
+    if (windir_size < 0 || (size_t)root_size + (size_t)windir_size + 2 >= environment_size) goto done;
+    environment[root_size + windir_size + 2] = 0;
+
     wchar_t command[MAX_PATH * 4 + 256];
     if (swprintf(command, sizeof(command) / sizeof(command[0]),
         L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\"",
@@ -223,7 +287,8 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         goto done;
     }
     if (!CreateProcessW(executable, command, NULL, NULL, FALSE,
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        environment, agent_dir,
         &startup.StartupInfo, &process)) {
         fprintf(stderr, "AppContainer process launch failed: %lu\n", GetLastError());
         CloseHandle(job);

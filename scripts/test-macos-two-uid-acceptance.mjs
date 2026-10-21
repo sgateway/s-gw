@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { access, lstat, readFile, realpath, readdir } from "node:fs/promises";
@@ -61,6 +61,16 @@ function parsePlan(raw) {
   requireValue(!sockets.has(plan.leaseDir) && !sockets.has(plan.stagedAgentScript) &&
     !sockets.has(plan.brokerCanary),
     "Fixture paths must not overlap.");
+  if (plan.fdTransferProbe !== undefined) {
+    const probe = plan.fdTransferProbe;
+    requireValue(isFixturePath(probe?.helperExecutable) && isFixturePath(probe?.rendezvousPath) &&
+      Buffer.byteLength(probe.rendezvousPath) < 100 &&
+      probe.helperExecutable !== probe.rendezvousPath &&
+      !sockets.has(probe.rendezvousPath) && !sockets.has(probe.helperExecutable) &&
+      ![plan.leaseDir, plan.stagedAgentScript, plan.brokerCanary].includes(probe.rendezvousPath) &&
+      ![plan.leaseDir, plan.stagedAgentScript, plan.brokerCanary].includes(probe.helperExecutable),
+    "The optional descriptor-transfer helper and rendezvous must be distinct fixture paths.");
+  }
   return plan;
 }
 
@@ -154,6 +164,26 @@ async function preflight(plan) {
   const stagedHash = createHash("sha256").update(await readFile(plan.stagedAgentScript)).digest("hex");
   const sourceHash = createHash("sha256").update(await readFile(scriptPath)).digest("hex");
   requireValue(stagedHash === sourceHash, "The staged agent fixture differs from this test source.");
+  if (plan.fdTransferProbe) {
+    const { helperExecutable, rendezvousPath } = plan.fdTransferProbe;
+    const helper = await lstat(helperExecutable);
+    requireValue(helper.isFile() && helper.uid === 0 &&
+      await realpath(helperExecutable) === helperExecutable &&
+      (helper.mode & 0o222) === 0 && (helper.mode & 0o111) !== 0 &&
+      (helper.mode & 0o004) !== 0,
+    "The staged descriptor-transfer helper must be root-owned, executable, and read-only to agents.");
+    await assertNoAclAllow(helperExecutable);
+    await checkedRootParents(helperExecutable, true);
+    const sharedDir = path.dirname(rendezvousPath);
+    const shared = await lstat(sharedDir);
+    requireValue(shared.isDirectory() && shared.uid === 0 &&
+      (shared.mode & 0o7777) === 0o1777 && await realpath(sharedDir) === sharedDir,
+    "The descriptor-transfer rendezvous needs a root-owned sticky shared directory.");
+    await assertNoAclAllow(sharedDir);
+    await checkedRootParents(sharedDir, true);
+    try { await lstat(rendezvousPath); throw new Error(`Rendezvous path already exists: ${rendezvousPath}`); }
+    catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
 
   for (const agent of plan.agents) {
     requireValue(agent.uid !== process.getuid() && agent.uid !== process.geteuid() &&
@@ -295,6 +325,32 @@ function readReport(socket) {
   });
 }
 
+function watchTransferredSocket(socket, failed, donorUid) {
+  let frame = "";
+  socket.setTimeout(15_000, () => socket.destroy());
+  socket.on("data", chunk => {
+    frame += String(chunk);
+    if (frame.length > 128 || (frame.includes("\n") && frame !== "XFER-USE-V1\n")) {
+      failed.resolve(new Error(`Agent ${donorUid} sent an invalid descriptor-transfer frame.`));
+      socket.destroy();
+      return;
+    }
+    if (frame === "XFER-USE-V1\n") {
+      failed.resolve(new Error(`Agent ${donorUid}'s authenticated broker socket was used by the other UID.`));
+      socket.end("XFER-ACK-V1\n");
+    }
+  });
+  socket.resume();
+}
+
+function requireTransferDenial(donor, recipient, transferStarted) {
+  requireValue(recipient !== "used", "The other UID used a donor-authenticated descriptor.");
+  requireValue(donor !== "sent" || transferStarted,
+    "The donor reported a sent descriptor without a verified broker connection.");
+  requireValue(donor === "denied" || recipient === "denied",
+    `Descriptor-transfer result is inconclusive: donor=${donor}, recipient=${recipient}.`);
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
@@ -314,6 +370,9 @@ async function runBroker(plan) {
   const heldSeen = new Map();
   const closedSeen = new Map();
   const finalReports = new Map();
+  const transferReports = new Map();
+  const transferResults = new Map();
+  let transferStarted = false;
   const probeStops = new Map();
   const heldMode = new Set();
   const revoking = new Set();
@@ -338,6 +397,7 @@ async function runBroker(plan) {
       heldSeen.set(agent.uid, deferred());
       closedSeen.set(agent.uid, deferred());
       finalReports.set(agent.uid, deferred());
+      if (plan.fdTransferProbe) transferReports.set(agent.uid, deferred());
       const probeServer = await startVerifiedPeerServer({
         socketPath: agent.socketPath, socketMode: 0o660, socketGid: agent.gid,
         onConnection: async (socket, principal, peer) => {
@@ -379,6 +439,16 @@ async function runBroker(plan) {
         onConnection: async (socket, principal, peer) => {
           try {
             const raw = await readReport(socket);
+            if (raw === "XFER-START-V1") {
+              requireValue(peer.uid === agent.uid && principal.principalId === `darwin:uid:${agent.uid}` &&
+                plan.fdTransferProbe && agent.uid === plan.agents[0].uid &&
+                received.has(agent.uid) && !transferStarted,
+              "Unexpected authenticated descriptor-transfer probe.");
+              transferStarted = true;
+              socket.write("XFER-READY-V1\n");
+              watchTransferredSocket(socket, failed, agent.uid);
+              return;
+            }
             const result = JSON.parse(raw);
             requireValue(peer.uid === agent.uid && principal.principalId === `darwin:uid:${agent.uid}` &&
               result.uid === agent.uid && result.sessionId === agent.sessionId,
@@ -392,6 +462,17 @@ async function runBroker(plan) {
               received.set(agent.uid, result);
               heldMode.add(agent.uid);
               socket.end("ACK-V1\n", () => reports.get(agent.uid).resolve());
+              return;
+            }
+            if (result.phase === "fd-transfer") {
+              requireValue(plan.fdTransferProbe && received.has(agent.uid) &&
+                !transferResults.has(agent.uid) &&
+                (agent.uid === plan.agents[0].uid
+                  ? ["sent", "denied", "unreachable"].includes(result.status)
+                  : ["used", "denied", "unreachable"].includes(result.status)),
+              `Agent ${agent.uid} sent an invalid descriptor-transfer result.`);
+              transferResults.set(agent.uid, result.status);
+              socket.end("ACK-V1\n", () => transferReports.get(agent.uid).resolve());
               return;
             }
             requireValue(result.phase === "revoked" && revoking.has(agent.uid) &&
@@ -426,7 +507,9 @@ async function runBroker(plan) {
           String(agent.uid), String(agent.gid), agent.sessionId, agent.socketPath, other.socketPath,
           String(other.uid), other.sessionId, agent.reportSocketPath,
           String(ipv4.port), String(ipv6.port), String(udp4.port), String(udp6.port),
-          plan.brokerCanary, other.workspace]
+          plan.brokerCanary, other.workspace,
+          ...(plan.fdTransferProbe ? [i === 0 ? "send" : "recv",
+            plan.fdTransferProbe.helperExecutable, plan.fdTransferProbe.rendezvousPath] : [])]
       };
     });
     process.stdout.write(`${JSON.stringify({ event: "ready", launchPlans })}\n`);
@@ -438,9 +521,14 @@ async function runBroker(plan) {
       failed.promise.then(error => { throw error; }), timeout
     ]);
     await Promise.race([
-      Promise.all([...heldSeen.values()].map(item => item.promise)),
+      Promise.all([...heldSeen.values(), ...transferReports.values()].map(item => item.promise)),
       failed.promise.then(error => { throw error; }), timeout
     ]);
+    if (plan.fdTransferProbe) {
+      const donor = transferResults.get(plan.agents[0].uid);
+      const recipient = transferResults.get(plan.agents[1].uid);
+      requireTransferDenial(donor, recipient, transferStarted);
+    }
     for (const agent of plan.agents) {
       revoking.add(agent.uid);
       probeStops.get(agent.uid)();
@@ -465,7 +553,8 @@ async function runBroker(plan) {
     }));
     process.stdout.write(`${JSON.stringify({ event: "passed", uids: plan.agents.map(agent => agent.uid),
       brokerLeasesRetained: true, livePeerRevocation: true,
-      hostLoopbackDenied: true, udpHostLoopbackDenied: true })}\n`);
+      hostLoopbackDenied: true, udpHostLoopbackDenied: true,
+      ...(plan.fdTransferProbe ? { crossAgentDescriptorTransferDenied: true } : {}) })}\n`);
   } finally {
     clearTimeout(deadlineTimer);
     process.off("SIGINT", interrupted);
@@ -560,13 +649,68 @@ async function selfTestReport() {
   try {
     await waitForHeldProbeClose({ host: "127.0.0.1", port: heldServer.address().port });
   } finally { await new Promise(resolve => heldServer.close(resolve)); }
+  const transferFailed = deferred();
+  const transferServer = createServer(socket => {
+    socket.on("error", () => socket.destroy());
+    watchTransferredSocket(socket, transferFailed, 231001);
+  });
+  await new Promise((resolve, reject) => {
+    transferServer.once("error", reject);
+    transferServer.listen(0, "127.0.0.1", resolve);
+  });
+  const transferClient = createConnection({ host: "127.0.0.1", port: transferServer.address().port });
+  transferClient.on("error", () => transferClient.destroy());
+  let transferTimer;
+  try {
+    await new Promise((resolve, reject) => {
+      transferClient.once("connect", resolve);
+      transferClient.once("error", reject);
+    });
+    transferClient.write("XFER-USE-V1\n");
+    const breach = await Promise.race([
+      transferFailed.promise,
+      new Promise((_, reject) => {
+        transferTimer = setTimeout(() => reject(new Error("The transferred-socket observer did not reject use.")), 1500);
+      })
+    ]);
+    requireValue(breach instanceof Error && breach.message.includes("used by the other UID"),
+      "The transferred-socket observer missed an authenticated descriptor use.");
+  } finally {
+    clearTimeout(transferTimer);
+    transferClient.destroy();
+    await new Promise(resolve => transferServer.close(resolve));
+  }
+  let rejectedUsed = false;
+  try { requireTransferDenial("denied", "used", false); }
+  catch (error) { rejectedUsed = String(error).includes("used a donor-authenticated descriptor"); }
+  requireValue(rejectedUsed, "A recipient that used the descriptor was accepted after a donor denial.");
+  requireTransferDenial("denied", "unreachable", false);
   process.stdout.write("Native acceptance result, held-probe framing, and UDP controls passed local round trips.\n");
 }
 
+function runTransferHelper(role, helperExecutable, rendezvousPath, reportSocket) {
+  const args = role === "send"
+    ? [role, rendezvousPath, reportSocket]
+    : [role, rendezvousPath];
+  const result = spawnSync(helperExecutable, args, {
+    encoding: "utf8", env: {}, timeout: 18_000, maxBuffer: 1024
+  });
+  requireValue(!result.error && result.status === 0 && !result.stderr,
+    `Native descriptor-transfer helper failed: ${result.error?.message || result.stderr || result.status}`);
+  const status = result.stdout.trim();
+  requireValue(role === "send"
+    ? ["sent", "denied", "unreachable"].includes(status)
+    : ["used", "denied", "unreachable"].includes(status),
+  "Native descriptor-transfer helper returned an invalid result.");
+  return status;
+}
+
 async function runAgent(args) {
-  requireValue(process.platform === "darwin" && args.length === 14, "Invalid native agent fixture arguments.");
+  requireValue(process.platform === "darwin" && (args.length === 14 || args.length === 17),
+    "Invalid native agent fixture arguments.");
   const [uidText, gidText, sessionId, ownSocket, otherSocket, otherUidText, otherSession,
-    reportSocket, ipv4Text, ipv6Text, udp4Text, udp6Text, brokerCanary, otherWorkspace] = args;
+    reportSocket, ipv4Text, ipv6Text, udp4Text, udp6Text, brokerCanary, otherWorkspace,
+    transferRole, transferHelper, transferRendezvous] = args;
   const uid = Number(uidText);
   const gid = Number(gidText);
   const otherUid = Number(otherUidText);
@@ -581,6 +725,11 @@ async function runAgent(args) {
     sessionPattern.test(sessionId) && sessionPattern.test(otherSession) &&
     [ownSocket, otherSocket, reportSocket, brokerCanary, otherWorkspace].every(isFixturePath),
     "Malformed agent fixture identity or paths.");
+  if (transferRole !== undefined) {
+    requireValue(["send", "recv"].includes(transferRole) &&
+      isFixturePath(transferHelper) && isFixturePath(transferRendezvous),
+    "Malformed descriptor-transfer fixture paths.");
+  }
   requireValue(process.getuid?.() === uid && process.geteuid?.() === uid &&
     process.getgid?.() === gid && process.getegid?.() === gid &&
     (process.getgroups?.() ?? []).every(group => group === gid) &&
@@ -610,6 +759,10 @@ async function runAgent(args) {
   await sendReport(reportSocket, result);
   requireValue(Object.values(result).slice(3).every(value => value === true),
     "An agent identity or direct-network probe failed.");
+  if (transferRole) {
+    const status = runTransferHelper(transferRole, transferHelper, transferRendezvous, reportSocket);
+    await sendReport(reportSocket, { phase: "fd-transfer", uid, sessionId, status });
+  }
   await waitForHeldProbeClose(ownSocket);
   const revoked = { phase: "revoked", uid, sessionId,
     heldClosed: true, reconnectDenied: await sendProbe(ownSocket, uid, sessionId) === "" };

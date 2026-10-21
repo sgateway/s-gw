@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type StdioOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readlink, readdir, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
@@ -265,7 +265,12 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);
-    if (!plan.serializedLifecycle) await rejectExistingUnitLifecycleLease(plan);
+    await this.withUnitOperationLock(plan, () => this.startLocked(plan));
+  }
+
+  private async startLocked(plan: LinuxAgentUnitPlan): Promise<void> {
+    if (plan.serializedLifecycle) await assertUnitNotPresent(plan);
+    else await rejectExistingUnitLifecycleLease(plan);
     if (this.lifecycleLeases.has(plan.sessionId)) {
       throw new Error("This Linux agent unit already has a lifecycle lease in this manager.");
     }
@@ -323,6 +328,10 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async inspect(plan: LinuxAgentUnitPlan): Promise<LinuxAgentUnitState> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);
+    return this.withUnitOperationLock(plan, () => this.inspectLocked(plan));
+  }
+
+  private async inspectLocked(plan: LinuxAgentUnitPlan): Promise<LinuxAgentUnitState> {
     this.rejectLifecycleDowngrade(plan);
     if (!plan.serializedLifecycle) {
       await rejectExistingUnitLifecycleLease(plan);
@@ -366,6 +375,10 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async release(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState): Promise<void> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);
+    await this.withUnitOperationLock(plan, () => this.releaseLocked(plan, expected));
+  }
+
+  private async releaseLocked(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState): Promise<void> {
     this.rejectLifecycleDowngrade(plan);
     if (!plan.serializedLifecycle) {
       await rejectExistingUnitLifecycleLease(plan);
@@ -433,6 +446,10 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async stop(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);
+    await this.withUnitOperationLock(plan, () => this.stopLocked(plan));
+  }
+
+  private async stopLocked(plan: LinuxAgentUnitPlan): Promise<void> {
     this.rejectLifecycleDowngrade(plan);
     if (!plan.serializedLifecycle) {
       await rejectExistingUnitLifecycleLease(plan);
@@ -479,6 +496,12 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     }
   }
 
+  private async withUnitOperationLock<T>(plan: LinuxAgentUnitPlan, action: () => Promise<T>): Promise<T> {
+    await checkedLifecycleRoot();
+    const filename = path.join(lifecycleRoot, `${linuxAgentUnitName(plan.sessionId)}.lock`);
+    return withLinuxUnitOperationLock(filename, 0, action);
+  }
+
   private async cleanGate(plan: LinuxAgentUnitPlan): Promise<void> {
     const identity = this.gates.get(plan.sessionId);
     if (!identity) return;
@@ -504,6 +527,60 @@ async function checkedLifecycleRoot(): Promise<void> {
       await realpath(lifecycleRoot) !== lifecycleRoot) {
     throw new Error("Linux agent lifecycle lock root is not private to the privileged manager.");
   }
+}
+
+export async function withLinuxUnitOperationLock<T>(filename: string, ownerUid: number,
+  action: () => Promise<T>): Promise<T> {
+  if (!path.isAbsolute(filename) || path.resolve(filename) !== filename ||
+      !Number.isSafeInteger(ownerUid) || ownerUid < 0) {
+    throw new Error("Linux agent operation lock path or owner is invalid.");
+  }
+  const parentPath = path.dirname(filename);
+  const parent = await lstat(parentPath);
+  if (!parent.isDirectory() || parent.uid !== ownerUid || (parent.mode & 0o077) !== 0 ||
+      await realpath(parentPath) !== parentPath) {
+    throw new Error("Linux agent operation lock parent is not private to its owner.");
+  }
+  const file = await open(filename, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    const before = await lstat(filename);
+    const opened = await file.stat();
+    if (!before.isFile() || before.uid !== ownerUid || (before.mode & 0o077) !== 0 ||
+        before.nlink !== 1 || before.dev !== opened.dev || before.ino !== opened.ino) {
+      throw new Error("Linux agent operation lock file is not privately owned.");
+    }
+    try { await run("/usr/bin/flock", ["--exclusive", "--nonblock", "3"], file.fd); }
+    catch (error) {
+      throw new Error("Linux agent operation lock is unavailable or busy.", { cause: error });
+    }
+    const current = await lstat(filename);
+    if (current.dev !== opened.dev || current.ino !== opened.ino ||
+        !current.isFile() || current.uid !== ownerUid || (current.mode & 0o077) !== 0 ||
+        current.nlink !== 1) {
+      throw new Error("Linux agent operation lock file changed during acquisition.");
+    }
+    return await action();
+  } finally { await file.close(); }
+}
+
+async function assertUnitNotPresent(plan: LinuxAgentUnitPlan): Promise<void> {
+  const output = await run("/usr/bin/systemctl", ["--system", "--no-pager", "show",
+    linuxAgentUnitName(plan.sessionId), "-p", "Id", "-p", "LoadState", "-p", "ActiveState"]);
+  if (!linuxUnitIsAbsent(plan, output)) {
+    throw new Error("Linux agent unit already exists or its presence is ambiguous before serialized start.");
+  }
+}
+
+export function linuxUnitIsAbsent(plan: LinuxAgentUnitPlan, output: string): boolean {
+  validateLinuxAgentPlan(plan);
+  const fields = new Map<string, string>();
+  for (const line of output.trimEnd().split("\n")) {
+    const index = line.indexOf("=");
+    if (index < 1 || fields.has(line.slice(0, index))) return false;
+    fields.set(line.slice(0, index), line.slice(index + 1));
+  }
+  return fields.size === 3 && fields.get("Id") === linuxAgentUnitName(plan.sessionId) &&
+    fields.get("LoadState") === "not-found" && fields.get("ActiveState") === "inactive";
 }
 
 async function rejectExistingUnitLifecycleLease(plan: LinuxAgentUnitPlan): Promise<void> {
@@ -872,10 +949,12 @@ function canonicalPath(value: string): boolean {
     !value.endsWith("/") && !value.includes("\0") && !value.includes(":");
 }
 
-function run(command: string, args: string[]): Promise<string> {
+function run(command: string, args: string[], sharedFd?: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    const stdio: StdioOptions = sharedFd === undefined ? ["ignore", "pipe", "pipe"] :
+      ["ignore", "pipe", "pipe", sharedFd];
     const child = spawn(command, args, { cwd: "/", env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
-      stdio: ["ignore", "pipe", "pipe"] });
+      stdio });
     let output = "";
     let errorOutput = "";
     let overflow = false;

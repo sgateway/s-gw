@@ -30,6 +30,8 @@
 #define POLICY_SOCKET "/private/var/db/s-gw/agent-network-policy.sock"
 #define UID_LEASE_DIR "/private/var/db/s-gw/agent-uid-leases"
 #define UID_SCAN_LIMIT 8192
+#define POLICY_CHECK_INTERVAL_MS 1000
+#define POLICY_REPLY_DEADLINE_MS 1500
 
 static volatile sig_atomic_t stopping = 0;
 
@@ -324,22 +326,62 @@ static int checked_broker_socket(const char *location, uid_t broker_uid, gid_t a
     return 0;
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int policy_exchange(int fd, uid_t uid, const char *session) {
+    char request[128];
+    int length = snprintf(request, sizeof(request), "CHECK-V1 %u %s\n", uid, session);
+    char expected[128];
+    int expected_len = snprintf(expected, sizeof(expected), "READY-V1 %u %s\n", uid, session);
+    if (length < 1 || length >= (int)sizeof(request) ||
+        expected_len < 1 || expected_len >= (int)sizeof(expected)) return -1;
+    int enabled = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) ||
+        send(fd, request, (size_t)length, MSG_DONTWAIT) != length) return -1;
+    int64_t deadline = monotonic_ms();
+    if (deadline < 0) return -1;
+    deadline += POLICY_REPLY_DEADLINE_MS;
+    size_t used = 0;
+    for (;;) {
+        int64_t now = monotonic_ms();
+        if (now < 0 || now >= deadline) return -1;
+        struct pollfd poll_fd = { .fd = fd, .events = POLLIN };
+        int ready = poll(&poll_fd, 1, (int)(deadline - now));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready != 1 || (poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+            !(poll_fd.revents & POLLIN)) return -1;
+        char response[128];
+        ssize_t received = recv(fd, response, sizeof(response), MSG_DONTWAIT);
+        if (received <= 0 || used + (size_t)received > (size_t)expected_len ||
+            memcmp(response, expected + used, (size_t)received)) return -1;
+        used += (size_t)received;
+        if (used == (size_t)expected_len) return 0;
+    }
+}
+
 static int policy_ready(uid_t uid, const char *session) {
     uid_t policy_uid;
     if (socket_peer(4, POLICY_SOCKET, 0, &policy_uid) || policy_uid != 0 ||
         trusted_socket_node(POLICY_SOCKET, 0, 0)) return -1;
-    char request[128];
-    int length = snprintf(request, sizeof(request), "CHECK-V1 %u %s\n", uid, session);
-    if (length < 1 || length >= (int)sizeof(request) || write(4, request, (size_t)length) != length) return -1;
-    struct pollfd poll_fd = { .fd = 4, .events = POLLIN };
-    if (poll(&poll_fd, 1, 1500) != 1 || !(poll_fd.revents & POLLIN)) return -1;
-    char response[128];
-    ssize_t received = read(4, response, sizeof(response) - 1);
-    if (received < 1) return -1;
-    response[received] = '\0';
-    char expected[128];
-    snprintf(expected, sizeof(expected), "READY-V1 %u %s\n", uid, session);
-    return strcmp(response, expected) == 0 ? 0 : -1;
+    return policy_exchange(4, uid, session);
+}
+
+static int policy_heartbeat(int fd, uid_t uid, const char *session, int64_t *next_check) {
+    struct pollfd poll_fd = { .fd = fd, .events = POLLIN };
+    int ready = poll(&poll_fd, 1, 0);
+    if (ready < 0 || (ready == 1 && poll_fd.revents)) return -1;
+    int64_t now = monotonic_ms();
+    if (now < 0) return -1;
+    if (now < *next_check) return 0;
+    if (policy_exchange(fd, uid, session)) return -1;
+    now = monotonic_ms();
+    if (now < 0) return -1;
+    *next_check = now + POLICY_CHECK_INTERVAL_MS;
+    return 0;
 }
 
 static void child_exec(uid_t uid, gid_t gid, const char *session, const char *workspace, const char *broker_socket,
@@ -413,6 +455,9 @@ int main(int argc, char **argv) {
     if (checked_workspace(argv[4], agent_uid) || checked_broker_socket(argv[5], broker_uid, agent_gid) ||
         checked_executable(argv[6], broker_uid)) return fail("unsafe workspace, broker socket, or executable");
     if (policy_ready(agent_uid, argv[3])) return fail("network policy service did not attest this session");
+    int64_t next_policy_check = monotonic_ms();
+    if (next_policy_check < 0) return fail("could not schedule network policy checks");
+    next_policy_check += POLICY_CHECK_INTERVAL_MS;
     if (reserve_uid(agent_uid, argv[3])) return fail("agent UID is already leased or lease storage is unavailable");
     if (uid_is_empty(agent_uid)) return fail("agent UID became active before launch; tombstone remains");
 
@@ -454,6 +499,7 @@ int main(int argc, char **argv) {
     }
     int sent_term = 0;
     int wait_error = 0;
+    int policy_error = 0;
     time_t term_at = 0;
     siginfo_t info;
     memset(&info, 0, sizeof(info));
@@ -462,6 +508,12 @@ int main(int argc, char **argv) {
         int wait_result = waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT | WNOHANG);
         if (wait_result == 0 && info.si_pid == child) break;
         if (wait_result < 0 && errno != EINTR) { wait_error = 1; break; }
+        if (!stopping && policy_heartbeat(4, agent_uid, argv[3], &next_policy_check)) {
+            policy_error = 1;
+            stopping = 1;
+            kill(-child, SIGKILL);
+            kill(child, SIGKILL);
+        }
         if (stopping && !sent_term) { kill(-child, SIGTERM); kill(child, SIGTERM); sent_term = 1; term_at = time(NULL); }
         if (sent_term && time(NULL) - term_at >= 2) { kill(-child, SIGKILL); kill(child, SIGKILL); }
         struct timespec pause = { .tv_sec = 0, .tv_nsec = 50000000 };
@@ -481,6 +533,7 @@ int main(int argc, char **argv) {
     if (teardown_error || teardown_uid(agent_uid, 0))
         return fail("agent UID teardown is incomplete; tombstone remains");
     if (reaped != child || wait_error) return fail("could not supervise agent exit");
+    if (policy_error) return fail("network policy service stopped attesting the agent session");
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     return 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : SIGTERM);
 }

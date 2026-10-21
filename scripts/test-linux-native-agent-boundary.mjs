@@ -296,6 +296,17 @@ async function rootRun() {
         states.get(ids[0]).cgroup === states.get(ids[1]).cgroup) {
       throw new Error("The two agents did not attest distinct UIDs and cgroups.");
     }
+    const legacyUnits = new SystemdRunAgentUnitManager();
+    for (const item of plans) {
+      let blocked = false;
+      try { await legacyUnits.stop({ ...item, serializedLifecycle: false }); }
+      catch (error) { blocked = /active or unreconciled serialized lifecycle lease/.test(String(error)); }
+      if (!blocked) throw new Error("A separate legacy manager stopped or bypassed a serialized agent unit.");
+      const current = await units.inspect(item);
+      if (current.invocationId !== states.get(item.sessionId).invocationId) {
+        throw new Error("A denied legacy stop changed the serialized agent unit.");
+      }
+    }
     const shmRoots = await Promise.all(plans.map(item =>
       stat(`/proc/${states.get(item.sessionId).mainPid}/root/dev/shm`)));
     const hostShm = await stat("/dev/shm");

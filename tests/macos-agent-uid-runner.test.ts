@@ -298,4 +298,101 @@ int main(void) {
       expect(run.status, run.stderr).toBe(0);
     } finally { rmSync(tmp, { recursive: true, force: true }); }
   });
+
+  it("keeps checking policy readiness and rejects a denied, silent, or closed service", () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), "sgw-uid-policy-"));
+    try {
+      const sourceDir = fileURLToPath(new URL("../native/macos-agent-launcher/", import.meta.url));
+      const harness = path.join(tmp, "policy-test.c");
+      const binary = path.join(tmp, "policy-test");
+      writeFileSync(harness, String.raw`
+#define main sgw_uid_runner_entry
+#include "uid-runner.c"
+#undef main
+
+static int read_request(int fd) {
+    char frame[128];
+    size_t used = 0;
+    while (used < sizeof(frame) - 1) {
+        ssize_t received = recv(fd, frame + used, 1, 0);
+        if (received != 1) return -1;
+        if (frame[used++] == '\n') {
+            frame[used] = '\0';
+            return strcmp(frame, "CHECK-V1 231000 test-session\n") == 0 ? 0 : -1;
+        }
+    }
+    return -1;
+}
+
+static int serve(int fd, int mode) {
+    if (mode == 4) return 0;
+    if (read_request(fd)) return 1;
+    const char *ready = "READY-V1 231000 test-session\n";
+    if (send(fd, ready, strlen(ready), 0) != (ssize_t)strlen(ready)) return 2;
+    if (read_request(fd)) return 3;
+    if (mode == 3) { sleep(3); return 0; }
+    const char *reply = mode == 2 ? "DENIED-V1 231000 test-session\n" : ready;
+    if (mode == 1) {
+        if (send(fd, reply, 9, 0) != 9) return 4;
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 5000000 };
+        nanosleep(&pause, NULL);
+        if (send(fd, reply + 9, strlen(reply) - 9, 0) != (ssize_t)strlen(reply) - 9) return 5;
+        char ignored;
+        recv(fd, &ignored, 1, 0);
+        return 0;
+    }
+    return send(fd, reply, strlen(reply), 0) == (ssize_t)strlen(reply) ? 0 : 6;
+}
+
+static int run_case(int mode) {
+    int ends[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ends)) return 10;
+    pid_t child = fork();
+    if (child < 0) return 11;
+    if (child == 0) {
+        close(ends[0]);
+        int result = serve(ends[1], mode);
+        close(ends[1]);
+        _exit(result);
+    }
+    close(ends[1]);
+    int result = 0;
+    int64_t next = 0;
+    if (mode == 4) {
+        int status;
+        waitpid(child, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) ||
+            policy_heartbeat(ends[0], 231000, "test-session", &next) == 0 ||
+            policy_exchange(ends[0], 231000, "test-session") == 0) result = 12;
+        close(ends[0]);
+        return result;
+    }
+    if (policy_exchange(ends[0], 231000, "test-session")) result = 13;
+    if (!result) {
+        int checked = policy_heartbeat(ends[0], 231000, "test-session", &next);
+        if ((mode == 1 && checked) || (mode != 1 && !checked)) result = 14;
+    }
+    if (!result && mode == 1 && policy_heartbeat(ends[0], 231000, "test-session", &next)) result = 15;
+    close(ends[0]);
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) result = 16;
+    return result;
+}
+
+int main(void) {
+    alarm(12);
+    for (int mode = 1; mode <= 4; mode++) {
+        int result = run_case(mode);
+        if (result) return result;
+    }
+    return 0;
+}
+`);
+      const build = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-I", sourceDir,
+        harness, "-o", binary], { encoding: "utf8" });
+      expect(build.status, build.stderr).toBe(0);
+      const run = spawnSync(binary, [], { encoding: "utf8", timeout: 15_000 });
+      expect(run.status, run.stderr).toBe(0);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
 });
