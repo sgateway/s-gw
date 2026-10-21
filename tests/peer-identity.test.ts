@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, symlink, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile, chmod } from "node:fs/promises";
 import { createConnection, Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -27,7 +27,8 @@ afterEach(async () => {
 });
 
 async function socketPath(): Promise<string> {
-  tmpDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-peer-test-")));
+  const parent = process.platform === "darwin" ? os.homedir() : os.tmpdir();
+  tmpDir = await realpath(await mkdtemp(path.join(parent, ".sgw-peer-test-")));
   return path.join(tmpDir, "broker.sock");
 }
 
@@ -252,6 +253,25 @@ describe.skipIf(!unix || !hasCompiler)("native Unix peer identity", () => {
     } finally {
       await rm(linkPath);
     }
+  });
+
+  it.skipIf(process.platform !== "darwin")("rejects an extended ACL grant on the broker socket directory", async () => {
+    const location = await socketPath();
+    const acl = spawnSync("/bin/chmod", ["+a", "everyone allow read,write,execute", tmpDir], { encoding: "utf8" });
+    expect(acl.status, acl.stderr).toBe(0);
+    await expect(startVerifiedPeerServer({ socketPath: location, onConnection() {} }))
+      .rejects.toThrow("extended ACL allow");
+  });
+
+  it.skipIf(process.platform !== "darwin")("rejects an extended ACL grant on a broker socket ancestor", async () => {
+    const location = await socketPath();
+    const parent = path.join(tmpDir, "parent");
+    const child = path.join(parent, "private");
+    await mkdir(child, { recursive: true, mode: 0o700 });
+    const acl = spawnSync("/bin/chmod", ["+a", "everyone allow read,write,execute", parent], { encoding: "utf8" });
+    expect(acl.status, acl.stderr).toBe(0);
+    await expect(startVerifiedPeerServer({ socketPath: path.join(child, path.basename(location)), onConnection() {} }))
+      .rejects.toThrow("extended ACL allow");
   });
 
   it("requires a connected Unix socket on the native helper's fd 3", () => {

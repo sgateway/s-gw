@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-context.js";
 import { checkLinuxActivatedSocket } from "./linux-activated-socket.js";
 import { checkLinuxPeerVerifier, verifyLinuxPeerProcess } from "./linux-peer-identity.js";
+import { assertNoMacAclAllow } from "./macos-path-acl.js";
 
 export interface UnixPeer {
   uid: number;
@@ -117,7 +118,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error("Native Unix peer verification is unavailable on this platform.");
   }
-  await checkedPeerHelper();
+  await checkedPeerHelper(true);
   if (process.platform === "linux" && options.requireLinuxPeerPidfd) await checkLinuxPeerVerifier();
   const activated = options.activatedFd !== undefined;
   if (activated && (process.platform !== "linux" || options.socketGid === undefined || options.socketMode !== undefined)) {
@@ -180,7 +181,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
 }
 
 async function readUnixPeer(socket: Socket): Promise<UnixPeer> {
-  const helper = await checkedPeerHelper();
+  const helper = await checkedPeerHelper(false);
   return new Promise((resolve, reject) => {
     const child = spawn(helper, [], { stdio: ["ignore", "pipe", "pipe", socket], env: {}, timeout: 1500 });
     let output = "";
@@ -201,14 +202,15 @@ async function readUnixPeer(socket: Socket): Promise<UnixPeer> {
   });
 }
 
-async function checkedPeerHelper(): Promise<string> {
+async function checkedPeerHelper(checkAcl: boolean): Promise<string> {
   const helper = fileURLToPath(new URL(`../dist/native/${process.platform}-${process.arch}/s-gw-peer-credentials`, import.meta.url));
   const stat = await lstat(helper);
   if (await realpath(helper) !== helper || !stat.isFile() || (stat.mode & 0o022) !== 0 || (stat.mode & 0o111) === 0 ||
       (stat.uid !== process.getuid!() && stat.uid !== 0)) {
     throw new Error("The Unix peer-credential helper is not a trusted executable.");
   }
-  await checkedDirectoryChain(path.dirname(helper));
+  if (checkAcl) await assertNoMacAclAllow(helper);
+  await checkedDirectoryChain(path.dirname(helper), checkAcl);
   return helper;
 }
 
@@ -238,7 +240,8 @@ async function checkedSocketPath(value: string): Promise<string> {
       await realpath(parent) !== parent) {
     throw new Error("Broker socket directory must be owned by the broker and not writable by agents.");
   }
-  await checkedDirectoryChain(path.dirname(parent));
+  await assertNoMacAclAllow(parent);
+  await checkedDirectoryChain(path.dirname(parent), true);
   try { await lstat(socketPath); throw new Error("Broker socket path already exists."); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -246,7 +249,7 @@ async function checkedSocketPath(value: string): Promise<string> {
   return socketPath;
 }
 
-async function checkedDirectoryChain(start: string): Promise<void> {
+async function checkedDirectoryChain(start: string, checkAcl: boolean): Promise<void> {
   let current = start;
   while (true) {
     const info = await lstat(current);
@@ -255,6 +258,7 @@ async function checkedDirectoryChain(start: string): Promise<void> {
         ((info.mode & 0o022) !== 0 && !rootSticky)) {
       throw new Error("Broker executable or socket has an untrusted parent directory.");
     }
+    if (checkAcl) await assertNoMacAclAllow(current);
     const next = path.dirname(current);
     if (next === current) return;
     current = next;

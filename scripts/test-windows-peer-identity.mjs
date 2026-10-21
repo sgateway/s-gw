@@ -122,12 +122,25 @@ function requestFrame(child) {
 async function acceptsAppContainer(executable, profile, packageSid, brokerSid, logonLuid, sessionId) {
   const name = pipeName();
   const run = launch([name, brokerSid, brokerSid, packageSid, logonLuid, sessionId]);
+  const loopback = net.createServer(socket => { loopbackHits++; socket.destroy(); });
+  let loopbackHits = 0;
   let client;
   try {
+    await deadline(new Promise((resolveListen, rejectListen) => {
+      loopback.once("error", rejectListen);
+      loopback.listen(0, "127.0.0.1", () => { loopback.off("error", rejectListen); resolveListen(); });
+    }), 10_000, "loopback probe listener");
+    const hostReached = new Promise(resolveHost => loopback.once("connection", resolveHost));
+    const hostProbe = net.createConnection({ host: "127.0.0.1", port: loopback.address().port });
+    hostProbe.on("error", () => {});
+    await deadline(hostReached, 5_000, "host loopback control");
+    hostProbe.destroy();
+    assert.equal(loopbackHits, 1, "The host loopback control did not reach its listener.");
+    loopbackHits = 0;
     assert.equal(await deadline(run.ready, 30_000, "AppContainer pipe"), true,
       "The AppContainer pipe was not ready.");
     const request = requestFrame(run.child);
-    client = launch(["launch", profile, name], executable);
+    client = launch(["launch", profile, name, String(loopback.address().port)], executable);
     const forwarded = await deadline(Promise.race([
       request,
       client.done.then(result => {
@@ -148,9 +161,11 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
     ]);
     assert.equal(broker.code, 0, broker.stderr || "The broker did not complete the verified exchange.");
     assert.equal(agent.code, 0, agent.stderr || "The AppContainer client did not receive the broker reply.");
+    assert.equal(loopbackHits, 0, "The AppContainer reached host loopback without a network capability.");
   } finally {
     client?.child.kill();
     run.child.kill();
+    await new Promise(resolveClose => loopback.close(() => resolveClose()));
   }
 }
 
@@ -169,7 +184,7 @@ const tmp = mkdtempSync(join(tmpdir(), "s-gw-windows-peer-test-"));
 try {
   const tokenProbe = compileFixture(tokenSource, "test-token", ["advapi32.lib"]);
   const appContainerFixture = compileFixture(appContainerSource, "test-appcontainer",
-    ["advapi32.lib", "userenv.lib"]);
+    ["advapi32.lib", "userenv.lib", "ws2_32.lib"]);
 
   const probed = spawnSync(tokenProbe, [], { encoding: "utf8", windowsHide: true });
   assert.equal(probed.status, 0, probed.stderr || "Could not inspect the CI process token.");

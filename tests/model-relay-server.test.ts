@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { createServer as createHttpsServer, request as httpsRequest, type Server as HttpsServer } from "node:https";
+import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -120,6 +121,101 @@ async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
 }
 
 describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay listener", () => {
+  it("closes a request whose headers never finish", async () => {
+    server = await startVerifiedModelRelayServer({ socketPath, store,
+      headerDeadlineMs: 200, approval: { async assertAuthorized() {} } });
+    await registerOwn("s-gw:api-token:fixture");
+    const slow = createConnection(socketPath);
+    slow.on("error", () => {});
+    await new Promise<void>((resolve, reject) => {
+      slow.once("connect", resolve);
+      slow.once("error", reject);
+    });
+    const closed = new Promise<void>(resolve => slow.once("close", () => resolve()));
+    slow.write("POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nX-Slow: ");
+    await closed;
+    expect((await send("/not-supported")).status).toBe(404);
+  }, 10_000);
+
+  it("bounds a trickled model body by an absolute deadline", async () => {
+    const handle = (await store.addSecret({ name: "Slow body fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.anthropic.com:443"] } })).handle;
+    let checks = 0;
+    server = await startVerifiedModelRelayServer({ socketPath, store,
+      maxBodyDurationMs: 700,
+      requestUpstream: () => { upstreamCalls++; throw new Error("Unexpected upstream request."); },
+      approval: { async assertAuthorized() { checks++; } } });
+    await registerOwn(handle);
+    const slow = createConnection(socketPath);
+    slow.on("error", () => {});
+    await new Promise<void>((resolve, reject) => {
+      slow.once("connect", resolve);
+      slow.once("error", reject);
+    });
+    const closed = new Promise<void>(resolve => slow.once("close", () => resolve()));
+    slow.write("POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{");
+    const trickle = setInterval(() => { if (!slow.destroyed) slow.write(" "); }, 70);
+    try {
+      await closed;
+      expect(checks).toBeGreaterThan(0);
+      expect(upstreamCalls).toBe(0);
+    } finally {
+      clearInterval(trickle);
+    }
+  }, 10_000);
+
+  it("closes a stalled model body before resolving any upstream request", async () => {
+    const handle = (await store.addSecret({ name: "Idle body fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.anthropic.com:443"] } })).handle;
+    let checks = 0;
+    server = await startVerifiedModelRelayServer({ socketPath, store,
+      bodyIdleMs: 150, maxBodyDurationMs: 10_000,
+      requestUpstream: () => { upstreamCalls++; throw new Error("Unexpected upstream request."); },
+      approval: { async assertAuthorized() { checks++; } } });
+    await registerOwn(handle);
+    const stalled = createConnection(socketPath);
+    stalled.on("error", () => {});
+    await new Promise<void>((resolve, reject) => {
+      stalled.once("connect", resolve);
+      stalled.once("error", reject);
+    });
+    const closed = new Promise<void>(resolve => stalled.once("close", () => resolve()));
+    stalled.write("POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{");
+    await closed;
+    expect(checks).toBeGreaterThan(0);
+    expect(upstreamCalls).toBe(0);
+  }, 7_000);
+
+  it("caps verified connections while a stream holds the only slot", async () => {
+    let release: () => void = () => {};
+    let entered: () => void = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const requestUpstream = await startProvider(async (req, res) => {
+      for await (const _chunk of req) {}
+      entered();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("event: start\ndata: {}\n\n");
+      await gate;
+      res.end("event: end\ndata: {}\n\n");
+    });
+    const handle = (await store.addSecret({ name: "Connection fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.anthropic.com:443"] } })).handle;
+    server = await startVerifiedModelRelayServer({ socketPath, store, requestUpstream,
+      maxVerifiedConnections: 1, maxActiveRequestsPerSession: 2,
+      approval: { async assertAuthorized() {} } });
+    await registerOwn(handle);
+    const first = send("/v1/messages");
+    try {
+      await started;
+      await expect(send("/v1/messages")).rejects.toThrow();
+    } finally {
+      release();
+    }
+    expect((await first).status).toBe(200);
+    await vi.waitFor(async () => expect((await send("/v1/messages")).status).toBe(200));
+  });
+
   it.skipIf(process.platform !== "darwin")("passes activated descriptors to the Linux-only peer listener", async () => {
     let launched: VerifiedModelRelayServer | undefined;
     let failure: unknown;

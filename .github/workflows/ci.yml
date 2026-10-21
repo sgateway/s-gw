@@ -49,6 +49,12 @@ jobs:
       - run: npm run check:rust
       - run: npm run check
       - run: npm run build
+      - name: Verify native Linux agent socket and launch gate
+        run: |
+          test "$(id -u)" -ne 0
+          npm run build:linux-activated-socket
+          test -x "dist/native/linux-$(node -p process.arch)/s-gw-linux-activated-socket"
+          npm exec -- vitest run tests/linux-activated-socket.test.ts tests/linux-agent-gate.test.ts --no-file-parallelism
       - run: npm test
       - run: npm run audit:release
       - run: npm run package:dry-run

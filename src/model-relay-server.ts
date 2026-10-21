@@ -20,6 +20,10 @@ export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions,
   approval: ModelRelayApproval;
   maxActiveRequestsPerSession?: number;
   maxPendingBrokerOperations?: number;
+  maxVerifiedConnections?: number;
+  headerDeadlineMs?: number;
+  bodyIdleMs?: number;
+  maxBodyDurationMs?: number;
   requestUpstream?: ModelUpstreamRequest;
   onSessionEndError?: (message: string) => void;
 }
@@ -43,9 +47,9 @@ const destinations: Record<ModelProvider, string> = {
   anthropic: "api.anthropic.com:443",
   openai: "api.openai.com:443"
 };
-const headerDeadlineMs = 10_000;
-const bodyIdleMs = 20_000;
-const maxBodyDurationMs = 60_000;
+const defaultHeaderDeadlineMs = 10_000;
+const defaultBodyIdleMs = 20_000;
+const defaultMaxBodyDurationMs = 60_000;
 const maxActiveRequests = 32;
 const maxPendingOperations = 32;
 
@@ -95,10 +99,25 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
   if (!Number.isSafeInteger(pendingLimit) || pendingLimit < 1 || pendingLimit > maxPendingOperations) {
     throw new Error("Invalid model relay broker operation limit.");
   }
+  const connectionLimit = options.maxVerifiedConnections;
+  if (connectionLimit !== undefined &&
+      (!Number.isSafeInteger(connectionLimit) || connectionLimit < 1 || connectionLimit > 4096)) {
+    throw new Error("Invalid model relay connection limit.");
+  }
+  const headerDeadlineMs = options.headerDeadlineMs ?? defaultHeaderDeadlineMs;
+  const bodyIdleMs = options.bodyIdleMs ?? defaultBodyIdleMs;
+  const maxBodyDurationMs = options.maxBodyDurationMs ?? defaultMaxBodyDurationMs;
+  if (![headerDeadlineMs, bodyIdleMs, maxBodyDurationMs].every(Number.isSafeInteger) ||
+      headerDeadlineMs < 1 || headerDeadlineMs > defaultHeaderDeadlineMs ||
+      bodyIdleMs < 1 || bodyIdleMs > defaultBodyIdleMs ||
+      maxBodyDurationMs < 1 || maxBodyDurationMs > defaultMaxBodyDurationMs) {
+    throw new Error("Invalid model relay request deadline.");
+  }
 
   const grants = new Map<string, ActiveGrant>();
   let activeRequests = 0;
   let pendingBrokerOperations = 0;
+  let verifiedConnections = 0;
   let closed = false;
   const pendingSessionEnds = new Set<Promise<void>>();
   const sessionEndErrors: Error[] = [];
@@ -221,6 +240,12 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
     activatedFd: options.activatedFd,
     requireLinuxPeerPidfd: true,
     onConnection(socket, principal) {
+      if (connectionLimit !== undefined && verifiedConnections >= connectionLimit) {
+        socket.destroy();
+        return;
+      }
+      verifiedConnections++;
+      socket.once("close", () => { verifiedConnections--; });
       principals.set(socket, principal);
       const timer = setTimeout(() => socket.destroy(new Error("Model request headers timed out.")), headerDeadlineMs);
       timer.unref();

@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
+import { assertNoMacAclAllow } from "./macos-path-acl.js";
 import type { PeerSession } from "./peer-identity.js";
 
 export class MacAgentSessionLeases {
@@ -62,6 +63,7 @@ async function checkedLeaseDirectory(value: string): Promise<void> {
       await realpath(value) !== value) {
     throw new Error("Agent UID lease directory must be private to the broker.");
   }
+  await assertNoMacAclAllow(value);
   let current = path.dirname(value);
   while (true) {
     const info = await lstat(current);
@@ -70,6 +72,7 @@ async function checkedLeaseDirectory(value: string): Promise<void> {
         ((info.mode & 0o022) !== 0 && !stickyRoot)) {
       throw new Error("Agent UID lease directory has an untrusted parent.");
     }
+    await assertNoMacAclAllow(current);
     const next = path.dirname(current);
     if (next === current) return;
     current = next;

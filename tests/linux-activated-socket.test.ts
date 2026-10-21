@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -96,6 +96,14 @@ describe.skipIf(!native)("native Linux activated-socket binding", () => {
     const replacement = await bind(location);
     expect(probe(original, location)).not.toBe(0);
     expect(probe(replacement, location)).toBe(0);
+
+    const alias = path.join(directory, "alias.sock");
+    await symlink(location, alias);
+    expect(probe(replacement, alias)).not.toBe(0);
+
+    await unlink(location);
+    await writeFile(location, "not a socket");
+    expect(probe(replacement, location)).not.toBe(0);
   });
 
   it("fails closed when the kernel socket diagnostic API is denied", async () => {
