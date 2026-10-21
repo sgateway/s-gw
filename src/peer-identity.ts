@@ -4,6 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-context.js";
+import { checkLinuxActivatedSocket } from "./linux-activated-socket.js";
 import { checkLinuxPeerVerifier, verifyLinuxPeerProcess } from "./linux-peer-identity.js";
 
 export interface UnixPeer {
@@ -105,6 +106,7 @@ export interface VerifiedPeerServerOptions {
   socketPath: string;
   socketMode?: 0o600 | 0o660;
   socketGid?: number;
+  activatedFd?: number;
   idleTimeoutMs?: number;
   requireLinuxPeerPidfd?: boolean;
   onConnection(socket: Socket, principal: VerifiedAgentPrincipal, peer: UnixPeer): void | Promise<void>;
@@ -116,7 +118,12 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   }
   await checkedPeerHelper();
   if (process.platform === "linux" && options.requireLinuxPeerPidfd) await checkLinuxPeerVerifier();
-  const socketPath = await checkedSocketPath(options.socketPath);
+  const activated = options.activatedFd !== undefined;
+  if (activated && (process.platform !== "linux" || options.socketGid === undefined || options.socketMode !== undefined)) {
+    throw new Error("An activated Linux socket needs its agent GID and systemd-owned mode.");
+  }
+  const socketPath = activated ? options.socketPath : await checkedSocketPath(options.socketPath);
+  if (activated) await checkLinuxActivatedSocket(socketPath, options.activatedFd!, options.socketGid!);
   const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs;
   if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 35 * 60_000) {
     throw new Error("Invalid broker connection idle deadline.");
@@ -145,12 +152,17 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   });
 
   try {
-    await listen(server, socketPath);
-    if (options.socketGid !== undefined) {
-      if (!Number.isSafeInteger(options.socketGid) || options.socketGid < 0) throw new Error("Invalid broker socket GID.");
-      await chown(socketPath, process.getuid!(), options.socketGid);
+    if (activated) {
+      await listenFd(server, options.activatedFd!);
+      await checkLinuxActivatedSocket(socketPath, options.activatedFd!, options.socketGid!);
+    } else {
+      await listen(server, socketPath);
+      if (options.socketGid !== undefined) {
+        if (!Number.isSafeInteger(options.socketGid) || options.socketGid < 0) throw new Error("Invalid broker socket GID.");
+        await chown(socketPath, process.getuid!(), options.socketGid);
+      }
+      await chmod(socketPath, socketMode);
     }
-    await chmod(socketPath, socketMode);
   } catch (error) {
     await closeServer(server, sockets);
     throw error;
@@ -248,6 +260,13 @@ function listen(server: Server, socketPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(socketPath, () => { server.off("error", reject); resolve(); });
+  });
+}
+
+function listenFd(server: Server, fd: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen({ fd }, () => { server.off("error", reject); resolve(); });
   });
 }
 

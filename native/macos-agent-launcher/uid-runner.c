@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,7 @@
 #define CONTROL_SOCKET "/private/var/run/s-gw/agent-launch-control.sock"
 #define POLICY_SOCKET "/private/var/run/s-gw/agent-network-policy.sock"
 #define UID_LEASE_DIR "/private/var/run/s-gw/agent-uid-leases"
+#define UID_SCAN_LIMIT 8192
 
 static volatile sig_atomic_t stopping = 0;
 
@@ -126,6 +128,126 @@ static int reserve_uid(uid_t uid, const char *session) {
     int synced = fsync(dir) == 0;
     close(dir);
     return synced ? 0 : -1;
+}
+
+static int check_uid_lease(uid_t uid, const char *session) {
+    struct stat info;
+    if (canonical_path(UID_LEASE_DIR) || lstat(UID_LEASE_DIR, &info) ||
+        !S_ISDIR(info.st_mode) || info.st_uid != 0 || (info.st_mode & 0777) != 0700 ||
+        trusted_parents(UID_LEASE_DIR, 0)) return -1;
+    int dir = open(UID_LEASE_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir < 0) return -1;
+    char name[32], expected[128], contents[128];
+    int name_len = snprintf(name, sizeof(name), "%u", uid);
+    int expected_len = snprintf(expected, sizeof(expected), "%u %s\n", uid, session);
+    if (name_len < 1 || name_len >= (int)sizeof(name) ||
+        expected_len < 1 || expected_len >= (int)sizeof(expected)) { close(dir); return -1; }
+    int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW);
+    close(dir);
+    if (fd < 0) return -1;
+    ssize_t amount = read(fd, contents, sizeof(contents));
+    int safe = fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
+        (info.st_mode & 0777) == 0600 && amount == expected_len &&
+        memcmp(contents, expected, (size_t)expected_len) == 0;
+    close(fd);
+    return safe ? 0 : -1;
+}
+
+struct uid_process {
+    pid_t pid;
+    uint64_t start_sec;
+    uint64_t start_usec;
+};
+
+static int process_under_uid(const struct proc_bsdinfo *info, uid_t uid) {
+    return info->pbi_uid == uid || info->pbi_ruid == uid || info->pbi_svuid == uid;
+}
+
+static int read_process(pid_t pid, uid_t uid, struct uid_process *found) {
+    struct proc_bsdinfo info;
+    errno = 0;
+    int amount = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    if (amount != sizeof(info)) {
+        if (kill(pid, 0) < 0 && errno == ESRCH) return 0;
+        return -1;
+    }
+    if (info.pbi_pid != (uint32_t)pid) return -1;
+    if (!process_under_uid(&info, uid)) return 0;
+    found->pid = pid;
+    found->start_sec = info.pbi_start_tvsec;
+    found->start_usec = info.pbi_start_tvusec;
+    return 1;
+}
+
+static int list_uid_processes(uid_t uid, pid_t ignored, struct uid_process *found, size_t *count) {
+    pid_t pids[UID_SCAN_LIMIT];
+    const uint32_t filters[] = { PROC_UID_ONLY, PROC_RUID_ONLY };
+    *count = 0;
+    for (size_t filter = 0; filter < sizeof(filters) / sizeof(filters[0]); filter++) {
+        int bytes = proc_listpids(filters[filter], uid, pids, sizeof(pids));
+        if (bytes < 0 || bytes >= (int)sizeof(pids) || bytes % sizeof(pid_t)) return -1;
+        for (int i = 0; i < bytes / (int)sizeof(pid_t); i++) {
+            pid_t pid = pids[i];
+            if (pid <= 0 || pid == ignored) continue;
+            int duplicate = 0;
+            for (size_t j = 0; j < *count; j++) {
+                if (found[j].pid == pid) { duplicate = 1; break; }
+            }
+            if (duplicate) continue;
+            struct uid_process current;
+            int match = read_process(pid, uid, &current);
+            if (match < 0) return -1;
+            if (match == 1) {
+                if (*count == UID_SCAN_LIMIT) return -1;
+                found[(*count)++] = current;
+            }
+        }
+    }
+    return 0;
+}
+
+static int signal_uid_process(const struct uid_process *target, uid_t uid, int signal_number) {
+    struct uid_process current;
+    int match = read_process(target->pid, uid, &current);
+    if (match < 0) return -1;
+    if (match == 0 || current.start_sec != target->start_sec ||
+        current.start_usec != target->start_usec) return 0;
+    if (kill(target->pid, signal_number) < 0 && errno != ESRCH) return -1;
+    return 0;
+}
+
+static int teardown_uid(uid_t uid, pid_t ignored) {
+    struct uid_process *found = calloc(UID_SCAN_LIMIT, sizeof(*found));
+    if (!found) return -1;
+    int clean = 0;
+    for (int attempt = 0; attempt < 40; attempt++) {
+        size_t count = 0;
+        if (list_uid_processes(uid, ignored, found, &count)) break;
+        if (!count) {
+            if (++clean == 2) { free(found); return 0; }
+        } else {
+            clean = 0;
+            for (size_t i = 0; i < count; i++) {
+                if (signal_uid_process(&found[i], uid, attempt < 5 ? SIGTERM : SIGKILL)) {
+                    free(found);
+                    return -1;
+                }
+            }
+        }
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 100000000 };
+        nanosleep(&pause, NULL);
+    }
+    free(found);
+    return -1;
+}
+
+static int uid_is_empty(uid_t uid) {
+    struct uid_process *found = calloc(UID_SCAN_LIMIT, sizeof(*found));
+    if (!found) return -1;
+    size_t count = 0;
+    int result = list_uid_processes(uid, 0, found, &count);
+    free(found);
+    return result == 0 && count == 0 ? 0 : -1;
 }
 
 static int close_inherited_fds(void) {
@@ -232,6 +354,20 @@ static void child_exec(uid_t uid, gid_t gid, const char *session, const char *wo
 
 int main(int argc, char **argv) {
     if (getuid() != 0 || geteuid() != 0) return fail("requires a root-owned service, never a setuid executable");
+    if (argc == 4 && !strcmp(argv[1], "--teardown")) {
+        unsigned long raw_uid;
+        uid_t broker_uid;
+        if (parse_id(argv[2], &raw_uid) || !valid_session(argv[3]) ||
+            socket_peer(3, CONTROL_SOCKET, 1, &broker_uid) || broker_uid == 0 ||
+            trusted_socket_node(CONTROL_SOCKET, broker_uid))
+            return fail("untrusted teardown request");
+        uid_t uid = (uid_t)raw_uid;
+        struct passwd *account = getpwuid(uid);
+        if (!account || strncmp(account->pw_name, "_sgwagent_", 10) || uid == broker_uid ||
+            check_uid_lease(uid, argv[3])) return fail("UID is not leased to this agent session");
+        if (teardown_uid(uid, 0)) return fail("agent UID teardown is incomplete; tombstone remains");
+        return 0;
+    }
     if (argc < 8 || strcmp(argv[7], "--")) return fail("invalid launch plan");
     unsigned long raw_uid, raw_gid;
     if (parse_id(argv[1], &raw_uid) || parse_id(argv[2], &raw_gid) || !valid_session(argv[3]))
@@ -245,12 +381,13 @@ int main(int argc, char **argv) {
     struct passwd *account = getpwuid(agent_uid);
     if (!account || strncmp(account->pw_name, "_sgwagent_", 10) || account->pw_gid != agent_gid)
         return fail("agent account was not provisioned for s-gw");
-    if (proc_listpids(PROC_UID_ONLY, agent_uid, NULL, 0) != 0)
+    if (uid_is_empty(agent_uid))
         return fail("agent UID already has a process");
     if (checked_workspace(argv[4], agent_uid) || checked_broker_socket(argv[5], broker_uid, agent_gid) ||
         checked_executable(argv[6], broker_uid)) return fail("unsafe workspace, broker socket, or executable");
     if (policy_ready(agent_uid, argv[3])) return fail("network policy service did not attest this session");
     if (reserve_uid(agent_uid, argv[3])) return fail("agent UID is already leased or lease storage is unavailable");
+    if (uid_is_empty(agent_uid)) return fail("agent UID became active before launch; tombstone remains");
 
     char **agent_args = calloc((size_t)argc - 6, sizeof(char *));
     if (!agent_args) return fail("could not allocate agent arguments");
@@ -285,6 +422,7 @@ int main(int argc, char **argv) {
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
         free(agent_args);
+        if (teardown_uid(agent_uid, 0)) return fail("agent UID teardown is incomplete; tombstone remains");
         return fail("could not resume agent supervision");
     }
     int sent_term = 0;
@@ -307,11 +445,14 @@ int main(int argc, char **argv) {
     struct timespec grace = { .tv_sec = 0, .tv_nsec = 100000000 };
     nanosleep(&grace, NULL);
     kill(-child, SIGKILL);
+    int teardown_error = teardown_uid(agent_uid, child);
     int status = 0;
     pid_t reaped;
     do { reaped = waitpid(child, &status, 0); }
     while (reaped < 0 && errno == EINTR);
     free(agent_args);
+    if (teardown_error || teardown_uid(agent_uid, 0))
+        return fail("agent UID teardown is incomplete; tombstone remains");
     if (reaped != child || wait_error) return fail("could not supervise agent exit");
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     return 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : SIGTERM);

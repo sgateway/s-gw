@@ -14,6 +14,7 @@ export interface LinuxAgentUnitPlan {
   executable: string;
   args: readonly string[];
   launchGate?: boolean;
+  activatedSocket?: boolean;
 }
 
 export interface LinuxAgentUnitState {
@@ -68,6 +69,7 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
   }
   if (!canonicalPath(plan.executable) || !plan.executable.startsWith("/usr/") ||
       (plan.launchGate !== undefined && typeof plan.launchGate !== "boolean") ||
+      (plan.activatedSocket !== undefined && typeof plan.activatedSocket !== "boolean") ||
       !Array.isArray(plan.args) || plan.args.length > 128 ||
       plan.args.some(arg => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
     throw new Error("Linux agent executable or arguments are invalid.");
@@ -223,6 +225,26 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     if (await readFile(path.join(dir, "release"), "utf8") !== "WAIT\n") {
       throw new Error("Linux agent launch gate was already released or altered.");
     }
+    const networkNamespace = await readlink(`/proc/${current.mainPid}/ns/net`);
+    const hostNetworkNamespace = await readlink("/proc/self/ns/net");
+    const brokerSocket = await lstat(plan.brokerSocket);
+    if (!/^net:\[\d+\]$/.test(networkNamespace) || networkNamespace === hostNetworkNamespace ||
+        !brokerSocket.isSocket() || brokerSocket.uid !== (plan.activatedSocket ? 0 : plan.brokerUid)) {
+      throw new Error("Linux agent forwarder boundary changed before release.");
+    }
+    const attestation = await open(path.join(dir, "forwarder.tmp"),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o444);
+    try {
+      await attestation.chmod(0o444);
+      await attestation.writeFile(JSON.stringify({ version: 1, sessionId: plan.sessionId,
+        uid: current.uid, gid: current.gid, brokerUid: plan.brokerUid,
+        brokerSocketOwnerUid: brokerSocket.uid,
+        cgroup: current.cgroup, networkNamespace, hostNetworkNamespace,
+        invocationId: current.invocationId, mainPid: current.mainPid,
+        brokerSocketDevice: String(brokerSocket.dev), brokerSocketInode: String(brokerSocket.ino) }) + "\n");
+      await attestation.sync();
+    } finally { await attestation.close(); }
+    await rename(path.join(dir, "forwarder.tmp"), path.join(dir, "forwarder-attestation.json"));
     const tmp = path.join(dir, "ready.tmp");
     const file = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o444);
     try {
@@ -269,14 +291,19 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
       !workspace.isDirectory() || workspace.uid !== plan.uid || workspace.gid !== plan.gid ||
       (workspace.mode & 0o077) !== 0 || !executable.isFile() || executable.uid !== 0 ||
       (executable.mode & 0o022) !== 0 || (executable.mode & 0o111) === 0 ||
-      !socket.isSocket() || socket.uid !== plan.brokerUid ||
+      !socket.isSocket() || socket.uid !== (plan.activatedSocket ? 0 : plan.brokerUid) ||
       socket.gid !== plan.gid ||
-      (socket.mode & 0o007) !== 0 || (socket.mode & 0o060) !== 0o060) {
+      (plan.activatedSocket ? (socket.mode & 0o777) !== 0o660 :
+        (socket.mode & 0o007) !== 0 || (socket.mode & 0o060) !== 0o060)) {
     throw new Error("Linux agent root, workspace, or broker socket is not privately staged.");
   }
   const socketParent = await lstat(path.dirname(plan.brokerSocket));
-  if (!socketParent.isDirectory() || socketParent.uid !== plan.brokerUid || socketParent.gid !== plan.gid ||
-      (socketParent.mode & 0o027) !== 0 || (socketParent.mode & 0o010) === 0) {
+  const activatedParent = plan.activatedSocket && socketParent.uid === 0 &&
+    (socketParent.mode & 0o777) === 0o711;
+  const brokerParent = !plan.activatedSocket && socketParent.uid === plan.brokerUid &&
+    socketParent.gid === plan.gid && (socketParent.mode & 0o027) === 0 &&
+    (socketParent.mode & 0o010) !== 0;
+  if (!socketParent.isDirectory() || (!activatedParent && !brokerParent)) {
     throw new Error("Linux agent broker socket directory is not controlled by the broker.");
   }
   await checkedRootParentChain(path.dirname(plan.rootDirectory));
@@ -348,14 +375,16 @@ async function cleanupGate(plan: LinuxAgentUnitPlan, identity: { dev: number; in
     throw new Error("Linux agent launch gate directory changed before cleanup.");
   }
   const names = await readdir(dir);
-  if (names.some(name => name !== "release" && name !== "ready.tmp")) {
+  if (names.some(name => name !== "release" && name !== "ready.tmp" &&
+      name !== "forwarder.tmp" && name !== "forwarder-attestation.json")) {
     throw new Error("Linux agent launch gate directory has unexpected files.");
   }
   for (const name of names) {
     const filePath = path.join(dir, name);
     const before = await lstat(filePath);
     if (!before.isFile() || before.uid !== 0 || before.nlink !== 1 ||
-        (before.mode & 0o022) !== 0 || before.size > 96) {
+        (before.mode & 0o022) !== 0 ||
+        before.size > (name.startsWith("forwarder") ? 1024 : 96)) {
       throw new Error("Linux agent launch gate marker changed before cleanup.");
     }
     const file = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);

@@ -443,6 +443,19 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run build
+      - name: Compile one-shot Windows peer helper
+        if: matrix.group == 'acl'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw 'Visual Studio installation discovery is unavailable.' }
+          $vsRoot = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if (-not $vsRoot) { throw 'MSVC C tools are unavailable.' }
+          $devCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
+          if (-not (Test-Path $devCmd)) { throw 'MSVC environment setup is unavailable.' }
+          $compile = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && npm run build:windows-peer-identity'
+          & cmd.exe /d /s /c $compile
+          if ($LASTEXITCODE -ne 0) { throw 'The one-shot Windows peer helper did not compile.' }
       - run: npm run test:windows -- --group ${{ matrix.group }}
 
   windows-preview:

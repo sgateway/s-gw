@@ -15,7 +15,7 @@ export interface ModelRelayApproval {
   retryPendingSessionEnds?(): Promise<void>;
 }
 
-export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions, "socketPath" | "socketMode" | "socketGid"> {
+export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions, "socketPath" | "socketMode" | "socketGid" | "activatedFd"> {
   store: SecretStore;
   approval: ModelRelayApproval;
   maxActiveRequestsPerSession?: number;
@@ -215,6 +215,7 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
     socketPath: options.socketPath,
     socketMode: options.socketMode,
     socketGid: options.socketGid,
+    activatedFd: options.activatedFd,
     requireLinuxPeerPidfd: true,
     onConnection(socket, principal) {
       principals.set(socket, principal);

@@ -65,6 +65,14 @@ describe("Linux systemd agent unit plan", () => {
       " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
   });
 
+  it("accepts an opt-in root-owned socket activation plan without changing the agent unit", () => {
+    const base = plan();
+    const activated = { ...base, activatedSocket: true };
+    expect(systemdRunArgs(activated)).toEqual(systemdRunArgs(base));
+    expect(parseSystemdAgentState(activated, attestation(activated)).mainPid).toBe(1234);
+    expect(() => validateLinuxAgentPlan({ ...base, activatedSocket: "yes" as never })).toThrow("arguments");
+  });
+
   it("rejects identity reuse, path traversal, shell interpolation, and unmanaged roots", () => {
     const base = plan();
     expect(() => validateLinuxAgentPlan({ ...base, uid: base.brokerUid })).toThrow("dedicated UID");

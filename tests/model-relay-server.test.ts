@@ -120,6 +120,19 @@ async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
 }
 
 describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay listener", () => {
+  it.skipIf(process.platform !== "darwin")("passes activated descriptors to the Linux-only peer listener", async () => {
+    let launched: VerifiedModelRelayServer | undefined;
+    let failure: unknown;
+    try {
+      launched = await startVerifiedModelRelayServer({ socketPath,
+        activatedFd: 3, socketGid: process.getgid!(), store,
+        approval: new StoreBackedModelRelayApprovals(store) });
+    } catch (error) { failure = error; }
+    await launched?.close();
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).toContain("activated Linux socket");
+  });
+
   it("uses a durable manual approval bound to one verified session and route set", async () => {
     const requestUpstream = await startProvider(async (req, res) => {
       for await (const _chunk of req) {}
