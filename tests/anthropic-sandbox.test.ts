@@ -207,6 +207,14 @@ describe("Anthropic sandbox", () => {
     await writeFile(workspaceCommand, "fixture");
     expect(anthropicSandboxConfig(workspace, store.home, opts,
       { HOME: outside, PATH: process.env.PATH }, workspaceCommand).filesystem.allowRead).toContain(workspaceCommand);
+    const workspaceNode = path.join(workspace, "runtime-node");
+    await writeFile(workspaceNode, "fixture");
+    const originalNode = process.execPath;
+    try {
+      process.execPath = workspaceNode;
+      expect(() => anthropicSandboxConfig(workspace, store.home, opts,
+        { HOME: outside, PATH: process.env.PATH }, workspaceCommand)).toThrow("broker's Node runtime");
+    } finally { process.execPath = originalNode; }
     expect(() => anthropicSandboxConfig(packageRoot, store.home, opts,
       { HOME: outside, PATH: process.env.PATH }, process.execPath)).toThrow("runtime package and workspace");
   });

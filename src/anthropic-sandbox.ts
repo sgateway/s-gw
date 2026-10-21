@@ -77,9 +77,13 @@ export function anthropicSandboxConfig(cwd: string, home: string, options: Anthr
   if (nativeHome && realStore) {
     const realWorkspace = realpathSync(workspace);
     const realPackageRoot = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
+    const realNode = realpathSync(process.execPath);
     const sessionRoot = path.join(realpathSync(path.dirname(sandboxSessionRoot())), path.basename(sandboxSessionRoot()));
     if (pathContains(realWorkspace, nativeHome)) throw new Error("Strict isolated authentication requires a workspace narrower than the native account home.");
     if (pathsOverlap(realWorkspace, realPackageRoot)) throw new Error("Strict isolated authentication cannot overlap the s-gw runtime package and workspace.");
+    if (pathContains(workspace, path.resolve(process.execPath)) || pathContains(realWorkspace, realNode)) {
+      throw new Error("Strict isolated authentication cannot execute the broker's Node runtime from the writable workspace.");
+    }
     if (pathsOverlap(realWorkspace, realStore)) throw new Error("Strict isolated authentication cannot overlap the s-gw store and workspace.");
     if (realRecovery && pathsOverlap(realWorkspace, realRecovery)) throw new Error("Strict isolated authentication cannot overlap the s-gw recovery vault and workspace.");
     if (pathContains(realWorkspace, sessionRoot) || pathContains(sessionRoot, realWorkspace)) {
