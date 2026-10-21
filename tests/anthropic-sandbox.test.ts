@@ -13,6 +13,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { anthropicSandboxConfig, isolatedAgentEnvironment, runAnthropicSandbox, sandboxAgentArguments, sandboxSessionRoot } from "../src/anthropic-sandbox.js";
 import { prepareGuardedRun, runGuardedAgent } from "../src/guard.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
+import { executeApprovedRequest } from "../src/executor.js";
 import { SecretStore } from "../src/store.js";
 import { startSandboxBroker, runSandboxMcpBridge, ownedModuleCommand, brokerChildEnvironment } from "../src/sandbox-broker.js";
 import { anthropicSandboxReadiness, agentAuthenticationPaths, restrictMacCredentialIpc, macAgentKeychainReadPath, allowMacAgentKeychainRead } from "../src/anthropic-sandbox.js";
@@ -676,7 +677,13 @@ writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0
     const tls = await httpsFixture(path.join(root, "outside"));
     const httpPassword = `synthetic HTTPS fixture ${randomUUID()}`;
     const issued = randomUUID();
-    const https = createHttpsServer(tls, (req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ result: "owned HTTPS fixture complete", echo: req.headers.authorization, access_token: issued })); });
+    let ownedHttpHits = 0;
+    const https = createHttpsServer(tls, (req, res) => {
+      ownedHttpHits += 1;
+      expect(req.headers.authorization).toBe(`Bearer ${httpPassword}`);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ result: "owned HTTPS fixture complete", echo: req.headers.authorization, access_token: issued }));
+    });
     await new Promise<void>(resolve => https.listen(0, "127.0.0.1", resolve));
     const httpsAddress = https.address();
     if (!httpsAddress || typeof httpsAddress === "string") throw new Error("HTTPS fixture port missing");
@@ -700,6 +707,20 @@ writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0
       await store.approveRequest(requestId!);
       expect(httpRequestId).toBeTruthy(); await store.approveRequest(httpRequestId!);
       await writeFile(path.join(root, "workspace", "approval-ready"), "approved fixture");
+      let claimDenied = false;
+      while (!claimDenied && Date.now() < deadline) {
+        try { await readFile(path.join(root, "workspace", "http-claim-denied")); claimDenied = true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (!claimDenied) await new Promise(resolve => setTimeout(resolve, 30));
+      }
+      expect(claimDenied).toBe(true);
+      expect(ownedHttpHits).toBe(0);
+      expect((await store.getRequest(httpRequestId!)).state).toBe("approved");
+      const httpSummary = await executeApprovedRequest(store, httpRequestId!, { http: { ca: tls.cert } });
+      expect(httpSummary.exitCode).toBe(0);
+      expect(ownedHttpHits).toBe(1);
+      await writeFile(path.join(root, "workspace", "operator-result.json"), JSON.stringify(httpSummary));
+      await writeFile(path.join(root, "workspace", "operator-executed"), "trusted operator executed");
       expect(await launch).toBe(0);
       expect(directConnections).toBe(0);
       const results = await readFile(path.join(root, "workspace", "results.json"), "utf8");

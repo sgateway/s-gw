@@ -2,11 +2,14 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <grp.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -102,8 +105,153 @@ static int network_probe(int family, int kind, const char *host, int port) {
     return kind == SOCK_STREAM ? result != 0 : 1;
 }
 
+static int initialized_broker_socket(const char *socket_path) {
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    strcpy(address.sun_path, socket_path);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct timeval deadline = { .tv_sec = 12, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0 ||
+        connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    char reply[16384];
+    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"handoff-probe\",\"version\":\"1\"}}\n") != 0 ||
+        receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":81") ||
+        !strstr(reply, "\"result\"") ||
+        send_line(fd, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n") != 0 ||
+        send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/list\",\"params\":{}}\n") != 0 ||
+        receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":82") ||
+        !strstr(reply, "sgw_list_handles")) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int positive_number(const char *text) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    return errno == 0 && end && *end == 0 && value > 0 && value <= 1000000000 ? (int)value : -1;
+}
+
+static int enter_agent_netns_and_drop(const char *pid_text, const char *uid_text,
+                                      const char *gid_text) {
+    int pid = positive_number(pid_text);
+    int uid = positive_number(uid_text);
+    int gid = positive_number(gid_text);
+    if (getuid() != 0 || geteuid() != 0 || pid < 1 || uid < 1 || gid < 1) return -1;
+    char name[64];
+    int length = snprintf(name, sizeof(name), "/proc/%d/ns/net", pid);
+    if (length < 0 || (size_t)length >= sizeof(name)) return -1;
+    int ns = open(name, O_RDONLY | O_CLOEXEC);
+    if (ns < 0) return -1;
+    int joined = setns(ns, CLONE_NEWNET);
+    close(ns);
+    if (joined != 0 || setgroups(0, NULL) != 0 ||
+        setresgid((gid_t)gid, (gid_t)gid, (gid_t)gid) != 0 ||
+        setresuid((uid_t)uid, (uid_t)uid, (uid_t)uid) != 0) return -1;
+    return 0;
+}
+
+static int handoff_socket(int broker_fd) {
+    const char *name = "/workspace/handoff.sock";
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    strcpy(address.sun_path, name);
+    int channel = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (channel < 0) return -1;
+    if (connect(channel, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        int error = errno;
+        close(channel);
+        return error == EACCES || error == EPERM || error == ENOENT || error == ECONNREFUSED ? 0 : -1;
+    }
+    char payload = 'x';
+    struct iovec iov = { .iov_base = &payload, .iov_len = 1 };
+    char control[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct msghdr message = { .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control, .msg_controllen = sizeof(control) };
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &broker_fd, sizeof(int));
+    ssize_t sent = sendmsg(channel, &message, MSG_NOSIGNAL);
+    int error = errno;
+    close(channel);
+    if (sent == 1) return 1;
+    return sent < 0 && (error == EACCES || error == EPERM) ? 0 : -1;
+}
+
+static int write_handoff_result(const char *filename, const char *result) {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    int written = send_line(fd, result);
+    int closed = close(fd);
+    return written == 0 && closed == 0 ? 0 : -1;
+}
+
+static int receive_handoff(const char *socket_name, const char *result_name,
+                           const char *pid_name, const char *expected_handle) {
+    if (strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 30;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    strcpy(address.sun_path, socket_name);
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(listener, 1) != 0) return 31;
+    char pid_text[32];
+    int pid_size = snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)getpid());
+    if (pid_size < 0 || (size_t)pid_size >= sizeof(pid_text) ||
+        write_handoff_result(pid_name, pid_text) != 0) return 38;
+    int channel = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+    if (channel < 0) return 32;
+    struct timeval deadline = { .tv_sec = 6, .tv_usec = 0 };
+    if (setsockopt(channel, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0) return 33;
+    char payload = 0;
+    struct iovec iov = { .iov_base = &payload, .iov_len = 1 };
+    char control[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct msghdr message = { .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control, .msg_controllen = sizeof(control) };
+    ssize_t count = recvmsg(channel, &message, MSG_CMSG_CLOEXEC);
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    int broker_fd = -1;
+    if (header && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS &&
+        header->cmsg_len == CMSG_LEN(sizeof(int))) memcpy(&broker_fd, CMSG_DATA(header), sizeof(int));
+    close(channel);
+    close(listener);
+    if (count != 1 || payload != 'x' || (message.msg_flags & MSG_CTRUNC) || broker_fd < 0) return 34;
+    struct stat info;
+    int socket_type = 0;
+    socklen_t type_size = sizeof(socket_type);
+    if (fstat(broker_fd, &info) != 0 || !S_ISSOCK(info.st_mode) ||
+        getsockopt(broker_fd, SOL_SOCKET, SO_TYPE, &socket_type, &type_size) != 0 ||
+        socket_type != SOCK_STREAM) return 35;
+    if (setsockopt(broker_fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0 ||
+        setsockopt(broker_fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0) return 36;
+    const char *result = "inconclusive\n";
+    if (send_line(broker_fd, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0) {
+        result = "denied\n";
+    } else {
+        char reply[16384];
+        int read_result = receive_line(broker_fd, reply, sizeof(reply));
+        if (read_result == -2) result = "denied\n";
+        else if (read_result == 0 && strstr(reply, "\"id\":91") &&
+                 strstr(reply, "\"result\"") && strstr(reply, expected_handle) &&
+                 !strstr(reply, "\"isError\":true")) result = "accepted\n";
+    }
+    close(broker_fd);
+    return write_handoff_result(result_name, result) == 0 ? 0 : 37;
+}
+
 int main(int argc, char **argv) {
     int claimant = argc == 2 && strcmp(argv[1], "--out-of-cgroup") == 0;
+    if (argc == 9 && strcmp(argv[1], "--receive-handoff") == 0) {
+        signal(SIGPIPE, SIG_IGN);
+        if (enter_agent_netns_and_drop(argv[6], argv[7], argv[8]) != 0) return 39;
+        return receive_handoff(argv[2], argv[3], argv[4], argv[5]);
+    }
     if (argc != 11 && !claimant) return 1;
     signal(SIGPIPE, SIG_IGN);
     const char *socket_path = getenv("SGW_BROKER_SOCKET");
@@ -155,6 +303,28 @@ int main(int argc, char **argv) {
         send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "sgw_list_handles") ||
         strstr(reply, "sgw_scan_file")) return 7;
+    int handoff_fd = initialized_broker_socket(socket_path);
+    if (handoff_fd < 0) return 28;
+    int ready = open("/workspace/handoff-ready", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (ready < 0 || write(ready, "ready\n", 6) != 6 || close(ready) != 0) return 26;
+    int release = 0;
+    char handoff_gate[32];
+    for (int attempt = 0; attempt < 900; attempt++) {
+        if (read_field("/workspace/handoff-go", handoff_gate, sizeof(handoff_gate)) == 0 &&
+            strcmp(handoff_gate, "go") == 0) { release = 1; break; }
+        usleep(100000);
+    }
+    if (!release) return 27;
+    int handoff = handoff_socket(handoff_fd);
+    close(handoff_fd);
+    if (handoff != 1) return 23;
+    int finished = 0;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        int result = open("/workspace/handoff-result", O_RDONLY | O_CLOEXEC);
+        if (result >= 0) { close(result); finished = 1; break; }
+        usleep(100000);
+    }
+    if (!finished) return 25;
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":3") ||
         !strstr(reply, "\"result\"") || !strstr(reply, handle)) return 8;

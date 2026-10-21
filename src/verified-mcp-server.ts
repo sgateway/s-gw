@@ -5,6 +5,7 @@ import { executeApprovedRequest } from "./executor.js";
 import { buildHttpRequestAction } from "./http-action.js";
 import type { OwnedHttpOptions } from "./http-executor.js";
 import { managedSshHostFingerprint } from "./managed-ssh.js";
+import { startLinuxMessageGate } from "./linux-message-gate.js";
 import { startVerifiedPeerServer, type PeerSession, type VerifiedPeerServerOptions } from "./peer-identity.js";
 import { defaultSshInjectEnv } from "./ssh.js";
 import type { SecretStore } from "./store.js";
@@ -37,7 +38,8 @@ export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions):
     socketGid: options.socketGid,
     activatedFd: options.activatedFd,
     requireLinuxPeerPidfd: true,
-    onConnection(socket, principal) {
+    requireLinuxMessageGate: process.platform === "linux" && options.activatedFd !== undefined,
+    async onConnection(socket, principal) {
       const session = principal.sessionId ? sessions.get(principal.sessionId) : undefined;
       if (!session) { socket.destroy(); return; }
       const connection = new AbortController();
@@ -128,8 +130,14 @@ export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions):
       }));
 
       socket.once("close", () => { void server.close().catch(() => {}); });
-      void server.connect(new StdioServerTransport(socket, socket, { maxBufferSize: 1024 * 1024 }))
-        .then(() => socket.resume(), () => socket.destroy());
+      if (process.platform === "linux" && options.activatedFd !== undefined) {
+        const gate = await startLinuxMessageGate(socket, session.uid, session.gid!, session.linuxCgroup!);
+        void server.connect(new StdioServerTransport(gate.input, gate.output,
+          { maxBufferSize: 1024 * 1024 })).catch(() => socket.destroy());
+      } else {
+        void server.connect(new StdioServerTransport(socket, socket, { maxBufferSize: 1024 * 1024 }))
+          .then(() => socket.resume(), () => socket.destroy());
+      }
     }
   });
 

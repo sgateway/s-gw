@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-context.js";
 import { checkLinuxActivatedSocket } from "./linux-activated-socket.js";
 import { checkLinuxPeerVerifier, verifyLinuxPeerProcess } from "./linux-peer-identity.js";
+import { prepareLinuxMessageListener } from "./linux-message-gate.js";
 import { assertNoMacAclAllow } from "./macos-path-acl.js";
 
 export interface UnixPeer {
@@ -112,6 +113,7 @@ export interface VerifiedPeerServerOptions {
   activatedFd?: number;
   idleTimeoutMs?: number;
   requireLinuxPeerPidfd?: boolean;
+  requireLinuxMessageGate?: boolean;
   onConnection(socket: Socket, principal: VerifiedAgentPrincipal, peer: UnixPeer): void | Promise<void>;
 }
 
@@ -122,6 +124,10 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   await checkedPeerHelper(true);
   if (process.platform === "linux" && options.requireLinuxPeerPidfd) await checkLinuxPeerVerifier();
   const activated = options.activatedFd !== undefined;
+  if (options.requireLinuxMessageGate &&
+      (process.platform !== "linux" || !activated || !options.requireLinuxPeerPidfd)) {
+    throw new Error("Linux MCP message gate requires an activated pidfd-verified listener.");
+  }
   if (activated && (process.platform !== "linux" || options.socketGid === undefined || options.socketMode !== undefined)) {
     throw new Error("An activated Linux socket needs its agent GID and systemd-owned mode.");
   }
@@ -136,7 +142,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   const registry = new PeerSessionRegistry(options.requireLinuxPeerPidfd === true);
   const sockets = new Set<Socket>();
   const pending = new Set<Socket>();
-  const server = createServer(socket => {
+  const server = createServer({ pauseOnConnect: true }, socket => {
     if (pending.size >= maxPendingConnections) { socket.destroy(); return; }
     socket.pause();
     socket.on("error", () => socket.destroy());
@@ -157,6 +163,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
 
   try {
     if (activated) {
+      if (options.requireLinuxMessageGate) await prepareLinuxMessageListener(options.activatedFd!);
       await listenFd(server, options.activatedFd!);
       await checkLinuxActivatedSocket(socketPath, options.activatedFd!, options.socketGid!);
     } else {

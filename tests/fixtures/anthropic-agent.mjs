@@ -86,15 +86,21 @@ try {
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /owned SSH fixture complete/);
   checks.push('external broker executes approved SSH action; pending action was denied');
-  const httpExecuted = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } });
-  assert(!httpExecuted.isError, JSON.stringify(httpExecuted));
-  const httpOutput = JSON.parse(httpExecuted.content[0].text);
+  const httpClaim = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } });
+  assert.equal(httpClaim.isError, true);
+  assert.match(httpClaim.content[0].text, /verified agent principal and session/);
+  writeFileSync(`${root}/workspace/http-claim-denied`, 'ordinary MCP claim denied');
+  while (!existsSync(`${root}/workspace/operator-executed`)) {
+    if (Date.now() > deadline) throw new Error('Fixture operator execution timed out');
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  const httpOutput = JSON.parse(readFileSync(`${root}/workspace/operator-result.json`, 'utf8'));
   assert.equal(httpOutput.exitCode, 0);
   assert.match(httpOutput.stdout, /owned HTTPS fixture complete/);
   assert.match(httpOutput.stdout, /SGW_RESPONSE_CREDENTIAL_WITHHELD/);
   assert.match(httpOutput.stdout, /SGW_SECRET/);
   assert.equal((await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } })).isError, true);
-  checks.push('external HTTPS authentication, credential-field redaction and replay denial work after denied POST');
+  checks.push('operator HTTPS authentication, credential-field redaction and replay denial work after denied agent claim');
   const changed = await client.callTool({ name: 'sgw_request_ssh_session', arguments: { handle, target: 'fixture@example.test', args: ['uptime'] } });
   assert.equal(JSON.parse(changed.content[0].text).request.state, 'pending');
   const replay = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: pending.id } });

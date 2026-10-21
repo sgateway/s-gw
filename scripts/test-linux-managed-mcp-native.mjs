@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { createSocket } from "node:dgram";
@@ -349,6 +349,64 @@ const agentMainPids = new Map();
 const brokerInvocations = new Map();
 let upstream;
 const networkCanaries = [];
+const handoffHelpers = new Map();
+const handoffOutcomes = [];
+async function startHandoffHelper(agent) {
+  const socketPath = `${agent.root}/workspace/handoff.sock`;
+  const resultPath = `${agent.root}/workspace/handoff-result`;
+  const pidPath = `${agent.root}/workspace/handoff-pid`;
+  const agentPid = agentMainPids.get(agent.sessionId);
+  if (!agentPid) throw new Error(`No live agent PID for ${agent.sessionId} descriptor handoff.`);
+  const child = spawn(`${agent.root}/usr/bin/managed-mcp-probe`,
+    ["--receive-handoff", socketPath, resultPath, pidPath, agent.seeded.handle,
+      String(agentPid), String(agent.uid), String(agent.uid)],
+  { detached: true, stdio: ["ignore", "ignore", "pipe"],
+    env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } });
+  let errors = "";
+  child.stderr.on("data", chunk => { errors = (errors + String(chunk)).slice(0, 2048); });
+  const finished = new Promise(resolve => {
+    child.once("error", error => resolve({ error: error.message }));
+    child.once("close", (code, signal) => resolve({ code, signal, errors }));
+  });
+  handoffHelpers.set(agent.sessionId, { child, finished, socketPath });
+  const pid = await until(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`The ${agent.sessionId} descriptor receiver exited: ${JSON.stringify(await finished)}`);
+    }
+    const contents = await maybeText(pidPath);
+    if (!contents) return false;
+    if (!/^[1-9][0-9]*\n$/.test(contents)) throw new Error("Invalid descriptor receiver PID.");
+    const item = await lstat(socketPath);
+    if (!item.isSocket() || item.uid !== agent.uid) {
+      throw new Error("The descriptor receiver did not bind an agent-owned Unix socket.");
+    }
+    return Number(contents.trim());
+  }, `${agent.sessionId} same-UID out-of-cgroup descriptor receiver`);
+  const status = await readFile(`/proc/${pid}/status`, "utf8");
+  const cgroup = await readFile(`/proc/${pid}/cgroup`, "utf8");
+  const hostCgroup = await readFile("/proc/self/cgroup", "utf8");
+  const agentCgroup = await readFile(`/proc/${agentPid}/cgroup`, "utf8");
+  const hostNet = await readlink("/proc/self/ns/net");
+  const agentNet = await readlink(`/proc/${agentPid}/ns/net`);
+  const uidValues = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
+  const gidValues = /^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
+  const extraGroups = status.split("\n").find(line => line.startsWith("Groups:"));
+  if (!uidValues || uidValues.slice(1).some(value => Number(value) !== agent.uid) ||
+      !gidValues || gidValues.slice(1).some(value => Number(value) !== agent.uid) ||
+      extraGroups?.trim() !== "Groups:" || cgroup !== hostCgroup || cgroup === agentCgroup ||
+      agentNet === hostNet || await readlink(`/proc/${pid}/ns/net`) !== agentNet) {
+    throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup, or agent network namespace.`);
+  }
+}
+
+async function stopHandoffHelper(helper) {
+  if (helper.child.exitCode === null && helper.child.signalCode === null && helper.child.pid) {
+    try { process.kill(-helper.child.pid, "SIGKILL"); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
+  }
+  return helper.finished;
+}
+
 let passed = false;
 try {
   let controlSocketExists = false;
@@ -616,7 +674,7 @@ try {
   await remember(controlUnitFile);
   for (const agent of agents) {
     const config = safeUnitValue(agent.configPath);
-    await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
+    await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
     await remember(agent.socketUnitFile);
     await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=${loaderUnset}\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile}\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile} -- ${config}\nRestart=no\n`, { mode: 0o644 });
     await remember(agent.brokerUnitFile);
@@ -672,6 +730,23 @@ try {
       socket.once("error", reject);
       socket.once("connect", () => { socket.destroy(); resolve(); });
     });
+  }
+  for (const agent of agents) {
+    const ready = await until(() => maybeText(`${agent.root}/workspace/handoff-ready`),
+      `${agent.sessionId} initialized MCP handoff gate`);
+    if (ready !== "ready\n") throw new Error(`Unexpected MCP handoff gate: ${ready}`);
+    const live = unitProperties(agent.agentUnit, ["Id", "User", "ControlGroup", "MainPID"]);
+    const mainPid = Number(live.get("MainPID"));
+    if (live.get("Id") !== agent.agentUnit || live.get("User") !== String(agent.uid) ||
+        live.get("ControlGroup") !== `/system.slice/${agent.agentUnit}` ||
+        !Number.isSafeInteger(mainPid) || mainPid < 1) {
+      throw new Error(`The ${agent.sessionId} handoff donor is not a live managed agent.`);
+    }
+    agentMainPids.set(agent.sessionId, mainPid);
+  }
+  for (const agent of agents) await startHandoffHelper(agent);
+  for (const agent of agents) {
+    await writeFile(`${agent.root}/workspace/handoff-go`, "go\n", { mode: 0o644 });
   }
   for (const agent of agents) await rememberClaimMarkers(agent);
   const { claimIdentityMarkers } = await import(new URL("../dist/linux-agent-control.js", import.meta.url));
@@ -754,6 +829,22 @@ try {
     throw new Error("A synthetic broker or peer workspace canary changed during agent probes.");
   }
   for (const agent of agents) {
+    const result = await until(() => maybeText(`${agent.root}/workspace/handoff-result`),
+      `${agent.sessionId} connected descriptor handoff result`);
+    if (result === "accepted\n") {
+      throw new Error(`A same-UID out-of-cgroup process used ${agent.sessionId}'s admitted broker socket.`);
+    }
+    if (result !== "denied\n") {
+      throw new Error(`The ${agent.sessionId} descriptor handoff was inconclusive: ${result}`);
+    }
+    const helper = handoffHelpers.get(agent.sessionId);
+    const finished = await helper.finished;
+    if (finished.code !== 0) {
+      throw new Error(`The ${agent.sessionId} descriptor receiver failed: ${JSON.stringify(finished)}`);
+    }
+    handoffOutcomes.push(`${agent.sessionId}:${result.trim()}`);
+  }
+  for (const agent of agents) {
     const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
     const claimant = run("runuser", ["-u", agent.userName, "--", "/usr/bin/env",
       `SGW_BROKER_SOCKET=${agent.socketPath}`, probe, "--out-of-cgroup"], true,
@@ -818,6 +909,7 @@ try {
     ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
   throw new Error(`${String(error)}\n${logs}`);
 } finally {
+  for (const helper of handoffHelpers.values()) await stopHandoffHelper(helper);
   if (upstream) {
     upstream.closeAllConnections();
     await new Promise(resolve => upstream.close(resolve));
@@ -965,5 +1057,5 @@ try {
   for (const canary of networkCanaries.reverse()) await canary.close();
 }
 if (passed) {
-  console.log("Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, out-of-cgroup denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.");
+  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, same-UID connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.`);
 }
