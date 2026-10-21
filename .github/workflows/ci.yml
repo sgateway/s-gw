@@ -73,6 +73,7 @@ jobs:
       - run: npm run build
       - run: npm test -- --no-file-parallelism
       - run: node scripts/test-macos-fd-transfer-helper.mjs
+      - run: node scripts/test-macos-two-uid-acceptance.mjs --self-test
 
   desktop-apps:
     name: Desktop app (${{ matrix.name }})
@@ -502,3 +503,8 @@ jobs:
           test -x "dist/native/linux-$(node -p process.arch)/s-gw-linux-activated-socket"
           node_path="$(command -v node)"
           sudo "$node_path" scripts/test-linux-native-agent-boundary.mjs --root "$(id -u)" "$(id -g)"
+      - name: Verify systemd managed MCP activation and root control teardown
+        run: |
+          test "$(id -u)" -ne 0
+          node_path="$(command -v node)"
+          sudo CI=true "$node_path" scripts/test-linux-managed-mcp-native.mjs --root "$(id -u)" "$(id -g)"

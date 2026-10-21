@@ -246,7 +246,8 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
 
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
-    const wchar_t *shared_path, const wchar_t *canary_path, int stop_job,
+    const wchar_t *shared_path, const wchar_t *canary_path, const wchar_t *job_name,
+    int stop_job, int pause_start, int without_job,
     const wchar_t *other_agent_pid, const wchar_t *broker_pid) {
     wchar_t parent_canary[64];
     DWORD canary_size = GetEnvironmentVariableW(L"SGW_WIN_FIXTURE_PARENT_CANARY",
@@ -311,13 +312,22 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     startup.StartupInfo.cb = sizeof(startup);
     startup.lpAttributeList = attrs;
     PROCESS_INFORMATION process = { 0 };
-    HANDLE job = CreateJobObjectW(NULL, NULL);
-    if (!job) goto done;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-        CloseHandle(job);
-        goto done;
+    HANDLE job = NULL;
+    if (without_job) {
+        job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, job_name);
+        if (!job) goto done;
+    } else {
+        job = CreateJobObjectW(NULL, job_name);
+        if (!job || GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (job) CloseHandle(job);
+            goto done;
+        }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+            CloseHandle(job);
+            goto done;
+        }
     }
     if (!CreateProcessW(executable, command, NULL, NULL, FALSE,
         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
@@ -328,9 +338,9 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         goto done;
     }
     BOOL assigned = FALSE;
-    if (!AssignProcessToJobObject(job, process.hProcess) ||
-        !IsProcessInJob(process.hProcess, job, &assigned) || !assigned ||
-        ResumeThread(process.hThread) == (DWORD)-1) {
+    if ((!without_job && !AssignProcessToJobObject(job, process.hProcess)) ||
+        !IsProcessInJob(process.hProcess, job, &assigned) ||
+        (!without_job && !assigned) || (without_job && assigned)) {
         fprintf(stderr, "AppContainer job assignment failed: %lu\n", GetLastError());
         TerminateProcess(process.hProcess, 1);
         CloseHandle(process.hThread);
@@ -338,9 +348,37 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         CloseHandle(job);
         goto done;
     }
-    if (!other_agent_pid && !stop_job) {
+    if (without_job) {
+        puts("OUT-OF-JOB-ATTESTED");
+        fflush(stdout);
+    }
+    if (pause_start) {
+        puts("JOB-READY");
+        fflush(stdout);
+    }
+    if (!other_agent_pid && !stop_job && !without_job) {
         printf("CHILD-PID=%lu\n", (unsigned long)process.dwProcessId);
         fflush(stdout);
+    }
+    if (pause_start) {
+        char signal = 0;
+        DWORD amount = 0;
+        HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+        if (input == INVALID_HANDLE_VALUE || !ReadFile(input, &signal, 1, &amount, NULL) ||
+            amount != 1 || signal != 'G') {
+            TerminateProcess(process.hProcess, 1);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            CloseHandle(job);
+            goto done;
+        }
+    }
+    if (ResumeThread(process.hThread) == (DWORD)-1) {
+        TerminateProcess(process.hProcess, 1);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        goto done;
     }
     DWORD exit_code = 1;
     if (stop_job) {
@@ -373,6 +411,29 @@ done:
     return result;
 }
 
+static int hold_empty_job(const wchar_t *name, DWORD flags) {
+    HANDLE job = CreateJobObjectW(NULL, name);
+    if (!job) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(job);
+        return 1;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+    limits.BasicLimitInformation.LimitFlags = flags;
+    if (flags && !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        CloseHandle(job);
+        return 1;
+    }
+    puts("JOB-READY");
+    fflush(stdout);
+    char signal;
+    DWORD amount = 0;
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (input != INVALID_HANDLE_VALUE) ReadFile(input, &signal, 1, &amount, NULL);
+    CloseHandle(job);
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
     if (argc == 3 && wcscmp(argv[1], L"create") == 0) return create_profile(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"delete") == 0) {
@@ -380,15 +441,27 @@ int wmain(int argc, wchar_t **argv) {
         if (FAILED(status)) fprintf(stderr, "DeleteAppContainerProfile failed: 0x%08lx\n", (unsigned long)status);
         return FAILED(status) ? 1 : 0;
     }
+    if (argc == 3 && wcscmp(argv[1], L"job-host") == 0)
+        return hold_empty_job(argv[2], JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if (argc == 3 && wcscmp(argv[1], L"job-host-breakaway") == 0)
+        return hold_empty_job(argv[2], JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+    if (argc == 3 && wcscmp(argv[1], L"job-host-no-kill") == 0)
+        return hold_empty_job(argv[2], 0);
     if ((argc == 8 || argc == 10) && wcscmp(argv[1], L"client") == 0)
         return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
             argc == 10 ? argv[8] : NULL, argc == 10 ? argv[9] : NULL);
-    if (argc == 8 && wcscmp(argv[1], L"launch") == 0)
-        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 0, NULL, NULL);
-    if (argc == 8 && wcscmp(argv[1], L"launch-stop") == 0)
-        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 1, NULL, NULL);
-    if (argc == 10 && wcscmp(argv[1], L"launch-process-probe") == 0)
-        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
-            0, argv[8], argv[9]);
+    if (argc == 9 && wcscmp(argv[1], L"launch") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            0, 0, 0, NULL, NULL);
+    if (argc == 9 && (wcscmp(argv[1], L"launch-paused") == 0 ||
+        wcscmp(argv[1], L"launch-stop-paused") == 0))
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            wcscmp(argv[1], L"launch-stop-paused") == 0, 1, 0, NULL, NULL);
+    if (argc == 9 && wcscmp(argv[1], L"launch-unassigned") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            0, 0, 1, NULL, NULL);
+    if (argc == 11 && wcscmp(argv[1], L"launch-process-probe") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            0, 0, 0, argv[9], argv[10]);
     return 1;
 }

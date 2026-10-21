@@ -127,7 +127,11 @@ export async function runOwnedHttpRequest(store: SecretStore, record: RequestRec
 }
 
 export function httpAddressAllowed(address: string, literal: boolean): boolean {
-  const ip = address.toLowerCase();
+  let ip = address.toLowerCase();
+  if (isIP(ip) === 6) {
+    try { ip = new URL(`http://[${ip}]/`).hostname.slice(1, -1); }
+    catch { return false; }
+  }
   const mappedHex = ip.match(/^::ffff:([a-f0-9]{1,4}):([a-f0-9]{1,4})$/);
   if (mappedHex) {
     const hi = parseInt(mappedHex[1], 16), lo = parseInt(mappedHex[2], 16);

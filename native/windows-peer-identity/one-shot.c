@@ -32,6 +32,16 @@ static int pipe_name_ok(const wchar_t *name) {
     return 1;
 }
 
+static int job_name_ok(const wchar_t *name) {
+    const wchar_t *prefix = L"Local\\s-gw-agent-";
+    size_t prefix_size = wcslen(prefix);
+    if (wcsncmp(name, prefix, prefix_size) != 0 || wcslen(name) != prefix_size + 32) return 0;
+    for (const wchar_t *item = name + prefix_size; *item; item++) {
+        if ((*item < L'0' || *item > L'9') && (*item < L'a' || *item > L'f')) return 0;
+    }
+    return 1;
+}
+
 static int parse_luid(const wchar_t *value, LUID *result) {
     if (wcslen(value) != 16) return 0;
     unsigned long long number = 0;
@@ -121,6 +131,31 @@ static int client_is(HANDLE pipe, PSID user_sid, PSID package_sid, LUID logon, D
     return matches;
 }
 
+static int job_is_confined(HANDLE job) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+    if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation,
+        &limits, sizeof(limits), NULL)) return 0;
+    DWORD flags = limits.BasicLimitInformation.LimitFlags;
+    return (flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) &&
+        !(flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK));
+}
+
+static int client_job_membership(HANDLE pipe, HANDLE job) {
+    ULONG pid = 0;
+    if (!GetNamedPipeClientProcessId(pipe, &pid) || !pid) return -1;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!process) return -1;
+    DWORD exit_code = 0;
+    BOOL member = FALSE;
+    int checked = GetProcessId(process) == pid &&
+        WaitForSingleObject(process, 0) == WAIT_TIMEOUT &&
+        GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE &&
+        IsProcessInJob(process, job, &member);
+    CloseHandle(process);
+    if (!checked) return -1;
+    return member ? 1 : 0;
+}
+
 static int write_all(HANDLE output, const void *buffer, DWORD size) {
     const BYTE *next = buffer;
     while (size) {
@@ -144,7 +179,7 @@ static int read_all(HANDLE input, void *buffer, DWORD size) {
 }
 
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 7 || !pipe_name_ok(argv[1]) || !numeric_sid(argv[2]) ||
+    if (argc != 8 || !pipe_name_ok(argv[1]) || !job_name_ok(argv[7]) || !numeric_sid(argv[2]) ||
         !numeric_sid(argv[3]) || (wcscmp(argv[4], L"-") != 0 && !numeric_sid(argv[4]))) return 1;
 
     LUID logon;
@@ -154,12 +189,24 @@ int wmain(int argc, wchar_t **argv) {
     PSID broker_sid = NULL, user_sid = NULL, package_sid = NULL;
     PSECURITY_DESCRIPTOR descriptor = NULL;
     HANDLE pipe = INVALID_HANDLE_VALUE;
+    HANDLE job = NULL;
     int status = 1;
     if (!ConvertStringSidToSidW(argv[2], &broker_sid) ||
         !ConvertStringSidToSidW(argv[3], &user_sid)) goto done;
     if (wcscmp(argv[4], L"-") != 0 && !ConvertStringSidToSidW(argv[4], &package_sid)) goto done;
     if (!package_sid && EqualSid(broker_sid, user_sid)) goto done;
     if (!current_broker_is(broker_sid)) goto done;
+    job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, argv[7]);
+    if (!job) {
+        fputs("Registered Job unavailable.\n", stderr);
+        goto done;
+    }
+    if (!job_is_confined(job)) {
+        fputs("Registered Job lacks required limits.\n", stderr);
+        goto done;
+    }
+    CloseHandle(job);
+    job = NULL;
 
     wchar_t sddl[1024];
     int size = package_sid
@@ -187,6 +234,26 @@ int wmain(int argc, wchar_t **argv) {
     if (!ReadFile(pipe, request, sizeof(request), &request_size, NULL) ||
         request_size == 0 || request_size > MAX_MESSAGE) goto done;
     if (!client_is(pipe, user_sid, package_sid, logon, session)) goto done;
+    job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, argv[7]);
+    if (!job) {
+        fputs("Registered Job unavailable.\n", stderr);
+        goto done;
+    }
+    if (!job_is_confined(job)) {
+        fputs("Registered Job lacks required limits.\n", stderr);
+        goto done;
+    }
+    int membership = client_job_membership(pipe, job);
+    if (membership < 0) {
+        fputs("Client Job membership could not be verified.\n", stderr);
+        goto done;
+    }
+    if (membership == 0) {
+        fputs("Client outside registered Job.\n", stderr);
+        goto done;
+    }
+    CloseHandle(job);
+    job = NULL;
 
     if (!write_all(output, "Q", 1) ||
         !write_all(output, &request_size, sizeof(request_size)) ||
@@ -206,6 +273,7 @@ int wmain(int argc, wchar_t **argv) {
 
 done:
     if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+    if (job) CloseHandle(job);
     if (descriptor) LocalFree(descriptor);
     if (package_sid) LocalFree(package_sid);
     if (user_sid) LocalFree(user_sid);

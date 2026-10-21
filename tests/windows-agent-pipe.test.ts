@@ -21,6 +21,7 @@ function identity(changes: Partial<WindowsAgentPipeIdentity> = {}): WindowsAgent
     appContainerSid: "S-1-15-2-111-222-333-444",
     logonLuid: "00000000000003e7",
     windowsSessionId: 3,
+    jobName: String.raw`Local\s-gw-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
     sessionId: "windows-session-1",
     name: "Synthetic Windows agent",
     ...changes
@@ -108,7 +109,8 @@ describe("Windows named-pipe session foundation", () => {
     expect(exchange.pipeName).toMatch(/^\\\\\.\\pipe\\LOCAL\\s-gw-[a-f0-9]{32}$/);
     expect(helper.launches[0]).toEqual([
       exchange.pipeName, "S-1-5-21-100-200-300-1001", "S-1-5-21-100-200-300-1001",
-      "S-1-15-2-111-222-333-444", "00000000000003e7", "3"
+      "S-1-15-2-111-222-333-444", "00000000000003e7", "3",
+      String.raw`Local\s-gw-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
     ]);
     await exchange.completed;
     expect(onRequest).toHaveBeenCalledOnce();
@@ -122,6 +124,7 @@ describe("Windows named-pipe session foundation", () => {
     expect(() => registry.register(identity({ appContainerSid: "S-1-5-21-123" }))).toThrow("package SID");
     expect(() => registry.register(identity({ appContainerSid: undefined }))).toThrow("must differ");
     expect(() => registry.register(identity({ logonLuid: "0000000000000000" }))).toThrow("logon LUID");
+    expect(() => registry.register(identity({ jobName: "agent-chosen" }))).toThrow("launcher-owned Job");
     expect(helper.launches).toHaveLength(0);
   });
 
@@ -131,8 +134,10 @@ describe("Windows named-pipe session foundation", () => {
     expect(() => registry.register(identity({ sessionId: "new-session" }))).toThrow("already used");
     expect(() => registry.register(identity({ appContainerSid: "S-1-15-2-555-666", sessionId: "windows-session-1" })))
       .toThrow("already used");
+    expect(() => registry.register(identity({ appContainerSid: "S-1-15-2-555-666", sessionId: "second",
+      jobName: identity().jobName }))).toThrow("already used");
     const dedicated = identity({ userSid: "S-1-5-21-100-200-300-5000", appContainerSid: undefined,
-      sessionId: "dedicated" });
+      sessionId: "dedicated", jobName: String.raw`Local\s-gw-agent-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` });
     registry.register(dedicated).revoke();
     expect(() => registry.register({ ...dedicated, logonLuid: "00000000000003e8", sessionId: "dedicated-next" }))
       .toThrow("already used");

@@ -56,6 +56,9 @@ describe("owned HTTPS operations", () => {
     expect(httpAddressAllowed("::ffff:a9fe:a9fe", true)).toBe(false);
     expect(httpAddressAllowed("127.0.0.1", false)).toBe(false);
     expect(httpAddressAllowed("127.0.0.1", true)).toBe(true);
+    expect(httpAddressAllowed("0:0:0:0:0:ffff:7f00:1", false)).toBe(false);
+    expect(httpAddressAllowed("0:0:0:0:0:ffff:a00:1", false)).toBe(false);
+    expect(httpAddressAllowed("0:0:0:0:0:ffff:7f00:1", true)).toBe(true);
   });
 
   it("authenticates directly after approval, redacts echoed credentials and prevents replay", async () => {
@@ -179,6 +182,18 @@ describe("owned HTTPS operations", () => {
     const pending = await f.store.createRequest(f.handle.handle, buildHttpRequestAction({ ...f.spec, url: `https://service.example.test:${f.port}/` }), "DNS fixture");
     await f.store.approveRequest(pending.id);
     await expect(executeApprovedRequest(f.store, pending.id, { http: { ca: f.ca } })).rejects.toThrow("restricted address");
+  });
+
+  it("rejects expanded IPv4-mapped DNS answers before reaching local HTTPS", async () => {
+    let hits = 0;
+    const f = await fixture((_req, res) => { hits++; res.end("unexpected"); });
+    await f.store.allowDestination(f.handle.handle, `service.example.test:${f.port}`);
+    vi.mocked(lookup).mockResolvedValue([{ address: "0:0:0:0:0:ffff:7f00:1", family: 6 }] as never);
+    const pending = await f.store.createRequest(f.handle.handle,
+      buildHttpRequestAction({ ...f.spec, url: `https://service.example.test:${f.port}/` }), "mapped DNS fixture");
+    await f.store.approveRequest(pending.id);
+    await expect(executeApprovedRequest(f.store, pending.id, { http: { ca: f.ca } })).rejects.toThrow("restricted address");
+    expect(hits).toBe(0);
   });
 
   it("bounds an oversized response without returning a clipped credential", async () => {

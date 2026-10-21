@@ -20,6 +20,7 @@
     "sgw": "./dist/cli.js",
     "s-gw-mcp": "./dist/mcp-server.js",
     "s-gw-mcp-peer-bridge": "./dist/mcp-peer-bridge.js",
+    "s-gw-linux-managed-mcp": "./dist/linux-managed-mcp.js",
     "secret-gateway-mcp": "./dist/mcp-server.js"
   },
   "files": [

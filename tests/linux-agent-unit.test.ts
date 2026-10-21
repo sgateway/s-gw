@@ -36,6 +36,8 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `StandardError=${p.sealedStdio ? "null" : "inherit"}`,
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
+    `BindsTo=${p.supervisedControlUnit ? "s-gw-agent-control.service" : ""}`,
+    `After=${p.supervisedControlUnit ? "s-gw-agent-control.service" : ""}`,
     "DynamicUser=no", "PrivateUsers=no",
     "PrivateNetwork=yes", "PrivateIPC=yes", "PrivateTmp=yes", "ProtectSystem=strict",
     "ProtectHome=yes", "PrivateDevices=yes", "NoNewPrivileges=yes",
@@ -80,6 +82,18 @@ describe("Linux systemd agent unit plan", () => {
     expect(() => parseSystemdAgentState(p, attestation(p).replace(
       " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
     expect(args.some(arg => arg.startsWith("--property=Standard"))).toBe(false);
+  });
+
+  it("binds a fully isolated managed unit to its trusted root control service", () => {
+    const managed = { ...plan(), launchGate: true, activatedSocket: true,
+      isolatedSharedMemory: true, serializedLifecycle: true, sealedStdio: true,
+      supervisedControlUnit: true };
+    expect(systemdRunArgs(managed)).toContain("--property=BindsTo=s-gw-agent-control.service");
+    expect(systemdRunArgs(managed)).toContain("--property=After=s-gw-agent-control.service");
+    expect(parseSystemdAgentState(managed, attestation(managed)).mainPid).toBe(1234);
+    expect(() => parseSystemdAgentState(managed, attestation(managed).replace(
+      "BindsTo=s-gw-agent-control.service", "BindsTo="))).toThrow("did not attest");
+    expect(() => validateLinuxAgentPlan({ ...managed, isolatedSharedMemory: false })).toThrow();
   });
 
   it("keeps POSIX shared memory usable but private in the isolated profile", () => {

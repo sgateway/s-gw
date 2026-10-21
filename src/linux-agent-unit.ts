@@ -20,6 +20,7 @@ export interface LinuxAgentUnitPlan {
   serializedLifecycle?: boolean;
   launchAttemptFence?: boolean;
   sealedStdio?: boolean;
+  supervisedControlUnit?: boolean;
 }
 
 export interface LinuxAgentUnitState {
@@ -85,6 +86,9 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
       (plan.serializedLifecycle === true && plan.launchAttemptFence === false) ||
       (plan.sealedStdio !== undefined && typeof plan.sealedStdio !== "boolean") ||
       (plan.sealedStdio === true && plan.launchGate !== true) ||
+      (plan.supervisedControlUnit !== undefined && typeof plan.supervisedControlUnit !== "boolean") ||
+      (plan.supervisedControlUnit === true && (!plan.launchGate || !plan.activatedSocket ||
+        !plan.serializedLifecycle || !plan.sealedStdio || !plan.isolatedSharedMemory)) ||
       !Array.isArray(plan.args) || plan.args.length > 128 ||
       plan.args.some(arg => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
     throw new Error("Linux agent executable or arguments are invalid.");
@@ -111,6 +115,7 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): st
     `BindReadOnlyPaths=${bindReadOnlyPaths(plan)}`,
     ...(plan.isolatedSharedMemory ? [`TemporaryFileSystem=${privateSharedMemoryMount}`] : []),
     ...(plan.sealedStdio ? ["StandardInput=null", "StandardOutput=null", "StandardError=null"] : []),
+    ...(plan.supervisedControlUnit ? ["BindsTo=s-gw-agent-control.service", "After=s-gw-agent-control.service"] : []),
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock"
   ];
   return ["--system", "--no-ask-password", `--unit=${unit}`,
@@ -165,7 +170,8 @@ export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
     plan.rootDirectory, plan.brokerSocket, plan.executable, plan.args,
     plan.launchGate === true, plan.activatedSocket === true,
     plan.isolatedSharedMemory === true, plan.serializedLifecycle === true,
-    linuxLaunchAttemptFenceEnabled(plan), plan.sealedStdio === true]);
+    linuxLaunchAttemptFenceEnabled(plan), plan.sealedStdio === true,
+    plan.supervisedControlUnit === true]);
 }
 
 export async function stopOwnedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,
@@ -265,6 +271,8 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       !enabled("ProtectKernelTunables") || !enabled("ProtectKernelModules") ||
       !enabled("ProtectControlGroups") || !enabled("RestrictNamespaces") ||
       !enabled("RestrictSUIDSGID") || !matches("NetworkNamespacePath", "") ||
+      (plan.supervisedControlUnit && (!fields.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
+        !fields.get("After")?.split(/\s+/).includes("s-gw-agent-control.service"))) ||
       !matches("IPCNamespacePath", "") || !matches("JoinsNamespaceOf", "") ||
       !validLinuxCgroupPath(cgroup) || cgroup !== `/system.slice/${unit}` ||
       !Number.isSafeInteger(mainPid) || mainPid < 1 || !/^[a-f0-9]{32}$/.test(invocationId)) {
@@ -390,6 +398,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       "-p", "PrivateDevices", "-p", "NoNewPrivileges", "-p", "CapabilityBoundingSet",
       "-p", "AmbientCapabilities", "-p", "ProtectKernelTunables", "-p", "ProtectKernelModules",
       "-p", "ProtectControlGroups", "-p", "RestrictNamespaces", "-p", "RestrictSUIDSGID",
+      "-p", "BindsTo", "-p", "After",
       "-p", "NetworkNamespacePath", "-p", "IPCNamespacePath", "-p", "JoinsNamespaceOf",
       "-p", "ControlGroup", "-p", "MainPID", "-p", "InvocationID"]);
     if (lease && !linuxUnitOwnedByStartAttempt(plan, lease.attemptId, output)) {

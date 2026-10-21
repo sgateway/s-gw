@@ -5,7 +5,8 @@ import { createHash } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { access, lstat, readFile, realpath, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
-import { createConnection, createServer } from "node:net";
+import { createConnection, createServer, isIP } from "node:net";
+import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -35,6 +36,10 @@ function parsePlan(raw) {
     "Lease, staged-script, and broker-canary paths must be inside the acceptance fixture root.");
   requireValue(typeof plan.nodeExecutable === "string" && path.isAbsolute(plan.nodeExecutable) &&
     path.resolve(plan.nodeExecutable) === plan.nodeExecutable, "A canonical Node executable is required.");
+  if (plan.hostIpv4Probe !== undefined) {
+    requireValue(typeof plan.hostIpv4Probe === "string" && isIP(plan.hostIpv4Probe) === 4 &&
+      !plan.hostIpv4Probe.startsWith("127."), "The host IPv4 probe must use a non-loopback address.");
+  }
   requireValue(Array.isArray(plan.agents) && plan.agents.length === 2, "Exactly two agent accounts are required.");
   const uids = new Set();
   const gids = new Set();
@@ -134,6 +139,12 @@ async function preflight(plan) {
   requireValue(process.platform === "darwin" && typeof process.getuid === "function" &&
     process.getuid() !== 0, "Run the broker fixture as a non-root macOS account.");
   const brokerGroups = new Set(process.getgroups?.() ?? []);
+  if (plan.hostIpv4Probe) {
+    const addresses = Object.values(networkInterfaces()).flat();
+    requireValue(addresses.some(address => address?.family === "IPv4" &&
+      address.address === plan.hostIpv4Probe && !address.internal),
+    "The host IPv4 probe must name an active non-loopback interface on this Mac.");
+  }
   await checkedPath(fixtureRoot, "directory", 0, 0o755);
   await checkedRootParents(fixtureRoot, true);
   await checkedPath(runnerControl, "socket", process.getuid(), 0o600);
@@ -382,6 +393,8 @@ async function runBroker(plan) {
   let ipv6;
   let udp4;
   let udp6;
+  let hostIpv4Tcp;
+  let hostIpv4Udp;
   let deadlineTimer;
   function interrupted() { failed.resolve(new Error("Native acceptance was interrupted.")); }
   process.once("SIGINT", interrupted);
@@ -391,6 +404,10 @@ async function runBroker(plan) {
     ipv6 = await startLoopback("::1");
     udp4 = await startUdpLoopback("127.0.0.1");
     udp6 = await startUdpLoopback("::1");
+    if (plan.hostIpv4Probe) {
+      hostIpv4Tcp = await startLoopback(plan.hostIpv4Probe);
+      hostIpv4Udp = await startUdpLoopback(plan.hostIpv4Probe);
+    }
     for (const agent of plan.agents) {
       launchSeen.set(agent.uid, deferred());
       reports.set(agent.uid, deferred());
@@ -458,6 +475,10 @@ async function runBroker(plan) {
                 result.ownAccepted === true && result.ipv4Denied === true && result.ipv6Denied === true &&
                 result.brokerCanaryDenied === true && result.otherWorkspaceDenied === true,
               `Agent ${agent.uid} failed a native isolation probe.`);
+              if (plan.hostIpv4Probe) {
+                requireValue(result.hostIpv4Denied === true,
+                  `Agent ${agent.uid} reached the host's non-loopback IPv4 address.`);
+              }
               requireValue(!received.has(agent.uid), `Agent ${agent.uid} sent duplicate initial results.`);
               received.set(agent.uid, result);
               heldMode.add(agent.uid);
@@ -508,6 +529,7 @@ async function runBroker(plan) {
           String(other.uid), other.sessionId, agent.reportSocketPath,
           String(ipv4.port), String(ipv6.port), String(udp4.port), String(udp6.port),
           plan.brokerCanary, other.workspace,
+          ...(plan.hostIpv4Probe ? [`--host-ipv4=${plan.hostIpv4Probe},${hostIpv4Tcp.port},${hostIpv4Udp.port}`] : []),
           ...(plan.fdTransferProbe ? [i === 0 ? "send" : "recv",
             plan.fdTransferProbe.helperExecutable, plan.fdTransferProbe.rendezvousPath] : [])]
       };
@@ -541,6 +563,10 @@ async function runBroker(plan) {
     requireValue(ipv4.hits() === 0 && ipv6.hits() === 0 &&
       udp4.hits() === 0 && udp6.hits() === 0,
       "An agent reached a host-loopback listener directly.");
+    if (plan.hostIpv4Probe) {
+      requireValue(hostIpv4Tcp.hits() === 0 && hostIpv4Udp.hits() === 0,
+        "An agent reached the host's non-loopback IPv4 listener directly.");
+    }
     for (const stop of stops) stop();
     await Promise.all(plan.agents.map(async agent => {
       try {
@@ -554,6 +580,7 @@ async function runBroker(plan) {
     process.stdout.write(`${JSON.stringify({ event: "passed", uids: plan.agents.map(agent => agent.uid),
       brokerLeasesRetained: true, livePeerRevocation: true,
       hostLoopbackDenied: true, udpHostLoopbackDenied: true,
+      ...(plan.hostIpv4Probe ? { hostIpv4Denied: true } : {}),
       ...(plan.fdTransferProbe ? { crossAgentDescriptorTransferDenied: true } : {}) })}\n`);
   } finally {
     clearTimeout(deadlineTimer);
@@ -565,6 +592,8 @@ async function runBroker(plan) {
     await ipv6?.close();
     await udp4?.close();
     await udp6?.close();
+    await hostIpv4Tcp?.close();
+    await hostIpv4Udp?.close();
   }
 }
 
@@ -619,6 +648,20 @@ async function selfTestReport() {
     requireValue(udp4.hits() > 0 && udp6.hits() > 0,
       "The UDP test listeners did not record probe traffic.");
   } finally { await udp4.close(); await udp6.close(); }
+  const localIpv4 = Object.values(networkInterfaces()).flat().find(address =>
+    address?.family === "IPv4" && !address.internal);
+  if (localIpv4) {
+    const tcp = await startLoopback(localIpv4.address);
+    const udp = await startUdpLoopback(localIpv4.address);
+    try {
+      requireValue(await canConnect(localIpv4.address, tcp.port),
+        "The host IPv4 TCP control is unreachable.");
+      await sendUdpProbe(localIpv4.address, udp.port);
+      await delay(50);
+      requireValue(tcp.hits() > 0 && udp.hits() > 0,
+        "The host IPv4 test listeners did not record control traffic.");
+    } finally { await tcp.close(); await udp.close(); }
+  }
   let received;
   const server = createServer(socket => {
     void readReport(socket).then(frame => {
@@ -685,7 +728,7 @@ async function selfTestReport() {
   catch (error) { rejectedUsed = String(error).includes("used a donor-authenticated descriptor"); }
   requireValue(rejectedUsed, "A recipient that used the descriptor was accepted after a donor denial.");
   requireTransferDenial("denied", "unreachable", false);
-  process.stdout.write("Native acceptance result, held-probe framing, and UDP controls passed local round trips.\n");
+  process.stdout.write("Native acceptance result, held-probe framing, and network controls passed local round trips.\n");
 }
 
 function runTransferHelper(role, helperExecutable, rendezvousPath, reportSocket) {
@@ -706,11 +749,23 @@ function runTransferHelper(role, helperExecutable, rendezvousPath, reportSocket)
 }
 
 async function runAgent(args) {
-  requireValue(process.platform === "darwin" && (args.length === 14 || args.length === 17),
+  requireValue(process.platform === "darwin" && args.length >= 14,
     "Invalid native agent fixture arguments.");
   const [uidText, gidText, sessionId, ownSocket, otherSocket, otherUidText, otherSession,
-    reportSocket, ipv4Text, ipv6Text, udp4Text, udp6Text, brokerCanary, otherWorkspace,
-    transferRole, transferHelper, transferRendezvous] = args;
+    reportSocket, ipv4Text, ipv6Text, udp4Text, udp6Text, brokerCanary, otherWorkspace] = args;
+  const extras = args.slice(14);
+  let hostIpv4Probe;
+  if (extras[0]?.startsWith("--host-ipv4=")) {
+    const match = /^--host-ipv4=([^,]+),(\d+),(\d+)$/.exec(extras.shift());
+    requireValue(match && isIP(match[1]) === 4 && !match[1].startsWith("127."),
+      "Malformed host IPv4 probe target.");
+    hostIpv4Probe = { address: match[1], tcpPort: Number(match[2]), udpPort: Number(match[3]) };
+    requireValue(Number.isSafeInteger(hostIpv4Probe.tcpPort) && hostIpv4Probe.tcpPort > 0 &&
+      Number.isSafeInteger(hostIpv4Probe.udpPort) && hostIpv4Probe.udpPort > 0,
+    "Malformed host IPv4 probe ports.");
+  }
+  requireValue(extras.length === 0 || extras.length === 3, "Malformed optional agent fixture arguments.");
+  const [transferRole, transferHelper, transferRendezvous] = extras;
   const uid = Number(uidText);
   const gid = Number(gidText);
   const otherUid = Number(otherUidText);
@@ -741,6 +796,7 @@ async function runAgent(args) {
   const ownReply = await sendProbe(ownSocket, uid, sessionId);
   await sendUdpProbe("127.0.0.1", udp4Port);
   await sendUdpProbe("::1", udp6Port);
+  if (hostIpv4Probe) await sendUdpProbe(hostIpv4Probe.address, hostIpv4Probe.udpPort);
   let brokerCanaryDenied = false;
   let otherWorkspaceDenied = false;
   try { await readFile(brokerCanary); }
@@ -754,6 +810,7 @@ async function runAgent(args) {
     ownAccepted: ownReply === `READY-V1 ${uid} ${sessionId}\n`,
     ipv4Denied: !await canConnect("127.0.0.1", ipv4Port),
     ipv6Denied: !await canConnect("::1", ipv6Port),
+    ...(hostIpv4Probe ? { hostIpv4Denied: !await canConnect(hostIpv4Probe.address, hostIpv4Probe.tcpPort) } : {}),
     brokerCanaryDenied, otherWorkspaceDenied
   };
   await sendReport(reportSocket, result);

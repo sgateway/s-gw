@@ -9,6 +9,7 @@ const maxMessageBytes = 32 * 1024;
 const maxExchangesPerSession = 8;
 const defaultExchangeTimeoutMs = 30_000;
 const sidPattern = /^S-1-(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*)){1,15}$/;
+const jobNamePattern = /^Local\\s-gw-agent-[a-f\d]{32}$/;
 
 export interface WindowsAgentPipeIdentity {
   brokerSid: string;
@@ -16,6 +17,7 @@ export interface WindowsAgentPipeIdentity {
   appContainerSid?: string;
   logonLuid: string;
   windowsSessionId: number;
+  jobName: string;
   sessionId: string;
   name: string;
 }
@@ -47,6 +49,7 @@ interface LiveWindowsSession {
 export class WindowsAgentPipeRegistry {
   private readonly usedIdentities = new Set<string>();
   private readonly usedSessionIds = new Set<string>();
+  private readonly usedJobNames = new Set<string>();
 
   constructor(private readonly helperPath: string, private readonly startHelper: HelperStart = spawnNativeHelper,
     private readonly expectedHelperSha256?: string,
@@ -71,14 +74,16 @@ export class WindowsAgentPipeRegistry {
   } {
     validateIdentity(identity);
     const key = (identity.appContainerSid || identity.userSid).toLowerCase();
-    if (this.usedIdentities.has(key) || this.usedSessionIds.has(identity.sessionId)) {
-      throw new Error("This Windows agent identity or session was already used by this broker.");
+    if (this.usedIdentities.has(key) || this.usedSessionIds.has(identity.sessionId) ||
+        this.usedJobNames.has(identity.jobName.toLowerCase())) {
+      throw new Error("This Windows agent identity, session, or Job was already used by this broker.");
     }
     const principal = principalForVerifiedPeer(`win32:sid:${key}`, identity.name, identity.sessionId);
     const live: LiveWindowsSession = { identity: { ...identity }, principal, exchanges: new Set(), opening: 0,
       ended: false };
     this.usedIdentities.add(key);
     this.usedSessionIds.add(identity.sessionId);
+    this.usedJobNames.add(identity.jobName.toLowerCase());
     return {
       openOnce: (onRequest, timeoutMs = defaultExchangeTimeoutMs) => this.openOnce(live, onRequest, timeoutMs),
       revoke: () => {
@@ -102,7 +107,7 @@ export class WindowsAgentPipeRegistry {
     const pipeName = String.raw`\\.\pipe\LOCAL\s-gw-` + randomBytes(16).toString("hex");
     const identity = live.identity;
     const args = [pipeName, identity.brokerSid, identity.userSid, identity.appContainerSid || "-",
-      identity.logonLuid, String(identity.windowsSessionId)];
+      identity.logonLuid, String(identity.windowsSessionId), identity.jobName];
     let child: ChildProcessWithoutNullStreams;
     try {
       if (live.ended) throw new Error("Windows agent session ended.");
@@ -225,6 +230,9 @@ function validateIdentity(identity: WindowsAgentPipeIdentity): void {
   }
   if (typeof identity.name !== "string" || !identity.name.trim()) {
     throw new Error("A Windows agent session needs a display name.");
+  }
+  if (!jobNamePattern.test(identity.jobName)) {
+    throw new Error("A Windows agent session needs a launcher-owned Job name.");
   }
 }
 

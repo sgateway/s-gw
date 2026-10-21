@@ -36,6 +36,8 @@ function launch(args, executable = helper) {
   let stderr = "";
   let readyDone;
   const ready = new Promise(resolve => { readyDone = resolve; });
+  let jobReadyDone;
+  const jobReady = new Promise(resolve => { jobReadyDone = resolve; });
   let finish;
   const done = new Promise(resolve => { finish = resolve; });
   let reportPid;
@@ -44,31 +46,40 @@ function launch(args, executable = helper) {
 
   child.stdout.on("data", chunk => {
     output = Buffer.concat([output, chunk]);
-    const match = /^CHILD-PID=(\d+)\r?\n/.exec(output.toString("ascii"));
+    const report = output.toString("ascii");
+    const match = /(?:^|\n)CHILD-PID=(\d+)\r?\n/.exec(report);
     if (match) reportPid(Number(match[1]));
+    if (/JOB-READY\r?\n/.test(report)) jobReadyDone(true);
     if (output.length) readyDone(output[0] === 0x52);
   });
   child.stderr.on("data", chunk => { stderr += chunk.toString(); });
   child.once("error", error => { spawnError = error; });
   child.once("close", (code, signal) => {
     readyDone(false);
+    jobReadyDone(false);
     reportPid(null);
     finish({ code, signal, output, stderr, spawnError });
   });
-  return { child, ready, done, processPid };
+  return { child, ready, jobReady, done, processPid };
 }
 
 function pipeName() {
   return String.raw`\\.\pipe\LOCAL\s-gw-` + randomBytes(16).toString("hex");
 }
 
-async function rejectsBeforePipe(args, label) {
+function jobName() {
+  return String.raw`Local\s-gw-agent-` + randomBytes(16).toString("hex");
+}
+
+async function rejectsBeforePipe(args, label, expectedStderr) {
   const run = launch(args);
   try {
     const result = await deadline(run.done, 10_000, label);
     assert.equal(result.spawnError, undefined, `${label}: helper failed to start`);
     assert.notEqual(result.code, 0, `${label}: helper unexpectedly succeeded`);
     assert.equal(result.output.length, 0, `${label}: helper opened a pipe`);
+    if (expectedStderr) assert.equal(result.stderr.trim(), expectedStderr,
+      `${label}: helper rejected the Job for the wrong reason`);
   } finally {
     run.child.kill();
   }
@@ -129,13 +140,14 @@ function requestFrame(child) {
 }
 
 async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
-  { intruderProfile, stopJob = false } = {}) {
+  { intruderProfile, stopJob = false, sameProfileOutOfJob = false } = {}) {
   const name = pipeName();
-  const run = launch([name, brokerSid, brokerSid, profile.sid, logonLuid, sessionId]);
+  const job = jobName();
+  let run;
   const loopbackHits = { ipv4: 0, ipv6: 0 };
   const ipv4 = net.createServer(socket => { loopbackHits.ipv4++; socket.destroy(); });
   const ipv6 = net.createServer(socket => { loopbackHits.ipv6++; socket.destroy(); });
-  let client, intruder, processProbe;
+  let client, intruder, processProbe, outsider;
   try {
     for (const [server, address, family] of [[ipv4, "127.0.0.1", "ipv4"], [ipv6, "::1", "ipv6"]]) {
       await deadline(new Promise((resolveListen, rejectListen) => {
@@ -150,11 +162,18 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
       assert.equal(loopbackHits[family], 1, `The host ${family} control did not reach its listener.`);
       loopbackHits[family] = 0;
     }
+    client = launch([stopJob ? "launch-stop-paused" : "launch-paused", profile.name, name,
+      String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
+      profile.canaryPath, job], profile.executable);
+    assert.equal(await deadline(client.jobReady, 30_000, "AppContainer Job"), true,
+      "The launcher did not create and retain the Job before the pipe opened.");
+    run = launch([name, brokerSid, brokerSid, profile.sid, logonLuid, sessionId, job]);
     assert.equal(await deadline(run.ready, 30_000, "AppContainer pipe"), true,
       "The AppContainer pipe was not ready.");
     if (intruderProfile) {
       intruder = launch(["launch", intruderProfile.name, name, String(ipv4.address().port),
-        String(ipv6.address().port), intruderProfile.sharedPath, intruderProfile.canaryPath],
+        String(ipv6.address().port), intruderProfile.sharedPath, intruderProfile.canaryPath,
+        jobName()],
       intruderProfile.executable);
       const denied = await deadline(intruder.done, 35_000, "cross-agent pipe attempt");
       assert.equal(denied.spawnError, undefined, denied.spawnError?.message);
@@ -163,10 +182,27 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
         "The other AppContainer was not denied by the pipe ACL.");
       assert.equal(run.child.exitCode, null, "The other AppContainer consumed the broker's pipe instance.");
     }
+    if (sameProfileOutOfJob) {
+      outsider = launch(["launch-unassigned", profile.name, name,
+        String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
+        profile.canaryPath, job], profile.executable);
+      const [outsiderResult, denied] = await Promise.all([
+        deadline(outsider.done, 35_000, "same-profile process outside Job"),
+        deadline(run.done, 35_000, "out-of-Job pipe attempt")
+      ]);
+      assert.equal(outsiderResult.spawnError, undefined, outsiderResult.spawnError?.message);
+      assert.match(outsiderResult.output.toString(), /^OUT-OF-JOB-ATTESTED\r?\n$/,
+        "The same-profile process was not checked outside the target Job.");
+      assert.notEqual(outsiderResult.code, 0, "The process outside the Job got a broker reply.");
+      assert.equal(denied.output.toString(), "R", "The helper forwarded an out-of-Job request.");
+      assert.equal(denied.stderr.trim(), "Client outside registered Job.",
+        "The helper denied this process for a reason other than Job membership.");
+      run = launch([name, brokerSid, brokerSid, profile.sid, logonLuid, sessionId, job]);
+      assert.equal(await deadline(run.ready, 30_000, "replacement AppContainer pipe"), true,
+        "The helper could not reopen for the in-Job agent.");
+    }
     const request = requestFrame(run.child);
-    client = launch([stopJob ? "launch-stop" : "launch", profile.name, name,
-      String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
-      profile.canaryPath], profile.executable);
+    client.child.stdin.write("G");
     const forwarded = await deadline(Promise.race([
       request,
       client.done.then(result => {
@@ -184,7 +220,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
       processProbe = launch(["launch-process-probe", intruderProfile.name, name,
         String(ipv4.address().port), String(ipv6.address().port),
         intruderProfile.sharedPath, intruderProfile.canaryPath,
-        String(targetPid), String(run.child.pid)], intruderProfile.executable);
+        jobName(), String(targetPid), String(run.child.pid)], intruderProfile.executable);
       const probeResult = await deadline(processProbe.done, 35_000, "cross-agent process-handle attempt");
       assert.equal(probeResult.spawnError, undefined, probeResult.spawnError?.message);
       assert.equal(probeResult.code, 0,
@@ -220,7 +256,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
     assert.deepEqual(loopbackHits, { ipv4: 0, ipv6: 0 },
       "The AppContainer reached host loopback without a network capability.");
   } finally {
-    const processes = [processProbe, intruder, client, run].filter(Boolean);
+    const processes = [processProbe, intruder, outsider, client, run].filter(Boolean);
     for (const item of processes) item.child.kill();
     await Promise.allSettled(processes.map(item => deadline(item.done, 5_000, "fixture cleanup")));
     for (const server of [ipv4, ipv6]) {
@@ -254,19 +290,45 @@ try {
   assert.match(sessionId, /^\d+$/);
   assert.equal(isAppContainer, "0", "The CI broker must run outside an AppContainer.");
 
-  await rejectsBeforePipe([pipeName(), "S-1-1-0", brokerSid, "-", logonLuid, sessionId],
+  await rejectsBeforePipe([pipeName(), "S-1-1-0", brokerSid, "-", logonLuid, sessionId, jobName()],
     "broker SID mismatch");
-  await rejectsBeforePipe([pipeName(), brokerSid, brokerSid, "-", logonLuid, sessionId],
+  await rejectsBeforePipe([pipeName(), brokerSid, brokerSid, "-", logonLuid, sessionId, jobName()],
     "same broker and agent SID without AppContainer");
   await rejectsBeforePipe([String.raw`\\.\pipe\s-gw-` + randomBytes(16).toString("hex"),
-    brokerSid, "S-1-1-0", "-", logonLuid, sessionId], "non-local pipe name");
-  await rejectsBeforePipe([pipeName(), brokerSid, "S-1-1-0", "-", "0", sessionId],
+    brokerSid, "S-1-1-0", "-", logonLuid, sessionId, jobName()], "non-local pipe name");
+  await rejectsBeforePipe([pipeName(), brokerSid, "S-1-1-0", "-", "0", sessionId, jobName()],
     "malformed logon LUID");
+  await rejectsBeforePipe([pipeName(), brokerSid, "S-1-1-0", "-", logonLuid, sessionId,
+    "agent-chosen-job"], "malformed Job name");
+  await rejectsBeforePipe([pipeName(), brokerSid, "S-1-1-0", "-", logonLuid, sessionId,
+    jobName()], "missing launcher Job", "Registered Job unavailable.");
 
-  await rejectsClient([pipeName(), brokerSid, "S-1-1-0", "-", logonLuid, sessionId],
-    "wrong agent user SID");
-  await rejectsClient([pipeName(), brokerSid, brokerSid, "S-1-15-2-1", logonLuid, sessionId],
-    "ordinary client without the required AppContainer");
+  for (const mode of ["job-host-no-kill", "job-host-breakaway"]) {
+    const weakJob = jobName();
+    const owner = launch([mode, weakJob], appContainerFixture);
+    try {
+      assert.equal(await deadline(owner.jobReady, 10_000, mode), true,
+        `${mode}: fixture did not create a Job`);
+      await rejectsBeforePipe([pipeName(), brokerSid, "S-1-1-0", "-", logonLuid, sessionId,
+        weakJob], mode, "Registered Job lacks required limits.");
+    } finally {
+      owner.child.stdin.end();
+      await deadline(owner.done, 10_000, `${mode} cleanup`);
+    }
+  }
+
+  const emptyJob = jobName();
+  const jobHost = launch(["job-host", emptyJob], appContainerFixture);
+  try {
+    assert.equal(await deadline(jobHost.jobReady, 10_000, "empty Job host"), true);
+    await rejectsClient([pipeName(), brokerSid, "S-1-1-0", "-", logonLuid, sessionId,
+      emptyJob], "wrong agent user SID");
+    await rejectsClient([pipeName(), brokerSid, brokerSid, "S-1-15-2-1", logonLuid, sessionId,
+      emptyJob], "ordinary client without the required AppContainer");
+  } finally {
+    jobHost.child.stdin.end();
+    await deadline(jobHost.done, 10_000, "empty Job cleanup");
+  }
 
   const profiles = [];
   try {
@@ -300,7 +362,7 @@ try {
     }
     assert.notEqual(profiles[0].sid, profiles[1].sid, "The two agents need distinct package identities.");
     await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
-      { intruderProfile: profiles[1] });
+      { intruderProfile: profiles[1], sameProfileOutOfJob: true });
     await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
       { intruderProfile: profiles[0] });
     await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { stopJob: true });
@@ -316,7 +378,7 @@ try {
       assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
     }
   }
-  console.log("Native Windows two-agent pipe, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
+  console.log("Native Windows two-agent pipe, same-profile out-of-Job denial, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }
