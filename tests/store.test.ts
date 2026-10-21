@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
+import { buildHttpRequestAction, SGW_HTTP_COMMAND } from "../src/http-action.js";
 import { tokenForHandle } from "../src/scanner.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
 import { assertActionAllowed, SecretStore } from "../src/store.js";
@@ -3702,6 +3703,51 @@ describe("SecretStore", () => {
     const operatorRequest = await store.createRequest(secret.handle, action, "operator claim", peer);
     await store.approveRequest(operatorRequest.id);
     expect((await executeApprovedRequest(store, operatorRequest.id, { engine: "typescript" })).stdout).toBe("claimed");
+  });
+
+  it("keeps ordinary owned HTTPS and managed SSH approvals for the operator until a verified session requests them", async () => {
+    const store = new SecretStore();
+    const httpSecret = await store.addSecret({ name: "claim HTTPS token", type: "api-token", value: "synthetic-http-token",
+      policy: { allowedCommands: [SGW_HTTP_COMMAND], allowedDestinations: ["example.test:443"] } });
+    const ordinary = { mcpClientName: "Codex", env: {} };
+    const otherClient = { mcpClientName: "Claude", env: {} };
+    const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
+    const http = await store.createRequest(httpSecret.handle, buildHttpRequestAction({
+      url: "https://example.test/operation", method: "GET", headers: {}, auth: { kind: "bearer" }
+    }), "ordinary HTTPS", ordinary);
+    await store.approveRequest(http.id);
+
+    for (const caller of [ordinary, otherClient, verified]) {
+      await expect(store.claimApprovedRequest(http.id, caller)).rejects.toThrow(/verified agent/);
+      expect((await store.getRequest(http.id)).state).toBe("approved");
+    }
+    expect((await store.claimApprovedRequest(http.id)).state).toBe("executing");
+    await store.markFailed(http.id, "synthetic operator fixture complete");
+
+    const sshSecret = await store.addSecret({ name: "claim SSH key", type: "ssh-key", value: "synthetic-ssh-key",
+      policy: { allowedCommands: [SGW_SSH_SESSION_COMMAND] } });
+    const keyType = Buffer.from("ssh-ed25519");
+    const keyBytes = Buffer.alloc(32, 7);
+    const len = (size: number) => { const out = Buffer.alloc(4); out.writeUInt32BE(size); return out; };
+    const route = await store.addManagedSshRoute({ name: "Claim route", host: "example.test", user: "tester", port: 22,
+      hostPublicKey: `ssh-ed25519 ${Buffer.concat([len(keyType.length), keyType, len(keyBytes.length), keyBytes]).toString("base64")}` });
+    const ssh = await store.createManagedSshRequest(sshSecret.handle, route.id,
+      { injectEnv: "SGW_SSH_CREDENTIAL", args: ["id"] }, "ordinary managed SSH", ordinary);
+    await store.approveRequest(ssh.id);
+    for (const caller of [ordinary, otherClient, verified]) {
+      await expect(store.claimApprovedRequest(ssh.id, caller)).rejects.toThrow(/verified agent/);
+      expect((await store.getRequest(ssh.id)).state).toBe("approved");
+    }
+    expect((await store.claimApprovedRequest(ssh.id)).state).toBe("executing");
+    await store.markFailed(ssh.id, "synthetic operator fixture complete");
+
+    const noSession = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex"), env: {} };
+    const managedHttp = await store.createRequest(httpSecret.handle, buildHttpRequestAction({
+      url: "https://example.test/operation", method: "GET", headers: {}, auth: { kind: "bearer" }
+    }), "missing verified session", noSession);
+    await store.approveRequest(managedHttp.id);
+    await expect(store.claimApprovedRequest(managedHttp.id, noSession)).rejects.toThrow(/different verified agent or session/);
+    expect((await store.getRequest(managedHttp.id)).state).toBe("approved");
   });
 
   it("rechecks a managed reusable permit against the peer before launch", async () => {

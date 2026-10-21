@@ -294,6 +294,40 @@ describe("MCP end-to-end flow", () => {
     }
   }, 30_000);
 
+  it("does not let either ordinary MCP client claim a manually approved owned HTTPS request", async () => {
+    runCli(["init"]);
+    const secret = JSON.parse(runCli([
+      "secret", "add", "--name", "owned HTTPS claim fixture", "--type", "api-token", "--value-stdin",
+      "--allow-command", "s-gw:https-request", "--allow-destination", "example.test:443"
+    ], "synthetic-owned-http-token"));
+    const clients: Client[] = [];
+    try {
+      for (const name of ["Codex", "Claude"]) {
+        const transport = new StdioClientTransport({
+          command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+          env: testEnv as Record<string, string>, stderr: "pipe"
+        });
+        const client = new Client({ name, version: "0.0.1" });
+        await client.connect(transport);
+        clients.push(client);
+      }
+      const pending = await clients[0].callTool({ name: "sgw_request_http", arguments: {
+        handle: secret.handle, url: "https://example.test/operation", auth: { kind: "bearer" }
+      } });
+      const request = JSON.parse(pending.content[0].text).request;
+      expect(request).toMatchObject({ state: "pending", agentSource: "mcp-client" });
+      runCli(["approve", request.id]);
+
+      for (const client of clients) {
+        const denied = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+        expect(denied.isError).toBe(true);
+        expect(denied.content[0].text).toMatch(/verified agent principal and session/);
+      }
+    } finally {
+      await Promise.all(clients.map(client => client.close()));
+    }
+  }, 30_000);
+
   it("does not let ordinary MCP execute a managed request ID", async () => {
     runCli(["init"]);
     const secret = JSON.parse(runCli([

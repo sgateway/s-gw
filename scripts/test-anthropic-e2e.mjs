@@ -151,6 +151,21 @@ try {
   const runCli = (args, value) => JSON.parse(run(process.execPath, [cli, ...args], {
     cwd: workspace, input: value, env: { ...env, SGW_ALLOW_NONINTERACTIVE_OPERATOR: '1' }
   }));
+  const executeCli = id => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, 'execute', id], {
+      cwd: workspace, env: { ...env, SGW_ALLOW_NONINTERACTIVE_OPERATOR: '1' }, stdio: ['ignore', 'pipe', 'pipe']
+    });
+    children.add(child);
+    let stdout = '', stderr = '';
+    child.stdout.on('data', data => stdout += data);
+    child.stderr.on('data', data => stderr += data);
+    child.once('error', reject);
+    child.once('close', code => {
+      children.delete(child);
+      if (code !== 0) { reject(new Error(stderr || stdout || `Operator execution exited ${code}`)); return; }
+      try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
+    });
+  });
   runCli(['init']);
   const keyFile = path.join(storeHome, 'server.key'), certFile = path.join(storeHome, 'server.crt');
   run('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', keyFile, '-out', certFile,
@@ -188,11 +203,9 @@ try {
   });
   await new Promise(resolve => ssh.listen(0, '127.0.0.1', resolve));
   const sshPort = ssh.address().port;
-  const knownHosts = path.join(storeHome, 'known_hosts');
-  await writeFile(knownHosts, `[127.0.0.1]:${sshPort} ssh-rsa ${utils.parseKey(hostKey).getPublicSSH().toString('base64')}\n`);
-  const helper = path.join(storeHome, 'ssh.cjs');
-  await writeFile(helper, `#!${process.execPath}\nconst {spawnSync}=require('node:child_process'); const result=spawnSync('/usr/bin/ssh',['-F','/dev/null','-o',${JSON.stringify(`UserKnownHostsFile=${knownHosts}`)},...process.argv.slice(2)],{stdio:'inherit'}); process.exit(result.status ?? 1);\n`, { mode: 0o700 });
-  env.SGW_SSH_CLI = helper;
+  const sshRoute = runCli(['ssh', 'route', 'add', '--name', 'package-e2e', '--host', '127.0.0.1',
+    '--user', 'fixture', '--port', String(sshPort),
+    '--host-public-key', `ssh-rsa ${utils.parseKey(hostKey).getPublicSSH().toString('base64')}`]);
   if (strictIsolatedAuth) {
     const agentCa = path.join(root, 'agent-ca.pem');
     await copyFile(certFile, agentCa);
@@ -207,7 +220,7 @@ try {
   consoleServer = await startConsoleServer({ port: 0 });
   assert.equal((await fetch(consoleServer.url)).status, 200);
   const deniedConsole = await fetch(new URL('api/state', consoleServer.url)); assert.equal(deniedConsole.status, 403);
-  await writeFile(path.join(workspace, 'fixture.json'), JSON.stringify({ storeHome, url, sshPort, consoleUrl: consoleServer.url,
+  await writeFile(path.join(workspace, 'fixture.json'), JSON.stringify({ storeHome, url, sshPort, sshRouteId: sshRoute.id, consoleUrl: consoleServer.url,
     syntheticAuthPath, isolatedAuth }));
   const probe = path.join(root, 'agent.mjs'); await copyFile(path.join(repo, 'tests', 'fixtures', 'anthropic-e2e-agent.mjs'), probe);
   function launch() {
@@ -238,11 +251,23 @@ try {
   assert.equal(approved.approvalGrantId, undefined);
   await api(`api/requests/${pending.ssh}/approve`, { mode: 'per-transaction', agentScope: 'same-agent' });
   await writeFile(path.join(workspace, 'approved'), 'synthetic operator approved');
+  const deniedClaims = await waitFor(() => jsonFile('claims-denied.json'), 'ordinary MCP claim denial');
+  assert.equal(deniedClaims.http, pending.http); assert.equal(deniedClaims.ssh, pending.ssh);
+  assert.equal(httpHits, 0); assert.equal(sshAuthentications, 0);
+  const httpResult = await executeCli(pending.http);
+  const sshResult = await executeCli(pending.ssh);
+  assert.equal(httpResult.exitCode, 0); assert.equal(sshResult.exitCode, 0);
+  await writeFile(path.join(workspace, 'operator-results.json'), JSON.stringify({ http: httpResult, ssh: sshResult }));
   const repeat = await waitFor(() => jsonFile('repeat-pending.json'), 'repeat HTTPS request');
   assert.equal(repeat.state, 'pending');
   assert.equal(httpHits, 1);
   await api(`api/requests/${repeat.id}/approve`, { mode: 'per-transaction', agentScope: 'same-agent' });
   await writeFile(path.join(workspace, 'repeat-approved'), 'synthetic operator approved repeat');
+  const repeatDenied = await waitFor(() => jsonFile('repeat-claim-denied.json'), 'repeat ordinary MCP claim denial');
+  assert.equal(repeatDenied.id, repeat.id); assert.equal(httpHits, 1);
+  const repeatResult = await executeCli(repeat.id);
+  assert.equal(repeatResult.exitCode, 0);
+  await writeFile(path.join(workspace, 'repeat-operator-result.json'), JSON.stringify(repeatResult));
   const result = await Promise.race([first.completion, new Promise((_resolve, reject) => { const timer = setTimeout(() => reject(new Error('E2E launcher timed out')), 30000); timer.unref(); })]);
   assert.equal(result.code, 0, result.output);
   assert.equal(httpHits, 2); assert.equal(sshAuthentications, 1); assert.deepEqual(commands, ['hostname']);
@@ -256,7 +281,7 @@ try {
   await api(`api/requests/${next.id}/deny`, {});
   await closedSession(); assert.equal(httpHits, 2);
   if (realAgent) {
-    const prompt = `This is a bounded s-gw integration test. Use only the s-gw MCP tools. List handles and find HTTPS package E2E. Request one HTTPS GET to ${url}, auth kind bearer, with no extra headers or body. Execute that request after local approval. Approval is handled by the test operator outside this process; if execution initially reports pending, retry the same request ID up to five times. Do not fetch or read any credential. Return REAL_AGENT_E2E_PASS only when the executed result has exitCode 0 and contains HTTPS package E2E success. Do not use any other services or tools.`;
+    const prompt = `This is a bounded s-gw integration test. Use only the s-gw MCP tools. List handles and find HTTPS package E2E. Request one HTTPS GET to ${url}, auth kind bearer, with no extra headers or body. The test operator will approve and execute the request outside this process. Do not fetch or read any credential. Return REAL_AGENT_E2E_PASS only after the request tool reports a pending approval request. Do not use any other services or tools.`;
     const command = realAgent === 'codex' ? (oldEnv.SGW_E2E_CODEX || 'codex') : (oldEnv.SGW_E2E_CLAUDE || 'claude');
     const args = realAgent === 'codex'
       ? ['exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', 'danger-full-access', '--config', `sqlite_home=${JSON.stringify(path.join(workspace, 'codex-state'))}`, '--config', `log_dir=${JSON.stringify(path.join(workspace, 'codex-log'))}`, '--json', prompt]
@@ -294,6 +319,9 @@ try {
     }, `${realAgent} live MCP operation`, 120000);
     assert.equal(code, 0, output); assert(approvedId, output);
     assert.match(output, /REAL_AGENT_E2E_PASS/);
+    const realSummary = await executeCli(approvedId);
+    assert.equal(realSummary.exitCode, 0);
+    assert.match(realSummary.stdout, /HTTPS package E2E success/);
     assert.equal((await api('api/state')).requests.find(request => request.id === approvedId).state, 'executed');
     assert.equal(httpHits, 3);
     for (const value of values) assert(!output.includes(value));
@@ -303,6 +331,7 @@ try {
   for (const value of values) assert(!JSON.stringify(finalState).includes(value));
   console.log(JSON.stringify({ packageInstalled: true, ordinaryMcp: true, legacyEnvExecution: true, compiledLauncher: true, realHttps: true, realOpenSsh: true,
     consoleApproval: true, pendingDenied: true, changedActionDenied: true, replayDenied: true,
+    unverifiedManualOwnedClaimsDenied: true, operatorOwnedExecution: true,
     unverifiedRepeatRequiresManualApproval: true, freshRunStillPending: true, credentialsRedacted: true, cleanup: true,
     cgroupRequired: process.platform === 'linux' && process.argv.includes('--require-cgroup'), isolatedAuth,
     unknownInheritedEnvDenied: isolatedAuth,

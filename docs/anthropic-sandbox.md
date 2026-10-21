@@ -12,7 +12,7 @@ The existing builtin guard is still the default. macOS and Linux use Anthropic s
 
 ## Credential-backed actions
 
-The sandbox MCP connection exposes handle metadata, HTTPS requests, SSH requests, SSH uploads, and approved execution. It does not expose scanning, raw secret reads, or generic credential-bearing commands. Ordinary MCP retains its existing tools.
+The sandbox MCP connection exposes handle metadata, HTTPS requests, SSH requests, SSH uploads, and approved execution. It does not expose scanning, raw secret reads, or generic credential-bearing commands. Ordinary MCP retains its existing tools. The current same-user launcher gives this MCP connection only a declared client name. It can submit owned HTTPS and managed SSH requests, but it cannot execute them after approval; the operator CLI/UI must execute those requests and return only sanitized results. Agent execution of those actions requires the separate verified MCP endpoint with a matching OS principal and session. This changes the earlier request-and-execute flow for ordinary MCP clients; target-based SSH keeps its current behavior.
 
 For HTTPS, allow the exact destination and the owned executor on an existing handle through the trusted operator CLI:
 
@@ -49,6 +49,6 @@ Sandbox launch manifests and MCP configuration now live in a private per-user se
 
 ## Validation
 
-`npm run test:anthropic-e2e` installs a fresh packed package into a disposable home and exercises ordinary MCP compatibility, confinement, approval, HTTPS authentication, SSH authentication, output sanitization, and cleanup. The isolated-auth lanes also require that short values in an unknown `npm_config_*` field and an unrelated inherited variable are absent from the agent environment. `--real-agent codex` uses a native Codex session. Synthetic credentials and test homes are isolated from the live store.
+`npm run test:anthropic-e2e` installs a fresh packed package into a disposable home and exercises ordinary MCP compatibility, confinement, manual claim denial, operator execution, HTTPS authentication, managed SSH authentication, output sanitization, and cleanup. The isolated-auth lanes also require that short values in an unknown `npm_config_*` field and an unrelated inherited variable are absent from the agent environment. `--real-agent codex` uses a native Codex session to submit a request that the test operator approves and executes. Synthetic credentials and test homes are isolated from the live store.
 
 For the strict lane, the Node binary running the test must also be outside the native account home. If the usual `node` lives there, run `node scripts/test-anthropic-e2e.mjs --strict-isolated-auth` with an independently installed Node binary outside that home.

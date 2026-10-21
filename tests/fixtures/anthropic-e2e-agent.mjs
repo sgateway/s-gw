@@ -33,9 +33,10 @@ async function call(name, args = {}) {
   assert(!result.isError, JSON.stringify(result));
   return JSON.parse(result.content[0].text);
 }
-async function cannotExecute(id) {
+async function cannotExecute(id, expected) {
   const result = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: id } });
   assert.equal(result.isError, true);
+  if (expected) assert.match(result.content[0].text, expected);
 }
 try {
   await client.connect(transport);
@@ -54,8 +55,9 @@ try {
     const changed = (await call('sgw_request_http', { ...input, method: 'POST', body: 'unapproved mutation' })).request;
     const ssh = (await call('sgw_request_ssh_session', {
       handle: handles.find(item => item.name === 'SSH package E2E').handle,
-      target: 'fixture@127.0.0.1', port: fixture.sshPort, args: ['hostname']
+      routeId: fixture.sshRouteId, args: ['hostname']
     })).request;
+    assert.equal(ssh.action.ssh.managedRouteId, fixture.sshRouteId);
     await cannotExecute(ssh.id);
     writeFileSync('pending.json', JSON.stringify({ http: first.id, ssh: ssh.id, changed: changed.id }));
     const deadline = Date.now() + 30000;
@@ -64,7 +66,14 @@ try {
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     await cannotExecute(changed.id);
-    const httpResult = await call('sgw_execute_request', { requestId: first.id });
+    await cannotExecute(first.id, /verified agent principal and session/);
+    await cannotExecute(ssh.id, /verified agent principal and session/);
+    writeFileSync('claims-denied.json', JSON.stringify({ http: first.id, ssh: ssh.id }));
+    while (!existsSync('operator-results.json')) {
+      if (Date.now() > deadline) throw new Error('E2E operator execution timed out');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const { http: httpResult, ssh: sshResult } = JSON.parse(readFileSync('operator-results.json', 'utf8'));
     assert.equal(httpResult.exitCode, 0);
     assert.match(httpResult.stdout, /HTTPS package E2E success/);
     assert.match(httpResult.stdout, /SGW_RESPONSE_CREDENTIAL_WITHHELD/);
@@ -77,12 +86,18 @@ try {
       if (Date.now() > deadline) throw new Error('E2E repeat approval timed out');
       await new Promise(resolve => setTimeout(resolve, 50));
     }
-    assert.equal((await call('sgw_execute_request', { requestId: repeat.id })).exitCode, 0);
-    const sshResult = await call('sgw_execute_request', { requestId: ssh.id });
+    await cannotExecute(repeat.id, /verified agent principal and session/);
+    writeFileSync('repeat-claim-denied.json', JSON.stringify({ id: repeat.id }));
+    while (!existsSync('repeat-operator-result.json')) {
+      if (Date.now() > deadline) throw new Error('E2E repeat operator execution timed out');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const repeatResult = JSON.parse(readFileSync('repeat-operator-result.json', 'utf8'));
+    assert.equal(repeatResult.exitCode, 0);
     assert.equal(sshResult.exitCode, 0);
     assert.match(sshResult.stdout, /SSH package E2E success/);
     assert.match(sshResult.stdout, /SGW_SECRET/);
     await cannotExecute(ssh.id);
-    writeFileSync('results.json', JSON.stringify({ http: httpResult, ssh: sshResult, repeat: repeat.id }));
+    writeFileSync('results.json', JSON.stringify({ http: httpResult, ssh: sshResult, repeat: repeatResult }));
   }
 } finally { await client.close(); }
