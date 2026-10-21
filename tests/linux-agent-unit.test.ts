@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { linuxAgentUnitName, parseSystemdAgentState, systemdRunArgs, validateLinuxAgentPlan,
+import { linuxAgentUnitName, linuxProcessGroupsAreDedicated, parseSystemdAgentState, systemdRunArgs, validateLinuxAgentPlan,
   type LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
 
 function plan(): LinuxAgentUnitPlan {
@@ -14,7 +14,7 @@ function plan(): LinuxAgentUnitPlan {
 function attestation(p: LinuxAgentUnitPlan): string {
   return [
     `Id=${linuxAgentUnitName(p.sessionId)}`, "ActiveState=active", "Type=exec",
-    `User=${p.uid}`, `Group=${p.gid}`,
+    `User=${p.uid}`, `Group=${p.gid}`, "SupplementaryGroups=",
     `RootDirectory=${p.rootDirectory}`, "WorkingDirectory=/workspace",
     `BindReadOnlyPaths=${p.brokerSocket}:/run/s-gw/broker.sock`, "BindPaths=",
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
@@ -70,6 +70,7 @@ describe("Linux systemd agent unit plan", () => {
       ["PrivateNetwork=yes", "PrivateNetwork=no"],
       ["PrivateIPC=yes", "PrivateIPC=no"],
       ["User=231001", "User=1000"],
+      ["SupplementaryGroups=\n", "SupplementaryGroups=docker\n"],
       ["RootDirectory=/var/lib/s-gw/agent-roots/session-123", "RootDirectory=/"],
       ["ControlGroup=/system.slice/s-gw-agent-session-123.service", "ControlGroup=/system.slice/other.service"],
       ["Restart=no", "Restart=always"],
@@ -82,5 +83,12 @@ describe("Linux systemd agent unit plan", () => {
       expect(() => parseSystemdAgentState(p, good.replace(before, after))).toThrow("did not attest");
     }
     expect(() => parseSystemdAgentState(p, good + "User=231001\n")).toThrow("Duplicate");
+  });
+
+  it("rejects an agent process with an unintended supplementary group", () => {
+    expect(linuxProcessGroupsAreDedicated("Groups:\t231001\n", 231001)).toBe(true);
+    expect(linuxProcessGroupsAreDedicated("Groups:\t\n", 231001)).toBe(true);
+    expect(linuxProcessGroupsAreDedicated("Groups:\t231001 998\n", 231001)).toBe(false);
+    expect(linuxProcessGroupsAreDedicated("Uid:\t231001\n", 231001)).toBe(false);
   });
 });

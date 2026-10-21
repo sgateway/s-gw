@@ -129,6 +129,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   const server = createServer(socket => {
     if (pending.size >= maxPendingConnections) { socket.destroy(); return; }
     socket.pause();
+    socket.on("error", () => socket.destroy());
     sockets.add(socket);
     pending.add(socket);
     socket.setTimeout(idleTimeoutMs, () => socket.destroy());

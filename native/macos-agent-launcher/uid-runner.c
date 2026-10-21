@@ -207,7 +207,8 @@ static void child_exec(uid_t uid, gid_t gid, const char *session, const char *wo
     if (connect(probe, (struct sockaddr *)&broker, sizeof(broker))) _exit(126);
     char request[128], expected[128], response[128];
     int length = snprintf(request, sizeof(request), "HELLO-V1 %u %s\n", uid, session);
-    if (length < 1 || length >= (int)sizeof(request) || write(probe, request, (size_t)length) != length) _exit(126);
+    if (length < 1 || length >= (int)sizeof(request) || write(probe, request, (size_t)length) != length ||
+        shutdown(probe, SHUT_WR)) _exit(126);
     struct pollfd poll_fd = { .fd = probe, .events = POLLIN };
     if (poll(&poll_fd, 1, 1500) != 1 || !(poll_fd.revents & POLLIN)) _exit(126);
     ssize_t received = read(probe, response, sizeof(response) - 1);

@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { decryptSecret, encryptSecret, fingerprintSecret, shortId } from "./crypto.js";
+import { decryptSecret, encryptSecret, fingerprintSecret, requirePassphrase, shortId } from "./crypto.js";
 import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
 import { isAbsoluteCommand, resolveCommandExecutable, verifyPinnedCommand } from "./command-path.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
@@ -373,8 +373,9 @@ export class SecretStore {
       throw new Error("Cannot add an empty secret.");
     }
 
+    const passphrase = requirePassphrase();
     return this.mutate(async (store) => {
-      const fingerprint = fingerprintSecret(input.value);
+      const fingerprint = fingerprintSecret(input.value, passphrase);
       const now = new Date().toISOString();
       const existing = store.secrets.find((secret) => secret.fingerprint === fingerprint);
       if (existing) {
@@ -405,7 +406,7 @@ export class SecretStore {
         updatedAt: now,
         source: input.source,
         fingerprint,
-        encrypted: encryptSecret(input.value),
+        encrypted: encryptSecret(input.value, passphrase),
         policy: normalizePolicy(input.policy)
       };
 
@@ -420,8 +421,9 @@ export class SecretStore {
       throw new Error("Cannot add an empty secret.");
     }
 
+    const passphrase = requirePassphrase();
     return this.mutate(async (store) => {
-      const fingerprint = fingerprintSecret(input.value);
+      const fingerprint = fingerprintSecret(input.value, passphrase);
       const now = new Date().toISOString();
       const existing = store.secrets.find((secret) => secret.fingerprint === fingerprint);
       const handle = existing?.handle || makeHandle(input.type);
@@ -433,7 +435,7 @@ export class SecretStore {
 
       setMacKeychainItem(ref, input.value);
 
-      const encryptedRef = encryptSecret(JSON.stringify(keychainRefPayload(ref)));
+      const encryptedRef = encryptSecret(JSON.stringify(keychainRefPayload(ref)), passphrase);
       if (existing) {
         existing.updatedAt = now;
         existing.name = input.name || existing.name;
@@ -476,8 +478,9 @@ export class SecretStore {
 
   async addOnePasswordReference(input: AddOnePasswordReferenceInput): Promise<SecretRecord> {
     const reference = normalizeOnePasswordReference(input.reference);
+    const passphrase = requirePassphrase();
     return this.mutate(async (store) => {
-      const fingerprint = fingerprintSecret(`onepassword:${reference}`);
+      const fingerprint = fingerprintSecret(`onepassword:${reference}`, passphrase);
       const now = new Date().toISOString();
       const existing = store.secrets.find((secret) => secret.fingerprint === fingerprint);
       if (existing) {
@@ -504,7 +507,7 @@ export class SecretStore {
         updatedAt: now,
         source: input.source || "onepassword",
         fingerprint,
-        encrypted: encryptSecret(reference),
+        encrypted: encryptSecret(reference, passphrase),
         policy: normalizePolicy(input.policy)
       };
 
@@ -651,6 +654,7 @@ export class SecretStore {
       return;
     }
 
+    const passphrase = requirePassphrase();
     await this.mutate((store) => {
       const now = new Date().toISOString();
       pruneExpiredApprovalGrants(store, now);
@@ -678,8 +682,8 @@ export class SecretStore {
         existing?.approvalPolicyRuleId === approvalPolicyRuleId;
       secret.cache = {
         backend: "onepassword",
-        encrypted: encryptSecret(value),
-        fingerprint: fingerprintSecret(`onepassword-cache:${value}`),
+        encrypted: encryptSecret(value, passphrase),
+        fingerprint: fingerprintSecret(`onepassword-cache:${value}`, passphrase),
         approvalGrantId,
         approvalPolicyRuleId,
         createdAt: sameAuthority && existing ? existing.createdAt : now,
@@ -693,60 +697,73 @@ export class SecretStore {
   }
 
   async deleteSecret(handle: string): Promise<DeleteSecretResult> {
-    return this.mutate((store) => {
-      const index = store.secrets.findIndex((secret) => secret.handle === handle);
-      if (index < 0) {
-        throw new Error(`Unknown secret handle: ${handle}`);
+    const retry = new Error("Credential changed during Keychain deletion; retry the operation.");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = await this.getSecretRecord(handle);
+      const keychainRef = before.backend === "keychain" ? keychainRefFromRecord(before) : undefined;
+      try {
+        return await this.mutate((store) => {
+          const index = store.secrets.findIndex((secret) => secret.handle === handle);
+          if (index < 0) {
+            throw new Error(`Unknown secret handle: ${handle}`);
+          }
+
+          const deleted = store.secrets[index];
+          if (deleted.backend === "keychain") {
+            if (!keychainRef || JSON.stringify(deleted.encrypted) !== JSON.stringify(before.encrypted)) {
+              throw retry;
+            }
+            deleteMacKeychainItem(keychainRef);
+          }
+          store.secrets.splice(index, 1);
+
+          const beforeGrants = store.approvalGrants.length;
+          const beforePolicies = (store.approvalPolicyRules || []).length;
+          const requestsById = new Map(store.requests.map((request) => [request.id, request]));
+          store.approvalGrants = store.approvalGrants.filter((grant) => {
+            if (grant.handle === handle) {
+              return false;
+            }
+
+            const request = grant.lastRequestId ? requestsById.get(grant.lastRequestId) : undefined;
+            return !request || !requestReferencesHandle(request, handle);
+          });
+          store.approvalPolicyRules = (store.approvalPolicyRules || []).filter((rule) => {
+            return !(rule.conditions.handles || []).includes(handle) &&
+              !(rule.conditions.envBindings || []).some((binding) => binding.handle === handle);
+          });
+          clearOnePasswordPolicyCaches(store);
+
+          const now = new Date().toISOString();
+          const failedRequests: RequestRecord[] = [];
+          for (const request of store.requests) {
+            if (!requestReferencesHandle(request, handle) || isTerminalRequestState(request.state)) {
+              continue;
+            }
+
+            request.state = "failed";
+            request.updatedAt = now;
+            request.error = "Credential handle was deleted before the request completed.";
+            failedRequests.push(request);
+            store.audit.push(
+              audit("request.failed", `Request ${request.id} failed because credential ${handle} was deleted.`, handle, request.id)
+            );
+          }
+
+          store.audit.push(audit("secret.deleted", `Deleted credential handle for ${deleted.name}.`, handle));
+          return {
+            handle,
+            name: deleted.name,
+            revokedApprovalGrants: beforeGrants - store.approvalGrants.length,
+            revokedApprovalPolicies: beforePolicies - store.approvalPolicyRules.length,
+            failedRequests
+          };
+        });
+      } catch (error) {
+        if (error !== retry) throw error;
       }
-
-      const deleted = store.secrets[index];
-      if (deleted.backend === "keychain") {
-        deleteMacKeychainItem(keychainRefFromRecord(deleted));
-      }
-      store.secrets.splice(index, 1);
-
-      const beforeGrants = store.approvalGrants.length;
-      const beforePolicies = (store.approvalPolicyRules || []).length;
-      const requestsById = new Map(store.requests.map((request) => [request.id, request]));
-      store.approvalGrants = store.approvalGrants.filter((grant) => {
-        if (grant.handle === handle) {
-          return false;
-        }
-
-        const request = grant.lastRequestId ? requestsById.get(grant.lastRequestId) : undefined;
-        return !request || !requestReferencesHandle(request, handle);
-      });
-      store.approvalPolicyRules = (store.approvalPolicyRules || []).filter((rule) => {
-        return !(rule.conditions.handles || []).includes(handle) &&
-          !(rule.conditions.envBindings || []).some((binding) => binding.handle === handle);
-      });
-      clearOnePasswordPolicyCaches(store);
-
-      const now = new Date().toISOString();
-      const failedRequests: RequestRecord[] = [];
-      for (const request of store.requests) {
-        if (!requestReferencesHandle(request, handle) || isTerminalRequestState(request.state)) {
-          continue;
-        }
-
-        request.state = "failed";
-        request.updatedAt = now;
-        request.error = "Credential handle was deleted before the request completed.";
-        failedRequests.push(request);
-        store.audit.push(
-          audit("request.failed", `Request ${request.id} failed because credential ${handle} was deleted.`, handle, request.id)
-        );
-      }
-
-      store.audit.push(audit("secret.deleted", `Deleted credential handle for ${deleted.name}.`, handle));
-      return {
-        handle,
-        name: deleted.name,
-        revokedApprovalGrants: beforeGrants - store.approvalGrants.length,
-        revokedApprovalPolicies: beforePolicies - store.approvalPolicyRules.length,
-        failedRequests
-      };
-    });
+    }
+    throw retry;
   }
 
   async getApprovalSettings(): Promise<ApprovalSettings> {

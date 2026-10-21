@@ -19,10 +19,10 @@ function deriveKey(passphrase: string, salt: Buffer): Buffer {
   return scryptSync(passphrase, salt, keyLen);
 }
 
-export function encryptSecret(plainText: string): EncryptedBox {
+export function encryptSecret(plainText: string, passphrase = requirePassphrase()): EncryptedBox {
   const salt = randomBytes(16);
   const iv = randomBytes(12);
-  const key = deriveKey(requirePassphrase(), salt);
+  const key = deriveKey(passphrase, salt);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ciphertext = Buffer.concat([cipher.update(plainText, "utf8"), cipher.final()]);
 
@@ -56,8 +56,7 @@ export function decryptSecret(box: EncryptedBox): string {
   return plain.toString("utf8");
 }
 
-export function fingerprintSecret(value: string): string {
-  const passphrase = requirePassphrase();
+export function fingerprintSecret(value: string, passphrase = requirePassphrase()): string {
   const fpKey = createHash("sha256")
     .update("s-gw-fingerprint-v1:")
     .update(passphrase)

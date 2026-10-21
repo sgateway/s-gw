@@ -102,6 +102,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
   const invocationId = fields.get("InvocationID") || "";
   if (!matches("Id", unit) || !matches("ActiveState", "active") || !matches("Type", "exec") ||
       !matches("User", String(plan.uid)) || !matches("Group", String(plan.gid)) ||
+      !matches("SupplementaryGroups", "") ||
       !matches("RootDirectory", plan.rootDirectory) || !matches("WorkingDirectory", "/workspace") ||
       !matches("BindReadOnlyPaths", `${plan.brokerSocket}:/run/s-gw/broker.sock`) ||
       !matches("BindPaths", "") ||
@@ -128,6 +129,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
 export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
+    await checkedAgentAccount(plan);
     const before = await checkedHostPaths(plan);
     await run("/usr/bin/systemd-run", systemdRunArgs(plan));
     try {
@@ -153,6 +155,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
       "-p", "Environment", "-p", "Restart", "-p", "KillMode", "-p", "SendSIGKILL",
       "-p", "Delegate", "-p", "DynamicUser", "-p", "PrivateUsers", "-p", "PrivateNetwork",
+      "-p", "SupplementaryGroups",
       "-p", "PrivateIPC", "-p", "PrivateTmp", "-p", "ProtectSystem", "-p", "ProtectHome",
       "-p", "PrivateDevices", "-p", "NoNewPrivileges", "-p", "CapabilityBoundingSet",
       "-p", "AmbientCapabilities", "-p", "ProtectKernelTunables", "-p", "ProtectKernelModules",
@@ -206,6 +209,19 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
     socketParent.dev, socketParent.ino, executable.dev, executable.ino].join(":");
 }
 
+async function checkedAgentAccount(plan: LinuxAgentUnitPlan): Promise<void> {
+  validateLinuxAgentPlan(plan);
+  const entry = (await run("/usr/bin/getent", ["passwd", String(plan.uid)])).trimEnd();
+  const fields = entry.split(":");
+  if (fields.length !== 7 || !fields[0] || Number(fields[2]) !== plan.uid || Number(fields[3]) !== plan.gid) {
+    throw new Error("Linux agent account does not match its dedicated UID and GID.");
+  }
+  const groups = await run("/usr/bin/id", ["-G", "--", fields[0]]);
+  if (!dedicatedGroups(groups, plan.gid, false)) {
+    throw new Error("Linux agent account has supplementary group access.");
+  }
+}
+
 async function checkedExecutableParents(root: string, executable: string): Promise<void> {
   let current = path.dirname(path.join(root, executable));
   while (current !== root) {
@@ -236,11 +252,23 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
   });
   if (!uid || !gid || uid.slice(1).some(value => Number(value) !== state.uid) ||
       gid.slice(1).some(value => Number(value) !== state.gid) ||
+      !linuxProcessGroupsAreDedicated(status, state.gid) ||
       (current !== state.cgroup && !current?.startsWith(`${state.cgroup}/`)) ||
       procRoot !== plan.rootDirectory || net === hostNet || ipc === hostIpc || mounts === hostMounts ||
       !noCapabilities || !/^NoNewPrivs:\s+1$/m.test(status) || !/^Seccomp:\s+2$/m.test(status)) {
     throw new Error("Linux agent main process did not attest its OS identity and namespaces.");
   }
+}
+
+export function linuxProcessGroupsAreDedicated(status: string, gid: number): boolean {
+  const groups = /^Groups:[ \t]*([0-9 \t]*)$/m.exec(status);
+  return Boolean(groups && dedicatedGroups(groups[1], gid, true));
+}
+
+function dedicatedGroups(value: string, gid: number, allowEmpty: boolean): boolean {
+  const groups = value.trim();
+  if (!groups) return allowEmpty;
+  return groups.split(/\s+/).every(item => /^\d+$/.test(item) && Number(item) === gid);
 }
 
 async function checkedRootParentChain(start: string): Promise<void> {
