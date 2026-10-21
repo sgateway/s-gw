@@ -92,7 +92,7 @@ Output sanitization is a last line of defense, not a data-loss-prevention guaran
 - Enroll credentials from a local terminal or supported UI, never from agent chat.
 - Prefer macOS Keychain, Linux Secret Service, or Windows Credential Manager over environment-provided unlock material.
 - Use absolute executable paths for command grants where practical.
-- Keep reusable approvals short and scoped to one agent when possible.
+- Keep reusable approvals short. Ordinary MCP agent names are client-declared; use a verified OS principal before relying on a same-agent scope as a security boundary.
 - Expect a new approval when an environment command's arguments change.
 - Treat unlimited approvals and high-severity credentials as exceptional.
 - Review SSH destinations, ports, and remote commands before approval.
@@ -106,6 +106,10 @@ Report suspected boundary failures through the private process in [SECURITY.md](
 ## Opt-in Anthropic mode
 
 The agent process is confined by Anthropic sandbox-runtime. Its MCP client reaches an authenticated loopback broker that owns approved SSH and HTTPS operations outside confinement. Credentials enrolled in s-gw are resolved only by s-gw. HTTPS uses destination TLS directly; no interception certificate or TLS credential replacement is added.
+
+The current launcher and ordinary MCP server do not establish a distinct OS identity for each agent. The ordinary server can use a client-declared name for agent-scoped policies, and a same-UID agent may be able to reach a capability held by another process. Do not treat name-scoped automatic approvals as proof of which agent made a request. The opt-in Unix peer verifier and model relay transport are foundations; neither is connected to the live launcher. [OS identity design](agent-os-identity.md) lists the required per-platform controls and acceptance checks.
+
+The ordinary browser console is a compatibility path: any local process that can load its page can obtain its session authority. `--operator-auth` protects one foreground listener, but every listener for the same store must be protected and unreachable from agent identities before operator-only approval can be claimed. Saved native agent sign-ins and direct outbound model/service TLS also remain available by default.
 
 Approvals for owned operations bind their complete operation scope. The executor rechecks active authorization and monitors revocation. Regular SSH uploads use a digest-verified copy in the denied store directory before connecting. Named pipe approvals bind the path and destination; the producer controls the streamed content. Explicit read denies are also applied to the upload broker. Ordinary execution and SSH session semantics are unchanged.
 

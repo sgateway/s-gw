@@ -1,0 +1,317 @@
+#if !defined(__APPLE__)
+#error This runner is for macOS only.
+#endif
+
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <limits.h>
+#include <stddef.h>
+#include <poll.h>
+#include <pwd.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
+
+#define CONTROL_SOCKET "/private/var/run/s-gw/agent-launch-control.sock"
+#define POLICY_SOCKET "/private/var/run/s-gw/agent-network-policy.sock"
+#define UID_LEASE_DIR "/private/var/run/s-gw/agent-uid-leases"
+
+static volatile sig_atomic_t stopping = 0;
+
+static void on_signal(int signal_number) {
+    (void)signal_number;
+    stopping = 1;
+}
+
+static int fail(const char *reason) {
+    fprintf(stderr, "s-gw agent UID runner: %s\n", reason);
+    return 1;
+}
+
+static int parse_id(const char *text, unsigned long *result) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || !text[0] || *end || value == 0 || value > UINT_MAX) return -1;
+    *result = value;
+    return 0;
+}
+
+static int valid_session(const char *value) {
+    size_t len = strlen(value);
+    if (!len || len > 64) return 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = value[i];
+        if ((ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') &&
+            (ch < '0' || ch > '9') && ch != '-' && ch != '_') return 0;
+    }
+    return 1;
+}
+
+static int socket_peer(int fd, const char *expected_path, int local, uid_t *peer_uid) {
+    int socket_type = 0;
+    socklen_t type_len = sizeof(socket_type);
+    struct sockaddr_un address;
+    socklen_t address_len = sizeof(address);
+    memset(&address, 0, sizeof(address));
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &type_len) || socket_type != SOCK_STREAM) return -1;
+    if (local) {
+        if (getsockname(fd, (struct sockaddr *)&address, &address_len)) return -1;
+    } else if (getpeername(fd, (struct sockaddr *)&address, &address_len)) return -1;
+    if (address.sun_family != AF_UNIX ||
+        address_len <= offsetof(struct sockaddr_un, sun_path) ||
+        strnlen(address.sun_path, sizeof(address.sun_path)) >= sizeof(address.sun_path) ||
+        strcmp(address.sun_path, expected_path)) return -1;
+    gid_t peer_gid;
+    return getpeereid(fd, peer_uid, &peer_gid);
+}
+
+static int trusted_socket_node(const char *location, uid_t owner) {
+    struct stat info;
+    if (lstat(location, &info) || !S_ISSOCK(info.st_mode) || info.st_uid != owner) return -1;
+    return (info.st_mode & 0777) == 0600 ? 0 : -1;
+}
+
+static int canonical_path(const char *location) {
+    char resolved[PATH_MAX];
+    if (location[0] != '/' || !realpath(location, resolved)) return -1;
+    return strcmp(location, resolved) == 0 ? 0 : -1;
+}
+
+static int trusted_parents(const char *location, uid_t allowed_owner) {
+    char current[PATH_MAX];
+    if (strlen(location) >= sizeof(current)) return -1;
+    strcpy(current, location);
+    for (;;) {
+        char *slash = strrchr(current, '/');
+        if (!slash) return -1;
+        if (slash == current) current[1] = '\0';
+        else *slash = '\0';
+        struct stat info;
+        if (lstat(current, &info) || !S_ISDIR(info.st_mode) ||
+            (info.st_uid != 0 && info.st_uid != allowed_owner) || (info.st_mode & 022)) return -1;
+        if (!strcmp(current, "/")) return 0;
+    }
+}
+
+static int reserve_uid(uid_t uid, const char *session) {
+    struct stat info;
+    if (canonical_path(UID_LEASE_DIR) || lstat(UID_LEASE_DIR, &info) ||
+        !S_ISDIR(info.st_mode) || info.st_uid != 0 || (info.st_mode & 0777) != 0700 ||
+        trusted_parents(UID_LEASE_DIR, 0)) return -1;
+    char location[PATH_MAX], record[128];
+    int path_len = snprintf(location, sizeof(location), "%s/%u", UID_LEASE_DIR, uid);
+    int record_len = snprintf(record, sizeof(record), "%u %s\n", uid, session);
+    if (path_len < 1 || path_len >= (int)sizeof(location) ||
+        record_len < 1 || record_len >= (int)sizeof(record)) return -1;
+    int fd = open(location, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    int written = write(fd, record, (size_t)record_len) == record_len && fsync(fd) == 0;
+    close(fd);
+    if (!written) return -1;
+    int dir = open(UID_LEASE_DIR, O_RDONLY | O_DIRECTORY);
+    if (dir < 0) return -1;
+    int synced = fsync(dir) == 0;
+    close(dir);
+    return synced ? 0 : -1;
+}
+
+static int close_inherited_fds(void) {
+    int needed = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, NULL, 0);
+    if (needed <= 0 || needed > 8 * 1024 * 1024) return -1;
+    size_t capacity = (size_t)needed + 1024 * sizeof(struct proc_fdinfo);
+    struct proc_fdinfo *fds = malloc(capacity);
+    if (!fds) return -1;
+    int amount = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, (int)capacity);
+    if (amount <= 0 || (size_t)amount > capacity || amount % sizeof(struct proc_fdinfo)) {
+        free(fds);
+        return -1;
+    }
+    for (int i = 0; i < amount / (int)sizeof(struct proc_fdinfo); i++) {
+        if (fds[i].proc_fd >= 3) close(fds[i].proc_fd);
+    }
+    free(fds);
+    return 0;
+}
+
+static int checked_workspace(const char *location, uid_t agent_uid) {
+    struct stat info;
+    if (canonical_path(location) || lstat(location, &info) || !S_ISDIR(info.st_mode) ||
+        info.st_uid != agent_uid || (info.st_mode & 0777) != 0700 ||
+        trusted_parents(location, 0)) return -1;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s/tmp", location) >= (int)sizeof(tmp)) return -1;
+    if (lstat(tmp, &info) || !S_ISDIR(info.st_mode) || info.st_uid != agent_uid ||
+        (info.st_mode & 0777) != 0700) return -1;
+    return 0;
+}
+
+static int checked_executable(const char *location, uid_t broker_uid) {
+    struct stat info;
+    if (canonical_path(location) || lstat(location, &info) || !S_ISREG(info.st_mode) ||
+        (info.st_uid != 0 && info.st_uid != broker_uid) || (info.st_mode & 022) ||
+        (info.st_mode & (S_ISUID | S_ISGID)) || !(info.st_mode & 0111) ||
+        trusted_parents(location, broker_uid)) return -1;
+    return 0;
+}
+
+static int checked_broker_socket(const char *location, uid_t broker_uid, gid_t agent_gid) {
+    struct stat info;
+    if (canonical_path(location) || lstat(location, &info) || !S_ISSOCK(info.st_mode) ||
+        info.st_uid != broker_uid || info.st_gid != agent_gid ||
+        (info.st_mode & 0777) != 0660 || trusted_parents(location, broker_uid)) return -1;
+    return 0;
+}
+
+static int policy_ready(uid_t uid, const char *session) {
+    uid_t policy_uid;
+    if (socket_peer(4, POLICY_SOCKET, 0, &policy_uid) || policy_uid != 0 ||
+        trusted_socket_node(POLICY_SOCKET, 0)) return -1;
+    char request[128];
+    int length = snprintf(request, sizeof(request), "CHECK-V1 %u %s\n", uid, session);
+    if (length < 1 || length >= (int)sizeof(request) || write(4, request, (size_t)length) != length) return -1;
+    struct pollfd poll_fd = { .fd = 4, .events = POLLIN };
+    if (poll(&poll_fd, 1, 1500) != 1 || !(poll_fd.revents & POLLIN)) return -1;
+    char response[128];
+    ssize_t received = read(4, response, sizeof(response) - 1);
+    if (received < 1) return -1;
+    response[received] = '\0';
+    char expected[128];
+    snprintf(expected, sizeof(expected), "READY-V1 %u %s\n", uid, session);
+    return strcmp(response, expected) == 0 ? 0 : -1;
+}
+
+static void child_exec(uid_t uid, gid_t gid, const char *session, const char *workspace, const char *broker_socket,
+                       const char *exe, char **args) {
+    if (setpgid(0, 0) || setgroups(0, NULL) || setgid(gid) || setuid(uid) ||
+        getuid() != uid || geteuid() != uid || getgid() != gid || getegid() != gid ||
+        chdir(workspace)) _exit(126);
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un broker;
+    memset(&broker, 0, sizeof(broker));
+    broker.sun_family = AF_UNIX;
+    if (probe < 0 || strlen(broker_socket) >= sizeof(broker.sun_path)) _exit(126);
+    strcpy(broker.sun_path, broker_socket);
+    if (connect(probe, (struct sockaddr *)&broker, sizeof(broker))) _exit(126);
+    char request[128], expected[128], response[128];
+    int length = snprintf(request, sizeof(request), "HELLO-V1 %u %s\n", uid, session);
+    if (length < 1 || length >= (int)sizeof(request) || write(probe, request, (size_t)length) != length) _exit(126);
+    struct pollfd poll_fd = { .fd = probe, .events = POLLIN };
+    if (poll(&poll_fd, 1, 1500) != 1 || !(poll_fd.revents & POLLIN)) _exit(126);
+    ssize_t received = read(probe, response, sizeof(response) - 1);
+    if (received < 1) _exit(126);
+    response[received] = '\0';
+    snprintf(expected, sizeof(expected), "READY-V1 %u %s\n", uid, session);
+    if (strcmp(response, expected)) _exit(126);
+    close(probe);
+    int null_fd = open("/dev/null", O_RDWR);
+    if (null_fd < 0 || dup2(null_fd, 0) < 0 || dup2(null_fd, 1) < 0 || dup2(null_fd, 2) < 0) _exit(126);
+    if (close_inherited_fds()) _exit(126);
+    umask(077);
+    char home[PATH_MAX + 6], tmp[PATH_MAX + 10], socket_env[PATH_MAX + 18];
+    if (snprintf(home, sizeof(home), "HOME=%s", workspace) >= (int)sizeof(home) ||
+        snprintf(tmp, sizeof(tmp), "TMPDIR=%s/tmp", workspace) >= (int)sizeof(tmp) ||
+        snprintf(socket_env, sizeof(socket_env), "SGW_AGENT_SOCKET=%s", broker_socket) >= (int)sizeof(socket_env)) _exit(126);
+    char *environment[] = { home, tmp, socket_env, "PATH=/usr/bin:/bin", NULL };
+    execve(exe, args, environment);
+    _exit(126);
+}
+
+int main(int argc, char **argv) {
+    if (getuid() != 0 || geteuid() != 0) return fail("requires a root-owned service, never a setuid executable");
+    if (argc < 8 || strcmp(argv[7], "--")) return fail("invalid launch plan");
+    unsigned long raw_uid, raw_gid;
+    if (parse_id(argv[1], &raw_uid) || parse_id(argv[2], &raw_gid) || !valid_session(argv[3]))
+        return fail("invalid agent identity or session");
+    uid_t agent_uid = (uid_t)raw_uid;
+    gid_t agent_gid = (gid_t)raw_gid;
+    uid_t broker_uid;
+    if (socket_peer(3, CONTROL_SOCKET, 1, &broker_uid) || broker_uid == 0 ||
+        trusted_socket_node(CONTROL_SOCKET, broker_uid) || agent_uid == broker_uid)
+        return fail("untrusted broker control connection");
+    struct passwd *account = getpwuid(agent_uid);
+    if (!account || strncmp(account->pw_name, "_sgwagent_", 10) || account->pw_gid != agent_gid)
+        return fail("agent account was not provisioned for s-gw");
+    if (proc_listpids(PROC_UID_ONLY, agent_uid, NULL, 0) != 0)
+        return fail("agent UID already has a process");
+    if (checked_workspace(argv[4], agent_uid) || checked_broker_socket(argv[5], broker_uid, agent_gid) ||
+        checked_executable(argv[6], broker_uid)) return fail("unsafe workspace, broker socket, or executable");
+    if (policy_ready(agent_uid, argv[3])) return fail("network policy service did not attest this session");
+    if (reserve_uid(agent_uid, argv[3])) return fail("agent UID is already leased or lease storage is unavailable");
+
+    char **agent_args = calloc((size_t)argc - 6, sizeof(char *));
+    if (!agent_args) return fail("could not allocate agent arguments");
+    agent_args[0] = argv[6];
+    for (int i = 8; i < argc; i++) agent_args[i - 7] = argv[i];
+    sigset_t launch_signals, previous_mask;
+    sigemptyset(&launch_signals);
+    sigaddset(&launch_signals, SIGTERM);
+    sigaddset(&launch_signals, SIGINT);
+    sigaddset(&launch_signals, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, &launch_signals, &previous_mask) ||
+        signal(SIGTERM, on_signal) == SIG_ERR ||
+        signal(SIGINT, on_signal) == SIG_ERR ||
+        signal(SIGHUP, on_signal) == SIG_ERR) {
+        free(agent_args);
+        return fail("could not guard agent launch signals");
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+        free(agent_args);
+        return fail("could not fork agent");
+    }
+    if (child == 0) {
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        if (sigprocmask(SIG_SETMASK, &previous_mask, NULL)) _exit(126);
+        child_exec(agent_uid, agent_gid, argv[3], argv[4], argv[5], argv[6], agent_args);
+    }
+    if (sigprocmask(SIG_SETMASK, &previous_mask, NULL)) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        free(agent_args);
+        return fail("could not resume agent supervision");
+    }
+    int sent_term = 0;
+    int wait_error = 0;
+    time_t term_at = 0;
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    for (;;) {
+        errno = 0;
+        int wait_result = waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT | WNOHANG);
+        if (wait_result == 0 && info.si_pid == child) break;
+        if (wait_result < 0 && errno != EINTR) { wait_error = 1; break; }
+        if (stopping && !sent_term) { kill(-child, SIGTERM); kill(child, SIGTERM); sent_term = 1; term_at = time(NULL); }
+        if (sent_term && time(NULL) - term_at >= 2) { kill(-child, SIGKILL); kill(child, SIGKILL); }
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 50000000 };
+        nanosleep(&pause, NULL);
+    }
+    // Keep the direct child unreaped until the group is gone, so its PGID cannot be reused.
+    kill(-child, SIGTERM);
+    struct timespec grace = { .tv_sec = 0, .tv_nsec = 100000000 };
+    nanosleep(&grace, NULL);
+    kill(-child, SIGKILL);
+    int status = 0;
+    pid_t reaped;
+    do { reaped = waitpid(child, &status, 0); }
+    while (reaped < 0 && errno == EINTR);
+    free(agent_args);
+    if (reaped != child || wait_error) return fail("could not supervise agent exit");
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : SIGTERM);
+}

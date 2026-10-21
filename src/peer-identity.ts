@@ -4,6 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-context.js";
+import { checkLinuxPeerVerifier, verifyLinuxPeerProcess } from "./linux-peer-identity.js";
 
 export interface UnixPeer {
   uid: number;
@@ -28,6 +29,8 @@ const maxPendingConnections = 32;
 const defaultIdleTimeoutMs = 35 * 60_000;
 
 export class PeerSessionRegistry {
+  constructor(private readonly requireLinuxPeerPidfd = false) {}
+
   private readonly sessions = new Map<number, LiveSession>();
   private readonly usedSessionIds = new Set<string>();
   private readonly usedUids = new Set<number>();
@@ -74,8 +77,15 @@ export class PeerSessionRegistry {
     const session = this.sessions.get(peer.uid);
     if (!session || accepted.get(peer.uid) !== session) throw new Error("Unknown or ended agent OS identity.");
     if (session.gid !== undefined && session.gid !== peer.gid) throw new Error("Agent OS group does not match the launch record.");
-    if (process.platform === "linux" && !await isInCgroup(peer.pid, session.linuxCgroup!)) {
-      throw new Error("Agent process is outside its registered cgroup.");
+    if (process.platform === "linux") {
+      if (this.requireLinuxPeerPidfd) {
+        const live = await verifyLinuxPeerProcess(socket, session.linuxCgroup!);
+        if (live.uid !== peer.uid || live.gid !== peer.gid || live.pid !== peer.pid) {
+          throw new Error("Linux peer credentials changed during verification.");
+        }
+      } else if (!await isInCgroup(peer.pid, session.linuxCgroup!)) {
+        throw new Error("Agent process is outside its registered cgroup.");
+      }
     }
     if (this.sessions.get(peer.uid) !== session) throw new Error("Agent session ended during peer verification.");
     if (socket.destroyed) throw new Error("Agent socket closed during peer verification.");
@@ -96,6 +106,7 @@ export interface VerifiedPeerServerOptions {
   socketMode?: 0o600 | 0o660;
   socketGid?: number;
   idleTimeoutMs?: number;
+  requireLinuxPeerPidfd?: boolean;
   onConnection(socket: Socket, principal: VerifiedAgentPrincipal, peer: UnixPeer): void | Promise<void>;
 }
 
@@ -104,6 +115,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
     throw new Error("Native Unix peer verification is unavailable on this platform.");
   }
   await checkedPeerHelper();
+  if (process.platform === "linux" && options.requireLinuxPeerPidfd) await checkLinuxPeerVerifier();
   const socketPath = await checkedSocketPath(options.socketPath);
   const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs;
   if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 35 * 60_000) {
@@ -111,7 +123,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   }
   const socketMode = options.socketMode ?? 0o600;
   if (socketMode !== 0o600 && socketMode !== 0o660) throw new Error("Invalid broker socket mode.");
-  const registry = new PeerSessionRegistry();
+  const registry = new PeerSessionRegistry(options.requireLinuxPeerPidfd === true);
   const sockets = new Set<Socket>();
   const pending = new Set<Socket>();
   const server = createServer(socket => {

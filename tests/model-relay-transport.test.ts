@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { httpsFixture } from "./helpers/https-fixture.js";
-import { relayModelRequest, type ModelProvider, type ModelUpstreamRequest } from "../src/model-relay-transport.js";
+import { modelAddressAllowed, relayModelRequest, type ModelProvider, type ModelUpstreamRequest } from "../src/model-relay-transport.js";
 
 let home = "";
 let provider: HttpsServer | undefined;
@@ -28,7 +28,9 @@ afterEach(async () => {
 async function startFixture(
   modelProvider: ModelProvider,
   upstreamHandler: Parameters<typeof createHttpsServer>[1],
-  authorized: () => Promise<void> = async () => {}
+  authorized: () => Promise<void> = async () => {},
+  allowedBetaValues: readonly string[] = [],
+  bufferOwner?: string
 ) {
   home = await mkdtemp(path.join(os.tmpdir(), "sgw-model-relay-"));
   const tls = await httpsFixture(home);
@@ -48,6 +50,8 @@ async function startFixture(
       provider: modelProvider,
       credential: key,
       assertAuthorized: authorized,
+      allowedBetaValues,
+      bufferOwner,
       workspaceId: modelProvider === "anthropic" ? "wrkspc_test" : undefined,
       projectId: modelProvider === "openai" ? "proj_test" : undefined
     }, transport);
@@ -59,6 +63,16 @@ async function startFixture(
 }
 
 describe("model relay transport", () => {
+  it("refuses special-use DNS answers, including IPv4-mapped addresses", () => {
+    for (const address of ["127.0.0.1", "198.18.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.1",
+      "::ffff:198.18.0.1", "::ffff:c612:1", "2001:db8::1", "2001::1", "2001:2::1",
+      "2001:10::1", "2001:20::1", "2002:7f00:1::1", "3fff::1"]) {
+      expect(modelAddressAllowed(address), address).toBe(false);
+    }
+    expect(modelAddressAllowed("8.8.8.8")).toBe(true);
+    expect(modelAddressAllowed("2606:4700:4700::1111")).toBe(true);
+  });
+
   it("streams Anthropic events over broker-owned TLS and replaces split credential echoes", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>(resolve => { release = resolve; });
@@ -73,7 +87,7 @@ describe("model relay transport", () => {
       const split = Math.floor(key.length / 2);
       res.write(`\nevent: content_block_delta\ndata: ${key.slice(0, split)}`);
       res.end(`${key.slice(split)}\n\nevent: message_stop\ndata: {}\n\n`);
-    });
+    }, undefined, ["feature-test"]);
     const body = JSON.stringify({ model: "claude-fixture", max_tokens: 10, stream: true, messages: [{ role: "user", content: "hi" }] });
     const response = await fetch(fixture.url + "/v1/messages?beta=true", {
       method: "POST",
@@ -82,7 +96,7 @@ describe("model relay transport", () => {
         "x-api-key": "agent-visible-key",
         cookie: "agent-cookie=1",
         "proxy-authorization": "Basic agent-proxy",
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": "2099-12-31",
         "anthropic-beta": "feature-test",
         "anthropic-workspace-id": "wrkspc_agent_override",
         "anthropic-api-key": "agent-visible-key",
@@ -116,6 +130,7 @@ describe("model relay transport", () => {
     expect(received[0].headers["proxy-authorization"]).toBeUndefined();
     expect(received[0].headers["anthropic-api-key"]).toBeUndefined();
     expect(received[0].headers["anthropic-beta"]).toBe("feature-test");
+    expect(received[0].headers["anthropic-version"]).toBe("2023-06-01");
     expect(received[0].headers["anthropic-workspace-id"]).toBe("wrkspc_test");
     expect(fixture.outbound).toEqual(["https://api.anthropic.com/v1/messages?beta=true"]);
   });
@@ -128,7 +143,7 @@ describe("model relay transport", () => {
       res.writeHead(200, { "content-type": "text/event-stream", "x-ratelimit-limit-requests": "20" });
       res.write("event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n");
       res.end("event: response.completed\ndata: {}\n\n");
-    });
+    }, undefined, ["responses=v1"]);
     const response = await fetch(fixture.url + "/v1/responses", {
       method: "POST",
       headers: {
@@ -149,6 +164,15 @@ describe("model relay transport", () => {
     expect(received[0]["openai-organization"]).toBeUndefined();
     expect(received[0]["openai-beta"]).toBe("responses=v1");
     expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses"]);
+  });
+
+  it("refuses beta headers outside the broker grant before contacting the provider", async () => {
+    const fixture = await startFixture("anthropic", (_req, res) => res.end("unexpected"));
+    const response = await fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-beta": "unapproved-feature" }, body: "{}"
+    });
+    expect(response.status).toBe(403);
+    expect(fixture.outbound).toEqual([]);
   });
 
   it("rejects arbitrary routes, methods, and queries before opening upstream TLS", async () => {
@@ -307,5 +331,31 @@ describe("model relay transport", () => {
     });
     expect(recovered.status).toBe(200);
     expect(await recovered.text()).toBe("2");
+  });
+
+  it("limits one verified session's request buffers independently of the global budget", async () => {
+    const fixture = await startFixture("anthropic", async (req, res) => {
+      for await (const _chunk of req) {}
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], "agent-one");
+    const port = Number(new URL(fixture.url).port);
+    const socket = connect(port, "127.0.0.1");
+    try {
+      await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+      socket.write("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 33554432\r\n\r\n");
+      await new Promise<void>((resolve, reject) => socket.write(Buffer.alloc(31 * 1024 * 1024, 0x20),
+        error => error ? reject(error) : resolve()));
+      const crowded = await fetch(fixture.url + "/v1/messages", {
+        method: "POST", headers: { "content-type": "application/json" }, body: Buffer.alloc(2 * 1024 * 1024, 0x20)
+      });
+      expect(crowded.status).toBe(503);
+      expect(fixture.outbound).toEqual([]);
+    } finally {
+      socket.destroy();
+    }
+    const recovered = await fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    });
+    expect(recovered.status).toBe(200);
   });
 });

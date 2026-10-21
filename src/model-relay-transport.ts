@@ -1,6 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { validateHeaderValue, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import { httpAddressAllowed } from "./http-executor.js";
 
 export type ModelProvider = "anthropic" | "openai";
@@ -12,6 +13,9 @@ export interface ModelRelayAuthority {
   workspaceId?: string;
   organizationId?: string;
   projectId?: string;
+  anthropicVersion?: string;
+  allowedBetaValues?: readonly string[];
+  bufferOwner?: string;
   ca?: string;
 }
 
@@ -28,6 +32,34 @@ const maxBufferedBodyBytes = 2 * maxBodyBytes;
 const maxResponseBytes = 64 * 1024 * 1024;
 const marker = Buffer.from("[s-gw withheld credential]");
 let bufferedBodyBytes = 0;
+const bufferedByOwner = new Map<string, number>();
+
+export function modelAddressAllowed(address: string): boolean {
+  if (!httpAddressAllowed(address, false)) return false;
+  const ip = address.toLowerCase();
+  if (ip.startsWith("::ffff:")) {
+    const tail = ip.slice(7);
+    if (isIP(tail) === 4) return modelAddressAllowed(tail);
+    const mapped = /^([a-f0-9]{1,4}):([a-f0-9]{1,4})$/.exec(tail);
+    if (!mapped) return false;
+    const high = Number.parseInt(mapped[1], 16), low = Number.parseInt(mapped[2], 16);
+    return modelAddressAllowed(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+  }
+  if (isIP(ip) === 4) {
+    const [a, b, c] = ip.split(".").map(Number);
+    if (a === 192 && ((b === 0 && (c === 0 || c === 2)) || (b === 88 && c === 99))) return false;
+    if (a === 198 && ((b === 18 || b === 19) || (b === 51 && c === 100))) return false;
+    if (a === 203 && b === 0 && c === 113) return false;
+    return true;
+  }
+  if (isIP(ip) !== 6) return false;
+  const [first, second] = ip.split(":").map(part => Number.parseInt(part || "0", 16));
+  if (first < 0x2000 || first > 0x3fff) return false;
+  if (first === 0x2001 && second < 0x200) return false;
+  if (first === 0x2001 && second === 0xdb8) return false;
+  if (first === 0x2002 || first === 0x3fff) return false;
+  return true;
+}
 
 interface BufferedBody {
   data?: Buffer;
@@ -38,7 +70,7 @@ class RelayError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
-function modelRoute(provider: ModelProvider, method: string | undefined, target: string | undefined): URL {
+export function modelRoute(provider: ModelProvider, method: string | undefined, target: string | undefined): URL {
   if (provider !== "anthropic" && provider !== "openai") {
     throw new RelayError(404, "Unsupported model provider.");
   }
@@ -94,18 +126,20 @@ function upstreamHeaders(req: IncomingMessage, authority: ModelRelayAuthority, b
   }
 
   if (authority.provider === "anthropic") {
-    for (const [name, value] of Object.entries(req.headers)) {
-      if (!name.startsWith("anthropic-") || /(?:key|token|secret|auth|cookie|credential)/i.test(name)) continue;
-      if (typeof value !== "string") throw new RelayError(400, `Invalid ${name} header.`);
-      validateHeaderValue(name, value);
-      headers[name] = value;
+    const beta = singleHeader(req, "anthropic-beta");
+    headers["anthropic-version"] = authority.anthropicVersion || "2023-06-01";
+    if (beta) {
+      if (!authority.allowedBetaValues?.includes(beta)) throw new RelayError(403, "Model beta feature is not approved.");
+      headers["anthropic-beta"] = beta;
     }
-    headers["anthropic-version"] ||= "2023-06-01";
     if (authority.workspaceId) headers["anthropic-workspace-id"] = authority.workspaceId;
     else delete headers["anthropic-workspace-id"];
   } else {
     const beta = singleHeader(req, "openai-beta");
-    if (beta) headers["openai-beta"] = beta;
+    if (beta) {
+      if (!authority.allowedBetaValues?.includes(beta)) throw new RelayError(403, "Model beta feature is not approved.");
+      headers["openai-beta"] = beta;
+    }
     if (authority.organizationId) headers["openai-organization"] = authority.organizationId;
     if (authority.projectId) headers["openai-project"] = authority.projectId;
   }
@@ -114,7 +148,7 @@ function upstreamHeaders(req: IncomingMessage, authority: ModelRelayAuthority, b
   return headers;
 }
 
-async function requestBody(req: IncomingMessage, signal: AbortSignal): Promise<BufferedBody> {
+async function requestBody(req: IncomingMessage, signal: AbortSignal, owner?: string): Promise<BufferedBody> {
   if (req.method === "GET") {
     if (req.headers["transfer-encoding"] || (req.headers["content-length"] && req.headers["content-length"] !== "0")) {
       throw new RelayError(400, "GET model requests cannot have a body.");
@@ -124,7 +158,15 @@ async function requestBody(req: IncomingMessage, signal: AbortSignal): Promise<B
   const parts: Buffer[] = [];
   let size = 0;
   let reserved = 0;
-  const release = () => { bufferedBodyBytes -= reserved; reserved = 0; };
+  const release = () => {
+    bufferedBodyBytes -= reserved;
+    if (owner) {
+      const left = (bufferedByOwner.get(owner) || 0) - reserved;
+      if (left > 0) bufferedByOwner.set(owner, left);
+      else bufferedByOwner.delete(owner);
+    }
+    reserved = 0;
+  };
   const onAbort = () => req.destroy(signal.reason instanceof Error ? signal.reason : new Error("Model request ended."));
   signal.addEventListener("abort", onAbort, { once: true });
   try {
@@ -137,7 +179,11 @@ async function requestBody(req: IncomingMessage, signal: AbortSignal): Promise<B
       if (bufferedBodyBytes + chunk.length > maxBufferedBodyBytes) {
         throw new RelayError(503, "Model relay request buffer is full.");
       }
+      if (owner && (bufferedByOwner.get(owner) || 0) + chunk.length > maxBodyBytes) {
+        throw new RelayError(503, "Model relay session buffer is full.");
+      }
       bufferedBodyBytes += chunk.length;
+      if (owner) bufferedByOwner.set(owner, (bufferedByOwner.get(owner) || 0) + chunk.length);
       reserved += chunk.length;
       parts.push(chunk);
     }
@@ -249,7 +295,7 @@ export async function relayModelRequest(
     const route = modelRoute(authority.provider, req.method, req.url);
     await check();
     abort.signal.throwIfAborted();
-    buffered = await requestBody(req, abort.signal);
+    buffered = await requestBody(req, abort.signal, authority.bufferOwner);
     const headers = upstreamHeaders(req, authority, buffered.data!.length);
     await check();
     abort.signal.throwIfAborted();
@@ -260,7 +306,7 @@ export async function relayModelRequest(
         rejectUnauthorized: true,
         lookup: (hostname, opts, callback) => {
           void lookup(hostname, { all: true }).then(addresses => {
-            if (!addresses.length || addresses.some(item => !httpAddressAllowed(item.address, false))) {
+            if (!addresses.length || addresses.some(item => !modelAddressAllowed(item.address))) {
               throw new Error("Model provider resolves to a restricted address.");
             }
             const chosen = addresses[0];
