@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
 #endif
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,8 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #endif
 
 #ifndef SGW_GATE_RELEASE_FILE
@@ -27,6 +31,21 @@
 
 #ifndef GATE_WAIT_SECONDS
 #define GATE_WAIT_SECONDS 60
+#endif
+
+#ifdef __linux__
+static int close_inherited_fds(void) {
+#ifdef SYS_close_range
+  if (syscall(SYS_close_range, 3u, ~0u, 0) == 0) return 0;
+#endif
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0 ||
+      limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT_MAX) return -1;
+  for (int fd = 3; (rlim_t)fd < limit.rlim_cur; fd++) {
+    if (close(fd) != 0 && errno != EBADF) return -1;
+  }
+  return 0;
+}
 #endif
 
 static int valid_invocation(const char *value) {
@@ -80,6 +99,9 @@ int main(int argc, char **argv) {
     char marker[96];
     if (read_release(marker, sizeof(marker)) != 0) return 70;
     if (strcmp(marker, expected) == 0) {
+#ifdef __linux__
+      if (close_inherited_fds() != 0) return 70;
+#endif
       execv(argv[2], argv + 2);
       return 71;
     }

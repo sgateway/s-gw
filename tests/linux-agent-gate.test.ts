@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { chmod, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createConnection, createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,8 +26,12 @@ async function compiledGate(): Promise<{ binary: string; marker: string }> {
   return { binary, marker };
 }
 
-function runGate(binary: string, args: string[]) {
-  const child = spawn(binary, ["--", ...args], { env: { INVOCATION_ID: invocation } });
+function runGate(binary: string, args: string[], inheritedFd?: number) {
+  const child = spawn(binary, ["--", ...args], {
+    env: { INVOCATION_ID: invocation },
+    ...(inheritedFd === undefined ? {} :
+      { stdio: ["ignore", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore", inheritedFd] })
+  });
   const finished = new Promise<number>((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", code => resolve(code ?? -1));
@@ -58,6 +63,60 @@ describe.skipIf(process.platform === "win32")("native Linux launch gate protocol
     const { finished } = runGate(binary, ["/bin/sh", "-c", `touch "${effect}"`]);
     expect(await finished).toBe(72);
     await expect(readFile(effect)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform !== "linux")("closes inherited descriptors before starting the agent", async () => {
+    const { binary, marker } = await compiledGate();
+    await writeFile(marker, "WAIT\n", { mode: 0o444 });
+    const probeSource = path.join(tmp, "probe.c");
+    const probe = path.join(tmp, "probe");
+    await writeFile(probeSource, `#include <errno.h>
+#include <fcntl.h>
+int main(void) {
+  for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) return 92;
+  for (int fd = 3; fd <= 7; fd++) {
+    if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) return 91;
+  }
+  return 0;
+}
+`);
+    const built = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", probeSource, "-o", probe],
+      { encoding: "utf8" });
+    if (built.status !== 0) throw new Error(built.stderr || "Could not compile inherited descriptor probe.");
+    const peers = new Set<ReturnType<typeof createConnection>>();
+    const server = createServer(socket => {
+      peers.add(socket);
+      socket.once("close", () => peers.delete(socket));
+      socket.resume();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No test listener address.");
+    const connected = createConnection({ host: "127.0.0.1", port: address.port });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        connected.once("connect", resolve);
+        connected.once("error", reject);
+      });
+      const fd = (connected as typeof connected & { _handle?: { fd?: number } })._handle?.fd;
+      if (!Number.isInteger(fd)) throw new Error("The test socket has no connected descriptor.");
+      const inheritedFd = fd as number;
+      const stdio = ["ignore", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore", inheritedFd] as const;
+      const control = spawnSync(probe, [], { stdio });
+      expect(control.status).toBe(91);
+      const { child, finished } = runGate(binary, [probe], inheritedFd);
+      const ready = path.join(tmp, "ready.tmp");
+      await writeFile(ready, `GO ${invocation} ${child.pid}\n`, { mode: 0o444 });
+      await rename(ready, marker);
+      expect(await finished).toBe(0);
+    } finally {
+      connected.destroy();
+      for (const peer of peers) peer.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
   it("times out closed and rejects a symlinked marker", async () => {

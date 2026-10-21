@@ -217,7 +217,8 @@ async function rootRun() {
   const temp = `/run/s-gw/ci-build-${runId}`;
   const units = new SystemdRunAgentUnitManager();
   const states = new Map();
-  const attempted = new Set();
+  const started = new Set();
+  const unresolvedStarts = new Set();
   const rpcInFlight = new Set();
   const createdUsers = [];
   const createdGroups = [];
@@ -234,6 +235,7 @@ async function rootRun() {
     const probe = path.join(temp, "probe");
     compile(path.join(project, "native/linux-agent-gate/launch-gate.c"), gate);
     compile(path.join(project, "scripts/linux-agent-native-probe.c"), probe);
+    command(probe, ["--rights-positive"]);
     command(probe, ["--tcp-positive", "ipv4", "127.0.0.1", String(ports.ipv4)]);
     command(probe, ["--tcp-positive", "ipv6", "::1", String(ports.ipv6)]);
     command(probe, ["--tcp-positive", "ipv4", hostIp, String(ports.host)]);
@@ -264,12 +266,13 @@ async function rootRun() {
       if (message.kind !== "rpc") return;
       const operation = (async () => {
         try {
-          if (message.method === "start") attempted.add(message.args[0].sessionId);
           const value = await units[message.method](...message.args);
-          if (message.method === "stop") attempted.delete(message.args[0].sessionId);
+          if (message.method === "start") started.add(message.args[0].sessionId);
+          if (message.method === "stop") started.delete(message.args[0].sessionId);
           if (message.method === "inspect") states.set(message.args[0].sessionId, value);
           if (broker.connected) broker.send({ kind: "rpc-result", id: message.id, value });
         } catch (error) {
+          if (message.method === "start") unresolvedStarts.add(message.args[0].sessionId);
           if (broker.connected) broker.send({ kind: "rpc-result", id: message.id, error: String(error) });
         }
       })();
@@ -297,6 +300,19 @@ async function rootRun() {
         `${item.sessionId} native result`);
       if (!/^own=1 cross=1 ipv4=1 ipv6=1 host=1 udp4=[01] udphost=[01]\n$/.test(result)) {
         throw new Error(`${item.sessionId} escaped its own socket, cross-session, or network boundary: ${result}`);
+      }
+    }
+    for (const item of plans) {
+      const ready = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer-ready")),
+        `${item.sessionId} descriptor-transfer listener`);
+      if (ready !== "ready\n") throw new Error(`${item.sessionId} did not prepare its transfer listeners.`);
+    }
+    for (const item of plans) process.kill(states.get(item.sessionId).mainPid, "SIGUSR2");
+    for (const item of plans) {
+      const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer")),
+        `${item.sessionId} descriptor-transfer result`);
+      if (result !== "rights=1 ownfs=1 ownabstract=1 fs=1 hostfs=1 abstract=1\n") {
+        throw new Error(`${item.sessionId} reached a cross-agent descriptor-transfer channel: ${result}`);
       }
     }
     await until(() => mailbox.events.filter(event => event.kind === "accepted").length >= 2 ? true : undefined,
@@ -362,12 +378,14 @@ async function rootRun() {
     await Promise.allSettled([...rpcInFlight]);
     const teardownErrors = [];
     for (const item of plans) {
-      if (!attempted.has(item.sessionId)) continue;
+      if (!started.has(item.sessionId)) continue;
       try {
         await units.stop(item);
-        attempted.delete(item.sessionId);
+        started.delete(item.sessionId);
       } catch (error) { teardownErrors.push(error); }
     }
+    if (unresolvedStarts.size > 0) teardownErrors.push(new Error(
+      `Could not prove whether these units started: ${[...unresolvedStarts].join(", ")}.`));
     if (rebound) await new Promise(resolve => rebound.close(resolve));
     if (teardownErrors.length === 0) {
       for (const item of plans) {
@@ -385,7 +403,7 @@ async function rootRun() {
         "Native Linux agent teardown failed; its dedicated account and root were preserved for investigation.");
     }
   }
-  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, cross-session denial, revocation, and socket rebind. The listener was manually staged; an installed systemd socket unit and production MCP/model relay remain untested.");
+  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, cross-session and descriptor-transfer denial, revocation, and socket rebind. The listener was manually staged; an installed systemd socket unit and production MCP/model relay remain untested.");
 }
 
 async function peer(socket) {

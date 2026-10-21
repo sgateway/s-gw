@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -15,10 +16,17 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t retry = 0;
+static volatile sig_atomic_t transfer_probe = 0;
+static int save(const char *filename, const char *value);
 
 static void on_retry(int signal_number) {
     (void)signal_number;
     retry = 1;
+}
+
+static void on_transfer(int signal_number) {
+    (void)signal_number;
+    transfer_probe = 1;
 }
 
 static int unix_connect(const char *name) {
@@ -30,6 +38,104 @@ static int unix_connect(const char *name) {
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0) return fd;
     close(fd);
     return -1;
+}
+
+static int unix_listen(const char *name) {
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    if (strlen(name) >= sizeof(address.sun_path)) return -1;
+    strcpy(address.sun_path, name);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0 && listen(fd, 2) == 0) return fd;
+    close(fd);
+    return -1;
+}
+
+static int abstract_socket(const char *name, int serving) {
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    size_t length = strlen(name);
+    if (length + 1 > sizeof(address.sun_path)) return -1;
+    memcpy(address.sun_path + 1, name, length);
+    socklen_t size = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + length);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int result = serving ? bind(fd, (struct sockaddr *)&address, size) :
+        connect(fd, (struct sockaddr *)&address, size);
+    if (result == 0 && (!serving || listen(fd, 2) == 0)) return fd;
+    close(fd);
+    return -1;
+}
+
+static int self_connect(int listener, int connector) {
+    if (connector < 0) return 0;
+    int accepted = accept(listener, NULL, NULL);
+    close(connector);
+    if (accepted < 0) return 0;
+    close(accepted);
+    return 1;
+}
+
+static int rights_selftest(void) {
+    int pair[2];
+    int pipefd[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) return 0;
+    if (pipe(pipefd) != 0) { close(pair[0]); close(pair[1]); return 0; }
+    char payload = 'x';
+    struct iovec iov = { .iov_base = &payload, .iov_len = 1 };
+    char control[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct msghdr message = { .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control, .msg_controllen = sizeof(control) };
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &pipefd[0], sizeof(int));
+    int sent = sendmsg(pair[0], &message, 0) == 1;
+    memset(control, 0, sizeof(control));
+    message.msg_controllen = sizeof(control);
+    int got = sent && recvmsg(pair[1], &message, 0) == 1 && !(message.msg_flags & MSG_CTRUNC);
+    header = got ? CMSG_FIRSTHDR(&message) : NULL;
+    int received = -1;
+    if (header && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS &&
+        header->cmsg_len >= CMSG_LEN(sizeof(int))) memcpy(&received, CMSG_DATA(header), sizeof(int));
+    int okay = received >= 0 && fcntl(received, F_GETFD) >= 0;
+    if (received >= 0) close(received);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    close(pair[0]);
+    close(pair[1]);
+    return okay;
+}
+
+static int socket_path(char *buffer, size_t size, const char *prefix, const char *session) {
+    int length = snprintf(buffer, size, "%s%s.sock", prefix, session);
+    return length > 0 && (size_t)length < size;
+}
+
+static int transfer_result(const char *own, const char *other, int path_listener, int abstract_listener) {
+    char workspace[128], host_path[128], abstract_name[96];
+    char own_path[128], own_abstract[96];
+    if (!socket_path(workspace, sizeof(workspace), "/workspace/transfer-", other) ||
+        !socket_path(abstract_name, sizeof(abstract_name), "sgw-ci-transfer-", other) ||
+        !socket_path(own_path, sizeof(own_path), "/workspace/transfer-", own) ||
+        !socket_path(own_abstract, sizeof(own_abstract), "sgw-ci-transfer-", own)) return -1;
+    int length = snprintf(host_path, sizeof(host_path),
+        "/var/lib/s-gw/agent-roots/%s%s", other, workspace);
+    if (length < 0 || (size_t)length >= sizeof(host_path)) return -1;
+    int file_fd = unix_connect(workspace);
+    int host_fd = unix_connect(host_path);
+    int abstract_fd = abstract_socket(abstract_name, 0);
+    int file_denied = file_fd < 0, host_denied = host_fd < 0, abstract_denied = abstract_fd < 0;
+    if (file_fd >= 0) close(file_fd);
+    if (host_fd >= 0) close(host_fd);
+    if (abstract_fd >= 0) close(abstract_fd);
+    int own_file = self_connect(path_listener, unix_connect(own_path));
+    int own_abstract_socket = self_connect(abstract_listener, abstract_socket(own_abstract, 0));
+    char result[128];
+    snprintf(result, sizeof(result),
+        "rights=%d ownfs=%d ownabstract=%d fs=%d hostfs=%d abstract=%d\n",
+        rights_selftest(), own_file, own_abstract_socket, file_denied, host_denied, abstract_denied);
+    return save("/workspace/transfer", result);
 }
 
 static int tcp_connect(int family, const char *host, int port) {
@@ -123,6 +229,9 @@ static int save(const char *filename, const char *value) {
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "--rights-positive") == 0) {
+        return rights_selftest() ? 0 : 1;
+    }
     if (argc == 5 && strcmp(argv[1], "--tcp-positive") == 0) {
         int family = strcmp(argv[2], "ipv6") == 0 ? AF_INET6 : AF_INET;
         int fd = tcp_connect(family, argv[3], atoi(argv[4]));
@@ -164,8 +273,26 @@ int main(int argc, char **argv) {
     struct sigaction action = { .sa_handler = on_retry };
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGUSR1, &action, NULL) != 0) return 70;
+    action.sa_handler = on_transfer;
+    if (sigaction(SIGUSR2, &action, NULL) != 0) return 70;
     if (save("/workspace/result", result) != 0) return 70;
-    while (!retry) pause();
+    char own_path[128], own_abstract[96];
+    if (!socket_path(own_path, sizeof(own_path), "/workspace/transfer-", argv[1]) ||
+        !socket_path(own_abstract, sizeof(own_abstract), "sgw-ci-transfer-", argv[1])) return 70;
+    int path_listener = unix_listen(own_path);
+    int abstract_listener = abstract_socket(own_abstract, 1);
+    if (path_listener < 0 || abstract_listener < 0 || !rights_selftest() ||
+        !self_connect(path_listener, unix_connect(own_path)) ||
+        !self_connect(abstract_listener, abstract_socket(own_abstract, 0)) ||
+        save("/workspace/transfer-ready", "ready\n") != 0) return 70;
+    while (!retry) {
+        if (transfer_probe) {
+            transfer_probe = 0;
+            if (transfer_result(argv[1], argv[2], path_listener, abstract_listener) != 0) return 70;
+        } else poll(NULL, 0, 100);
+    }
+    close(path_listener);
+    close(abstract_listener);
     const char *rebound = approved(argv[2], argv[1]) ? "rebind=accepted\n" : "rebind=denied\n";
     return save("/workspace/rebind", rebound) == 0 ? 0 : 70;
 }

@@ -210,26 +210,19 @@ static int read_process(pid_t pid, uid_t uid, struct uid_process *found) {
 
 static int list_uid_processes(uid_t uid, pid_t ignored, struct uid_process *found, size_t *count) {
     pid_t pids[UID_SCAN_LIMIT];
-    const uint32_t filters[] = { PROC_UID_ONLY, PROC_RUID_ONLY };
     *count = 0;
-    for (size_t filter = 0; filter < sizeof(filters) / sizeof(filters[0]); filter++) {
-        int bytes = proc_listpids(filters[filter], uid, pids, sizeof(pids));
-        if (bytes < 0 || bytes >= (int)sizeof(pids) || bytes % sizeof(pid_t)) return -1;
-        for (int i = 0; i < bytes / (int)sizeof(pid_t); i++) {
-            pid_t pid = pids[i];
-            if (pid <= 0 || pid == ignored) continue;
-            int duplicate = 0;
-            for (size_t j = 0; j < *count; j++) {
-                if (found[j].pid == pid) { duplicate = 1; break; }
-            }
-            if (duplicate) continue;
-            struct uid_process current;
-            int match = read_process(pid, uid, &current);
-            if (match < 0) return -1;
-            if (match == 1) {
-                if (*count == UID_SCAN_LIMIT) return -1;
-                found[(*count)++] = current;
-            }
+    // The UID filters omit processes that retain only the agent's saved UID.
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
+    if (bytes <= 0 || bytes >= (int)sizeof(pids) || bytes % sizeof(pid_t)) return -1;
+    for (int i = 0; i < bytes / (int)sizeof(pid_t); i++) {
+        pid_t pid = pids[i];
+        if (pid <= 0 || pid == ignored) continue;
+        struct uid_process current;
+        int match = read_process(pid, uid, &current);
+        if (match < 0) return -1;
+        if (match == 1) {
+            if (*count == UID_SCAN_LIMIT) return -1;
+            found[(*count)++] = current;
         }
     }
     return 0;

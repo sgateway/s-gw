@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { linuxAgentUnitName, linuxProcessGroupsAreDedicated, parseSystemdAgentState, systemdRunArgs, validateLinuxAgentPlan,
+import { describe, expect, it, vi } from "vitest";
+import { linuxAgentUnitName, linuxProcessGroupsAreDedicated, linuxUnitOwnedByStartAttempt,
+  parseSystemdAgentState, startPreparedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan,
   type LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
 
 function plan(): LinuxAgentUnitPlan {
@@ -65,6 +66,90 @@ describe("Linux systemd agent unit plan", () => {
       .mainPid).toBe(1234);
     expect(() => parseSystemdAgentState(p, attestation(p).replace(
       " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
+  });
+
+  it("marks each start attempt and refuses ownership of a preexisting unit", () => {
+    const p = plan();
+    const attempt = "0123456789abcdef0123456789abcdef";
+    const output = [
+      `Id=${linuxAgentUnitName(p.sessionId)}`,
+      `Description=s-gw-agent-start:${attempt}`,
+      `User=${p.uid}`, `Group=${p.gid}`, `RootDirectory=${p.rootDirectory}`
+    ].join("\n") + "\n";
+    expect(systemdRunArgs(p, attempt)).toContain(`--description=s-gw-agent-start:${attempt}`);
+    expect(() => systemdRunArgs(p, "wrong")).toThrow("launch attempt ID");
+    expect(linuxUnitOwnedByStartAttempt(p, attempt, output)).toBe(true);
+    for (const changed of [
+      output.replace(attempt, "fedcba9876543210fedcba9876543210"),
+      output.replace(`Id=${linuxAgentUnitName(p.sessionId)}`, "Id=other.service"),
+      output.replace(`User=${p.uid}`, "User=1000"),
+      output.replace(`Group=${p.gid}`, "Group=1000"),
+      output.replace(`RootDirectory=${p.rootDirectory}`, "RootDirectory=/"),
+      output + `Description=s-gw-agent-start:${attempt}\n`,
+      output.replace(`Description=s-gw-agent-start:${attempt}\n`, "")
+    ]) {
+      expect(linuxUnitOwnedByStartAttempt(p, attempt, changed)).toBe(false);
+    }
+  });
+
+  it("stops only the unit from an ambiguous start attempt", async () => {
+    const p = plan();
+    const attempt = "0123456789abcdef0123456789abcdef";
+    const owned = [`Id=${linuxAgentUnitName(p.sessionId)}`, `Description=s-gw-agent-start:${attempt}`,
+      `User=${p.uid}`, `Group=${p.gid}`, `RootDirectory=${p.rootDirectory}`].join("\n") + "\n";
+    const events: string[] = [];
+    const launch = vi.fn(async () => { events.push("launch"); throw new Error("systemd-run timed out"); });
+    const inspectOwnership = vi.fn(async () => { events.push("inspect"); return owned; });
+    const verify = vi.fn(async () => { events.push("verify"); });
+    const stopOwned = vi.fn(async () => { events.push("stop"); });
+    const operations = { launch, inspectOwnership, verify, stopOwned };
+
+    await expect(startPreparedLinuxAgentUnit(p, attempt, operations)).rejects.toThrow("systemd-run timed out");
+    expect(events).toEqual(["launch", "inspect", "stop"]);
+    expect(verify).not.toHaveBeenCalled();
+
+    events.length = 0;
+    inspectOwnership.mockImplementationOnce(async () => {
+      events.push("inspect");
+      return owned.replace(attempt, "fedcba9876543210fedcba9876543210");
+    });
+    await expect(startPreparedLinuxAgentUnit(p, attempt, operations)).rejects.toThrow("systemd-run timed out");
+    expect(events).toEqual(["launch", "inspect"]);
+
+    events.length = 0;
+    launch.mockImplementationOnce(async () => { events.push("launch"); });
+    verify.mockImplementationOnce(async () => { events.push("verify"); throw new Error("socket changed"); });
+    await expect(startPreparedLinuxAgentUnit(p, attempt, operations)).rejects.toThrow("socket changed");
+    expect(events).toEqual(["launch", "verify", "inspect", "stop"]);
+
+    events.length = 0;
+    launch.mockImplementationOnce(async () => { events.push("launch"); });
+    verify.mockImplementationOnce(async () => { events.push("verify"); throw new Error("socket changed"); });
+    inspectOwnership.mockImplementationOnce(async () => {
+      events.push("inspect");
+      return owned.replace(attempt, "fedcba9876543210fedcba9876543210");
+    });
+    await expect(startPreparedLinuxAgentUnit(p, attempt, operations))
+      .rejects.toThrow("Linux agent start and teardown failed");
+    expect(events).toEqual(["launch", "verify", "inspect"]);
+  });
+
+  it("retains the failed start for recovery when owned-unit stop fails", async () => {
+    const p = plan();
+    const attempt = "0123456789abcdef0123456789abcdef";
+    const owned = [`Id=${linuxAgentUnitName(p.sessionId)}`, `Description=s-gw-agent-start:${attempt}`,
+      `User=${p.uid}`, `Group=${p.gid}`, `RootDirectory=${p.rootDirectory}`].join("\n") + "\n";
+    let gateCleaned = false;
+    const stopUnit = vi.fn(async () => { throw new Error("systemctl stop failed"); });
+    const result = startPreparedLinuxAgentUnit(p, attempt, {
+      launch: async () => { throw new Error("systemd-run timed out"); },
+      inspectOwnership: async () => owned,
+      verify: async () => { throw new Error("should not verify"); },
+      stopOwned: async () => { await stopUnit(); gateCleaned = true; }
+    });
+    await expect(result).rejects.toThrow("Linux agent start and teardown failed");
+    expect(stopUnit).toHaveBeenCalledOnce();
+    expect(gateCleaned).toBe(false);
   });
 
   it("accepts an opt-in root-owned socket activation plan without changing the agent unit", () => {

@@ -127,40 +127,58 @@ int main(void) {
 
 static int scenario;
 static int alive;
+static int saved_alive;
 static int reads;
 static int terms;
 static int kills;
 static int foreign_signals;
 
 int fake_listpids(uint32_t type, uint32_t uid, void *buffer, int bytes) {
-    if (uid != 231000 || bytes < (int)(2 * sizeof(pid_t))) return -1;
+    if (bytes < (int)(3 * sizeof(pid_t))) return -1;
     if (scenario == 5) return bytes;
     pid_t *pids = buffer;
-    if (type == PROC_UID_ONLY) {
-        pids[0] = 3333; // The escaped child has another process group.
-        pids[1] = 4444; // A PID that now belongs to someone else.
+    if (type == PROC_UID_ONLY && uid == 231000) {
+        pids[0] = 3333;
+        pids[1] = 4444;
         return 2 * sizeof(pid_t);
     }
-    if (type == PROC_RUID_ONLY) { pids[0] = 3333; return sizeof(pid_t); }
-    return -1;
+    if (type == PROC_RUID_ONLY && uid == 231000) {
+        pids[0] = 3333;
+        return sizeof(pid_t);
+    }
+    if (type != PROC_ALL_PIDS || uid != 0) return -1;
+    pids[0] = 3333; // The escaped child has another process group.
+    pids[1] = 4444; // A PID that now belongs to someone else.
+    if (scenario != 6) return 2 * sizeof(pid_t);
+    pids[2] = 5555; // Only the saved UID still names the agent.
+    return 3 * sizeof(pid_t);
 }
 
 int fake_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int bytes) {
     if (flavor != PROC_PIDTBSDINFO || arg != 0 || bytes != sizeof(struct proc_bsdinfo)) return -1;
     if (scenario == 4 && pid == 3333) { errno = EPERM; return -1; }
     if (pid == 3333 && !alive) { errno = ESRCH; return -1; }
+    if (pid == 5555 && !saved_alive) { errno = ESRCH; return -1; }
     struct proc_bsdinfo *info = buffer;
     memset(info, 0, sizeof(*info));
     info->pbi_pid = (uint32_t)pid;
-    info->pbi_uid = pid == 4444 || (scenario == 2 && ++reads >= 2) ? 501 : 231000;
+    info->pbi_uid = pid == 4444 || pid == 5555 || (scenario == 2 && ++reads >= 2) ? 501 : 231000;
     info->pbi_ruid = info->pbi_uid;
+    info->pbi_svuid = pid == 5555 ? 231000 : info->pbi_uid;
     info->pbi_start_tvsec = pid == 4444 ? 99 : 42;
     info->pbi_pgid = pid == 3333 ? 7777 : 4444;
     return sizeof(*info);
 }
 
 int fake_kill(pid_t pid, int signal_number) {
-    if (signal_number == 0) { errno = pid == 3333 && !alive ? ESRCH : 0; return errno ? -1 : 0; }
+    if (signal_number == 0) {
+        errno = (pid == 3333 && !alive) || (pid == 5555 && !saved_alive) ? ESRCH : 0;
+        return errno ? -1 : 0;
+    }
+    if (pid == 5555) {
+        if (signal_number == SIGTERM) { terms++; saved_alive = 0; }
+        return 0;
+    }
     if (pid != 3333) { foreign_signals++; return 0; }
     if (signal_number == SIGTERM) { terms++; if (scenario == 1) alive = 0; }
     if (signal_number == SIGKILL) { kills++; alive = 0; }
@@ -184,6 +202,9 @@ int main(void) {
     if (teardown_uid(231000, 0) == 0 || terms || foreign_signals) return 4;
     scenario = 5; alive = 1;
     if (teardown_uid(231000, 0) == 0 || foreign_signals) return 5;
+    scenario = 6; alive = 0; saved_alive = 1; terms = 0;
+    if (uid_is_empty(231000) == 0 || teardown_uid(231000, 0) ||
+        terms != 1 || saved_alive || foreign_signals) return 6;
     return 0;
 }
 `);
@@ -195,7 +216,7 @@ int main(void) {
     } finally { rmSync(tmp, { recursive: true, force: true }); }
   });
 
-  it("finds its own PID with both macOS UID filters", () => {
+  it("finds its own PID in the full macOS process scan", () => {
     const tmp = mkdtempSync(path.join(os.tmpdir(), "sgw-uid-list-"));
     try {
       const sourceDir = fileURLToPath(new URL("../native/macos-agent-launcher/", import.meta.url));
@@ -207,16 +228,13 @@ int main(void) {
 #undef main
 int main(void) {
     pid_t pids[UID_SCAN_LIMIT];
-    uint32_t filters[] = { PROC_UID_ONLY, PROC_RUID_ONLY };
-    for (size_t filter = 0; filter < 2; filter++) {
-        int bytes = proc_listpids(filters[filter], getuid(), pids, sizeof(pids));
-        if (bytes <= 0 || bytes >= (int)sizeof(pids) || bytes % sizeof(pid_t)) return 1;
-        int seen = 0;
-        for (int i = 0; i < bytes / (int)sizeof(pid_t); i++) {
-            if (pids[i] == getpid()) { seen = 1; break; }
-        }
-        if (!seen) return 2;
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
+    if (bytes <= 0 || bytes >= (int)sizeof(pids) || bytes % sizeof(pid_t)) return 1;
+    int seen = 0;
+    for (int i = 0; i < bytes / (int)sizeof(pid_t); i++) {
+        if (pids[i] == getpid()) { seen = 1; break; }
     }
+    if (!seen) return 2;
     struct uid_process self;
     return read_process(getpid(), getuid(), &self) == 1 ? 0 : 3;
 }

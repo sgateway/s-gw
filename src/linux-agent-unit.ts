@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readlink, readdir, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -76,8 +77,11 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
   }
 }
 
-export function systemdRunArgs(plan: LinuxAgentUnitPlan): string[] {
+export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): string[] {
   validateLinuxAgentPlan(plan);
+  if (attemptId !== undefined && !/^[a-f0-9]{32}$/.test(attemptId)) {
+    throw new Error("Invalid Linux agent launch attempt ID.");
+  }
   const unit = linuxAgentUnitName(plan.sessionId);
   const properties = [
     ...unitProperties,
@@ -89,8 +93,60 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan): string[] {
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock"
   ];
   return ["--system", "--no-ask-password", `--unit=${unit}`,
+    ...(attemptId ? [`--description=s-gw-agent-start:${attemptId}`] : []),
     ...properties.map(value => `--property=${value}`),
     "--", ...(plan.launchGate ? [gateExecutable, "--"] : []), plan.executable, ...plan.args];
+}
+
+export function linuxUnitOwnedByStartAttempt(plan: LinuxAgentUnitPlan, attemptId: string, output: string): boolean {
+  validateLinuxAgentPlan(plan);
+  if (!/^[a-f0-9]{32}$/.test(attemptId)) return false;
+  const fields = new Map<string, string>();
+  for (const line of output.trimEnd().split("\n")) {
+    const index = line.indexOf("=");
+    if (index < 1 || fields.has(line.slice(0, index))) return false;
+    fields.set(line.slice(0, index), line.slice(index + 1));
+  }
+  return fields.get("Id") === linuxAgentUnitName(plan.sessionId) &&
+    fields.get("Description") === `s-gw-agent-start:${attemptId}` &&
+    fields.get("User") === String(plan.uid) && fields.get("Group") === String(plan.gid) &&
+    fields.get("RootDirectory") === plan.rootDirectory;
+}
+
+interface PreparedLinuxUnitStart {
+  launch(): Promise<void>;
+  inspectOwnership(): Promise<string>;
+  verify(): Promise<void>;
+  stopOwned(): Promise<void>;
+}
+
+export async function startPreparedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,
+  operations: PreparedLinuxUnitStart): Promise<void> {
+  const stopAttempt = async () => {
+    const output = await operations.inspectOwnership();
+    if (!linuxUnitOwnedByStartAttempt(plan, attemptId, output)) return false;
+    await operations.stopOwned();
+    return true;
+  };
+  try {
+    await operations.launch();
+  } catch (error) {
+    try { await stopAttempt(); }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Linux agent start and teardown failed.");
+    }
+    throw error;
+  }
+  try {
+    await operations.verify();
+  } catch (error) {
+    try {
+      if (!await stopAttempt()) throw new Error("Could not prove ownership of the failed Linux agent start.");
+    } catch (stopError) {
+      throw new AggregateError([error, stopError], "Linux agent start and teardown failed.");
+    }
+    throw error;
+  }
 }
 
 function gateDirectory(plan: LinuxAgentUnitPlan): string {
@@ -159,39 +215,30 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
 
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
+    const attemptId = randomBytes(16).toString("hex");
+    const args = systemdRunArgs(plan, attemptId);
     await checkedAgentAccount(plan);
     if (plan.launchGate) await assertNoUidProcesses(plan.uid);
     const before = await checkedHostPaths(plan);
     if (plan.launchGate) this.gates.set(plan.sessionId, await prepareGate(plan));
-    try {
-      await run("/usr/bin/systemd-run", systemdRunArgs(plan));
-    } catch (error) {
-      if (plan.launchGate) {
-        try {
-          await assertNoUidProcesses(plan.uid);
-          await this.cleanGate(plan);
-        } catch (cleanupError) {
-          throw new AggregateError([error, cleanupError], "Linux agent start and gate cleanup failed.");
+    const unit = linuxAgentUnitName(plan.sessionId);
+    await startPreparedLinuxAgentUnit(plan, attemptId, {
+      launch: async () => { await run("/usr/bin/systemd-run", args); },
+      inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
+        "-p", "Id", "-p", "Description", "-p", "User", "-p", "Group", "-p", "RootDirectory"]),
+      verify: async () => {
+        if (await checkedHostPaths(plan) !== before) {
+          throw new Error("Linux agent launch paths changed while starting the unit.");
         }
-      }
-      throw error;
-    }
-    try {
-      if (await checkedHostPaths(plan) !== before) {
-        throw new Error("Linux agent launch paths changed while starting the unit.");
-      }
-      if (plan.launchGate) await checkedGateFiles(plan);
-      if (plan.launchGate && plan.activatedSocket) this.launchPaths.set(plan.sessionId, before);
-    } catch (error) {
-      try {
-        await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
+        if (plan.launchGate) await checkedGateFiles(plan);
+        if (plan.launchGate && plan.activatedSocket) this.launchPaths.set(plan.sessionId, before);
+      },
+      stopOwned: async () => {
+        await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", unit]);
         await assertNoUidProcesses(plan.uid);
         if (plan.launchGate) await this.cleanGate(plan);
-      } catch (stopError) {
-        throw new AggregateError([error, stopError], "Linux agent start and teardown failed.");
       }
-      throw error;
-    }
+    });
   }
 
   async inspect(plan: LinuxAgentUnitPlan): Promise<LinuxAgentUnitState> {

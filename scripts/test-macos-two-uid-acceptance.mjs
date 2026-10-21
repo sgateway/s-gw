@@ -270,8 +270,16 @@ async function runBroker(plan) {
   const servers = [];
   const stops = [];
   const received = new Map();
+  const revokedReports = new Map();
   const launchSeen = new Map();
   const reports = new Map();
+  const heldSeen = new Map();
+  const closedSeen = new Map();
+  const finalReports = new Map();
+  const probeStops = new Map();
+  const heldMode = new Set();
+  const revoking = new Set();
+  const heldSockets = new Map();
   const failed = deferred();
   let ipv4;
   let ipv6;
@@ -285,9 +293,40 @@ async function runBroker(plan) {
     for (const agent of plan.agents) {
       launchSeen.set(agent.uid, deferred());
       reports.set(agent.uid, deferred());
+      heldSeen.set(agent.uid, deferred());
+      closedSeen.set(agent.uid, deferred());
+      finalReports.set(agent.uid, deferred());
       const probeServer = await startVerifiedPeerServer({
         socketPath: agent.socketPath, socketMode: 0o660, socketGid: agent.gid,
         onConnection: async (socket, principal, peer) => {
+          if (revoking.has(agent.uid)) {
+            failed.resolve(new Error(`Agent ${agent.uid} was admitted after revocation.`));
+            socket.destroy();
+            return;
+          }
+          if (heldMode.has(agent.uid)) {
+            try {
+              requireValue(!heldSockets.has(agent.uid) && peer.uid === agent.uid &&
+                principal.principalId === `darwin:uid:${agent.uid}`,
+              `Agent ${agent.uid} opened an invalid held probe.`);
+              heldSockets.set(agent.uid, socket);
+              socket.once("close", () => {
+                if (!revoking.has(agent.uid)) {
+                  failed.resolve(new Error(`Agent ${agent.uid} lost its held probe before revocation.`));
+                  return;
+                }
+                closedSeen.get(agent.uid).resolve();
+              });
+              socket.write("HELD-V1\n");
+              requireValue(await readReport(socket) === "HOLD-ACK-V1",
+                `Agent ${agent.uid} did not acknowledge its held probe.`);
+              heldSeen.get(agent.uid).resolve();
+            } catch (error) {
+              failed.resolve(error);
+              throw error;
+            }
+            return;
+          }
           await acknowledgeMacAgentLaunch(socket, principal, peer);
           launchSeen.get(agent.uid).resolve();
         }
@@ -300,14 +339,25 @@ async function runBroker(plan) {
             const raw = await readReport(socket);
             const result = JSON.parse(raw);
             requireValue(peer.uid === agent.uid && principal.principalId === `darwin:uid:${agent.uid}` &&
-              result.uid === agent.uid && result.sessionId === agent.sessionId &&
-              result.wrongClaimDenied === true && result.crossIdentityDenied === true &&
-              result.ownAccepted === true && result.ipv4Denied === true && result.ipv6Denied === true &&
-              result.brokerCanaryDenied === true && result.otherWorkspaceDenied === true,
+              result.uid === agent.uid && result.sessionId === agent.sessionId,
+            `Agent ${agent.uid} sent a result under the wrong identity.`);
+            if (result.phase === "initial") {
+              requireValue(result.wrongClaimDenied === true && result.crossIdentityDenied === true &&
+                result.ownAccepted === true && result.ipv4Denied === true && result.ipv6Denied === true &&
+                result.brokerCanaryDenied === true && result.otherWorkspaceDenied === true,
               `Agent ${agent.uid} failed a native isolation probe.`);
-            requireValue(!received.has(agent.uid), `Agent ${agent.uid} sent duplicate results.`);
-            received.set(agent.uid, result);
-            socket.end("ACK-V1\n", () => reports.get(agent.uid).resolve());
+              requireValue(!received.has(agent.uid), `Agent ${agent.uid} sent duplicate initial results.`);
+              received.set(agent.uid, result);
+              heldMode.add(agent.uid);
+              socket.end("ACK-V1\n", () => reports.get(agent.uid).resolve());
+              return;
+            }
+            requireValue(result.phase === "revoked" && revoking.has(agent.uid) &&
+              heldSockets.has(agent.uid) && result.heldClosed === true &&
+              result.reconnectDenied === true && !revokedReports.has(agent.uid),
+            `Agent ${agent.uid} failed live peer revocation.`);
+            revokedReports.set(agent.uid, result);
+            socket.end("ACK-V1\n", () => finalReports.get(agent.uid).resolve());
           } catch (error) {
             failed.resolve(error);
             throw error;
@@ -316,7 +366,9 @@ async function runBroker(plan) {
       });
       servers.push(resultServer);
       const session = { uid: agent.uid, gid: agent.gid, sessionId: agent.sessionId, name: agent.account };
-      stops.push(await new MacAgentSessionLeases(plan.leaseDir).register(session, probeServer.registerSession));
+      const stopProbe = await new MacAgentSessionLeases(plan.leaseDir).register(session, probeServer.registerSession);
+      probeStops.set(agent.uid, stopProbe);
+      stops.push(stopProbe);
       stops.push(resultServer.registerSession(session));
     }
     for (const agent of plan.agents) {
@@ -342,6 +394,18 @@ async function runBroker(plan) {
       Promise.all([...launchSeen.values(), ...reports.values()].map(item => item.promise)),
       failed.promise.then(error => { throw error; }), timeout
     ]);
+    await Promise.race([
+      Promise.all([...heldSeen.values()].map(item => item.promise)),
+      failed.promise.then(error => { throw error; }), timeout
+    ]);
+    for (const agent of plan.agents) {
+      revoking.add(agent.uid);
+      probeStops.get(agent.uid)();
+    }
+    await Promise.race([
+      Promise.all([...closedSeen.values(), ...finalReports.values()].map(item => item.promise)),
+      failed.promise.then(error => { throw error; }), timeout
+    ]);
     await delay(200);
     requireValue(ipv4.hits() === 0 && ipv6.hits() === 0,
       "An agent reached a host-loopback listener directly.");
@@ -356,7 +420,7 @@ async function runBroker(plan) {
       }
     }));
     process.stdout.write(`${JSON.stringify({ event: "passed", uids: plan.agents.map(agent => agent.uid),
-      brokerLeasesRetained: true, hostLoopbackDenied: true })}\n`);
+      brokerLeasesRetained: true, livePeerRevocation: true, hostLoopbackDenied: true })}\n`);
   } finally {
     clearTimeout(deadlineTimer);
     process.off("SIGINT", interrupted);
@@ -380,6 +444,35 @@ async function sendReport(location, result) {
   });
 }
 
+function waitForHeldProbeClose(location) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(location);
+    let connected = false;
+    let acknowledged = false;
+    let reply = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("Held agent probe did not close after revocation."));
+    }, 15_000);
+    socket.once("connect", () => { connected = true; });
+    socket.on("data", chunk => {
+      reply += String(chunk);
+      if (reply === "HELD-V1\n" && !acknowledged) {
+        acknowledged = true;
+        socket.write("HOLD-ACK-V1\n");
+      } else if (reply.length > "HELD-V1\n".length) {
+        socket.destroy();
+      }
+    });
+    socket.once("error", error => { if (!connected) reject(error); });
+    socket.once("close", () => {
+      clearTimeout(timer);
+      if (!connected || !acknowledged) reject(new Error("The held agent probe was never accepted."));
+      else resolve();
+    });
+  });
+}
+
 async function selfTestReport() {
   let received;
   const server = createServer(socket => {
@@ -397,7 +490,21 @@ async function selfTestReport() {
     requireValue(received?.uid === 231001 && received.passed === true,
       "The newline-framed result exchange failed.");
   } finally { await new Promise(resolve => server.close(resolve)); }
-  process.stdout.write("Native acceptance result framing passed a local round trip.\n");
+  const heldServer = createServer(socket => {
+    socket.write("HELD-V1\n");
+    void readReport(socket).then(frame => {
+      if (frame !== "HOLD-ACK-V1") throw new Error("The held probe acknowledgement was wrong.");
+      socket.destroy();
+    }).catch(() => socket.destroy());
+  });
+  await new Promise((resolve, reject) => {
+    heldServer.once("error", reject);
+    heldServer.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    await waitForHeldProbeClose({ host: "127.0.0.1", port: heldServer.address().port });
+  } finally { await new Promise(resolve => heldServer.close(resolve)); }
+  process.stdout.write("Native acceptance result and held-probe framing passed local round trips.\n");
 }
 
 async function runAgent(args) {
@@ -431,7 +538,7 @@ async function runAgent(args) {
   try { await readdir(otherWorkspace); }
   catch (error) { otherWorkspaceDenied = error?.code === "EACCES" || error?.code === "EPERM"; }
   const result = {
-    uid, sessionId,
+    phase: "initial", uid, sessionId,
     wrongClaimDenied: wrongSessionReply === "" && wrongUidReply === "",
     crossIdentityDenied: otherReply === "",
     ownAccepted: ownReply === `READY-V1 ${uid} ${sessionId}\n`,
@@ -440,8 +547,13 @@ async function runAgent(args) {
     brokerCanaryDenied, otherWorkspaceDenied
   };
   await sendReport(reportSocket, result);
-  requireValue(Object.values(result).slice(2).every(value => value === true),
+  requireValue(Object.values(result).slice(3).every(value => value === true),
     "An agent identity or direct-network probe failed.");
+  await waitForHeldProbeClose(ownSocket);
+  const revoked = { phase: "revoked", uid, sessionId,
+    heldClosed: true, reconnectDenied: await sendProbe(ownSocket, uid, sessionId) === "" };
+  await sendReport(reportSocket, revoked);
+  requireValue(revoked.reconnectDenied, "A revoked agent reconnected to the broker probe.");
 }
 
 async function main() {
