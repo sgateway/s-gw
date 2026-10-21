@@ -279,12 +279,15 @@ static int close_inherited_fds(void) {
     struct proc_fdinfo *fds = malloc(capacity);
     if (!fds) return -1;
     int amount = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, (int)capacity);
-    if (amount <= 0 || (size_t)amount > capacity || amount % sizeof(struct proc_fdinfo)) {
+    if (amount <= 0 || (size_t)amount >= capacity || amount % sizeof(struct proc_fdinfo)) {
         free(fds);
         return -1;
     }
     for (int i = 0; i < amount / (int)sizeof(struct proc_fdinfo); i++) {
-        if (fds[i].proc_fd >= 3) close(fds[i].proc_fd);
+        if (fds[i].proc_fd >= 3 && close(fds[i].proc_fd)) {
+            free(fds);
+            return -1;
+        }
     }
     free(fds);
     return 0;

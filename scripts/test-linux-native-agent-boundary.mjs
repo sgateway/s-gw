@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, chown, copyFile, mkdir, readFile, rename, rm } from "node:fs/promises";
+import { chmod, chown, copyFile, mkdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { createSocket } from "node:dgram";
 import { createServer } from "node:net";
 import { networkInterfaces } from "node:os";
@@ -100,7 +100,7 @@ function availableIdentity() {
 async function stageRoot(plan, gateBinary, probeBinary) {
   const root = plan.rootDirectory;
   for (const relative of ["", "usr", "usr/bin", "usr/libexec", "usr/libexec/s-gw",
-    "run", "run/s-gw", "run/s-gw/launch-gate", "workspace"]) {
+    "run", "run/s-gw", "run/s-gw/launch-gate", "dev", "dev/shm", "workspace"]) {
     await mkdir(path.join(root, relative), { recursive: true, mode: 0o755 });
   }
   await chmod(root, 0o755);
@@ -126,7 +126,7 @@ function plan(sessionId, uid, brokerUid, otherId, ports, address) {
     executable: "/usr/bin/s-gw-native-probe",
     args: [sessionId, otherId, String(ports.ipv4), String(ports.ipv6), address, String(ports.host),
       String(ports.udp4), String(ports.udpHost)],
-    launchGate: true, activatedSocket: true
+    launchGate: true, activatedSocket: true, isolatedSharedMemory: true
   };
 }
 
@@ -295,6 +295,13 @@ async function rootRun() {
         states.get(ids[0]).cgroup === states.get(ids[1]).cgroup) {
       throw new Error("The two agents did not attest distinct UIDs and cgroups.");
     }
+    const shmRoots = await Promise.all(plans.map(item =>
+      stat(`/proc/${states.get(item.sessionId).mainPid}/root/dev/shm`)));
+    const hostShm = await stat("/dev/shm");
+    if (shmRoots.some(item => !item.isDirectory() || item.dev === hostShm.dev) ||
+        shmRoots[0].dev === shmRoots[1].dev) {
+      throw new Error("The two Linux agents did not receive distinct private shared-memory mounts.");
+    }
     for (const item of plans) {
       const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/result")),
         `${item.sessionId} native result`);
@@ -311,8 +318,8 @@ async function rootRun() {
     for (const item of plans) {
       const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer")),
         `${item.sessionId} peer Unix socket result`);
-      if (result !== "rights=1 ownfs=1 ownabstract=1 fs=1 hostfs=1 abstract=1\n") {
-        throw new Error(`${item.sessionId} failed a peer Unix socket or local SCM_RIGHTS probe: ${result}`);
+      if (result !== "rights=1 ownfs=1 ownabstract=1 fs=1 hostfs=1 abstract=1 ownshm=1 crossshm=1\n") {
+        throw new Error(`${item.sessionId} failed a peer Unix socket or POSIX shared-memory probe: ${result}`);
       }
     }
     await until(() => mailbox.events.filter(event => event.kind === "accepted").length >= 2 ? true : undefined,
@@ -403,7 +410,7 @@ async function rootRun() {
         "Native Linux agent teardown failed; its dedicated account and root were preserved for investigation.");
     }
   }
-  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, tested peer pathname/abstract Unix socket denial, local SCM_RIGHTS, revocation, and socket rebind. The listener was manually staged; cross-agent descriptor transfer, an installed systemd socket unit, and production MCP/model relay remain untested.");
+  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, tested peer pathname/abstract Unix socket denial, local SCM_RIGHTS, private POSIX shared memory, revocation, and socket rebind. The listener was manually staged; cross-agent descriptor transfer, an installed systemd socket unit, and production MCP/model relay remain untested.");
 }
 
 async function peer(socket) {

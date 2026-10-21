@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -119,29 +119,34 @@ function requestFrame(child) {
   });
 }
 
-async function acceptsAppContainer(executable, profile, packageSid, brokerSid, logonLuid, sessionId,
+async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
   { intruderProfile, stopJob = false } = {}) {
   const name = pipeName();
-  const run = launch([name, brokerSid, brokerSid, packageSid, logonLuid, sessionId]);
-  const loopback = net.createServer(socket => { loopbackHits++; socket.destroy(); });
-  let loopbackHits = 0;
+  const run = launch([name, brokerSid, brokerSid, profile.sid, logonLuid, sessionId]);
+  const loopbackHits = { ipv4: 0, ipv6: 0 };
+  const ipv4 = net.createServer(socket => { loopbackHits.ipv4++; socket.destroy(); });
+  const ipv6 = net.createServer(socket => { loopbackHits.ipv6++; socket.destroy(); });
   let client, intruder;
   try {
-    await deadline(new Promise((resolveListen, rejectListen) => {
-      loopback.once("error", rejectListen);
-      loopback.listen(0, "127.0.0.1", () => { loopback.off("error", rejectListen); resolveListen(); });
-    }), 10_000, "loopback probe listener");
-    const hostReached = new Promise(resolveHost => loopback.once("connection", resolveHost));
-    const hostProbe = net.createConnection({ host: "127.0.0.1", port: loopback.address().port });
-    hostProbe.on("error", () => {});
-    await deadline(hostReached, 5_000, "host loopback control");
-    hostProbe.destroy();
-    assert.equal(loopbackHits, 1, "The host loopback control did not reach its listener.");
-    loopbackHits = 0;
+    for (const [server, address, family] of [[ipv4, "127.0.0.1", "ipv4"], [ipv6, "::1", "ipv6"]]) {
+      await deadline(new Promise((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(0, address, () => { server.off("error", rejectListen); resolveListen(); });
+      }), 10_000, `${family} loopback listener`);
+      const hostReached = new Promise(resolveHost => server.once("connection", resolveHost));
+      const hostProbe = net.createConnection({ host: address, port: server.address().port });
+      hostProbe.on("error", () => {});
+      await deadline(hostReached, 5_000, `${family} host loopback control`);
+      hostProbe.destroy();
+      assert.equal(loopbackHits[family], 1, `The host ${family} control did not reach its listener.`);
+      loopbackHits[family] = 0;
+    }
     assert.equal(await deadline(run.ready, 30_000, "AppContainer pipe"), true,
       "The AppContainer pipe was not ready.");
     if (intruderProfile) {
-      intruder = launch(["launch", intruderProfile, name, String(loopback.address().port)], executable);
+      intruder = launch(["launch", intruderProfile.name, name, String(ipv4.address().port),
+        String(ipv6.address().port), intruderProfile.sharedPath, intruderProfile.canaryPath],
+      intruderProfile.executable);
       const denied = await deadline(intruder.done, 35_000, "cross-agent pipe attempt");
       assert.equal(denied.spawnError, undefined, denied.spawnError?.message);
       assert.notEqual(denied.code, 0, "The other AppContainer opened this agent's pipe.");
@@ -150,8 +155,9 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
       assert.equal(run.child.exitCode, null, "The other AppContainer consumed the broker's pipe instance.");
     }
     const request = requestFrame(run.child);
-    client = launch([stopJob ? "launch-stop" : "launch", profile, name,
-      String(loopback.address().port)], executable);
+    client = launch([stopJob ? "launch-stop" : "launch", profile.name, name,
+      String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
+      profile.canaryPath], profile.executable);
     const forwarded = await deadline(Promise.race([
       request,
       client.done.then(result => {
@@ -167,7 +173,8 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
       run.child.stdin.end();
       const broker = await deadline(run.done, 10_000, "broker after agent teardown");
       assert.notEqual(broker.code, 0, "The broker completed a request after the agent was killed.");
-      assert.equal(loopbackHits, 0, "The AppContainer reached host loopback without a network capability.");
+      assert.deepEqual(loopbackHits, { ipv4: 0, ipv6: 0 },
+        "The AppContainer reached host loopback without a network capability.");
       return;
     }
 
@@ -183,12 +190,15 @@ async function acceptsAppContainer(executable, profile, packageSid, brokerSid, l
     ]);
     assert.equal(broker.code, 0, broker.stderr || "The broker did not complete the verified exchange.");
     assert.equal(agent.code, 0, agent.stderr || "The AppContainer client did not receive the broker reply.");
-    assert.equal(loopbackHits, 0, "The AppContainer reached host loopback without a network capability.");
+    assert.deepEqual(loopbackHits, { ipv4: 0, ipv6: 0 },
+      "The AppContainer reached host loopback without a network capability.");
   } finally {
     const processes = [intruder, client, run].filter(Boolean);
     for (const item of processes) item.child.kill();
     await Promise.allSettled(processes.map(item => deadline(item.done, 5_000, "fixture cleanup")));
-    await new Promise(resolveClose => loopback.close(() => resolveClose()));
+    for (const server of [ipv4, ipv6]) {
+      if (server.listening) await new Promise(resolveClose => server.close(() => resolveClose()));
+    }
   }
 }
 
@@ -207,7 +217,7 @@ const tmp = mkdtempSync(join(tmpdir(), "s-gw-windows-peer-test-"));
 try {
   const tokenProbe = compileFixture(tokenSource, "test-token", ["advapi32.lib"]);
   const appContainerFixture = compileFixture(appContainerSource, "test-appcontainer",
-    ["advapi32.lib", "userenv.lib", "ws2_32.lib"]);
+    ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib"]);
 
   const probed = spawnSync(tokenProbe, [], { encoding: "utf8", windowsHide: true });
   assert.equal(probed.status, 0, probed.stderr || "Could not inspect the CI process token.");
@@ -238,30 +248,48 @@ try {
       const created = spawnSync(appContainerFixture, ["create", name],
         { encoding: "utf8", windowsHide: true });
       assert.equal(created.status, 0, created.stderr || "Could not create a temporary AppContainer profile.");
-      const sid = created.stdout.trim();
-      profiles.push({ name, sid });
+      const profile = { name };
+      profiles.push(profile);
+      const [sid, folder] = created.stdout.trim().split(/\r?\n/);
       assert.match(sid, /^S-1-15-2-(?:\d+-)*\d+$/);
-      for (const [path, permission] of [[tmp, "(OI)(CI)RX"], [appContainerFixture, "RX"]]) {
-        const acl = spawnSync("icacls", [path, "/grant", `*${sid}:${permission}`],
-          { encoding: "utf8", windowsHide: true });
-        assert.equal(acl.status, 0, acl.stderr || acl.stdout);
-      }
+      assert.ok(folder && existsSync(folder), "The AppContainer profile folder is unavailable.");
+      profile.sid = sid;
+      profile.fixtureDir = join(folder, `s-gw-ci-${randomBytes(8).toString("hex")}`);
+      mkdirSync(profile.fixtureDir);
+      const acl = spawnSync("icacls", [profile.fixtureDir, "/grant", `*${sid}:(OI)(CI)RX`],
+        { encoding: "utf8", windowsHide: true });
+      assert.equal(acl.status, 0, acl.stderr || acl.stdout);
+      profile.executable = join(profile.fixtureDir, "test-appcontainer.exe");
+      profile.sharedPath = join(profile.fixtureDir, "agent-readable.txt");
+      profile.canaryPath = join(tmp, `broker-only-canary-${name}.txt`);
+      copyFileSync(appContainerFixture, profile.executable);
+      writeFileSync(profile.sharedPath, "agent-readable fixture\n");
+      writeFileSync(profile.canaryPath, "broker-only fixture data\n");
+      const denied = spawnSync("icacls", [profile.canaryPath, "/deny", `*${sid}:(GR,GW,DE,WDAC,WO)`],
+        { encoding: "utf8", windowsHide: true });
+      assert.equal(denied.status, 0, denied.stderr || denied.stdout);
+      assert.equal(readFileSync(profile.canaryPath, "utf8"), "broker-only fixture data\n",
+        "The broker canary must remain readable to the host account.");
     }
     assert.notEqual(profiles[0].sid, profiles[1].sid, "The two agents need distinct package identities.");
-    await acceptsAppContainer(appContainerFixture, profiles[0].name, profiles[0].sid,
-      brokerSid, logonLuid, sessionId, { intruderProfile: profiles[1].name });
-    await acceptsAppContainer(appContainerFixture, profiles[1].name, profiles[1].sid,
-      brokerSid, logonLuid, sessionId, { intruderProfile: profiles[0].name });
-    await acceptsAppContainer(appContainerFixture, profiles[0].name, profiles[0].sid,
-      brokerSid, logonLuid, sessionId, { stopJob: true });
+    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
+      { intruderProfile: profiles[1] });
+    await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
+      { intruderProfile: profiles[0] });
+    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { stopJob: true });
+    for (const profile of profiles) {
+      assert.equal(readFileSync(profile.canaryPath, "utf8"), "broker-only fixture data\n",
+        "The broker canary changed during AppContainer execution.");
+    }
   } finally {
-    for (const { name } of profiles.reverse()) {
+    for (const { name, fixtureDir } of profiles.reverse()) {
+      if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
       const deleted = spawnSync(appContainerFixture, ["delete", name],
         { encoding: "utf8", windowsHide: true });
       assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
     }
   }
-  console.log("Native Windows two-agent pipe isolation, Job teardown, and AppContainer exchange passed.");
+  console.log("Native Windows two-agent pipe, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

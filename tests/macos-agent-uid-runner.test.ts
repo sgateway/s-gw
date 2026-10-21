@@ -106,6 +106,58 @@ int main(void) {
     } finally { rmSync(tmp, { recursive: true, force: true }); }
   });
 
+  it("refuses an ambiguous descriptor scan or a failed close", () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), "sgw-uid-fd-errors-"));
+    try {
+      const sourceDir = fileURLToPath(new URL("../native/macos-agent-launcher/", import.meta.url));
+      const harness = path.join(tmp, "fd-errors.c");
+      const binary = path.join(tmp, "fd-errors");
+      writeFileSync(harness, String.raw`
+#define proc_pidinfo fake_pidinfo
+#define close fake_close
+#define main sgw_uid_runner_entry
+#include "uid-runner.c"
+#undef main
+#undef close
+#undef proc_pidinfo
+
+static int scenario;
+static int closes;
+
+int fake_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int bytes) {
+    (void)pid;
+    (void)arg;
+    if (flavor != PROC_PIDLISTFDS) return -1;
+    if (!buffer) return sizeof(struct proc_fdinfo);
+    struct proc_fdinfo *fds = buffer;
+    fds[0].proc_fd = 7;
+    return scenario == 1 ? bytes : sizeof(*fds);
+}
+
+int fake_close(int fd) {
+    if (fd != 7) return -1;
+    closes++;
+    if (scenario == 2) { errno = EIO; return -1; }
+    return 0;
+}
+
+int main(void) {
+    scenario = 1;
+    if (close_inherited_fds() == 0 || closes != 0) return 1;
+    scenario = 2;
+    if (close_inherited_fds() == 0 || closes != 1) return 2;
+    scenario = 3;
+    return close_inherited_fds() == 0 && closes == 2 ? 0 : 3;
+}
+`);
+      const build = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-I", sourceDir,
+        harness, "-o", binary], { encoding: "utf8" });
+      expect(build.status, build.stderr).toBe(0);
+      const run = spawnSync(binary, [], { encoding: "utf8" });
+      expect(run.status, run.stderr).toBe(0);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
   it("sweeps escaped UID descendants and refuses stale or uninspectable PIDs", () => {
     const tmp = mkdtempSync(path.join(os.tmpdir(), "sgw-uid-teardown-"));
     try {

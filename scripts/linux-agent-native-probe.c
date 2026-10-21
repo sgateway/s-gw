@@ -9,7 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -112,6 +114,40 @@ static int socket_path(char *buffer, size_t size, const char *prefix, const char
     return length > 0 && (size_t)length < size;
 }
 
+static int shared_memory_name(char *buffer, size_t size, const char *session) {
+    int length = snprintf(buffer, size, "/sgw-ci-%s", session);
+    return length > 0 && (size_t)length < size;
+}
+
+static int create_shared_memory(const char *name) {
+    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) return -1;
+    const char marker = 's';
+    if (fchmod(fd, 0666) != 0 || ftruncate(fd, 1) != 0 ||
+        pwrite(fd, &marker, 1, 0) != 1) {
+        close(fd);
+        shm_unlink(name);
+        return -1;
+    }
+    return fd;
+}
+
+static int shared_memory_result(const char *own, const char *other,
+                                int *own_good, int *other_denied) {
+    char own_name[96], other_name[96];
+    if (!shared_memory_name(own_name, sizeof(own_name), own) ||
+        !shared_memory_name(other_name, sizeof(other_name), other)) return -1;
+    int fd = shm_open(own_name, O_RDONLY, 0);
+    char marker = 0;
+    *own_good = fd >= 0 && pread(fd, &marker, 1, 0) == 1 && marker == 's';
+    if (fd >= 0) close(fd);
+    fd = shm_open(other_name, O_RDONLY, 0);
+    int error = errno;
+    if (fd >= 0) close(fd);
+    *other_denied = fd < 0 && error == ENOENT;
+    return 0;
+}
+
 static int transfer_result(const char *own, const char *other, int path_listener, int abstract_listener) {
     char workspace[128], host_path[128], abstract_name[96];
     char own_path[128], own_abstract[96];
@@ -131,10 +167,13 @@ static int transfer_result(const char *own, const char *other, int path_listener
     if (abstract_fd >= 0) close(abstract_fd);
     int own_file = self_connect(path_listener, unix_connect(own_path));
     int own_abstract_socket = self_connect(abstract_listener, abstract_socket(own_abstract, 0));
-    char result[128];
+    int own_shared = 0, other_shared_denied = 0;
+    if (shared_memory_result(own, other, &own_shared, &other_shared_denied) != 0) return -1;
+    char result[160];
     snprintf(result, sizeof(result),
-        "rights=%d ownfs=%d ownabstract=%d fs=%d hostfs=%d abstract=%d\n",
-        rights_selftest(), own_file, own_abstract_socket, file_denied, host_denied, abstract_denied);
+        "rights=%d ownfs=%d ownabstract=%d fs=%d hostfs=%d abstract=%d ownshm=%d crossshm=%d\n",
+        rights_selftest(), own_file, own_abstract_socket, file_denied, host_denied,
+        abstract_denied, own_shared, other_shared_denied);
     return save("/workspace/transfer", result);
 }
 
@@ -281,10 +320,19 @@ int main(int argc, char **argv) {
         !socket_path(own_abstract, sizeof(own_abstract), "sgw-ci-transfer-", argv[1])) return 70;
     int path_listener = unix_listen(own_path);
     int abstract_listener = abstract_socket(own_abstract, 1);
+    char shared_name[96];
+    if (!shared_memory_name(shared_name, sizeof(shared_name), argv[1])) return 70;
+    int shared_fd = create_shared_memory(shared_name);
     if (path_listener < 0 || abstract_listener < 0 || !rights_selftest() ||
+        shared_fd < 0 ||
         !self_connect(path_listener, unix_connect(own_path)) ||
         !self_connect(abstract_listener, abstract_socket(own_abstract, 0)) ||
-        save("/workspace/transfer-ready", "ready\n") != 0) return 70;
+        save("/workspace/transfer-ready", "ready\n") != 0) {
+        if (shared_fd >= 0) { close(shared_fd); shm_unlink(shared_name); }
+        if (path_listener >= 0) close(path_listener);
+        if (abstract_listener >= 0) close(abstract_listener);
+        return 70;
+    }
     while (!retry) {
         if (transfer_probe) {
             transfer_probe = 0;
@@ -293,6 +341,8 @@ int main(int argc, char **argv) {
     }
     close(path_listener);
     close(abstract_listener);
+    close(shared_fd);
+    shm_unlink(shared_name);
     const char *rebound = approved(argv[2], argv[1]) ? "rebind=accepted\n" : "rebind=denied\n";
     return save("/workspace/rebind", rebound) == 0 ? 0 : 70;
 }

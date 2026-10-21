@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { linuxAgentUnitName, linuxProcessGroupsAreDedicated, linuxUnitOwnedByStartAttempt,
+import { linuxAgentUnitName, linuxPrivateSharedMemoryMount, linuxProcessGroupsAreDedicated, linuxUnitOwnedByStartAttempt,
   parseSystemdAgentState, startPreparedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan,
   type LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
 
@@ -21,6 +21,7 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `RootDirectory=${p.rootDirectory}`, "WorkingDirectory=/workspace",
     `ReadWritePaths=${p.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${binds}`, "BindPaths=",
+    `TemporaryFileSystem=${p.isolatedSharedMemory ? "/dev/shm:rw,nosuid,nodev,noexec,mode=1777" : ""}`,
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
     "DynamicUser=no", "PrivateUsers=no",
@@ -66,6 +67,36 @@ describe("Linux systemd agent unit plan", () => {
       .mainPid).toBe(1234);
     expect(() => parseSystemdAgentState(p, attestation(p).replace(
       " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
+  });
+
+  it("keeps POSIX shared memory usable but private in the isolated profile", () => {
+    const ordinary = plan();
+    const isolated = { ...ordinary, launchGate: true, isolatedSharedMemory: true };
+    expect(systemdRunArgs(ordinary).some(arg => arg.startsWith("--property=TemporaryFileSystem="))).toBe(false);
+    expect(systemdRunArgs(isolated)).toContain(
+      "--property=TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777");
+    expect(parseSystemdAgentState(isolated, attestation(isolated)).mainPid).toBe(1234);
+    expect(() => parseSystemdAgentState(isolated, attestation(isolated).replace(
+      "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
+      "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,mode=1777"))).toThrow("did not attest");
+    expect(() => parseSystemdAgentState(isolated, attestation(isolated).replace(
+      "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
+      "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777 /dev/shm-host")))
+      .toThrow("did not attest");
+    expect(() => validateLinuxAgentPlan({ ...ordinary, isolatedSharedMemory: "yes" as never }))
+      .toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...ordinary, isolatedSharedMemory: true }))
+      .toThrow("arguments");
+  });
+
+  it("rejects a host shared-memory bind despite matching tmpfs mount flags", () => {
+    const mount = "51 30 0:44 / /dev/shm rw,nosuid,nodev,noexec - tmpfs tmpfs rw,mode=1777\n";
+    expect(linuxPrivateSharedMemoryMount(mount, 44, 43)).toBe(true);
+    expect(linuxPrivateSharedMemoryMount(mount, 43, 43)).toBe(false);
+    expect(linuxPrivateSharedMemoryMount(mount + mount, 44, 43)).toBe(false);
+    expect(linuxPrivateSharedMemoryMount(mount.replace("noexec", "exec"), 44, 43)).toBe(false);
+    expect(linuxPrivateSharedMemoryMount(mount.replace("tmpfs tmpfs", "ext4 /dev/sda"), 44, 43))
+      .toBe(false);
   });
 
   it("marks each start attempt and refuses ownership of a preexisting unit", () => {

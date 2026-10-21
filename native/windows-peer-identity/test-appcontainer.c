@@ -5,6 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <objbase.h>
 #include <sddl.h>
 #include <userenv.h>
 #include <stdio.h>
@@ -17,39 +18,63 @@
 static int create_profile(const wchar_t *name) {
     PSID sid = NULL;
     LPSTR text = NULL;
+    LPWSTR wide_sid = NULL;
+    PWSTR folder = NULL;
+    char *folder_utf8 = NULL;
     HRESULT status = CreateAppContainerProfile(name, L"s-gw pipe test", L"Temporary CI identity", NULL, 0, &sid);
     if (FAILED(status)) {
         fprintf(stderr, "CreateAppContainerProfile failed: 0x%08lx\n", (unsigned long)status);
         return 1;
     }
-    if (!ConvertSidToStringSidA(sid, &text)) {
-        DeleteAppContainerProfile(name);
-        FreeSid(sid);
-        return 1;
-    }
-    puts(text);
+    int result = 1;
+    if (!ConvertSidToStringSidA(sid, &text) || !ConvertSidToStringSidW(sid, &wide_sid)) goto done;
+    status = GetAppContainerFolderPath(wide_sid, &folder);
+    if (FAILED(status) || !folder) goto done;
+    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, folder, -1, NULL, 0, NULL, NULL);
+    if (bytes < 2) goto done;
+    folder_utf8 = malloc((size_t)bytes);
+    if (!folder_utf8 || !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, folder, -1,
+        folder_utf8, bytes, NULL, NULL)) goto done;
+    printf("%s\n%s\n", text, folder_utf8);
+    result = 0;
+
+done:
+    if (result) DeleteAppContainerProfile(name);
+    free(folder_utf8);
+    if (folder) CoTaskMemFree(folder);
+    if (wide_sid) LocalFree(wide_sid);
     LocalFree(text);
     FreeSid(sid);
-    return 0;
+    return result;
 }
 
-static int loopback_blocked(const wchar_t *port_text) {
+static int loopback_blocked(const wchar_t *port_text, int family) {
     wchar_t *end = NULL;
     unsigned long port = wcstoul(port_text, &end, 10);
     if (!end || *end || port < 1 || port > 65535) return 0;
     WSADATA winsock;
     if (WSAStartup(MAKEWORD(2, 2), &winsock)) return 0;
-    SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET probe = socket(family, SOCK_STREAM, IPPROTO_TCP);
     if (probe == INVALID_SOCKET) {
         int error = WSAGetLastError();
         WSACleanup();
         return error == WSAEACCES;
     }
-    struct sockaddr_in target = { 0 };
-    target.sin_family = AF_INET;
-    target.sin_port = htons((u_short)port);
-    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int blocked = connect(probe, (const struct sockaddr *)&target, sizeof(target)) == SOCKET_ERROR;
+    int blocked;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 target = { 0 };
+        IN6_ADDR loopback = IN6ADDR_LOOPBACK_INIT;
+        target.sin6_family = AF_INET6;
+        target.sin6_port = htons((u_short)port);
+        target.sin6_addr = loopback;
+        blocked = connect(probe, (const struct sockaddr *)&target, sizeof(target)) == SOCKET_ERROR;
+    } else {
+        struct sockaddr_in target = { 0 };
+        target.sin_family = AF_INET;
+        target.sin_port = htons((u_short)port);
+        target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        blocked = connect(probe, (const struct sockaddr *)&target, sizeof(target)) == SOCKET_ERROR;
+    }
     int error = blocked ? WSAGetLastError() : 0;
     closesocket(probe);
     WSACleanup();
@@ -57,7 +82,47 @@ static int loopback_blocked(const wchar_t *port_text) {
     return blocked;
 }
 
-static int run_client(const wchar_t *pipe_name, const wchar_t *probe_port, const wchar_t *profile) {
+static int can_read_fixture(const wchar_t *path) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    const char expected[] = "agent-readable fixture\n";
+    char content[sizeof(expected) - 1];
+    DWORD amount = 0;
+    int readable = ReadFile(file, content, sizeof(content), &amount, NULL) &&
+        amount == sizeof(content) && memcmp(content, expected, sizeof(content)) == 0;
+    CloseHandle(file);
+    return readable;
+}
+
+static int canary_access_denied(const wchar_t *path, DWORD rights, const char *operation) {
+    HANDLE file = CreateFileW(path, rights, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+        fprintf(stderr, "AppContainer broker canary allowed %s.\n", operation);
+        return 0;
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED) return 1;
+    fprintf(stderr, "AppContainer broker canary %s failed unexpectedly: %lu\n", operation, error);
+    return 0;
+}
+
+static int canary_delete_denied(const wchar_t *path) {
+    if (DeleteFileW(path)) {
+        fputs("AppContainer deleted the broker canary.\n", stderr);
+        return 0;
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED) return 1;
+    fprintf(stderr, "AppContainer broker canary delete failed unexpectedly: %lu\n", error);
+    return 0;
+}
+
+static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
+    const wchar_t *ipv6_port, const wchar_t *shared_path,
+    const wchar_t *canary_path, const wchar_t *profile) {
     PSID expected_sid = NULL;
     if (FAILED(DeriveAppContainerSidFromAppContainerName(profile, &expected_sid))) return 1;
     HANDLE token = NULL;
@@ -76,8 +141,19 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *probe_port, const
     CloseHandle(token);
     FreeSid(expected_sid);
     if (!isolated) return 1;
-    if (!loopback_blocked(probe_port)) {
-        fputs("AppContainer reached forbidden host loopback.\n", stderr);
+    if (!loopback_blocked(ipv4_port, AF_INET) || !loopback_blocked(ipv6_port, AF_INET6)) {
+        fputs("AppContainer reached forbidden IPv4 or IPv6 host loopback.\n", stderr);
+        return 1;
+    }
+    if (!can_read_fixture(shared_path)) {
+        fputs("AppContainer could not read its shared-file control.\n", stderr);
+        return 1;
+    }
+    if (!canary_access_denied(canary_path, GENERIC_READ, "read") ||
+        !canary_access_denied(canary_path, GENERIC_WRITE, "write") ||
+        !canary_access_denied(canary_path, DELETE, "delete") ||
+        !canary_access_denied(canary_path, WRITE_DAC, "ACL change") ||
+        !canary_delete_denied(canary_path)) {
         return 1;
     }
 
@@ -102,8 +178,9 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *probe_port, const
     return result;
 }
 
-static int launch_client(const wchar_t *name, const wchar_t *pipe_name, const wchar_t *probe_port,
-    int stop_job) {
+static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
+    const wchar_t *ipv4_port, const wchar_t *ipv6_port,
+    const wchar_t *shared_path, const wchar_t *canary_path, int stop_job) {
     PSID sid = NULL;
     HRESULT status = DeriveAppContainerSidFromAppContainerName(name, &sid);
     if (FAILED(status)) return 1;
@@ -128,9 +205,10 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name, const wc
     wchar_t executable[MAX_PATH];
     DWORD length = GetModuleFileNameW(NULL, executable, MAX_PATH);
     if (!length || length >= MAX_PATH) goto done;
-    wchar_t command[MAX_PATH + 256];
-    if (swprintf(command, sizeof(command) / sizeof(command[0]), L"\"%ls\" client \"%ls\" %ls \"%ls\"",
-        executable, pipe_name, probe_port, name) < 0) goto done;
+    wchar_t command[MAX_PATH * 4 + 256];
+    if (swprintf(command, sizeof(command) / sizeof(command[0]),
+        L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\"",
+        executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path, name) < 0) goto done;
 
     STARTUPINFOEXW startup = { 0 };
     startup.StartupInfo.cb = sizeof(startup);
@@ -199,8 +277,11 @@ int wmain(int argc, wchar_t **argv) {
         if (FAILED(status)) fprintf(stderr, "DeleteAppContainerProfile failed: 0x%08lx\n", (unsigned long)status);
         return FAILED(status) ? 1 : 0;
     }
-    if (argc == 5 && wcscmp(argv[1], L"client") == 0) return run_client(argv[2], argv[3], argv[4]);
-    if (argc == 5 && wcscmp(argv[1], L"launch") == 0) return launch_client(argv[2], argv[3], argv[4], 0);
-    if (argc == 5 && wcscmp(argv[1], L"launch-stop") == 0) return launch_client(argv[2], argv[3], argv[4], 1);
+    if (argc == 8 && wcscmp(argv[1], L"client") == 0)
+        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+    if (argc == 8 && wcscmp(argv[1], L"launch") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 0);
+    if (argc == 8 && wcscmp(argv[1], L"launch-stop") == 0)
+        return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], 1);
     return 1;
 }

@@ -16,6 +16,7 @@ export interface LinuxAgentUnitPlan {
   args: readonly string[];
   launchGate?: boolean;
   activatedSocket?: boolean;
+  isolatedSharedMemory?: boolean;
 }
 
 export interface LinuxAgentUnitState {
@@ -39,6 +40,7 @@ const socketPrefix = "/run/s-gw/agents/";
 const gatePrefix = "/run/s-gw/launch-gates/";
 const gateExecutable = "/usr/libexec/s-gw/agent-launch-gate";
 const gateMount = "/run/s-gw/launch-gate";
+const privateSharedMemoryMount = "/dev/shm:rw,nosuid,nodev,noexec,mode=1777";
 const unitProperties = [
   "Type=exec", "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
   "DynamicUser=no", "PrivateUsers=no",
@@ -71,6 +73,8 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
   if (!canonicalPath(plan.executable) || !plan.executable.startsWith("/usr/") ||
       (plan.launchGate !== undefined && typeof plan.launchGate !== "boolean") ||
       (plan.activatedSocket !== undefined && typeof plan.activatedSocket !== "boolean") ||
+      (plan.isolatedSharedMemory !== undefined && typeof plan.isolatedSharedMemory !== "boolean") ||
+      (plan.isolatedSharedMemory === true && plan.launchGate !== true) ||
       !Array.isArray(plan.args) || plan.args.length > 128 ||
       plan.args.some(arg => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
     throw new Error("Linux agent executable or arguments are invalid.");
@@ -90,6 +94,7 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): st
     "WorkingDirectory=/workspace",
     `ReadWritePaths=${plan.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${bindReadOnlyPaths(plan)}`,
+    ...(plan.isolatedSharedMemory ? [`TemporaryFileSystem=${privateSharedMemoryMount}`] : []),
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock"
   ];
   return ["--system", "--no-ask-password", `--unit=${unit}`,
@@ -188,6 +193,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       !matches("RootDirectory", plan.rootDirectory) || !matches("WorkingDirectory", "/workspace") ||
       !matches("ReadWritePaths", `${plan.rootDirectory}/workspace`) ||
       !attestedReadOnlyPaths(plan, fields.get("BindReadOnlyPaths")) ||
+      (plan.isolatedSharedMemory && !matches("TemporaryFileSystem", privateSharedMemoryMount)) ||
       !matches("BindPaths", "") ||
       !matches("Environment", "SGW_BROKER_SOCKET=/run/s-gw/broker.sock") ||
       !matches("Restart", "no") || !matches("KillMode", "control-group") ||
@@ -247,6 +253,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     const output = await run("/usr/bin/systemctl", ["--system", "--no-pager", "show", linuxAgentUnitName(plan.sessionId),
       "-p", "Id", "-p", "ActiveState", "-p", "Type", "-p", "User", "-p", "Group",
       "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "ReadWritePaths", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
+      "-p", "TemporaryFileSystem",
       "-p", "Environment", "-p", "Restart", "-p", "KillMode", "-p", "SendSIGKILL",
       "-p", "Delegate", "-p", "DynamicUser", "-p", "PrivateUsers", "-p", "PrivateNetwork",
       "-p", "SupplementaryGroups",
@@ -511,6 +518,33 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
     throw new Error("Linux agent main process did not attest its OS identity and namespaces.");
   }
   if (plan.launchGate) await assertHeldLaunchGate(plan, state);
+  if (plan.isolatedSharedMemory) await assertPrivateSharedMemory(state);
+}
+
+async function assertPrivateSharedMemory(state: LinuxAgentUnitState): Promise<void> {
+  const [mountinfo, inside, host] = await Promise.all([
+    readFile(`/proc/${state.mainPid}/mountinfo`, "utf8"),
+    stat(`/proc/${state.mainPid}/root/dev/shm`), stat("/dev/shm")
+  ]);
+  if (!inside.isDirectory() || (inside.mode & 0o7777) !== 0o1777 ||
+      !host.isDirectory() ||
+      !linuxPrivateSharedMemoryMount(mountinfo, inside.dev, host.dev)) {
+    throw new Error("Linux agent private shared-memory mount did not attest.");
+  }
+}
+
+export function linuxPrivateSharedMemoryMount(mountinfo: string, agentDev: number,
+  hostDev: number): boolean {
+  if (!Number.isSafeInteger(agentDev) || !Number.isSafeInteger(hostDev) ||
+      agentDev === hostDev) return false;
+  const mounts = mountinfo.split("\n").filter(line => line.split(" ")[4] === "/dev/shm");
+  if (mounts.length !== 1) return false;
+  const fields = mounts[0].split(" ");
+  const separator = fields.indexOf("-");
+  const options = fields[5]?.split(",") || [];
+  return separator >= 0 && fields[separator + 1] === "tmpfs" &&
+    options.includes("rw") && options.includes("nosuid") &&
+    options.includes("nodev") && options.includes("noexec");
 }
 
 async function assertHeldLaunchGate(plan: LinuxAgentUnitPlan, state: LinuxAgentUnitState): Promise<void> {

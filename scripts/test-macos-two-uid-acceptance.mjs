@@ -2,6 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createSocket } from "node:dgram";
 import { access, lstat, readFile, realpath, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { createConnection, createServer } from "node:net";
@@ -218,6 +219,43 @@ function canConnect(host, port) {
   });
 }
 
+function sendUdpProbe(host, port) {
+  return new Promise(resolve => {
+    const socket = createSocket(host.includes(":") ? "udp6" : "udp4");
+    let done = false;
+    const timer = setTimeout(finish, 1500);
+    function finish() {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket.close();
+      resolve();
+    }
+    socket.on("error", finish);
+    socket.send("SGW-UDP-PROBE", port, host, finish);
+  });
+}
+
+function startUdpLoopback(host) {
+  let hits = 0;
+  const socket = createSocket(host.includes(":") ? "udp6" : "udp4");
+  socket.on("message", () => { hits++; });
+  return new Promise((resolve, reject) => {
+    socket.once("error", reject);
+    socket.bind(0, host, async () => {
+      socket.off("error", reject);
+      try {
+        const port = socket.address().port;
+        await sendUdpProbe(host, port);
+        await delay(50);
+        requireValue(hits > 0, `Broker cannot reach its ${host} UDP test listener.`);
+        hits = 0;
+        resolve({ port, hits: () => hits, close: () => new Promise(done => socket.close(done)) });
+      } catch (error) { socket.close(); reject(error); }
+    });
+  });
+}
+
 function sendProbe(location, uid, session) {
   return new Promise(resolve => {
     const socket = createConnection(location);
@@ -283,6 +321,8 @@ async function runBroker(plan) {
   const failed = deferred();
   let ipv4;
   let ipv6;
+  let udp4;
+  let udp6;
   let deadlineTimer;
   function interrupted() { failed.resolve(new Error("Native acceptance was interrupted.")); }
   process.once("SIGINT", interrupted);
@@ -290,6 +330,8 @@ async function runBroker(plan) {
   try {
     ipv4 = await startLoopback("127.0.0.1");
     ipv6 = await startLoopback("::1");
+    udp4 = await startUdpLoopback("127.0.0.1");
+    udp6 = await startUdpLoopback("::1");
     for (const agent of plan.agents) {
       launchSeen.set(agent.uid, deferred());
       reports.set(agent.uid, deferred());
@@ -383,7 +425,8 @@ async function runBroker(plan) {
           agent.socketPath, plan.nodeExecutable, "--", plan.stagedAgentScript, "--agent",
           String(agent.uid), String(agent.gid), agent.sessionId, agent.socketPath, other.socketPath,
           String(other.uid), other.sessionId, agent.reportSocketPath,
-          String(ipv4.port), String(ipv6.port), plan.brokerCanary, other.workspace]
+          String(ipv4.port), String(ipv6.port), String(udp4.port), String(udp6.port),
+          plan.brokerCanary, other.workspace]
       };
     });
     process.stdout.write(`${JSON.stringify({ event: "ready", launchPlans })}\n`);
@@ -407,7 +450,8 @@ async function runBroker(plan) {
       failed.promise.then(error => { throw error; }), timeout
     ]);
     await delay(200);
-    requireValue(ipv4.hits() === 0 && ipv6.hits() === 0,
+    requireValue(ipv4.hits() === 0 && ipv6.hits() === 0 &&
+      udp4.hits() === 0 && udp6.hits() === 0,
       "An agent reached a host-loopback listener directly.");
     for (const stop of stops) stop();
     await Promise.all(plan.agents.map(async agent => {
@@ -420,7 +464,8 @@ async function runBroker(plan) {
       }
     }));
     process.stdout.write(`${JSON.stringify({ event: "passed", uids: plan.agents.map(agent => agent.uid),
-      brokerLeasesRetained: true, livePeerRevocation: true, hostLoopbackDenied: true })}\n`);
+      brokerLeasesRetained: true, livePeerRevocation: true,
+      hostLoopbackDenied: true, udpHostLoopbackDenied: true })}\n`);
   } finally {
     clearTimeout(deadlineTimer);
     process.off("SIGINT", interrupted);
@@ -429,6 +474,8 @@ async function runBroker(plan) {
     for (const server of servers.reverse()) await server.close();
     await ipv4?.close();
     await ipv6?.close();
+    await udp4?.close();
+    await udp6?.close();
   }
 }
 
@@ -474,6 +521,15 @@ function waitForHeldProbeClose(location) {
 }
 
 async function selfTestReport() {
+  const udp4 = await startUdpLoopback("127.0.0.1");
+  const udp6 = await startUdpLoopback("::1");
+  try {
+    await sendUdpProbe("127.0.0.1", udp4.port);
+    await sendUdpProbe("::1", udp6.port);
+    await delay(50);
+    requireValue(udp4.hits() > 0 && udp6.hits() > 0,
+      "The UDP test listeners did not record probe traffic.");
+  } finally { await udp4.close(); await udp6.close(); }
   let received;
   const server = createServer(socket => {
     void readReport(socket).then(frame => {
@@ -504,21 +560,24 @@ async function selfTestReport() {
   try {
     await waitForHeldProbeClose({ host: "127.0.0.1", port: heldServer.address().port });
   } finally { await new Promise(resolve => heldServer.close(resolve)); }
-  process.stdout.write("Native acceptance result and held-probe framing passed local round trips.\n");
+  process.stdout.write("Native acceptance result, held-probe framing, and UDP controls passed local round trips.\n");
 }
 
 async function runAgent(args) {
-  requireValue(process.platform === "darwin" && args.length === 12, "Invalid native agent fixture arguments.");
+  requireValue(process.platform === "darwin" && args.length === 14, "Invalid native agent fixture arguments.");
   const [uidText, gidText, sessionId, ownSocket, otherSocket, otherUidText, otherSession,
-    reportSocket, ipv4Text, ipv6Text, brokerCanary, otherWorkspace] = args;
+    reportSocket, ipv4Text, ipv6Text, udp4Text, udp6Text, brokerCanary, otherWorkspace] = args;
   const uid = Number(uidText);
   const gid = Number(gidText);
   const otherUid = Number(otherUidText);
   const ipv4Port = Number(ipv4Text);
   const ipv6Port = Number(ipv6Text);
+  const udp4Port = Number(udp4Text);
+  const udp6Port = Number(udp6Text);
   requireValue(Number.isSafeInteger(uid) && uid > 0 && Number.isSafeInteger(gid) && gid > 0 &&
     Number.isSafeInteger(otherUid) && otherUid > 0 &&
     Number.isSafeInteger(ipv4Port) && ipv4Port > 0 && Number.isSafeInteger(ipv6Port) && ipv6Port > 0 &&
+    Number.isSafeInteger(udp4Port) && udp4Port > 0 && Number.isSafeInteger(udp6Port) && udp6Port > 0 &&
     sessionPattern.test(sessionId) && sessionPattern.test(otherSession) &&
     [ownSocket, otherSocket, reportSocket, brokerCanary, otherWorkspace].every(isFixturePath),
     "Malformed agent fixture identity or paths.");
@@ -531,6 +590,8 @@ async function runAgent(args) {
   const wrongUidReply = await sendProbe(ownSocket, otherUid, sessionId);
   const otherReply = await sendProbe(otherSocket, otherUid, otherSession);
   const ownReply = await sendProbe(ownSocket, uid, sessionId);
+  await sendUdpProbe("127.0.0.1", udp4Port);
+  await sendUdpProbe("::1", udp6Port);
   let brokerCanaryDenied = false;
   let otherWorkspaceDenied = false;
   try { await readFile(brokerCanary); }
