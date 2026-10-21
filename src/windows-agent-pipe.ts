@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-context.js";
+import { inspectWindowsPeerHelperAcl } from "./windows-peer-helper-acl.js";
 import { windowsSystemEnvironment } from "./windows-system.js";
 
 const maxMessageBytes = 32 * 1024;
@@ -29,6 +30,7 @@ export type WindowsPipeRequestHandler = (request: Buffer, principal: VerifiedAge
   signal: AbortSignal) => Promise<Buffer>;
 
 type HelperStart = (helperPath: string, args: string[]) => ChildProcessWithoutNullStreams;
+type HelperInspection = (helperPath: string, expectedSha256: string) => Promise<void>;
 
 interface RunningExchange {
   cancel(error: Error): void;
@@ -46,15 +48,20 @@ export class WindowsAgentPipeRegistry {
   private readonly usedIdentities = new Set<string>();
   private readonly usedSessionIds = new Set<string>();
 
-  constructor(private readonly helperPath: string, private readonly startHelper: HelperStart = spawnNativeHelper) {
+  constructor(private readonly helperPath: string, private readonly startHelper: HelperStart = spawnNativeHelper,
+    private readonly expectedHelperSha256?: string,
+    private readonly inspectHelper: HelperInspection = inspectWindowsPeerHelperAcl) {
     if (process.platform !== "win32" && process.env.SGW_TEST_MODE !== "1") {
       throw new Error("Windows agent pipes require Windows.");
     }
     if (startHelper !== spawnNativeHelper && process.env.SGW_TEST_MODE !== "1") {
       throw new Error("A synthetic Windows pipe helper is allowed only in isolated tests.");
     }
-    if (startHelper === spawnNativeHelper) {
-      throw new Error("Native Windows agent pipes require installer-verified helper ACLs.");
+    if (inspectHelper !== inspectWindowsPeerHelperAcl && process.env.SGW_TEST_MODE !== "1") {
+      throw new Error("A synthetic Windows helper inspection is allowed only in isolated tests.");
+    }
+    if (startHelper === spawnNativeHelper && !/^[a-f\d]{64}$/i.test(expectedHelperSha256 || "")) {
+      throw new Error("Native Windows agent pipes require an installer-pinned helper hash.");
     }
   }
 
@@ -99,6 +106,11 @@ export class WindowsAgentPipeRegistry {
     let child: ChildProcessWithoutNullStreams;
     try {
       if (live.ended) throw new Error("Windows agent session ended.");
+      if (this.startHelper === spawnNativeHelper) {
+        await this.inspectHelper(this.helperPath, this.expectedHelperSha256!);
+        if (live.ended) throw new Error("Windows agent session ended.");
+        throw new Error("Native Windows agent pipes require verified launcher and egress controls.");
+      }
       child = this.startHelper(this.helperPath, args);
     } finally {
       live.opening--;

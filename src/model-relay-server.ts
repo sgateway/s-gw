@@ -1,25 +1,18 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import type { VerifiedAgentPrincipal } from "./agent-context.js";
+import { normalizeModelRelayGrant, SGW_MODEL_RELAY_COMMAND, type ModelRelayGrant } from "./model-relay-action.js";
 import { modelRoute, relayModelRequest, type ModelProvider, type ModelUpstreamRequest } from "./model-relay-transport.js";
 import { startVerifiedPeerServer, type PeerSession, type VerifiedPeerServerOptions } from "./peer-identity.js";
 import type { SecretStore } from "./store.js";
 
-export const SGW_MODEL_RELAY_COMMAND = "s-gw:model-relay";
-
-export interface ModelRelayGrant {
-  provider: ModelProvider;
-  handle: string;
-  ttlMs: number;
-  workspaceId?: string;
-  organizationId?: string;
-  projectId?: string;
-  anthropicVersion?: string;
-  allowedBetaValues?: readonly string[];
-}
+export { SGW_MODEL_RELAY_COMMAND } from "./model-relay-action.js";
+export type { ModelRelayGrant } from "./model-relay-action.js";
 
 export interface ModelRelayApproval {
   assertAuthorized(principal: VerifiedAgentPrincipal, grant: Readonly<ModelRelayGrant>): Promise<void>;
+  onSessionEnded?(session: PeerSession): Promise<void> | void;
+  retryPendingSessionEnds?(): Promise<void>;
 }
 
 export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions, "socketPath" | "socketMode" | "socketGid"> {
@@ -28,6 +21,7 @@ export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions,
   maxActiveRequestsPerSession?: number;
   maxPendingBrokerOperations?: number;
   requestUpstream?: ModelUpstreamRequest;
+  onSessionEndError?: (message: string) => void;
 }
 
 export interface VerifiedModelRelayServer {
@@ -36,6 +30,7 @@ export interface VerifiedModelRelayServer {
 }
 
 interface ActiveGrant {
+  session: PeerSession;
   grant: Readonly<ModelRelayGrant>;
   expiresAt: number;
   active: number;
@@ -47,7 +42,6 @@ const destinations: Record<ModelProvider, string> = {
   anthropic: "api.anthropic.com:443",
   openai: "api.openai.com:443"
 };
-const maxGrantMs = 30 * 60_000;
 const headerDeadlineMs = 10_000;
 const bodyIdleMs = 20_000;
 const maxBodyDurationMs = 60_000;
@@ -70,34 +64,12 @@ async function within<T>(run: () => Promise<T>, timeoutMs: number): Promise<T> {
 }
 
 function checkGrant(grant: ModelRelayGrant): Readonly<ModelRelayGrant> {
-  if (grant.provider !== "anthropic" && grant.provider !== "openai") throw new Error("Unsupported model provider.");
-  if (typeof grant.handle !== "string" || !/^s-gw:api-token:[A-Za-z0-9_-]{1,128}$/.test(grant.handle)) {
-    throw new Error("A model relay grant needs an API-token handle.");
-  }
-  if (!Number.isSafeInteger(grant.ttlMs) || grant.ttlMs < 1 || grant.ttlMs > maxGrantMs) {
-    throw new Error("A model relay grant needs a finite lifetime of at most 30 minutes.");
-  }
-  for (const value of [grant.workspaceId, grant.organizationId, grant.projectId]) {
-    if (value !== undefined && (typeof value !== "string" || value.length > 512 || /[\x00-\x1f\x7f]/.test(value))) {
-      throw new Error("Invalid operator-owned model account ID.");
-    }
-  }
-  if (grant.provider === "anthropic" && (grant.organizationId || grant.projectId)) {
-    throw new Error("OpenAI account IDs cannot be used with Anthropic.");
-  }
-  if (grant.provider === "openai" && grant.workspaceId) {
-    throw new Error("An Anthropic workspace ID cannot be used with OpenAI.");
-  }
-  if (grant.anthropicVersion !== undefined &&
-      (grant.provider !== "anthropic" || !/^\d{4}-\d{2}-\d{2}$/.test(grant.anthropicVersion))) {
-    throw new Error("Invalid operator-owned Anthropic API version.");
-  }
-  const beta = grant.allowedBetaValues ?? [];
-  if (!Array.isArray(beta) || beta.length > 16 || beta.some(value =>
-    typeof value !== "string" || value.length < 1 || value.length > 512 || /[\x00-\x1f\x7f]/.test(value))) {
-    throw new Error("Invalid operator-owned model beta values.");
-  }
-  return Object.freeze({ ...grant, allowedBetaValues: Object.freeze([...beta]) });
+  const checked = normalizeModelRelayGrant(grant);
+  return Object.freeze({
+    ...checked,
+    routes: Object.freeze([...checked.routes]),
+    allowedBetaValues: Object.freeze([...checked.allowedBetaValues!])
+  });
 }
 
 function deny(res: ServerResponse, status: number, message: string): void {
@@ -127,6 +99,8 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
   let activeRequests = 0;
   let pendingBrokerOperations = 0;
   let closed = false;
+  const pendingSessionEnds = new Set<Promise<void>>();
+  const sessionEndErrors: Error[] = [];
   const principals = new WeakMap<Socket, VerifiedAgentPrincipal>();
   const headers = new WeakMap<Socket, ReturnType<typeof setTimeout>>();
   const http = createServer((req, res) => { void handleRequest(req, res); });
@@ -136,6 +110,24 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
   http.maxRequestsPerSocket = 1;
   http.keepAliveTimeout = 1000;
   http.on("clientError", (_error, socket) => socket.destroy());
+
+  function endSession(session: PeerSession): void {
+    const task = Promise.resolve()
+      .then(() => options.approval.onSessionEnded?.(session))
+      .then(() => {}, error => {
+        sessionEndErrors.push(error instanceof Error ? error : new Error(String(error)));
+        const message = "Model relay session-end audit failed.";
+        try {
+          if (options.onSessionEndError) options.onSessionEndError(message);
+          else process.emitWarning(message, { code: "SGW_MODEL_RELAY_AUDIT" });
+        } catch {
+          try { process.emitWarning(message, { code: "SGW_MODEL_RELAY_AUDIT" }); }
+          catch { /* The failure remains available to close(). */ }
+        }
+      });
+    pendingSessionEnds.add(task);
+    void task.then(() => pendingSessionEnds.delete(task));
+  }
 
   async function brokerOperation<T>(run: () => Promise<T>, timeoutMs: number): Promise<T> {
     if (pendingBrokerOperations >= pendingLimit) throw new Error("Model relay broker is busy.");
@@ -171,7 +163,10 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       return;
     }
     try {
-      modelRoute(active.grant.provider, req.method, req.url);
+      const route = modelRoute(active.grant.provider, req.method, req.url);
+      if (!active.grant.routes?.includes(`${req.method} ${route.pathname}`)) {
+        throw new Error("Model relay route is outside this grant.");
+      }
     } catch {
       deny(res, 404, "Unsupported model relay route.");
       return;
@@ -238,12 +233,13 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       const grant = checkGrant(input);
       if (grants.has(session.sessionId)) throw new Error("This model relay session is already registered.");
       const stopPeer = peer.registerSession(session);
-      const active: ActiveGrant = { grant, expiresAt: Date.now() + grant.ttlMs, active: 0, stopPeer };
+      const active: ActiveGrant = { session, grant, expiresAt: Date.now() + grant.ttlMs, active: 0, stopPeer };
       const stop = () => {
         if (grants.get(session.sessionId) !== active) return;
         grants.delete(session.sessionId);
         if (active.expiry) clearTimeout(active.expiry);
         stopPeer();
+        endSession(session);
       };
       grants.set(session.sessionId, active);
       const timer = setTimeout(stop, grant.ttlMs);
@@ -257,10 +253,20 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       for (const active of grants.values()) {
         if (active.expiry) clearTimeout(active.expiry);
         active.stopPeer();
+        endSession(active.session);
       }
       grants.clear();
       await peer.close();
       http.closeAllConnections();
+      await Promise.all([...pendingSessionEnds]);
+      try {
+        await options.approval.retryPendingSessionEnds?.();
+      } catch (error) {
+        sessionEndErrors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+      if (sessionEndErrors.length) {
+        throw new AggregateError(sessionEndErrors, "Model relay session-end audit failed.");
+      }
     }
   };
 }

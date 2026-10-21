@@ -6,6 +6,8 @@ import { requestAgentIdentity } from "../src/agent-context.js";
 import { WindowsAgentPipeRegistry, type WindowsAgentPipeIdentity } from "../src/windows-agent-pipe.js";
 
 const oldTestMode = process.env.SGW_TEST_MODE;
+const nativeHelperPath = String.raw`C:\Program Files\s-gw\s-gw-windows-peer-identity.exe`;
+const nativeHelperHash = "a".repeat(64);
 beforeAll(() => { process.env.SGW_TEST_MODE = "1"; });
 afterAll(() => {
   if (oldTestMode === undefined) delete process.env.SGW_TEST_MODE;
@@ -53,9 +55,43 @@ process.stdin.on('data', chunk => {
 `;
 
 describe("Windows named-pipe session foundation", () => {
-  it("refuses the native helper before installer ACL attestation exists", () => {
-    expect(() => new WindowsAgentPipeRegistry(String.raw`C:\Program Files\s-gw\peer-identity.exe`))
-      .toThrow("Native Windows agent pipes require installer-verified helper ACLs.");
+  it("requires an installer-pinned hash before preparing a native helper", () => {
+    expect(() => new WindowsAgentPipeRegistry(nativeHelperPath))
+      .toThrow("Native Windows agent pipes require an installer-pinned helper hash.");
+    expect(() => new WindowsAgentPipeRegistry(nativeHelperPath, undefined, "invalid"))
+      .toThrow("Native Windows agent pipes require an installer-pinned helper hash.");
+  });
+
+  it("inspects the native helper for each opening and still refuses an unverified OS boundary", async () => {
+    const inspect = vi.fn(async () => {});
+    const onRequest = vi.fn(async () => Buffer.from("ok"));
+    const registry = new WindowsAgentPipeRegistry(nativeHelperPath, undefined, nativeHelperHash, inspect);
+    const session = registry.register(identity());
+    for (let index = 0; index < 2; index++) {
+      await expect(session.openOnce(onRequest)).rejects.toThrow("verified launcher and egress controls");
+    }
+    expect(inspect).toHaveBeenCalledTimes(2);
+    expect(inspect).toHaveBeenCalledWith(nativeHelperPath, nativeHelperHash);
+    expect(onRequest).not.toHaveBeenCalled();
+    session.revoke();
+  });
+
+  it("does not open a native pipe after the helper check fails or the session ends", async () => {
+    const inspectFailure = vi.fn(async () => { throw new Error("helper was replaced"); });
+    const denied = new WindowsAgentPipeRegistry(nativeHelperPath, undefined, nativeHelperHash,
+      inspectFailure).register(identity());
+    await expect(denied.openOnce(async () => Buffer.from("ok"))).rejects.toThrow("helper was replaced");
+    denied.revoke();
+
+    let finishInspection!: () => void;
+    const inspection = new Promise<void>(resolve => { finishInspection = resolve; });
+    const inspectPending = vi.fn(() => inspection);
+    const session = new WindowsAgentPipeRegistry(nativeHelperPath, undefined, nativeHelperHash,
+      inspectPending).register(identity());
+    const opening = session.openOnce(async () => Buffer.from("ok"));
+    session.revoke();
+    finishInspection();
+    await expect(opening).rejects.toThrow("session ended");
   });
 
   it("binds a request to the registered SID, ignoring an agent-claimed principal", async () => {

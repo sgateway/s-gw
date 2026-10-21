@@ -768,6 +768,23 @@ describe("local console server", () => {
     expect(anyCommand.conditions.resolvedCommands).toEqual([]);
   });
 
+  it("accepts a scoped model relay deny rule and rejects automatic model relay allow", async () => {
+    running = await startConsoleServer({ port: 0 });
+    const deny = await fetchJson("api/approval/policies", {
+      method: "POST",
+      body: { name: "Deny model relay", decision: "deny", actionKinds: ["model_relay"],
+        handles: ["s-gw:api-token:console"] }
+    });
+    expect(deny.conditions.actionKinds).toEqual(["model_relay"]);
+
+    const allow = await fetch(consoleUrl("api/approval/policies"), {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ name: "Unsafe model autoallow", decision: "allow", actionKinds: ["model_relay"] })
+    });
+    expect(allow.status).toBe(409);
+    expect((await allow.json()).error).toMatch(/one-time verified-session approval/);
+  });
+
   it("rejects malformed policy constraints without widening an existing rule", async () => {
     running = await startConsoleServer({ port: 0 });
     const created = await fetchJson("api/approval/policies", {

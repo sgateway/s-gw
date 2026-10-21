@@ -416,6 +416,11 @@ describe("CLI unknown-command behavior (end to end)", () => {
         "--allow-command",
         process.execPath
       ], "cli-any-command-secret-value-123456789"));
+      const modelDeny = JSON.parse(run([
+        "approval", "policy", "add", "--name", "Deny model relay", "--decision", "deny",
+        "--handle", secret.handle, "--action-kind", "model_relay"
+      ]));
+      expect(modelDeny.conditions.actionKinds).toEqual(["model_relay"]);
       const policyArgs = [
         "--decision",
         "allow",

@@ -17,7 +17,7 @@ export type RequestApprovalSource = "manual" | "grant" | "policy";
 export type ApprovalMode = "per-transaction" | "timed-session" | "login-session" | "always";
 export type ApprovalAgentScope = "same-agent" | "any-agent";
 export type ApprovalPolicyDecision = "ask" | "allow" | "deny";
-export type ApprovalPolicyActionKind = "env_command" | "ssh_session" | "http_request";
+export type ApprovalPolicyActionKind = "env_command" | "ssh_session" | "http_request" | "model_relay";
 export type AgentIdentitySource = "managed-peer" | "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
 
 export interface ApprovalSettings {
@@ -177,7 +177,19 @@ export interface CommandAction {
   timeoutMs: number;
   ssh?: SshSessionSpec;
   http?: HttpRequestSpec;
+  model?: ModelRelaySpec;
   owned?: boolean;
+}
+
+export interface ModelRelaySpec {
+  provider: "anthropic" | "openai";
+  routes: string[];
+  ttlMs: number;
+  workspaceId?: string;
+  organizationId?: string;
+  projectId?: string;
+  anthropicVersion?: string;
+  allowedBetaValues?: string[];
 }
 
 export interface HttpRequestSpec {

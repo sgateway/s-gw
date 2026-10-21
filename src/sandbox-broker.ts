@@ -147,7 +147,8 @@ function strictBrokerEnvironment(inherited: NodeJS.ProcessEnv, cwd: string, home
     if (value !== undefined) env[name] = boundedBrokerValue(name, value);
   }
 
-  for (const name of ["SGW_DISABLE_KEYCHAIN", "SGW_DISABLE_ONEPASSWORD_BACKUP", "SGW_ALLOW_SECURITY_CLI"] as const) {
+  for (const name of ["SGW_DISABLE_KEYCHAIN", "SGW_DISABLE_ONEPASSWORD_BACKUP", "SGW_ALLOW_SECURITY_CLI",
+    "SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK"] as const) {
     const value = inherited[name];
     if (value === undefined) continue;
     if (value !== "0" && value !== "1") throw new Error(`Invalid trusted broker setting: ${name}.`);
@@ -164,6 +165,14 @@ function strictBrokerEnvironment(inherited: NodeJS.ProcessEnv, cwd: string, home
       throw new Error("Invalid trusted broker setting: SGW_ONEPASSWORD_TIMEOUT_MS.");
     }
     env.SGW_ONEPASSWORD_TIMEOUT_MS = timeout;
+  }
+
+  const keychainTimeout = inherited.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS;
+  if (keychainTimeout !== undefined) {
+    if (!/^\d{1,6}$/.test(keychainTimeout) || Number(keychainTimeout) < 100 || Number(keychainTimeout) > 120_000) {
+      throw new Error("Invalid trusted broker setting: SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS.");
+    }
+    env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS = keychainTimeout;
   }
 
   const connectHost = inherited.OP_CONNECT_HOST;

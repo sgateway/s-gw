@@ -38,6 +38,7 @@ const staleKeychainRepairMs = 30_000;
 const defaultSecretToolTimeoutMs = 10_000;
 const defaultWindowsCredentialHelperTimeoutMs = 30_000;
 const maxWindowsCredentialHelperTestTimeoutMs = 120_000;
+const maxMacKeychainSubprocessTimeoutMs = 120_000;
 const maxSecretToolInputBytes = 8_191;
 
 export interface KeychainInfo {
@@ -837,10 +838,14 @@ function inspectTrustedHelpers(ref: MacKeychainItemRef, candidates: string[]): s
 
   const args = ["trusted-helper", "--service", ref.service, "--account", ref.account];
   for (const candidate of candidates) args.push("--candidate", candidate);
+  const timeoutMs = macKeychainSubprocessTimeoutMs();
   const result = spawnSync(inspector, args, {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: timeoutMs,
+    killSignal: "SIGKILL"
   });
+  assertMacKeychainSubprocessCompleted(result, "Keychain inspector", timeoutMs);
   if (result.status === 44) return [];
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `Keychain inspector failed with status ${result.status}`);
@@ -860,11 +865,15 @@ function inspectTrustedHelpers(ref: MacKeychainItemRef, candidates: string[]): s
 
 function trustedApplicationPaths(ref: MacKeychainItemRef): string[] {
   if (keychainAclDumpCache === undefined) {
+    const timeoutMs = macKeychainSubprocessTimeoutMs();
     const result = spawnSync(keychainStatusCliPath(), ["dump-keychain", "-a"], {
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: timeoutMs,
+      killSignal: "SIGKILL"
     });
+    assertMacKeychainSubprocessCompleted(result, "Keychain ACL inspection", timeoutMs);
     if (result.status !== 0) {
       throw new Error(result.stderr.trim() || `Keychain ACL inspection failed with status ${result.status}`);
     }
@@ -942,6 +951,7 @@ function untrustedKeychainItemError(ref: MacKeychainItemRef): Error {
 
 function withKeychainRepairLock<T>(body: () => T): T {
   const lockPath = path.join(path.resolve(getSgwHome()), ".keychain-repair.lock");
+  const requireMarkedOwner = markedKeychainRepairLockRequired();
   mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   const owner: KeychainRepairLockOwner = { version: 1, pid: process.pid, token: randomUUID() };
   const markerPath = path.join(lockPath, `owner-${owner.token}.json`);
@@ -976,7 +986,7 @@ function withKeychainRepairLock<T>(body: () => T): T {
     } catch (error) {
       if (created) throw error;
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (removeAbandonedKeychainRepairLock(lockPath)) continue;
+      if (removeAbandonedKeychainRepairLock(lockPath, requireMarkedOwner)) continue;
       if (Date.now() - started > keychainRepairLockTimeoutMs()) {
         throw new Error(`Timed out waiting for Keychain repair lock at ${lockPath}.`);
       }
@@ -1012,7 +1022,15 @@ function keychainRepairLockTimeoutMs(): number {
     : keychainRepairTimeoutMs;
 }
 
-function removeAbandonedKeychainRepairLock(lockPath: string): boolean {
+function markedKeychainRepairLockRequired(): boolean {
+  const value = process.env.SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK;
+  if (value !== undefined && value !== "0" && value !== "1") {
+    throw new Error("SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK must be 0 or 1.");
+  }
+  return value === "1";
+}
+
+function removeAbandonedKeychainRepairLock(lockPath: string, requireMarkedOwner: boolean): boolean {
   let info;
   try {
     info = lstatSync(lockPath);
@@ -1032,6 +1050,7 @@ function removeAbandonedKeychainRepairLock(lockPath: string): boolean {
     throw error;
   }
   if (entries.length === 0) {
+    if (requireMarkedOwner) return false;
     // Older s-gw builds used an empty directory. Keep their stale recovery path for now.
     if (Date.now() - info.mtimeMs <= staleKeychainRepairMs) return false;
     return removeEmptyKeychainRepairLock(lockPath, info);
@@ -1218,14 +1237,15 @@ function keychainItemExists(info: KeychainInfo): boolean {
       }
       throw new Error("The macOS Keychain inspector is missing. Reinstall s-gw before accessing credentials.");
     }
+    const timeoutMs = macKeychainSubprocessTimeoutMs();
     const result = spawnSync(inspector, ["exists", "--service", info.service, "--account", info.account], {
       encoding: "utf8",
-      stdio: ["ignore", "ignore", "pipe"]
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: timeoutMs,
+      killSignal: "SIGKILL"
     });
 
-    if (result.error) {
-      throw result.error;
-    }
+    assertMacKeychainSubprocessCompleted(result, "Keychain inspector", timeoutMs);
     if (result.status === 0) {
       return true;
     }
@@ -1264,12 +1284,13 @@ function keychainItemExists(info: KeychainInfo): boolean {
 }
 
 function keychainItemExistsWithSecurityCli(info: KeychainInfo): boolean {
+  const timeoutMs = macKeychainSubprocessTimeoutMs();
   const result = spawnSync(
     keychainStatusCliPath(),
     ["find-generic-password", "-a", info.account, "-s", info.service],
-    { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] }
+    { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"], timeout: timeoutMs, killSignal: "SIGKILL" }
   );
-  if (result.error) throw result.error;
+  assertMacKeychainSubprocessCompleted(result, "Keychain status check", timeoutMs);
   if (result.status === 0) return true;
   if (result.status === 44) return false;
   throw new Error(result.stderr.trim() || `Keychain status check failed with status ${result.status}`);
@@ -1400,12 +1421,17 @@ function assertSecretToolCompleted(result: ReturnType<typeof spawnSync>): void {
 }
 
 function runNativeHelper(helperPath: string, args: string[], input?: string): string {
+  const configuredTimeout = macKeychainSubprocessTimeoutMs();
+  const timeoutMs = args[0] === "get" ? configuredTimeout : undefined;
   const result = spawnSync(helperPath, args, {
     input,
     encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: timeoutMs,
+    killSignal: "SIGKILL"
   });
 
+  assertMacKeychainSubprocessCompleted(result, "Native Keychain helper", timeoutMs);
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `Native Keychain helper failed with status ${result.status}`);
   }
@@ -1414,10 +1440,46 @@ function runNativeHelper(helperPath: string, args: string[], input?: string): st
 }
 
 function runSecurity(args: string[]): string {
-  return execFileSync("/usr/bin/security", args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+  const configuredTimeout = macKeychainSubprocessTimeoutMs();
+  const timeoutMs = args[0] === "find-generic-password" ? configuredTimeout : undefined;
+  try {
+    return execFileSync("/usr/bin/security", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: timeoutMs,
+      killSignal: "SIGKILL"
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+      throw new Error(`Keychain security CLI timed out after ${timeoutMs} ms.`);
+    }
+    throw error;
+  }
+}
+
+function macKeychainSubprocessTimeoutMs(): number | undefined {
+  const configured = process.env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS;
+  if (configured === undefined) return undefined;
+  if (!/^\d{1,6}$/.test(configured)) {
+    throw new Error("SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS must be an integer from 100 to 120000.");
+  }
+  const value = Number(configured);
+  if (!Number.isSafeInteger(value) || value < 100 || value > maxMacKeychainSubprocessTimeoutMs) {
+    throw new Error("SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS must be an integer from 100 to 120000.");
+  }
+  return value;
+}
+
+function assertMacKeychainSubprocessCompleted(
+  result: ReturnType<typeof spawnSync>,
+  command: string,
+  timeoutMs: number | undefined
+): void {
+  if (!result.error) return;
+  if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+    throw new Error(`${command} timed out after ${timeoutMs} ms.`);
+  }
+  throw result.error;
 }
 
 function keychainStatusCliPath(): string {

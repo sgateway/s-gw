@@ -1,12 +1,13 @@
 import { assertHttpDestination, buildHttpRequestAction, SGW_HTTP_COMMAND } from "./http-action.js";
 import { parseAllowedDestination } from "./destinations.js";
 import { normalizeManagedSshRoute, type ManagedSshRoute } from "./managed-ssh.js";
+import { buildModelRelayAction, grantFromModelRelayAction, normalizeModelRelayAction, SGW_MODEL_RELAY_COMMAND, type ModelRelayGrant } from "./model-relay-action.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { decryptSecret, encryptSecret, fingerprintSecret, requirePassphrase, shortId } from "./crypto.js";
-import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext } from "./agent-context.js";
+import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext, type VerifiedAgentPrincipal } from "./agent-context.js";
 import { isAbsoluteCommand, resolveCommandExecutable, verifyPinnedCommand } from "./command-path.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
 import {
@@ -1031,6 +1032,75 @@ export class SecretStore {
     return this.mutate((store) => createRequestInStore(store, handle, action, reason, agentContext));
   }
 
+  async createModelRelayRequest(
+    grant: ModelRelayGrant,
+    principal: VerifiedAgentPrincipal,
+    reason = "Managed agent requested model API access."
+  ): Promise<RequestRecord> {
+    return this.createRequest(grant.handle, buildModelRelayAction(grant), reason, { managedPrincipal: principal });
+  }
+
+  async claimApprovedModelRelayRequest(id: string, principal: VerifiedAgentPrincipal): Promise<ModelRelayGrant> {
+    return this.mutate(store => {
+      const request = store.requests.find(item => item.id === id);
+      if (!request || request.action.kind !== "model_relay" || request.state !== "approved" ||
+          request.approvalSource !== "manual") {
+        throw new Error("An approved model relay request is required.");
+      }
+      assertModelRelayCaller(request, principal);
+      const now = new Date().toISOString();
+      const approvedAt = request.approvedAt ? Date.parse(request.approvedAt) : NaN;
+      if (!Number.isFinite(approvedAt) || Date.parse(now) - approvedAt > 5 * 60_000) {
+        throw new Error("Model relay approval expired before launch.");
+      }
+      const secret = store.secrets.find(item => item.handle === request.handle);
+      if (!secret) throw new Error("Model relay credential handle was removed.");
+      assertActionAllowed(secret, request.action);
+      const deny = blockingDenyPolicyRuleForAction(store, secret, request.action, identityFromRequest(request), now);
+      if (deny) throw new Error(`Model relay is denied by approval policy ${deny.name}.`);
+      const grant = grantFromModelRelayAction(request.handle, request.action);
+      request.state = "executing";
+      request.updatedAt = now;
+      store.audit.push(audit("model_relay.started", `Started approved model relay ${id}.`, request.handle, id, request));
+      return grant;
+    });
+  }
+
+  async assertModelRelayRequestAuthorized(id: string, principal: VerifiedAgentPrincipal, grant: ModelRelayGrant): Promise<void> {
+    const store = await this.read();
+    const request = store.requests.find(item => item.id === id);
+    if (!request || request.action.kind !== "model_relay" || request.state !== "executing" ||
+        request.approvalSource !== "manual") {
+      throw new Error("Model relay authorization is no longer active.");
+    }
+    assertModelRelayCaller(request, principal);
+    const expected = grantFromModelRelayAction(request.handle, request.action);
+    if (JSON.stringify(expected) !== JSON.stringify(grantFromModelRelayAction(grant.handle, buildModelRelayAction(grant)))) {
+      throw new Error("Model relay grant differs from its approval.");
+    }
+    const claimedAt = Date.parse(request.updatedAt);
+    if (!Number.isFinite(claimedAt) || Date.now() >= claimedAt + expected.ttlMs) {
+      throw new Error("Model relay approval expired.");
+    }
+    const secret = store.secrets.find(item => item.handle === request.handle);
+    if (!secret) throw new Error("Model relay credential handle was removed.");
+    assertActionAllowed(secret, request.action);
+    const deny = blockingDenyPolicyRuleForAction(store, secret, request.action, identityFromRequest(request), new Date().toISOString());
+    if (deny) throw new Error(`Model relay is denied by approval policy ${deny.name}.`);
+  }
+
+  async finishModelRelayRequest(id: string): Promise<void> {
+    await this.mutate(store => {
+      const request = store.requests.find(item => item.id === id);
+      if (!request || request.action.kind !== "model_relay" || request.state !== "executing") return;
+      const now = new Date().toISOString();
+      request.state = "executed";
+      request.updatedAt = now;
+      request.executedAt = now;
+      store.audit.push(audit("model_relay.ended", `Ended model relay ${id}.`, request.handle, id, request));
+    });
+  }
+
   async prepareOneShotExecution(
     handle: string,
     action: CommandAction,
@@ -1126,6 +1196,9 @@ export class SecretStore {
       }
       if (request.state !== "pending") {
         throw new Error(`Only pending requests can be approved. Current state: ${request.state}`);
+      }
+      if (request.action.kind === "model_relay") {
+        throw new Error("Model relay approval is bound to one verified agent session and cannot become an allow policy.");
       }
 
       const now = new Date().toISOString();
@@ -1228,6 +1301,9 @@ export class SecretStore {
       const request = store.requests.find((item) => item.id === id);
       if (!request) {
         throw new Error(`Unknown request: ${id}`);
+      }
+      if (request.action.kind === "model_relay") {
+        throw new Error("Model relay requests must be claimed by the verified relay launcher.");
       }
       assertExecutionCaller(request, caller);
       if (request.state !== "approved") {
@@ -3306,13 +3382,20 @@ function executionAdmissionContext(
 
   const normalizedAction = resolveManagedSshAction(store, action);
   const agent = requestAgentIdentity(reason, agentContext);
+  if (normalizedAction.kind === "model_relay" &&
+      (agent.source !== "managed-peer" || !agent.principalId || !agent.agentSessionId)) {
+    throw new Error("Model relay requests need a verified live agent session.");
+  }
   const loginSessionId = currentLoginSessionId();
   assertActionAllowed(secret, normalizedAction);
   assertBoundHandlesAllowed(store, handle, normalizedAction);
   const admittedAction = actionForAdmission(normalizedAction);
   assertCredentialBackedExecutableAllowed(admittedAction);
-  const policyRule = matchingApprovalPolicyRuleForAction(store, secret, admittedAction, agent, now);
-  const grant = activeApprovalGrant(store, handle, admittedAction, agent, now, loginSessionId);
+  const matchedRule = matchingApprovalPolicyRuleForAction(store, secret, admittedAction, agent, now);
+  const policyRule = admittedAction.kind === "model_relay" && matchedRule?.decision === "allow" ? undefined : matchedRule;
+  const grant = admittedAction.kind === "model_relay"
+    ? undefined
+    : activeApprovalGrant(store, handle, admittedAction, agent, now, loginSessionId);
   return { secret, action: admittedAction, agent, loginSessionId, now, policyRule, grant };
 }
 
@@ -3661,7 +3744,10 @@ function reapStaleExecutions(store: StoreFile, nowIso: string): RequestRecord[] 
 
     const claimedAt = Date.parse(request.updatedAt);
     // Leave a NaN timestamp alone rather than failing a request we cannot reason about.
-    if (Number.isFinite(claimedAt) && claimedAt > cutoff) {
+    const relayCutoff = request.action.kind === "model_relay"
+      ? Date.parse(nowIso) - Math.max(staleExecutionMs, request.action.model?.ttlMs || 0)
+      : cutoff;
+    if (Number.isFinite(claimedAt) && claimedAt > relayCutoff) {
       continue;
     }
 
@@ -3772,6 +3858,9 @@ function approvalGrantIsNewer(candidate: ApprovalGrant, current: ApprovalGrant):
 
 function approvalActionKey(handle: string, action: CommandAction): string {
   const normalized = normalizeAction(action);
+  if (normalized.kind === "model_relay") {
+    return createHash("sha256").update(JSON.stringify({ handle, kind: normalized.kind, model: normalized.model })).digest("base64url");
+  }
   const payload = {
     handle,
     kind: normalized.kind,
@@ -3906,6 +3995,7 @@ function approvalPolicyMatches(
   envBindings: CommandEnvBinding[]
 ): boolean {
   const conditions = normalizeApprovalPolicyConditions(rule.conditions);
+  if (action.kind === "model_relay" && rule.decision === "allow") return false;
   if (rule.decision === "allow" && action.ssh?.managed && !conditions.actionKeys?.length) return false;
   if (conditions.actionKeys?.length && !conditions.actionKeys.includes(approvalActionKey(secret.handle, action))) return false;
   if (conditions.handles?.length && !conditions.handles.includes(secret.handle)) {
@@ -3983,6 +4073,7 @@ function approvalPolicyMatches(
 }
 
 function policyEnvBindingsForAction(primaryHandle: string, action: CommandAction): CommandEnvBinding[] {
+  if (action.kind === "model_relay") return [];
   return normalizePolicyEnvBindings([
     { handle: primaryHandle, injectEnv: action.injectEnv },
     ...(action.env || [])
@@ -4059,13 +4150,17 @@ function approvePendingRequest(
   if (request.state !== "pending") {
     throw new Error(`Only pending requests can be approved. Current state: ${request.state}`);
   }
+  if (request.action.kind === "model_relay" && options.mode && options.mode !== "per-transaction") {
+    throw new Error("Model relay approval is available only for this agent session.");
+  }
 
   request.state = "approved";
   request.approvedAt = now;
   request.updatedAt = now;
   request.approvalSource = policyRule ? "policy" : "manual";
   request.approvalPolicyRuleId = policyRule?.id;
-  const grant = createApprovalGrant(store, request, now, options);
+  const grant = createApprovalGrant(store, request, now,
+    request.action.kind === "model_relay" ? { mode: "per-transaction" } : options);
   request.approvalGrantId = grant?.id;
   store.audit.push(
     policyRule
@@ -4105,6 +4200,14 @@ function assertExecutionCaller(
       !request.principalId || request.principalId !== agent.principalId ||
       request.agentSessionId !== agent.agentSessionId) {
     throw new Error("This execution is bound to a different verified agent or session.");
+  }
+}
+
+function assertModelRelayCaller(request: RequestRecord, principal: VerifiedAgentPrincipal): void {
+  const agent = requestAgentIdentity("", { managedPrincipal: principal });
+  if (request.agentSource !== "managed-peer" || !request.principalId || !request.agentSessionId ||
+      agent.principalId !== request.principalId || agent.agentSessionId !== request.agentSessionId) {
+    throw new Error("Model relay approval is bound to a different verified agent session.");
   }
 }
 
@@ -4163,13 +4266,17 @@ function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddAppro
 
 function normalizeApprovalPolicyRule(rule: Partial<ApprovalPolicyRule>, nowIso = new Date().toISOString()): ApprovalPolicyRule {
   const decision = isApprovalPolicyDecision(rule.decision) ? rule.decision : "ask";
+  const conditions = normalizeApprovalPolicyConditions(rule.conditions);
+  if (decision === "allow" && conditions.actionKinds?.includes("model_relay")) {
+    throw new Error("Model relay requires a one-time verified-session approval; allow policies cannot include model_relay.");
+  }
   return {
     id: typeof rule.id === "string" && rule.id.trim() ? rule.id.trim() : shortId("policy"),
     name: typeof rule.name === "string" && rule.name.trim() ? rule.name.trim().slice(0, 120) : defaultPolicyRuleName(decision),
     enabled: rule.enabled !== false,
     priority: normalizePolicyPriority(rule.priority),
     decision,
-    conditions: normalizeApprovalPolicyConditions(rule.conditions),
+    conditions,
     expiresAt: normalizePolicyExpiresAt(rule.expiresAt),
     createdAt: typeof rule.createdAt === "string" && rule.createdAt ? rule.createdAt : nowIso,
     updatedAt: typeof rule.updatedAt === "string" && rule.updatedAt ? rule.updatedAt : nowIso
@@ -4355,9 +4462,9 @@ function normalizePolicySecretTypes(values: string[], strict: boolean): SecretTy
 }
 
 function normalizePolicyActionKinds(values: string[], strict: boolean): ApprovalPolicyActionKind[] {
-  const kinds = values.filter((value): value is ApprovalPolicyActionKind => value === "env_command" || value === "ssh_session" || value === "http_request");
+  const kinds = values.filter((value): value is ApprovalPolicyActionKind => value === "env_command" || value === "ssh_session" || value === "http_request" || value === "model_relay");
   if (strict && kinds.length !== values.length) {
-    throw new Error("actionKinds must contain env_command, ssh_session or http_request.");
+    throw new Error("actionKinds must contain env_command, ssh_session, http_request or model_relay.");
   }
   return kinds;
 }
@@ -4628,6 +4735,7 @@ function normalizePolicy(input?: Partial<SecretPolicy>, existing?: SecretPolicy)
 }
 
 function normalizeAction(action: CommandAction): CommandAction {
+  if (action.kind === "model_relay") return normalizeModelRelayAction(action);
   if (action.kind === "http_request") {
     if (!action.http) throw new Error("HTTPS request specification is required.");
     return buildHttpRequestAction(action.http, action.timeoutMs, action.injectEnv);
@@ -4795,6 +4903,15 @@ function assertBoundHandlesAllowed(store: StoreFile, primaryHandle: string, acti
 }
 
 export function assertActionAllowed(secret: SecretRecord, action: CommandAction): void {
+  if (action.kind === "model_relay") {
+    const grant = grantFromModelRelayAction(secret.handle, action);
+    const destination = grant.provider === "anthropic" ? "api.anthropic.com:443" : "api.openai.com:443";
+    if (secret.type !== "api-token" || !secret.policy.allowedCommands.includes(SGW_MODEL_RELAY_COMMAND) ||
+        !secret.policy.allowedDestinations?.some(item => item.toLowerCase() === destination)) {
+      throw new Error("Handle policy does not allow this model relay provider.");
+    }
+    return;
+  }
   if (action.kind !== "env_command" && action.kind !== "ssh_session" && action.kind !== "http_request") {
     throw new Error("Unsupported request action kind.");
   }

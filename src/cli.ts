@@ -1014,8 +1014,10 @@ function approvalPolicyActionKind(input: string): ApprovalPolicyActionKind {
   if (normalized === "ssh-session" || normalized === "ssh_session" || normalized === "ssh") {
     return "ssh_session";
   }
+  if (normalized === "http-request" || normalized === "http_request" || normalized === "https") return "http_request";
+  if (normalized === "model-relay" || normalized === "model_relay") return "model_relay";
 
-  throw new Error("--action-kind must be env_command or ssh_session.");
+  throw new Error("--action-kind must be env_command, ssh_session, http_request, or model_relay.");
 }
 
 function optionalSecretSeverity(input: string | undefined): SecretSeverity | undefined {
@@ -2697,7 +2699,7 @@ Commands:
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m]
   s-gw approval grants
   s-gw approval policy list
-  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session|http_request] [--duration 8h]
+  s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session|http_request|model_relay] [--duration 8h]
   s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--clear-expiry]
   s-gw approval policy arrange
   s-gw approval policy delete --id POLICY_ID

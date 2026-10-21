@@ -3102,6 +3102,8 @@ function ApprovalSheet({
                 ["Authentication", handle?.name || request.handle],
                 ["Handle", shortHandle(request.handle)],
                 ["Working dir", request.action.workingDir || "-"],
+                ...(request.action.kind === "model_relay" ? [["Verified principal", request.principalId || "Unavailable"],
+                  ["Agent session", request.agentSessionId || "Unavailable"]] as Array<[string, string]> : []),
                 ["Risk", handle?.severity || "unknown"],
                 ["Policy", "User approval required"]
               ]}
@@ -3144,6 +3146,19 @@ function ApprovalSheet({
                 <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded border p-2">{request.action.http.body ?? "(none)"}</pre>
               </div>
             ) : null}
+            {request.action.kind === "model_relay" && request.action.model ? (
+              <div className="space-y-1 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm break-all">
+                <div className="font-medium">Model API relay for this agent session</div>
+                <div>Provider: {request.action.model.provider}</div>
+                <div>Allowed routes: {Array.isArray(request.action.model.routes) ? request.action.model.routes.join(", ") : "Unavailable"}</div>
+                <div>Lifetime after launch: {Math.ceil(request.action.model.ttlMs / 60_000)} minute(s)</div>
+                {request.action.model.workspaceId ? <div>Workspace: {request.action.model.workspaceId}</div> : null}
+                {request.action.model.organizationId ? <div>Organization: {request.action.model.organizationId}</div> : null}
+                {request.action.model.projectId ? <div>Project: {request.action.model.projectId}</div> : null}
+                {request.action.model.anthropicVersion ? <div>Anthropic version: {request.action.model.anthropicVersion}</div> : null}
+                <div>Allowed beta headers: {request.action.model.allowedBetaValues?.join(", ") || "none"}</div>
+              </div>
+            ) : null}
             <Textarea placeholder="Optional note for this decision..." />
           </div>
         ) : null}
@@ -3157,7 +3172,7 @@ function ApprovalSheet({
             {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Approve once
           </Button>
-          <Popover>
+          {request?.action.kind !== "model_relay" ? <Popover>
             <PopoverTrigger asChild>
               <Button disabled={busy || !managedRouteReady} variant="outline">
                 Allow for...
@@ -3175,7 +3190,7 @@ function ApprovalSheet({
                 Always allow this request scope
               </Button>
             </PopoverContent>
-          </Popover>
+          </Popover> : null}
           <Button disabled={busy} variant="destructive" onClick={deny}>Deny</Button>
         </SheetFooter> : null}
       </SheetContent>
@@ -3356,7 +3371,8 @@ const policySecretTypeOptions: MultiSelectOption[] = [
 const policyActionKindOptions: MultiSelectOption[] = [
   { value: "env_command", label: "Command" },
   { value: "ssh_session", label: "SSH session" },
-  { value: "http_request", label: "HTTPS operation" }
+  { value: "http_request", label: "HTTPS operation" },
+  { value: "model_relay", label: "Model API relay" }
 ];
 
 type PolicyOptionSources = {
@@ -3682,7 +3698,7 @@ function PolicyFormFields({
       <PolicyField label="Resolved executables" hint="Pins named commands to exact executable paths. If Commands is not empty, an allow rule needs at least one path here.">
         <MultiSelectField values={form.resolvedCommands} onChange={(value) => update("resolvedCommands", value)} options={sources.resolvedCommands} aria-label="Policy resolved executables" />
       </PolicyField>
-      <PolicyField label="Action kinds">
+      <PolicyField label="Action kinds" hint="Model API relay supports deny and ask rules; each allow needs a one-time request approval.">
         <MultiSelectField values={form.actionKinds} onChange={(value) => update("actionKinds", value)} options={policyActionKindOptions} allowCustom={false} aria-label="Policy action kinds" />
       </PolicyField>
       {advanced ? (

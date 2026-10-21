@@ -9,6 +9,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SGW_MODEL_RELAY_COMMAND, startVerifiedModelRelayServer, type VerifiedModelRelayServer } from "../src/model-relay-server.js";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
+import { registerDurableModelRelaySession, StoreBackedModelRelayApprovals } from "../src/model-relay-approval.js";
 import type { ModelUpstreamRequest } from "../src/model-relay-transport.js";
 import type { PeerSession } from "../src/peer-identity.js";
 import { SecretStore } from "../src/store.js";
@@ -118,6 +120,136 @@ async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
 }
 
 describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay listener", () => {
+  it("uses a durable manual approval bound to one verified session and route set", async () => {
+    const requestUpstream = await startProvider(async (req, res) => {
+      for await (const _chunk of req) {}
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    const handle = (await store.addSecret({ name: "Durable model fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.anthropic.com:443"] } })).handle;
+    const session = await ownSession();
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    await store.addApprovalPolicyRule({ name: "Existing broad allow", decision: "allow",
+      conditions: { handles: [handle], principalIds: [principal.id] } });
+    const approvals = new StoreBackedModelRelayApprovals(store);
+    const request = await store.createModelRelayRequest({
+      provider: "anthropic", handle, ttlMs: 30_000,
+      routes: ["POST /v1/messages"], workspaceId: "workspace-test",
+      allowedBetaValues: ["test-feature"]
+    }, principal);
+    expect(request.state).toBe("pending");
+    for (const mode of ["timed-session", "login-session", "always"] as const) {
+      await expect(store.approveRequest(request.id, { mode })).rejects.toThrow(/only for this agent session/);
+    }
+    await expect(store.approveRequestWithScopedPolicy(request.id)).rejects.toThrow(/cannot become an allow policy/);
+    await store.approveRequest(request.id, { mode: "per-transaction" });
+    await expect(store.claimApprovedRequest(request.id, { managedPrincipal: principal })).rejects.toThrow(/verified relay launcher/);
+    await expect(approvals.claim(request.id, { ...session, sessionId: "other-session" })).rejects.toThrow(/different verified agent session/);
+
+    server = await startVerifiedModelRelayServer({ socketPath, store, requestUpstream, approval: approvals });
+    const brokerUid = process.getuid!();
+    const fake = brokerUid === 0 ? 1 : 0;
+    const uid = vi.spyOn(process, "getuid").mockReturnValue(fake);
+    const euid = vi.spyOn(process, "geteuid").mockReturnValue(fake);
+    let stop: (() => void) | undefined;
+    try {
+      stop = await registerDurableModelRelaySession(server, approvals, session, request.id);
+    } finally {
+      uid.mockRestore();
+      euid.mockRestore();
+    }
+    expect((await store.getRequest(request.id)).state).toBe("executing");
+    expect((await send("/v1/messages")).status).toBe(200);
+    expect((await send("/v1/messages/count_tokens")).status).toBe(404);
+    expect(upstreamCalls).toBe(1);
+    const deny = await store.addApprovalPolicyRule({ name: "Deny this relay", decision: "deny",
+      conditions: { handles: [handle], principalIds: [principal.id], actionKinds: ["model_relay"] } });
+    expect((await send("/v1/messages")).status).toBe(403);
+    await store.deleteApprovalPolicyRule(deny.id);
+    expect((await send("/v1/messages")).status).toBe(200);
+    expect(upstreamCalls).toBe(2);
+    await expect(store.assertModelRelayRequestAuthorized(request.id, principal, {
+      provider: "anthropic", handle, ttlMs: 30_000, routes: ["POST /v1/messages"],
+      workspaceId: "other-workspace", allowedBetaValues: ["test-feature"]
+    })).rejects.toThrow(/differs from its approval/);
+    await store.deleteSecret(handle);
+    expect((await send("/v1/messages")).status).toBe(403);
+    stop?.();
+  });
+
+  it("keeps a model relay approval durable across store reads and denies reuse after completion", async () => {
+    const handle = (await store.addSecret({ name: "Persistent model fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
+    const session = await ownSession();
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    const request = await store.createModelRelayRequest({ provider: "openai", handle, ttlMs: 20_000,
+      routes: ["POST /v1/responses"], organizationId: "org-test" }, principal);
+    await store.setApprovalSettings({ mode: "always", durationMs: 15 * 60_000 });
+    await store.approveRequest(request.id);
+    expect(await store.listApprovalGrants()).toHaveLength(0);
+    const reopened = new SecretStore(path.join(root, "store"));
+    const approvals = new StoreBackedModelRelayApprovals(reopened);
+    const grant = await approvals.claim(request.id, session);
+    await approvals.assertAuthorized(principal, grant);
+    await approvals.onSessionEnded(session);
+    expect((await reopened.getRequest(request.id)).state).toBe("executed");
+    await expect(approvals.assertAuthorized(principal, grant)).rejects.toThrow(/no matching durable approval/);
+    await expect(approvals.claim(request.id, session)).rejects.toThrow(/approved model relay request/);
+  });
+
+  it("retains a failed session-end write for retry without restoring access", async () => {
+    const handle = (await store.addSecret({ name: "Retry model fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
+    const session = await ownSession();
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    const request = await store.createModelRelayRequest({ provider: "openai", handle, ttlMs: 20_000,
+      routes: ["POST /v1/responses"] }, principal);
+    await store.approveRequest(request.id);
+    const approvals = new StoreBackedModelRelayApprovals(store);
+    const grant = await approvals.claim(request.id, session);
+    const finish = vi.spyOn(store, "finishModelRelayRequest").mockRejectedValueOnce(new Error("synthetic disk error"));
+    await expect(approvals.onSessionEnded(session)).rejects.toThrow("synthetic disk error");
+    await expect(approvals.assertAuthorized(principal, grant)).rejects.toThrow(/no matching durable approval/);
+    expect((await store.getRequest(request.id)).state).toBe("executing");
+    finish.mockRestore();
+    await approvals.retryPendingSessionEnds();
+    expect((await store.getRequest(request.id)).state).toBe("executed");
+    await approvals.retryPendingSessionEnds();
+  });
+
+  it("rejects unverified request identities and expires a claimed relay", async () => {
+    const handle = (await store.addSecret({ name: "Expiring model fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
+    const session = await ownSession();
+    const grant = { provider: "openai" as const, handle, ttlMs: 1, routes: ["POST /v1/responses"] };
+    await expect(store.createModelRelayRequest(grant, {
+      id: `${process.platform}:uid:${session.uid}`, name: session.name, sessionId: session.sessionId
+    })).rejects.toThrow(/was not verified/);
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    const request = await store.createModelRelayRequest(grant, principal);
+    await store.approveRequest(request.id);
+    const approvals = new StoreBackedModelRelayApprovals(store);
+    const active = await approvals.claim(request.id, session);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await expect(approvals.assertAuthorized(principal, active)).rejects.toThrow(/expired/);
+    await approvals.onSessionEnded(session);
+  });
+
+  it("surfaces a failed session-end audit when the listener closes", async () => {
+    const report = vi.fn();
+    server = await startVerifiedModelRelayServer({ socketPath, store,
+      onSessionEndError: report,
+      approval: {
+        async assertAuthorized() {},
+        async onSessionEnded() { throw new Error("synthetic audit failure"); }
+      }
+    });
+    const stop = await registerOwn("s-gw:api-token:fixture");
+    stop();
+    await vi.waitFor(() => expect(report).toHaveBeenCalledWith("Model relay session-end audit failed."));
+    await expect(server.close()).rejects.toThrow(/session-end audit failed/);
+  });
+
   it("binds an API-token handle and fixed upstream to the verified session", async () => {
     const recorded: Record<string, unknown>[] = [];
     const requestUpstream = await startProvider(async (req, res) => {

@@ -107,11 +107,16 @@ export interface RequestRecord {
   handle: string;
   reason: string;
   agentName?: string;
+  principalId?: string;
+  agentSessionId?: string;
   managedSsh?: { destination: string; hostKeyFingerprint: string; routeName: string; routeCurrent: boolean };
   action: {
     kind: "env_command" | "ssh_session" | "http_request" | string;
     owned?: boolean;
     http?: { url: string; method: string; headers: Record<string, string>; body?: string; auth: { kind: string; username?: string; name?: string } };
+    model?: { provider: "anthropic" | "openai"; routes: string[]; ttlMs: number;
+      workspaceId?: string; organizationId?: string; projectId?: string;
+      anthropicVersion?: string; allowedBetaValues?: string[] };
     command: string;
     resolvedCommand?: string;
     args: string[];

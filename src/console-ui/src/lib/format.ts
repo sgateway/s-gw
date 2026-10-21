@@ -6,6 +6,7 @@ export function shortHandle(value: string): string {
 }
 
 export function commandName(request: RequestRecord): string {
+  if (request.action.kind === "model_relay") return "Model API relay";
   if (request.action.kind === "http_request") return request.action.http?.method || "HTTPS";
   if (request.action.kind === "ssh_session") return "ssh";
   const parts = String(request.action.command || "").replace(/\\/g, "/").split("/");
@@ -13,6 +14,11 @@ export function commandName(request: RequestRecord): string {
 }
 
 export function requestTarget(request: RequestRecord): string {
+  if (request.action.kind === "model_relay") {
+    if (request.action.model?.provider === "anthropic") return "api.anthropic.com";
+    if (request.action.model?.provider === "openai") return "api.openai.com";
+    return "Model API";
+  }
   if (request.action.kind === "ssh_session" && request.action.ssh?.managed) {
     if (request.managedSsh?.destination) return request.managedSsh.destination;
     const route = request.action.ssh.managed;

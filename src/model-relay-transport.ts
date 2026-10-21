@@ -199,13 +199,17 @@ async function requestBody(req: IncomingMessage, signal: AbortSignal, owner?: st
 class StreamRedactor {
   private tail = Buffer.alloc(0);
   private readonly patterns: Buffer[];
+  private readonly escaped?: Buffer;
 
   constructor(secret: string) {
     this.patterns = secretVariants(secret);
+    const encoded = encodeURIComponent(secret);
+    if (encoded.includes("%")) this.escaped = Buffer.from(encoded);
   }
 
   push(chunk: Buffer, finish = false): Buffer {
     const data = Buffer.concat([this.tail, chunk]);
+    const normalized = this.escaped ? normalizePercentEscapes(data) : undefined;
     const keep = finish ? 0 : Math.max(...this.patterns.map(item => item.length)) - 1;
     const limit = Math.max(0, data.length - keep);
     const output: Buffer[] = [];
@@ -220,6 +224,13 @@ class StreamRedactor {
           found = pattern;
         }
       }
+      if (normalized && this.escaped) {
+        const at = normalized.indexOf(this.escaped, cursor);
+        if (at >= 0 && (index < 0 || at < index || (at === index && this.escaped.length > found!.length))) {
+          index = at;
+          found = this.escaped;
+        }
+      }
       if (index < 0 || index >= limit) break;
       output.push(data.subarray(cursor, index), marker);
       cursor = index + found!.length;
@@ -231,16 +242,36 @@ class StreamRedactor {
 }
 
 function secretVariants(secret: string): Buffer[] {
-  const candidates = [secret, Buffer.from(secret).toString("base64"), encodeURIComponent(secret),
+  const escaped = encodeURIComponent(secret);
+  const candidates = [secret, Buffer.from(secret).toString("base64"),
+    Buffer.from(secret).toString("base64url"), escaped,
+    escaped.replace(/%[0-9A-F]{2}/g, value => value.toLowerCase()),
     JSON.stringify(secret).slice(1, -1)];
   return [...new Set(candidates)].filter(value => value.length > 0).map(value => Buffer.from(value));
+}
+
+function normalizePercentEscapes(data: Buffer): Buffer {
+  const normalized = Buffer.from(data);
+  const hex = (value: number) => (value >= 48 && value <= 57) ||
+    (value >= 65 && value <= 70) || (value >= 97 && value <= 102);
+  for (let i = 0; i + 2 < normalized.length; i++) {
+    if (normalized[i] !== 37 || !hex(normalized[i + 1]) || !hex(normalized[i + 2])) continue;
+    for (let offset = 1; offset <= 2; offset++) {
+      if (normalized[i + offset] >= 97) normalized[i + offset] -= 32;
+    }
+    i += 2;
+  }
+  return normalized;
 }
 
 function responseHeaders(upstream: IncomingMessage, credential: string): Record<string, string> {
   const headers: Record<string, string> = {};
   const variants = secretVariants(credential).map(value => value.toString());
+  const escaped = encodeURIComponent(credential);
   for (const [name, value] of Object.entries(upstream.headers)) {
     if (typeof value !== "string" || variants.some(secret => name.includes(secret) || value.includes(secret))) continue;
+    if (escaped.includes("%") && [name, value].some(item =>
+      item.replace(/%[0-9a-fA-F]{2}/g, part => part.toUpperCase()).includes(escaped))) continue;
     const rateLimit = /^(?:anthropic-ratelimit-(?:requests|tokens|input-tokens|output-tokens)-(?:limit|remaining|reset)|x-ratelimit-(?:limit|remaining|reset)-(?:requests|tokens))$/.test(name);
     if (name === "content-type" || name === "retry-after" || name === "x-should-retry" ||
         name === "x-request-id" || rateLimit) {

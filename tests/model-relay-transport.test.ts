@@ -30,7 +30,8 @@ async function startFixture(
   upstreamHandler: Parameters<typeof createHttpsServer>[1],
   authorized: () => Promise<void> = async () => {},
   allowedBetaValues: readonly string[] = [],
-  bufferOwner?: string
+  bufferOwner?: string,
+  credential = key
 ) {
   home = await mkdtemp(path.join(os.tmpdir(), "sgw-model-relay-"));
   const tls = await httpsFixture(home);
@@ -48,7 +49,7 @@ async function startFixture(
   gateway = createHttpServer((req, res) => {
     void relayModelRequest(req, res, {
       provider: modelProvider,
-      credential: key,
+      credential,
       assertAuthorized: authorized,
       allowedBetaValues,
       bufferOwner,
@@ -164,6 +165,29 @@ describe("model relay transport", () => {
     expect(received[0]["openai-organization"]).toBeUndefined();
     expect(received[0]["openai-beta"]).toBe("responses=v1");
     expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses"]);
+  });
+
+  it("redacts common URL and base64url renderings of a reflected credential", async () => {
+    const credential = "synthetic:key/with+chars?";
+    const escaped = encodeURIComponent(credential).replace(/%[0-9A-F]{2}/g, value => value.toLowerCase());
+    const mixed = escaped.replace("%2f", "%2F").replace("%2b", "%2B");
+    const encoded = Buffer.from(credential).toString("base64url");
+    const fixture = await startFixture("anthropic", (_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream", "x-request-id": mixed });
+      res.write(`data: ${escaped.slice(0, 11)}`);
+      res.end(`${escaped.slice(11)}\n\ndata: ${encoded}\n\ndata: ${mixed}\n\n`);
+    }, undefined, [], undefined, credential);
+
+    const response = await fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    });
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).not.toContain(escaped);
+    expect(body).not.toContain(encoded);
+    expect(body).not.toContain(mixed);
+    expect(response.headers.get("x-request-id")).toBeNull();
+    expect(body).toContain("[s-gw withheld credential]");
   });
 
   it("refuses beta headers outside the broker grant before contacting the provider", async () => {

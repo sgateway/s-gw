@@ -46,6 +46,11 @@ afterEach(async () => {
   delete process.env.SGW_ALLOW_SECURITY_CLI;
   delete process.env.SGW_FAKE_KEYCHAIN_DB;
   delete process.env.SGW_TEST_KEYCHAIN_REPAIR_LOCK_TIMEOUT_MS;
+  delete process.env.SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK;
+  delete process.env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS;
+  delete process.env.SGW_FAKE_KEYCHAIN_GET_WAIT_MS;
+  delete process.env.SGW_FAKE_KEYCHAIN_SET_WAIT_MS;
+  delete process.env.SGW_FAKE_INSPECTOR_WAIT_MS;
   delete process.env.SGW_HOME;
   delete process.env.SGW_RECOVERY_HOME;
   if (tmpDir) {
@@ -109,6 +114,41 @@ describe("unlock passphrase provider", () => {
     expect(status.keychain.configured).toBe(true);
     expect(status.keychain.service).toBe("com.s-gw.test");
     expect(status.keychain.provider).toBe("native-helper");
+  });
+
+  it.skipIf(process.platform !== "darwin")("times out a stalled native Keychain helper when opted in", async () => {
+    await installFakeHelper("synthetic passphrase");
+    process.env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS = "200";
+    process.env.SGW_FAKE_KEYCHAIN_GET_WAIT_MS = "3000";
+
+    expect(() => getMacKeychainItem({ service: "com.s-gw.test", account: "unit-test" }))
+      .toThrow("Native Keychain helper timed out after 200 ms.");
+  });
+
+  it.skipIf(process.platform !== "darwin")("reports a stalled metadata inspector as unavailable when opted in", async () => {
+    await installFakeHelper("synthetic passphrase");
+    process.env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS = "200";
+    process.env.SGW_FAKE_INSPECTOR_WAIT_MS = "3000";
+
+    const status = unlockStatus();
+    expect(status.keychain.state).toBe("unavailable");
+    expect(status.keychain.error).toBe("Keychain inspector timed out after 200 ms.");
+  });
+
+  it.skipIf(process.platform !== "darwin")("rejects an invalid Keychain subprocess timeout", async () => {
+    await installFakeHelper("synthetic passphrase");
+    process.env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS = "120001";
+
+    expect(() => getMacKeychainItem({ service: "com.s-gw.test", account: "unit-test" }))
+      .toThrow("SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS must be an integer from 100 to 120000.");
+  });
+
+  it.skipIf(process.platform !== "darwin")("does not interrupt a Keychain write with an uncertain outcome", async () => {
+    await installFakeHelper("");
+    process.env.SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS = "100";
+    process.env.SGW_FAKE_KEYCHAIN_SET_WAIT_MS = "300";
+
+    expect(() => setKeychainPassphrase("synthetic passphrase")).not.toThrow();
   });
 
   it("sets the Keychain passphrase through helper stdin instead of command arguments", async () => {
@@ -428,6 +468,40 @@ describe("unlock passphrase provider", () => {
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("can refuse stale empty repair locks without disabling marked-owner recovery", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:marked-only" };
+    await installRepairHarness({ ...ref, value: "marked-only-value" });
+    const lockPath = path.join(process.env.SGW_HOME!, ".keychain-repair.lock");
+    process.env.SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK = "1";
+    process.env.SGW_TEST_KEYCHAIN_REPAIR_LOCK_TIMEOUT_MS = "150";
+    await mkdir(lockPath);
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(lockPath, stale, stale);
+
+    expect(() => repairMacKeychainItemAccess(ref)).toThrow(/Timed out waiting for Keychain repair lock/u);
+    expect(await readdir(lockPath)).toEqual([]);
+    await rm(lockPath, { recursive: true });
+
+    const dead = spawnSync(process.execPath, ["-e", ""]);
+    expect(dead.status).toBe(0);
+    const token = randomUUID();
+    await mkdir(lockPath);
+    await writeFile(path.join(lockPath, `owner-${token}.json`), JSON.stringify({ version: 1, pid: dead.pid, token }));
+    expect(repairMacKeychainItemAccess(ref).state).toBe("migrated");
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not silently ignore an invalid marked-owner setting", async () => {
+    if (process.platform !== "darwin") return;
+
+    const ref = { service: "com.s-gw.test.secret", account: "s-gw:test:invalid-lock-setting" };
+    await installRepairHarness({ ...ref, value: "unused" });
+    process.env.SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK = "yes";
+    expect(() => repairMacKeychainItemAccess(ref)).toThrow(/must be 0 or 1/u);
+  });
+
   it("refuses a symlink at the repair lock path", async () => {
     if (process.platform !== "darwin") return;
 
@@ -602,6 +676,9 @@ const fs = require("fs");
 const passphrase = process.env.SGW_FAKE_KEYCHAIN_VALUE || "";
 const command = process.argv[2];
 if (command === "get") {
+  if (process.env.SGW_FAKE_KEYCHAIN_GET_WAIT_MS) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SGW_FAKE_KEYCHAIN_GET_WAIT_MS));
+  }
   if (process.env.SGW_FAKE_KEYCHAIN_GET_DENIED === "1") process.exit(70);
   if (!passphrase) process.exit(44);
   process.stdout.write(passphrase + "\\n");
@@ -613,6 +690,9 @@ if (command === "set") {
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", chunk => input += chunk);
   process.stdin.on("end", () => {
+    if (process.env.SGW_FAKE_KEYCHAIN_SET_WAIT_MS) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SGW_FAKE_KEYCHAIN_SET_WAIT_MS));
+    }
     if (process.env.SGW_FAKE_KEYCHAIN_CAPTURE) {
       fs.writeFileSync(process.env.SGW_FAKE_KEYCHAIN_CAPTURE, JSON.stringify({
         args: process.argv.slice(2),
@@ -644,6 +724,9 @@ if (args[0] !== "exists") process.exit(64);
 if (process.env.SGW_FAKE_INSPECTOR_FAILURE) {
   process.stderr.write(process.env.SGW_FAKE_INSPECTOR_FAILURE + "\\n");
   process.exit(70);
+}
+if (process.env.SGW_FAKE_INSPECTOR_WAIT_MS) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SGW_FAKE_INSPECTOR_WAIT_MS));
 }
 process.exit(process.env.SGW_FAKE_KEYCHAIN_VALUE ? 0 : 44);
 `

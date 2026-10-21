@@ -1074,6 +1074,7 @@ function targetTypeKey(action: RequestRecord["action"]): string {
 }
 
 function targetTypeLabel(action: RequestRecord["action"]): string {
+  if (action.kind === "model_relay") return "Model API";
   if (sshDestination(action)) {
     return "SSH server";
   }
@@ -1156,6 +1157,11 @@ function actionLabel(action: RequestRecord["action"]): string {
 }
 
 function actionTarget(action: RequestRecord["action"]): string {
+  if (action.kind === "model_relay") {
+    if (action.model?.provider === "anthropic") return "api.anthropic.com";
+    if (action.model?.provider === "openai") return "api.openai.com";
+    return "model API";
+  }
   const sshTarget = sshDestination(action);
   if (sshTarget) return sshTarget;
 
@@ -1488,7 +1494,8 @@ function approvalPolicyActionKind(input: string): ApprovalPolicyActionKind {
   }
 
   if (input === "http_request") return "http_request";
-  throw new HttpError(400, "actionKinds must contain env_command, ssh_session or http_request.");
+  if (input === "model_relay" || input === "model-relay") return "model_relay";
+  throw new HttpError(400, "actionKinds must contain env_command, ssh_session, http_request or model_relay.");
 }
 
 function optionalApprovalMode(input: unknown): ApprovalMode | undefined {
