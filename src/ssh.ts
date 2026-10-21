@@ -89,12 +89,20 @@ export function normalizeSshTransfer(transfer?: SshTransferSpec): SshTransferSpe
       !transfer.destinationPath || /[\x00\r\n]/.test(transfer.destinationPath) ||
       (transfer.sha256 !== undefined && !/^[a-f0-9]{64}$/.test(transfer.sha256))) throw new Error("Invalid approved SSH upload.");
   const approvalScope = transfer.approvalScope || (transfer.sha256 ? "content-sha256" : "path-stream");
-  if ((approvalScope !== "content-sha256" && approvalScope !== "path-stream") ||
-      (approvalScope === "content-sha256") !== Boolean(transfer.sha256)) {
+  if (approvalScope !== "content-sha256" && approvalScope !== "path-stream" &&
+      approvalScope !== "spooled-content-sha256") {
     throw new Error("Invalid approved SSH upload scope.");
   }
+  if ((approvalScope === "path-stream") === Boolean(transfer.sha256)) throw new Error("Invalid approved SSH upload scope.");
+  if (approvalScope === "spooled-content-sha256") {
+    if (!transfer.spoolId || !/^slot[0-7]-[a-f0-9-]{36}$/.test(transfer.spoolId) ||
+        !transfer.spoolExpiresAt || Number.isNaN(Date.parse(transfer.spoolExpiresAt))) {
+      throw new Error("Invalid approved SSH upload spool.");
+    }
+  } else if (transfer.spoolId || transfer.spoolExpiresAt) throw new Error("Invalid approved SSH upload spool.");
   return { direction: "upload", sourcePath: transfer.sourcePath,
-    destinationPath: transfer.destinationPath, sha256: transfer.sha256, approvalScope };
+    destinationPath: transfer.destinationPath, sha256: transfer.sha256, approvalScope,
+    ...(transfer.spoolId ? { spoolId: transfer.spoolId, spoolExpiresAt: transfer.spoolExpiresAt } : {}) };
 }
 
 export function sshSessionIdentity(action: CommandAction): string {

@@ -48,6 +48,10 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_UI_Shell"
 ] }
 
+[patch.crates-io]
+# GTK3 tray bindings still require glib 0.18; this copy has the upstream iterator fix.
+glib = { path = "vendor/glib-0.18.5" }
+
 [profile.release]
 codegen-units = 1
 lto = true

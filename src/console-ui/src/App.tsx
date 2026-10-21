@@ -2947,10 +2947,12 @@ function MenubarSurface({ ctx, openApprovals }: { ctx: ConsoleContext; openAppro
               <div className="mt-1 break-all text-xs text-muted-foreground">Host key SHA-256: {request.managedSsh?.hostKeyFingerprint || "Unavailable"}</div>
             ) : null}
             {request.action.ssh?.transfer ? (
-              <div className="mt-1 text-xs text-amber-700 dark:text-amber-300" data-upload-approval-scope={request.action.ssh.transfer.sha256 ? "content-sha256" : "path-stream"}>
-                {request.action.ssh.transfer.sha256
-                  ? "File upload: approved SHA-256 digest and destination."
-                  : "Named pipe upload: only path and destination are approved. Producer chooses bytes during execution."}
+              <div className="mt-1 text-xs text-amber-700 dark:text-amber-300" data-upload-approval-scope={request.action.ssh.transfer.approvalScope || (request.action.ssh.transfer.sha256 ? "content-sha256" : "path-stream")}>
+                {request.action.ssh.transfer.approvalScope === "spooled-content-sha256"
+                  ? "Named pipe upload: bytes were spooled before approval; SHA-256 digest and destination are bound."
+                  : request.action.ssh.transfer.sha256
+                    ? "File upload: approved SHA-256 digest and destination."
+                    : "Named pipe upload: only path and destination are approved. Producer chooses bytes during execution."}
               </div>
             ) : null}
             <div className="mt-2 grid grid-cols-2 gap-2">
@@ -3118,14 +3120,17 @@ function ApprovalSheet({
               <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded border p-2">{JSON.stringify(request.action.args, null, 2)}</pre>
             ) : null}
             {request.action.ssh?.transfer ? (
-              <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm break-all" data-upload-approval-scope={request.action.ssh.transfer.sha256 ? "content-sha256" : "path-stream"}>
-                <div className="font-medium">{request.action.ssh.transfer.sha256 ? "Content-bound file upload" : "Path-bound named-pipe stream"}</div>
-                <div>{request.action.ssh.transfer.sha256
-                  ? "Approval binds the SHA-256 digest and destination. s-gw verifies and copies the file before connecting."
-                  : "Approval binds the pipe path and destination only. The producer controls bytes supplied during execution; those bytes are not reviewed before approval."}</div>
+              <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm break-all" data-upload-approval-scope={request.action.ssh.transfer.approvalScope || (request.action.ssh.transfer.sha256 ? "content-sha256" : "path-stream")}>
+                <div className="font-medium">{request.action.ssh.transfer.approvalScope === "spooled-content-sha256" ? "Content-bound named-pipe upload" : request.action.ssh.transfer.sha256 ? "Content-bound file upload" : "Path-bound named-pipe stream"}</div>
+                <div>{request.action.ssh.transfer.approvalScope === "spooled-content-sha256"
+                  ? "s-gw captured the stream before this approval. Approval binds the SHA-256 digest and destination. The capture expires after one hour or is removed after its first execution; repeat uploads need a new request and stream."
+                  : request.action.ssh.transfer.sha256
+                    ? "Approval binds the SHA-256 digest and destination. s-gw verifies and copies the file before connecting."
+                    : "Approval binds the pipe path and destination only. The producer controls bytes supplied during execution; those bytes are not reviewed before approval."}</div>
                 <div>Upload source: {request.action.ssh.transfer.sourcePath}</div>
                 <div>Destination: {request.action.ssh.transfer.destinationPath}</div>
                 {request.action.ssh.transfer.sha256 ? <div>SHA-256: {request.action.ssh.transfer.sha256}</div> : null}
+                {request.action.ssh.transfer.spoolExpiresAt ? <div>Captured bytes expire: {request.action.ssh.transfer.spoolExpiresAt}</div> : null}
                 <div>Timeout: {request.action.timeoutMs} ms</div>
               </div>
             ) : null}

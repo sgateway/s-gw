@@ -575,6 +575,15 @@ export class SecretStore {
     return found;
   }
 
+  async preflightOwnedSshUpload(handle: string, action: CommandAction): Promise<void> {
+    if (action.kind !== "ssh_session" || !action.owned) throw new Error("Owned SSH upload is required.");
+    const store = await this.read();
+    const secret = store.secrets.find((item) => item.handle === handle);
+    if (!secret) throw new Error(`Unknown secret handle: ${handle}`);
+    const resolved = resolveManagedSshAction(store, action);
+    assertActionAllowed(secret, resolved);
+  }
+
   async revealSecretForLocalUse(
     handle: string,
     request?: RequestRecord,
@@ -3763,7 +3772,11 @@ function approvalActionKey(handle: string, action: CommandAction): string {
         direction: normalized.ssh.transfer.direction,
         sourcePath: normalized.ssh.transfer.sourcePath,
         destinationPath: normalized.ssh.transfer.destinationPath,
-        sha256: normalized.ssh.transfer.sha256
+        sha256: normalized.ssh.transfer.sha256,
+        ...(normalized.ssh.transfer.approvalScope === "spooled-content-sha256" ? {
+          approvalScope: normalized.ssh.transfer.approvalScope,
+          spoolId: normalized.ssh.transfer.spoolId
+        } : {})
       } } : {}) } : {})
   };
 
@@ -4910,6 +4923,8 @@ function audit(type: string, message: string, handle?: string, requestId?: strin
     scopeMessage = " Upload scope: pipe path and destination; the producer supplies bytes during execution.";
   } else if (uploadApprovalScope === "content-sha256") {
     scopeMessage = " Upload scope: SHA-256 content digest and destination.";
+  } else if (uploadApprovalScope === "spooled-content-sha256") {
+    scopeMessage = " Upload scope: broker-spooled SHA-256 content digest and destination; bytes were captured before approval.";
   }
   return {
     id: shortId("audit"),

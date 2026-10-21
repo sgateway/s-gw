@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -30,10 +31,95 @@ afterEach(async () => {
   if (tmpHome) {
     await rm(tmpHome, { recursive: true, force: true });
     await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
+    await rm(`${tmpHome}-input.pipe`, { force: true });
   }
 });
 
 describe("MCP end-to-end flow", () => {
+  it.skipIf(process.platform === "win32")("rejects invalid FIFO upload authority before allocating a spool", async () => {
+    runCli(["init"]);
+    const source = `${tmpHome}-input.pipe`;
+    execFileSync("mkfifo", [source]);
+    const deniedHandle = JSON.parse(runCli([
+      "secret", "add", "--name", "no SSH policy", "--type", "ssh-key", "--value-stdin",
+      "--allow-command", process.execPath
+    ], "synthetic-denied-value"));
+    const allowedHandle = JSON.parse(runCli([
+      "secret", "add", "--name", "SSH policy", "--type", "ssh-key", "--value-stdin",
+      "--allow-command", "s-gw:ssh-session"
+    ], "synthetic-allowed-value"));
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+      env: testEnv as Record<string, string>, stderr: "pipe"
+    });
+    const client = new Client({ name: "Unprivileged Probe", version: "0.0.1" });
+    await client.connect(transport);
+    try {
+      const invalid = await client.callTool({ name: "sgw_request_ssh_transfer", arguments: {
+        handle: "s-gw:ssh-key:unknown", target: "fixture@example.test", sourcePath: source,
+        destinationPath: "/tmp/output", pipeMode: "spooled-content-sha256"
+      } });
+      expect(invalid.isError).toBe(true);
+      expect(invalid.content[0].text).toContain("Unknown secret handle");
+      const denied = await client.callTool({ name: "sgw_request_ssh_transfer", arguments: {
+        handle: deniedHandle.handle, target: "fixture@example.test", sourcePath: source,
+        destinationPath: "/tmp/output", pipeMode: "spooled-content-sha256"
+      } });
+      expect(denied.isError).toBe(true);
+      expect(denied.content[0].text).toContain("not allowed for s-gw-owned SSH");
+      const missingRoute = await client.callTool({ name: "sgw_request_ssh_transfer", arguments: {
+        handle: allowedHandle.handle, routeId: "route_123456789012", sourcePath: source,
+        destinationPath: "/tmp/output", pipeMode: "spooled-content-sha256"
+      } });
+      expect(missingRoute.isError).toBe(true);
+      expect(missingRoute.content[0].text).toContain("Unknown managed SSH route");
+      expect(await readdir(path.join(tmpHome, "uploads", "spooled")).catch(() => [])).toEqual([]);
+    } finally { await client.close(); }
+  }, 20_000);
+
+  it.skipIf(process.platform === "win32")("removes a completed FIFO capture when request creation fails", async () => {
+    runCli(["init"]);
+    const handle = JSON.parse(runCli([
+      "secret", "add", "--name", "revoke during capture", "--type", "ssh-key", "--value-stdin",
+      "--allow-command", "s-gw:ssh-session"
+    ], "synthetic-capture-value"));
+    const source = `${tmpHome}-input.pipe`;
+    execFileSync("mkfifo", [source]);
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+      env: testEnv as Record<string, string>, stderr: "pipe"
+    });
+    const client = new Client({ name: "Capture probe", version: "0.0.1" });
+    await client.connect(transport);
+    let writer: ReturnType<typeof createWriteStream> | undefined;
+    try {
+      const pending = client.callTool({ name: "sgw_request_ssh_transfer", arguments: {
+        handle: handle.handle, target: "fixture@example.test", sourcePath: source,
+        destinationPath: "/tmp/output", pipeMode: "spooled-content-sha256"
+      } });
+      const spoolRoot = path.join(tmpHome, "uploads", "spooled");
+      let occupied = false;
+      for (let i = 0; i < 100; i++) {
+        occupied = (await readdir(spoolRoot).catch(() => [])).length > 0;
+        if (occupied) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(occupied).toBe(true);
+      runCli(["secret", "delete", handle.handle]);
+      writer = createWriteStream(source);
+      const written = new Promise<void>((resolve, reject) => {
+        writer!.once("finish", resolve);
+        writer!.once("error", reject);
+      });
+      writer.end("captured after preflight");
+      const result = await pending;
+      await written;
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Unknown secret handle");
+      expect(await readdir(spoolRoot)).toEqual([]);
+    } finally { writer?.destroy(); await client.close(); }
+  }, 20_000);
+
   it("starts through the primary CLI", async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,

@@ -8,7 +8,7 @@ import { SecretStore } from "./store.js";
 import { defaultSshInjectEnv } from "./ssh.js";
 import { CURRENT_VERSION } from "./version.js";
 
-import { prepareUpload } from "./ssh-upload.js";
+import { discardPreparedSpool, prepareUpload } from "./ssh-upload.js";
 import { buildHttpRequestAction } from "./http-action.js";
 import { managedSshHostFingerprint } from "./managed-ssh.js";
 import { runSandboxMcpBridge } from "./sandbox-broker.js";
@@ -241,26 +241,35 @@ server.registerTool(
   "sgw_request_ssh_transfer",
   {
     title: "Request s-gw-Owned SSH Upload",
-    description: "Request an SSH upload from the agent workspace. A regular file approval binds its SHA-256 digest and destination. A named pipe approval binds only the pipe path and destination; its producer chooses the bytes streamed during execution.",
+    description: "Request an SSH upload from the agent workspace. A regular file approval binds its SHA-256 digest and destination. Named pipes default to path-stream approval; set pipeMode to spooled-content-sha256 to capture one stream in broker storage before approval.",
     inputSchema: { handle: z.string(), target: z.string().min(1).optional(), routeId: z.string().min(1).optional(), port: z.number().int().positive().optional(),
-      sourcePath: z.string(), destinationPath: z.string(), timeoutMs: z.number().int().positive().optional(), reason: z.string().optional() }
+      sourcePath: z.string(), destinationPath: z.string(), pipeMode: z.enum(["path-stream", "spooled-content-sha256"]).optional(),
+      timeoutMs: z.number().int().positive().optional(), reason: z.string().optional() }
   },
-  async ({ handle, target, routeId, port, sourcePath, destinationPath, timeoutMs, reason }) => {
-    const transfer = await prepareUpload(sourcePath, destinationPath, store.home);
+  async ({ handle, target, routeId, port, sourcePath, destinationPath, pipeMode, timeoutMs, reason }) => {
+    if (routeId && (target !== undefined || port !== undefined)) throw new Error("Use routeId alone for a managed SSH destination.");
+    if (!routeId && !target) throw new Error("SSH target or managed routeId is required.");
     const secret = await store.getSecretRecord(handle);
-    if (routeId) {
-      if (target !== undefined || port !== undefined) throw new Error("Use routeId alone for a managed SSH destination.");
-      const request = await store.createManagedSshRequest(handle, routeId, {
-        injectEnv: defaultSshInjectEnv(secret), timeoutMs, transfer
-      }, reason || "Agent requested an SSH upload.", mcpAgentContext());
-      return asText({ approvalRequired: request.state !== "approved", request });
-    }
-    if (!target) throw new Error("SSH target or managed routeId is required.");
-    const action = buildSshSessionAction({ target, port, timeoutMs, injectEnv: defaultSshInjectEnv(secret) });
+    const action = buildSshSessionAction({ target: routeId || target!, port, timeoutMs, injectEnv: defaultSshInjectEnv(secret) });
     action.owned = true;
-    action.ssh!.transfer = transfer;
-    const request = await store.createRequest(handle, action, reason || "Agent requested an SSH upload.", mcpAgentContext());
-    return asText({ approvalRequired: request.state !== "approved", request });
+    if (routeId) action.ssh!.managedRouteId = routeId;
+    if (pipeMode === "spooled-content-sha256") await store.preflightOwnedSshUpload(handle, action);
+    const transfer = await prepareUpload(sourcePath, destinationPath, store.home, { pipeMode });
+    try {
+      if (routeId) {
+        const request = await store.createManagedSshRequest(handle, routeId, {
+          injectEnv: defaultSshInjectEnv(secret), timeoutMs, transfer
+        }, reason || "Agent requested an SSH upload.", mcpAgentContext());
+        return asText({ approvalRequired: request.state !== "approved", request });
+      }
+      action.ssh!.transfer = transfer;
+      const request = await store.createRequest(handle, action, reason || "Agent requested an SSH upload.", mcpAgentContext());
+      return asText({ approvalRequired: request.state !== "approved", request });
+    } catch (error) {
+      try { await discardPreparedSpool(transfer, store.home); }
+      catch (cleanupError) { throw new AggregateError([error, cleanupError], "SSH upload request and spool cleanup failed."); }
+      throw error;
+    }
   }
 );
 

@@ -63,7 +63,7 @@
     "build:installers": "npm run build && node scripts/build-installers.mjs && npm run validate:release-assets",
     "dev:macos-app": "scripts/dev-macos-app.sh",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.console.json --noEmit",
-    "check:desktop-app": "cargo fmt --manifest-path native/desktop-app/Cargo.toml -- --check && cargo check --manifest-path native/desktop-app/Cargo.toml --locked && cargo clippy --manifest-path native/desktop-app/Cargo.toml --locked -- -D warnings",
+    "check:desktop-app": "node scripts/verify-vendored-glib.mjs && cargo fmt --manifest-path native/desktop-app/Cargo.toml -- --check && cargo check --manifest-path native/desktop-app/Cargo.toml --locked && cargo clippy --manifest-path native/desktop-app/Cargo.toml --locked -- -D warnings",
     "package:local": "npm run verify && npm pack",
     "package:dry-run": "npm pack --dry-run",
     "validate:npm-package": "node scripts/validate-npm-package.mjs",

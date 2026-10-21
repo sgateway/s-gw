@@ -164,6 +164,40 @@ it.skipIf(process.platform === "win32")("streams approved named-pipe bytes over 
   } finally { writer?.destroy(); await f.close(); }
 });
 
+it.skipIf(process.platform === "win32")("uploads only broker-spooled FIFO bytes over a real SSH connection", async () => {
+  const f = await sshFixture("private-key");
+  const sourcePath = path.join(root, "captured.pipe");
+  execFileSync("mkfifo", [sourcePath]);
+  const bytes = Buffer.from(`captured before approval ${randomUUID()}`);
+  const writer = createWriteStream(sourcePath);
+  const writerDone = new Promise<void>((resolve, reject) => {
+    writer.once("error", reject);
+    writer.once("finish", resolve);
+  });
+  try {
+    writer.end(bytes);
+    const action = buildSshSessionAction({ target: "fixture@127.0.0.1", port: f.port, timeoutMs: 10000 });
+    action.owned = true;
+    action.ssh!.transfer = await prepareUpload(sourcePath, "/tmp/captured.bin", f.store.home,
+      { pipeMode: "spooled-content-sha256" });
+    await writerDone;
+    const request = await f.store.createRequest(f.handle.handle, action, "content-bound pipe fixture");
+    expect(request.action.ssh?.transfer?.approvalScope).toBe("spooled-content-sha256");
+    await expect(executeApprovedRequest(f.store, request.id)).rejects.toThrow("approval");
+    expect(f.uploads).toEqual([]);
+    await rm(sourcePath);
+    await writeFile(sourcePath, "bytes supplied after approval must not be sent");
+    await f.store.approveRequest(request.id);
+    const result = await executeApprovedRequest(f.store, request.id);
+    expect(result.exitCode).toBe(0);
+    expect(f.uploads).toEqual([bytes]);
+    const events = (await f.store.auditLog()).filter((event) => event.requestId === request.id);
+    expect(events.every((event) => event.uploadApprovalScope === "spooled-content-sha256")).toBe(true);
+    expect(events.some((event) => event.message.includes("captured before approval"))).toBe(true);
+    expect(await readdir(path.join(f.store.home, "uploads", "spooled"))).toEqual([]);
+  } finally { writer.destroy(); await f.close(); }
+});
+
 it.skipIf(process.platform === "win32")("routes a managed alias to the pinned host without reading SSH configuration", async () => {
   const f = await sshFixture("private-key");
   delete process.env.SGW_SSH_CLI;

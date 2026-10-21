@@ -5,7 +5,7 @@ import { createWriteStream, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { approvedPipeStream, hashUpload, openApprovedUpload, prepareUpload, uploadCommand } from "../src/ssh-upload.js";
+import { approvedPipeStream, discardPreparedSpool, hashUpload, openApprovedUpload, prepareUpload, uploadCommand } from "../src/ssh-upload.js";
 import { buildSshSessionAction, normalizeSshTransfer } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
 let root = "";
@@ -94,6 +94,67 @@ it.skipIf(process.platform === "win32")("preserves named pipe uploads and quotes
   expect(await readdir(root)).not.toContain("injected");
 });
 
+it.skipIf(process.platform === "win32")("spools named-pipe bytes before approval and replays only that digest", async () => {
+  const source = path.join(root, "captured.pipe"), home = path.join(root, "store");
+  execFileSync("mkfifo", [source]);
+  const bytes = Buffer.from("captured before approval\n");
+  const writer = createWriteStream(source);
+  const written = new Promise<void>((resolve, reject) => { writer.once("finish", resolve); writer.once("error", reject); });
+  writer.end(bytes);
+  const transfer = await prepareUpload(source, "/tmp/output", home, { pipeMode: "spooled-content-sha256" });
+  await written;
+  expect(transfer.approvalScope).toBe("spooled-content-sha256");
+  expect(transfer.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+  expect(transfer.spoolId).toMatch(/^slot[0-7]-/);
+  rmSync(source); writeFileSync(source, "unapproved replacement");
+  await expect(openApprovedUpload({ ...transfer, destinationPath: "/tmp/other" }, home)).rejects.toThrow("changed or expired");
+  const upload = await openApprovedUpload(transfer, home);
+  const slot = transfer.spoolId!.split("-")[0];
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of upload.stream) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks)).toEqual(bytes);
+    await writeFile(path.join(home, "uploads", "spooled", slot, "payload"), "tampered after approval");
+    await expect(openApprovedUpload(transfer, home)).rejects.toThrow("changed after approval");
+  } finally { upload.stream.destroy(); await upload.cleanup(); }
+  expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
+});
+
+it.skipIf(process.platform === "win32")("bounds spooled streams, clears failed captures, and keeps legacy pipe timing", async () => {
+  const source = path.join(root, "bounded.pipe"), home = path.join(root, "store");
+  execFileSync("mkfifo", [source]);
+  await expect(prepareUpload(source, "/tmp/output", home,
+    { pipeMode: "spooled-content-sha256", spoolTimeoutMs: 80 })).rejects.toThrow("timed out");
+  expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
+  const old = await prepareUpload(source, "/tmp/output", home);
+  expect(old.approvalScope).toBe("path-stream");
+  expect(old.sha256).toBeUndefined();
+
+  const writer = createWriteStream(source);
+  const writing = new Promise<void>((resolve) => { writer.once("finish", resolve); writer.once("error", resolve); writer.once("close", resolve); });
+  writer.end(Buffer.alloc(32 * 1024 * 1024 + 1, 65));
+  await expect(prepareUpload(source, "/tmp/output", home, { pipeMode: "spooled-content-sha256" }))
+    .rejects.toThrow("exceeds 32 MiB");
+  writer.destroy();
+  await writing;
+  expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
+});
+
+it.skipIf(process.platform === "win32")("deletes only the prepared spool whose metadata matches the request", async () => {
+  const source = path.join(root, "discard.pipe"), home = path.join(root, "store");
+  execFileSync("mkfifo", [source]);
+  const writer = createWriteStream(source);
+  const written = new Promise<void>((resolve, reject) => { writer.once("finish", resolve); writer.once("error", reject); });
+  writer.end("synthetic capture");
+  const transfer = await prepareUpload(source, "/tmp/output", home, { pipeMode: "spooled-content-sha256" });
+  await written;
+  await expect(discardPreparedSpool({ ...transfer, destinationPath: "/tmp/other" }, home))
+    .rejects.toThrow("changed or expired");
+  expect((await readdir(path.join(home, "uploads", "spooled"))).length).toBe(1);
+  await discardPreparedSpool(transfer, home);
+  expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
+});
+
 it("rejects a claimed upload scope that disagrees with its digest, while accepting old records", () => {
   const sourcePath = path.join(root, "payload");
   const oldPipe = { direction: "upload" as const, sourcePath, destinationPath: "/tmp/output" };
@@ -102,6 +163,8 @@ it("rejects a claimed upload scope that disagrees with its digest, while accepti
   expect(normalizeSshTransfer(oldFile)?.approvalScope).toBe("content-sha256");
   expect(() => normalizeSshTransfer({ ...oldPipe, approvalScope: "content-sha256" })).toThrow("scope");
   expect(() => normalizeSshTransfer({ ...oldFile, approvalScope: "path-stream" })).toThrow("scope");
+  expect(() => normalizeSshTransfer({ ...oldFile, approvalScope: "spooled-content-sha256" })).toThrow("spool");
+  expect(() => normalizeSshTransfer({ ...oldPipe, spoolId: "slot0-bad" })).toThrow("spool");
 });
 
 it.skipIf(process.platform === "win32")("persists named-pipe scope in requests and approval audit records", async () => {
