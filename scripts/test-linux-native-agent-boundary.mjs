@@ -126,7 +126,8 @@ function plan(sessionId, uid, brokerUid, otherId, ports, address) {
     executable: "/usr/bin/s-gw-native-probe",
     args: [sessionId, otherId, String(ports.ipv4), String(ports.ipv6), address, String(ports.host),
       String(ports.udp4), String(ports.udpHost)],
-    launchGate: true, activatedSocket: true, isolatedSharedMemory: true
+    launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
+    serializedLifecycle: true, sealedStdio: true
   };
 }
 
@@ -313,13 +314,15 @@ async function rootRun() {
       const ready = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer-ready")),
         `${item.sessionId} Unix rendezvous listener`);
       if (ready !== "ready\n") throw new Error(`${item.sessionId} did not prepare its Unix listeners.`);
+      const rightsNode = await stat(path.join(item.rootDirectory, "workspace", `rights-${item.sessionId}.sock`));
+      if (!rightsNode.isSocket()) throw new Error(`${item.sessionId} did not bind its descriptor receiver.`);
     }
     for (const item of plans) process.kill(states.get(item.sessionId).mainPid, "SIGUSR2");
     for (const item of plans) {
       const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer")),
         `${item.sessionId} peer Unix socket result`);
-      if (result !== "rights=1 ownfs=1 ownabstract=1 fs=1 hostfs=1 abstract=1 ownshm=1 crossshm=1\n") {
-        throw new Error(`${item.sessionId} failed a peer Unix socket or POSIX shared-memory probe: ${result}`);
+      if (result !== "rights=1 ownfs=1 ownabstract=1 fs=1 hostfs=1 abstract=1 ownshm=1 crossshm=1 ownrights=1 ownrightsa=1 rightsfs=1 rightshostfs=1 rightsa=1\n") {
+        throw new Error(`${item.sessionId} failed a peer Unix socket, descriptor transfer, or POSIX shared-memory probe: ${result}`);
       }
     }
     await until(() => mailbox.events.filter(event => event.kind === "accepted").length >= 2 ? true : undefined,
@@ -410,7 +413,7 @@ async function rootRun() {
         "Native Linux agent teardown failed; its dedicated account and root were preserved for investigation.");
     }
   }
-  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, tested peer pathname/abstract Unix socket denial, local SCM_RIGHTS, private POSIX shared memory, revocation, and socket rebind. The listener was manually staged; cross-agent descriptor transfer, an installed systemd socket unit, and production MCP/model relay remain untested.");
+  console.log("Native Linux component-chain fixture passed: two UIDs/cgroups, broker identity, host egress, tested peer pathname/abstract Unix socket denial, local SCM_RIGHTS and blocked descriptor sends to three peer address candidates, private POSIX shared memory, revocation, and socket rebind. The listener was manually staged; other descriptor-transfer routes, an installed systemd socket unit, and production MCP/model relay remain untested.");
 }
 
 async function peer(socket) {
@@ -454,11 +457,25 @@ async function brokerRun() {
       void checkLinuxActivatedSocket(item.brokerSocket, fd, item.gid)
         .then(() => peer(socket)).then(identity => registry.authenticate(identity, socket, snapshot))
         .then(principal => {
-          socket.once("data", chunk => {
-            const claim = /^CLAIM ([a-z0-9-]+)\n$/.exec(String(chunk))?.[1] || "invalid";
+          let request = Buffer.alloc(0);
+          const readRequest = chunk => {
+            if (request.length + chunk.length > 96) { socket.destroy(); return; }
+            request = Buffer.concat([request, chunk]);
+            const newline = request.indexOf(10);
+            if (newline < 0) return;
+            socket.off("data", readRequest);
+            if (newline !== request.length - 1) { socket.destroy(); return; }
+            const line = request.toString("utf8");
+            if (line === "TRANSFER\n") {
+              socket.on("data", () => socket.destroy());
+              socket.write("READY\n");
+              return;
+            }
+            const claim = /^CLAIM ([a-z0-9-]+)\n$/.exec(line)?.[1] || "invalid";
             send({ kind: "accepted", sessionId: principal.sessionId, claim });
             socket.end(`ALLOW ${principal.sessionId}\n`);
-          });
+          };
+          socket.on("data", readRequest);
           socket.resume();
         }).catch(error => {
           send({ kind: "rejected", reason: String(error) });

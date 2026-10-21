@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { linuxAgentUnitName, linuxPrivateSharedMemoryMount, linuxProcessGroupsAreDedicated, linuxUnitOwnedByStartAttempt,
-  parseSystemdAgentState, startPreparedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan,
+  parseSystemdAgentState, reserveLinuxUnitLifecycleDirectory, startPreparedLinuxAgentUnit,
+  stopOwnedLinuxAgentUnit, systemdRunArgs, validateLinuxAgentPlan,
   type LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
 
 function plan(): LinuxAgentUnitPlan {
@@ -22,6 +26,9 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `ReadWritePaths=${p.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${binds}`, "BindPaths=",
     `TemporaryFileSystem=${p.isolatedSharedMemory ? "/dev/shm:rw,nosuid,nodev,noexec,mode=1777" : ""}`,
+    `StandardInput=${p.sealedStdio ? "null" : "tty"}`,
+    `StandardOutput=${p.sealedStdio ? "null" : "journal"}`,
+    `StandardError=${p.sealedStdio ? "null" : "inherit"}`,
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
     "DynamicUser=no", "PrivateUsers=no",
@@ -67,6 +74,7 @@ describe("Linux systemd agent unit plan", () => {
       .mainPid).toBe(1234);
     expect(() => parseSystemdAgentState(p, attestation(p).replace(
       " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
+    expect(args.some(arg => arg.startsWith("--property=Standard"))).toBe(false);
   });
 
   it("keeps POSIX shared memory usable but private in the isolated profile", () => {
@@ -87,6 +95,25 @@ describe("Linux systemd agent unit plan", () => {
       .toThrow("arguments");
     expect(() => validateLinuxAgentPlan({ ...ordinary, isolatedSharedMemory: true }))
       .toThrow("arguments");
+  });
+
+  it("requires a gated unit for the opt-in serialized lifecycle", () => {
+    const ordinary = plan();
+    expect(systemdRunArgs(ordinary).some(arg => arg.startsWith("--property=Standard"))).toBe(false);
+    expect(() => validateLinuxAgentPlan({ ...ordinary, serializedLifecycle: true })).toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...ordinary, launchGate: true,
+      serializedLifecycle: "yes" as never })).toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...ordinary, sealedStdio: true })).toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...ordinary, launchGate: true,
+      sealedStdio: "yes" as never })).toThrow("arguments");
+    const sealed = { ...ordinary, launchGate: true, serializedLifecycle: true, sealedStdio: true };
+    const args = systemdRunArgs(sealed);
+    for (const property of ["StandardInput", "StandardOutput", "StandardError"]) {
+      expect(args).toContain(`--property=${property}=null`);
+      expect(() => parseSystemdAgentState(sealed, attestation(sealed).replace(
+        `${property}=null`, `${property}=journal`))).toThrow("did not attest");
+    }
+    expect(parseSystemdAgentState(sealed, attestation(sealed)).mainPid).toBe(1234);
   });
 
   it("rejects a host shared-memory bind despite matching tmpfs mount flags", () => {
@@ -181,6 +208,57 @@ describe("Linux systemd agent unit plan", () => {
     await expect(result).rejects.toThrow("Linux agent start and teardown failed");
     expect(stopUnit).toHaveBeenCalledOnce();
     expect(gateCleaned).toBe(false);
+  });
+
+  it("refuses a leased stop when the attempt or invocation changed", async () => {
+    const p = { ...plan(), launchGate: true, serializedLifecycle: true };
+    const attempt = "0123456789abcdef0123456789abcdef";
+    const invocation = "fedcba9876543210fedcba9876543210";
+    const owned = [`Id=${linuxAgentUnitName(p.sessionId)}`, `Description=s-gw-agent-start:${attempt}`,
+      `User=${p.uid}`, `Group=${p.gid}`, `RootDirectory=${p.rootDirectory}`,
+      `InvocationID=${invocation}`].join("\n") + "\n";
+    const stopOwned = vi.fn(async () => {});
+    await stopOwnedLinuxAgentUnit(p, attempt, invocation, {
+      inspectOwnership: async () => owned, stopOwned
+    });
+    expect(stopOwned).toHaveBeenCalledOnce();
+    stopOwned.mockClear();
+    for (const output of [
+      owned.replace(attempt, "00000000000000000000000000000000"),
+      owned.replace(invocation, "00000000000000000000000000000000"),
+      owned.replace(`RootDirectory=${p.rootDirectory}`, "RootDirectory=/"),
+      owned + `InvocationID=${invocation}\n`
+    ]) {
+      await expect(stopOwnedLinuxAgentUnit(p, attempt, invocation, {
+        inspectOwnership: async () => output, stopOwned
+      })).rejects.toThrow("changed before its owned stop");
+    }
+    expect(stopOwned).not.toHaveBeenCalled();
+  });
+
+  it("reserves only one per-unit lifecycle directory and leaves stale locks closed", async () => {
+    const ownerUid = process.getuid?.();
+    if (ownerUid === undefined) return;
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "s-gw-unit-lock-")));
+    try {
+      const directory = path.join(root, linuxAgentUnitName("session-123"));
+      const results = await Promise.allSettled([
+        reserveLinuxUnitLifecycleDirectory(directory, ownerUid),
+        reserveLinuxUnitLifecycleDirectory(directory, ownerUid)
+      ]);
+      expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+      await expect(reserveLinuxUnitLifecycleDirectory(directory, ownerUid))
+        .rejects.toThrow("active or unreconciled lifecycle lease");
+      const stale = path.join(root, linuxAgentUnitName("old-session"));
+      await mkdir(stale, { mode: 0o700 });
+      await expect(reserveLinuxUnitLifecycleDirectory(stale, ownerUid))
+        .rejects.toThrow("active or unreconciled lifecycle lease");
+      const link = path.join(root, linuxAgentUnitName("linked-session"));
+      await symlink(stale, link);
+      await expect(reserveLinuxUnitLifecycleDirectory(link, ownerUid))
+        .rejects.toThrow("active or unreconciled lifecycle lease");
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("accepts an opt-in root-owned socket activation plan without changing the agent unit", () => {

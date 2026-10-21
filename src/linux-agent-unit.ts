@@ -17,6 +17,8 @@ export interface LinuxAgentUnitPlan {
   launchGate?: boolean;
   activatedSocket?: boolean;
   isolatedSharedMemory?: boolean;
+  serializedLifecycle?: boolean;
+  sealedStdio?: boolean;
 }
 
 export interface LinuxAgentUnitState {
@@ -38,6 +40,7 @@ export interface LinuxAgentUnitManager {
 const rootPrefix = "/var/lib/s-gw/agent-roots/";
 const socketPrefix = "/run/s-gw/agents/";
 const gatePrefix = "/run/s-gw/launch-gates/";
+const lifecycleRoot = "/run/s-gw/agent-unit-lifecycle";
 const gateExecutable = "/usr/libexec/s-gw/agent-launch-gate";
 const gateMount = "/run/s-gw/launch-gate";
 const privateSharedMemoryMount = "/dev/shm:rw,nosuid,nodev,noexec,mode=1777";
@@ -75,6 +78,10 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
       (plan.activatedSocket !== undefined && typeof plan.activatedSocket !== "boolean") ||
       (plan.isolatedSharedMemory !== undefined && typeof plan.isolatedSharedMemory !== "boolean") ||
       (plan.isolatedSharedMemory === true && plan.launchGate !== true) ||
+      (plan.serializedLifecycle !== undefined && typeof plan.serializedLifecycle !== "boolean") ||
+      (plan.serializedLifecycle === true && plan.launchGate !== true) ||
+      (plan.sealedStdio !== undefined && typeof plan.sealedStdio !== "boolean") ||
+      (plan.sealedStdio === true && plan.launchGate !== true) ||
       !Array.isArray(plan.args) || plan.args.length > 128 ||
       plan.args.some(arg => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
     throw new Error("Linux agent executable or arguments are invalid.");
@@ -95,6 +102,7 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): st
     `ReadWritePaths=${plan.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${bindReadOnlyPaths(plan)}`,
     ...(plan.isolatedSharedMemory ? [`TemporaryFileSystem=${privateSharedMemoryMount}`] : []),
+    ...(plan.sealedStdio ? ["StandardInput=null", "StandardOutput=null", "StandardError=null"] : []),
     "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock"
   ];
   return ["--system", "--no-ask-password", `--unit=${unit}`,
@@ -123,6 +131,38 @@ interface PreparedLinuxUnitStart {
   inspectOwnership(): Promise<string>;
   verify(): Promise<void>;
   stopOwned(): Promise<void>;
+}
+
+interface LinuxUnitLifecycleLease {
+  attemptId: string;
+  planKey: string;
+  directory: string;
+  marker: string;
+  dev: number;
+  ino: number;
+  busy: boolean;
+  invocationId?: string;
+}
+
+function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
+  return JSON.stringify([plan.sessionId, plan.uid, plan.gid, plan.brokerUid,
+    plan.rootDirectory, plan.brokerSocket, plan.executable, plan.args,
+    plan.launchGate === true, plan.activatedSocket === true,
+    plan.isolatedSharedMemory === true, plan.serializedLifecycle === true,
+    plan.sealedStdio === true]);
+}
+
+export async function stopOwnedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,
+  invocationId: string | undefined, operations: {
+    inspectOwnership(): Promise<string>;
+    stopOwned(): Promise<void>;
+  }): Promise<void> {
+  const output = await operations.inspectOwnership();
+  if (!linuxUnitOwnedByStartAttempt(plan, attemptId, output) ||
+      (invocationId !== undefined && !output.split("\n").includes(`InvocationID=${invocationId}`))) {
+    throw new Error("Linux agent unit changed before its owned stop.");
+  }
+  await operations.stopOwned();
 }
 
 export async function startPreparedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,
@@ -194,6 +234,8 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       !matches("ReadWritePaths", `${plan.rootDirectory}/workspace`) ||
       !attestedReadOnlyPaths(plan, fields.get("BindReadOnlyPaths")) ||
       (plan.isolatedSharedMemory && !matches("TemporaryFileSystem", privateSharedMemoryMount)) ||
+      (plan.sealedStdio && (!matches("StandardInput", "null") ||
+        !matches("StandardOutput", "null") || !matches("StandardError", "null"))) ||
       !matches("BindPaths", "") ||
       !matches("Environment", "SGW_BROKER_SOCKET=/run/s-gw/broker.sock") ||
       !matches("Restart", "no") || !matches("KillMode", "control-group") ||
@@ -218,42 +260,88 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
 export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   private readonly gates = new Map<string, { dev: number; ino: number }>();
   private readonly launchPaths = new Map<string, string>();
+  private readonly lifecycleLeases = new Map<string, LinuxUnitLifecycleLease>();
 
   async start(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
+    validateLinuxAgentPlan(plan);
+    if (!plan.serializedLifecycle) await rejectExistingUnitLifecycleLease(plan);
+    if (this.lifecycleLeases.has(plan.sessionId)) {
+      throw new Error("This Linux agent unit already has a lifecycle lease in this manager.");
+    }
     const attemptId = randomBytes(16).toString("hex");
     const args = systemdRunArgs(plan, attemptId);
     await checkedAgentAccount(plan);
     if (plan.launchGate) await assertNoUidProcesses(plan.uid);
     const before = await checkedHostPaths(plan);
-    if (plan.launchGate) this.gates.set(plan.sessionId, await prepareGate(plan));
     const unit = linuxAgentUnitName(plan.sessionId);
-    await startPreparedLinuxAgentUnit(plan, attemptId, {
-      launch: async () => { await run("/usr/bin/systemd-run", args); },
-      inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
-        "-p", "Id", "-p", "Description", "-p", "User", "-p", "Group", "-p", "RootDirectory"]),
-      verify: async () => {
-        if (await checkedHostPaths(plan) !== before) {
-          throw new Error("Linux agent launch paths changed while starting the unit.");
+    const lease = plan.serializedLifecycle ? await acquireUnitLifecycleLease(plan, attemptId) : undefined;
+    if (lease) this.lifecycleLeases.set(plan.sessionId, lease);
+    let launchAttempted = false;
+    let safeTeardown = false;
+    try {
+      if (plan.launchGate) this.gates.set(plan.sessionId, await prepareGate(plan));
+      await startPreparedLinuxAgentUnit(plan, attemptId, {
+        launch: async () => {
+          if (!lease) await rejectExistingUnitLifecycleLease(plan);
+          launchAttempted = true;
+          await run("/usr/bin/systemd-run", args);
+        },
+        inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
+          "-p", "Id", "-p", "Description", "-p", "User", "-p", "Group", "-p", "RootDirectory"]),
+        verify: async () => {
+          if (await checkedHostPaths(plan) !== before) {
+            throw new Error("Linux agent launch paths changed while starting the unit.");
+          }
+          if (plan.launchGate) await checkedGateFiles(plan);
+          if (plan.launchGate && plan.activatedSocket) this.launchPaths.set(plan.sessionId, before);
+        },
+        stopOwned: async () => {
+          if (lease) await verifyUnitLifecycleLease(lease);
+          else await rejectExistingUnitLifecycleLease(plan);
+          await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", unit]);
+          await assertNoUidProcesses(plan.uid);
+          if (plan.launchGate) await this.cleanGate(plan);
+          safeTeardown = true;
         }
-        if (plan.launchGate) await checkedGateFiles(plan);
-        if (plan.launchGate && plan.activatedSocket) this.launchPaths.set(plan.sessionId, before);
-      },
-      stopOwned: async () => {
-        await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", unit]);
-        await assertNoUidProcesses(plan.uid);
-        if (plan.launchGate) await this.cleanGate(plan);
+      });
+    } catch (error) {
+      if (lease && (!launchAttempted || safeTeardown)) {
+        try {
+          await releaseUnitLifecycleLease(lease);
+          this.lifecycleLeases.delete(plan.sessionId);
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], "Linux agent start and lifecycle cleanup failed.");
+        }
       }
-    });
+      throw error;
+    } finally {
+      if (lease) lease.busy = false;
+    }
   }
 
   async inspect(plan: LinuxAgentUnitPlan): Promise<LinuxAgentUnitState> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);
+    this.rejectLifecycleDowngrade(plan);
+    if (!plan.serializedLifecycle) {
+      await rejectExistingUnitLifecycleLease(plan);
+      return this.inspectUnit(plan);
+    }
+    const lease = this.checkedLease(plan);
+    lease.busy = true;
+    try {
+      await verifyUnitLifecycleLease(lease);
+      return await this.inspectUnit(plan, lease);
+    } finally { lease.busy = false; }
+  }
+
+  private async inspectUnit(plan: LinuxAgentUnitPlan,
+    lease?: LinuxUnitLifecycleLease): Promise<LinuxAgentUnitState> {
     const output = await run("/usr/bin/systemctl", ["--system", "--no-pager", "show", linuxAgentUnitName(plan.sessionId),
-      "-p", "Id", "-p", "ActiveState", "-p", "Type", "-p", "User", "-p", "Group",
+      "-p", "Id", "-p", "Description", "-p", "ActiveState", "-p", "Type", "-p", "User", "-p", "Group",
       "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "ReadWritePaths", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
-      "-p", "TemporaryFileSystem",
+      "-p", "TemporaryFileSystem", "-p", "StandardInput", "-p", "StandardOutput", "-p", "StandardError",
       "-p", "Environment", "-p", "Restart", "-p", "KillMode", "-p", "SendSIGKILL",
       "-p", "Delegate", "-p", "DynamicUser", "-p", "PrivateUsers", "-p", "PrivateNetwork",
       "-p", "SupplementaryGroups",
@@ -263,20 +351,43 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       "-p", "ProtectControlGroups", "-p", "RestrictNamespaces", "-p", "RestrictSUIDSGID",
       "-p", "NetworkNamespacePath", "-p", "IPCNamespacePath", "-p", "JoinsNamespaceOf",
       "-p", "ControlGroup", "-p", "MainPID", "-p", "InvocationID"]);
+    if (lease && !linuxUnitOwnedByStartAttempt(plan, lease.attemptId, output)) {
+      throw new Error("Linux agent unit changed after its leased start.");
+    }
     const state = parseSystemdAgentState(plan, output);
+    if (lease?.invocationId && lease.invocationId !== state.invocationId) {
+      throw new Error("Linux agent invocation changed during its lifecycle lease.");
+    }
     await assertMainProcess(state, plan);
+    if (lease) lease.invocationId = state.invocationId;
     return state;
   }
 
   async release(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState): Promise<void> {
     this.requireRoot();
+    validateLinuxAgentPlan(plan);
+    this.rejectLifecycleDowngrade(plan);
+    if (!plan.serializedLifecycle) {
+      await rejectExistingUnitLifecycleLease(plan);
+      return this.releaseUnit(plan, expected);
+    }
+    const lease = this.checkedLease(plan);
+    lease.busy = true;
+    try {
+      await verifyUnitLifecycleLease(lease);
+      await this.releaseUnit(plan, expected, lease);
+    } finally { lease.busy = false; }
+  }
+
+  private async releaseUnit(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState,
+    lease?: LinuxUnitLifecycleLease): Promise<void> {
     if (!plan.launchGate) throw new Error("This Linux agent unit has no launch gate.");
     const currentPaths = await checkedHostPaths(plan);
     if (plan.activatedSocket && this.launchPaths.get(plan.sessionId) !== currentPaths) {
       throw new Error("Linux activated socket path changed before launch gate release.");
     }
     await checkedGateFiles(plan);
-    const current = await this.inspect(plan);
+    const current = await this.inspectUnit(plan, lease);
     if (current.unit !== expected.unit || current.uid !== expected.uid || current.gid !== expected.gid ||
         current.cgroup !== expected.cgroup || current.mainPid !== expected.mainPid ||
         current.invocationId !== expected.invocationId) {
@@ -322,10 +433,50 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   async stop(plan: LinuxAgentUnitPlan): Promise<void> {
     this.requireRoot();
     validateLinuxAgentPlan(plan);
-    await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
-    await assertNoUidProcesses(plan.uid);
-    if (plan.launchGate) await this.cleanGate(plan);
-    this.launchPaths.delete(plan.sessionId);
+    this.rejectLifecycleDowngrade(plan);
+    if (!plan.serializedLifecycle) {
+      await rejectExistingUnitLifecycleLease(plan);
+      await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", linuxAgentUnitName(plan.sessionId)]);
+      await assertNoUidProcesses(plan.uid);
+      if (plan.launchGate) await this.cleanGate(plan);
+      this.launchPaths.delete(plan.sessionId);
+      return;
+    }
+    const lease = this.checkedLease(plan);
+    lease.busy = true;
+    try {
+      await verifyUnitLifecycleLease(lease);
+      const unit = linuxAgentUnitName(plan.sessionId);
+      await stopOwnedLinuxAgentUnit(plan, lease.attemptId, lease.invocationId, {
+        inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
+          "-p", "Id", "-p", "Description", "-p", "User", "-p", "Group", "-p", "RootDirectory",
+          "-p", "InvocationID"]),
+        stopOwned: async () => {
+          await verifyUnitLifecycleLease(lease);
+          await run("/usr/bin/systemctl", ["--system", "--no-ask-password", "stop", unit]);
+        }
+      });
+      await assertNoUidProcesses(plan.uid);
+      if (plan.launchGate) await this.cleanGate(plan);
+      await releaseUnitLifecycleLease(lease);
+      this.lifecycleLeases.delete(plan.sessionId);
+      this.launchPaths.delete(plan.sessionId);
+    } finally { lease.busy = false; }
+  }
+
+  private checkedLease(plan: LinuxAgentUnitPlan): LinuxUnitLifecycleLease {
+    validateLinuxAgentPlan(plan);
+    const lease = this.lifecycleLeases.get(plan.sessionId);
+    if (!lease || lease.planKey !== lifecyclePlanKey(plan) || lease.busy) {
+      throw new Error("Linux agent lifecycle lease is absent, busy, or belongs to another plan.");
+    }
+    return lease;
+  }
+
+  private rejectLifecycleDowngrade(plan: LinuxAgentUnitPlan): void {
+    if (!plan.serializedLifecycle && this.lifecycleLeases.has(plan.sessionId)) {
+      throw new Error("Linux agent unit has a serialized lifecycle lease in this manager.");
+    }
   }
 
   private async cleanGate(plan: LinuxAgentUnitPlan): Promise<void> {
@@ -340,6 +491,99 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       throw new Error("The Linux systemd launcher requires the privileged system service.");
     }
   }
+}
+
+async function checkedLifecycleRoot(): Promise<void> {
+  await checkedRootParentChain(path.dirname(lifecycleRoot));
+  try { await mkdir(lifecycleRoot, { mode: 0o700 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const folder = await lstat(lifecycleRoot);
+  if (!folder.isDirectory() || folder.uid !== 0 || (folder.mode & 0o077) !== 0 ||
+      await realpath(lifecycleRoot) !== lifecycleRoot) {
+    throw new Error("Linux agent lifecycle lock root is not private to the privileged manager.");
+  }
+}
+
+async function rejectExistingUnitLifecycleLease(plan: LinuxAgentUnitPlan): Promise<void> {
+  const directory = path.join(lifecycleRoot, linuxAgentUnitName(plan.sessionId));
+  try { await lstat(directory); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("Linux agent unit has an active or unreconciled serialized lifecycle lease.");
+}
+
+async function acquireUnitLifecycleLease(plan: LinuxAgentUnitPlan,
+  attemptId: string): Promise<LinuxUnitLifecycleLease> {
+  await checkedLifecycleRoot();
+  const directory = path.join(lifecycleRoot, linuxAgentUnitName(plan.sessionId));
+  const folder = await reserveLinuxUnitLifecycleDirectory(directory, 0);
+  const marker = `${attemptId}:${randomBytes(16).toString("hex")}:${process.pid}\n`;
+  const file = await open(path.join(directory, "owner"),
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    await file.chmod(0o600);
+    await file.writeFile(marker);
+    await file.sync();
+  } finally { await file.close(); }
+  const dir = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { await dir.sync(); }
+  finally { await dir.close(); }
+  return { attemptId, planKey: lifecyclePlanKey(plan), directory, marker,
+    dev: folder.dev, ino: folder.ino, busy: true };
+}
+
+export async function reserveLinuxUnitLifecycleDirectory(directory: string,
+  ownerUid: number): Promise<{ dev: number; ino: number }> {
+  if (!path.isAbsolute(directory) || path.resolve(directory) !== directory ||
+      !Number.isSafeInteger(ownerUid) || ownerUid < 0) {
+    throw new Error("Linux agent lifecycle lock path or owner is invalid.");
+  }
+  try { await mkdir(directory, { mode: 0o700 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error("Linux agent unit has an active or unreconciled lifecycle lease.");
+    }
+    throw error;
+  }
+  const folder = await lstat(directory);
+  if (!folder.isDirectory() || folder.uid !== ownerUid || (folder.mode & 0o077) !== 0 ||
+      await realpath(directory) !== directory) {
+    throw new Error("Linux agent lifecycle lease directory changed during acquisition.");
+  }
+  return { dev: folder.dev, ino: folder.ino };
+}
+
+async function verifyUnitLifecycleLease(lease: LinuxUnitLifecycleLease): Promise<void> {
+  await checkedLifecycleRoot();
+  const folder = await lstat(lease.directory);
+  if (!folder.isDirectory() || folder.uid !== 0 || (folder.mode & 0o077) !== 0 ||
+      folder.dev !== lease.dev || folder.ino !== lease.ino ||
+      await realpath(lease.directory) !== lease.directory) {
+    throw new Error("Linux agent lifecycle lease directory changed.");
+  }
+  const filePath = path.join(lease.directory, "owner");
+  const before = await lstat(filePath);
+  if (!before.isFile() || before.uid !== 0 || (before.mode & 0o077) !== 0 || before.nlink !== 1) {
+    throw new Error("Linux agent lifecycle lease owner changed.");
+  }
+  const file = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const current = await file.stat();
+    if (current.dev !== before.dev || current.ino !== before.ino ||
+        await file.readFile({ encoding: "utf8" }) !== lease.marker) {
+      throw new Error("Linux agent lifecycle lease owner changed.");
+    }
+  } finally { await file.close(); }
+}
+
+async function releaseUnitLifecycleLease(lease: LinuxUnitLifecycleLease): Promise<void> {
+  await verifyUnitLifecycleLease(lease);
+  await unlink(path.join(lease.directory, "owner"));
+  await rmdir(lease.directory);
 }
 
 async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
@@ -519,6 +763,20 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
   }
   if (plan.launchGate) await assertHeldLaunchGate(plan, state);
   if (plan.isolatedSharedMemory) await assertPrivateSharedMemory(state);
+  if (plan.sealedStdio) await assertSealedStandardDescriptors(state.mainPid);
+}
+
+async function assertSealedStandardDescriptors(pid: number): Promise<void> {
+  const nullDevice = await stat("/dev/null");
+  if (!nullDevice.isCharacterDevice()) {
+    throw new Error("Linux host null device is not a character device.");
+  }
+  for (let fd = 0; fd < 3; fd++) {
+    const current = await stat(`/proc/${pid}/fd/${fd}`);
+    if (!current.isCharacterDevice() || current.rdev !== nullDevice.rdev) {
+      throw new Error("Linux agent standard descriptor is not the null device.");
+    }
+  }
 }
 
 async function assertPrivateSharedMemory(state: LinuxAgentUnitState): Promise<void> {
