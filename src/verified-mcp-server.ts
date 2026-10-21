@@ -12,7 +12,7 @@ import type { SecretStore } from "./store.js";
 import { CURRENT_VERSION } from "./version.js";
 
 export interface VerifiedMcpServerOptions extends Pick<VerifiedPeerServerOptions,
-  "socketPath" | "socketMode" | "socketGid" | "activatedFd"> {
+  "socketPath" | "socketMode" | "socketGid" | "activatedFd" | "requireLinuxMessageGate"> {
   store: SecretStore;
   http?: OwnedHttpOptions;
 }
@@ -29,6 +29,7 @@ function asText(value: unknown) {
 
 export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions): Promise<VerifiedMcpServer> {
   if (!options.store) throw new Error("Verified MCP needs a broker-owned store.");
+  const gated = options.requireLinuxMessageGate === true;
   const sessions = new Map<string, PeerSession>();
   const activeTools = new Map<string, number>();
   let closed = false;
@@ -38,7 +39,7 @@ export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions):
     socketGid: options.socketGid,
     activatedFd: options.activatedFd,
     requireLinuxPeerPidfd: true,
-    requireLinuxMessageGate: process.platform === "linux" && options.activatedFd !== undefined,
+    requireLinuxMessageGate: gated,
     async onConnection(socket, principal) {
       const session = principal.sessionId ? sessions.get(principal.sessionId) : undefined;
       if (!session) { socket.destroy(); return; }
@@ -130,7 +131,7 @@ export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions):
       }));
 
       socket.once("close", () => { void server.close().catch(() => {}); });
-      if (process.platform === "linux" && options.activatedFd !== undefined) {
+      if (gated) {
         const gate = await startLinuxMessageGate(socket, session.uid, session.gid!, session.linuxCgroup!);
         void server.connect(new StdioServerTransport(gate.input, gate.output,
           { maxBufferSize: 1024 * 1024 })).catch(() => socket.destroy());
