@@ -2,6 +2,7 @@ import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rm, writeFile } fr
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { resolveCommandExecutable } from "../src/command-path.js";
 import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
@@ -10,6 +11,7 @@ import { SecretStore } from "../src/store.js";
 let testRoot = "";
 let savedPath: string | undefined;
 let savedPathExt: string | undefined;
+const verifiedAgent = { managedPrincipal: principalForVerifiedPeer("test:command-path", "Codex", "session-1") };
 
 beforeEach(async () => {
   testRoot = await mkdtemp(path.join(os.tmpdir(), "sgw-command-path-"));
@@ -51,7 +53,7 @@ describe("credential command path pinning", () => {
       injectEnv: "SGW_PIN_PRIMARY",
       env: [{ handle: extra.handle, injectEnv: "SGW_PIN_EXTRA" }]
     });
-    const request = await store.createRequest(primary.handle, action, "Codex pinned executable first request");
+    const request = await store.createRequest(primary.handle, action, "Codex pinned executable first request", verifiedAgent);
     expect(request.action.command).toBe(command);
     expect(request.action.resolvedCommand).toBe(await realpath(firstExecutable));
 
@@ -60,21 +62,24 @@ describe("credential command path pinning", () => {
       durationMs: 60 * 60 * 1000
     });
     expect(approved.approvalGrantId).toMatch(/^grant_/);
+    expect((await store.createRequest(primary.handle, action, "name-only repeat", { mcpClientName: "Codex" })).state)
+      .toBe("pending");
 
     await expect(store.createRequest(
       primary.handle,
       buildEnvCommandAction({ command: firstExecutable, injectEnv: "SGW_PIN_PRIMARY" }),
-      "Codex absolute request against bare grant"
+      "Codex absolute request against bare grant",
+      verifiedAgent
     )).rejects.toThrow(/not allowed/i);
 
     process.env.PATH = withOriginalPath(secondBin);
-    const next = await store.createRequest(primary.handle, action, "Codex pinned executable after PATH swap");
+    const next = await store.createRequest(primary.handle, action, "Codex pinned executable after PATH swap", verifiedAgent);
     expect(next.action.resolvedCommand).toBe(await realpath(secondExecutable));
     expect(next.state).toBe("pending");
     expect(next.approvalGrantId).toBeUndefined();
 
     const reveal = vi.spyOn(store, "revealSecretForLocalUse");
-    await expect(executeApprovedRequest(store, request.id, { engine: "typescript" }))
+    await expect(executeApprovedRequest(store, request.id, { engine: "typescript", caller: verifiedAgent }))
       .rejects.toThrow(/different executable/i);
     expect(reveal).not.toHaveBeenCalled();
     expect((await store.getRequest(request.id)).state).toBe("failed");
@@ -93,15 +98,15 @@ describe("credential command path pinning", () => {
     const store = new SecretStore();
     const record = await addSecret(store, "permit", "SGW_PIN_PERMIT", command);
     const action = buildEnvCommandAction({ command, injectEnv: "SGW_PIN_PERMIT" });
-    const first = await store.createRequest(record.handle, action, "Codex reusable pin approval");
+    const first = await store.createRequest(record.handle, action, "Codex reusable pin approval", verifiedAgent);
     await store.approveRequest(first.id, { mode: "timed-session", durationMs: 60 * 60 * 1000 });
-    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex reusable pin run");
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex reusable pin run", verifiedAgent);
     expect(admission.kind).toBe("reusable");
     if (admission.kind !== "reusable") throw new Error("Expected a reusable permit.");
 
     process.env.PATH = withOriginalPath(secondBin);
     const reveal = vi.spyOn(store, "revealSecretForLocalUse");
-    await expect(executeReusablePermit(store, admission.permit, { engine: "typescript" }))
+    await expect(executeReusablePermit(store, admission.permit, { engine: "typescript", caller: verifiedAgent }))
       .rejects.toThrow(/different executable/i);
     expect(reveal).not.toHaveBeenCalled();
   });
@@ -131,7 +136,8 @@ describe("credential command path pinning", () => {
         args: ["-e", "0"],
         injectEnv: "SGW_LEGACY_ABSOLUTE"
       }),
-      "Codex legacy policy request"
+      "Codex legacy policy request",
+      verifiedAgent
     );
     await removeStoredPin(store.storePath, legacyPolicyRequest.id);
     await expect(store.approveRequestWithScopedPolicy(legacyPolicyRequest.id))

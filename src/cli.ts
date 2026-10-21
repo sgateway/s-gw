@@ -2176,11 +2176,14 @@ async function handleApprovalCommand(
     if (requireVerified && allowUnverified) {
       throw new Error("Use either --require-verified-agent or --allow-unverified-agent, not both.");
     }
+    if (allowUnverified) {
+      throw new Error("Automatic approval now requires a verified agent. Approve ordinary requests once instead; --allow-unverified-agent is no longer supported.");
+    }
     printJson(
       await store.setApprovalSettings({
         mode,
         durationMs: duration ? parseDurationMs(duration) : undefined,
-        requireVerifiedAgentForAutoApproval: requireVerified ? true : allowUnverified ? false : undefined
+        requireVerifiedAgentForAutoApproval: requireVerified ? true : undefined
       })
     );
     return;
@@ -2723,7 +2726,7 @@ Commands:
   s-gw ssh run --request-id REQUEST_ID
   s-gw ssh close HANDLE --target user@host [--port 22]
   s-gw approval settings
-  s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m] [--require-verified-agent|--allow-unverified-agent]
+  s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m] [--require-verified-agent]
   s-gw approval grants
   s-gw approval policy list
   s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session|http_request|model_relay] [--duration 8h]

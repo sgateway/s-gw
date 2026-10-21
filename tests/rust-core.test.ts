@@ -3,6 +3,7 @@ import { chmod, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { tokenForHandle } from "../src/scanner.js";
@@ -308,22 +309,25 @@ describe("Rust execution core", () => {
       args: ["-e", "console.log(process.env.SGW_REUSABLE_LAUNCH_FALLBACK)"],
       injectEnv: "SGW_REUSABLE_LAUNCH_FALLBACK"
     });
+    const caller = { managedPrincipal: principalForVerifiedPeer("test:rust-core", "Codex"), env: {} };
     await store.addApprovalPolicyRule({
       name: "Allow reusable launch fallback",
       decision: "allow",
       conditions: {
         handles: [record.handle],
+        principalIds: ["test:rust-core"],
         commands: [process.execPath],
         resolvedCommands: [await realpath(process.execPath)]
       }
     });
-    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex reusable launch fallback");
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex reusable launch fallback", caller);
     expect(admission.kind).toBe("reusable");
     if (admission.kind !== "reusable") throw new Error("Expected a reusable execution permit.");
 
     const summary = await executeReusablePermit(store, admission.permit, {
       engine: "auto",
-      coreBinary: brokenCore
+      coreBinary: brokenCore,
+      caller
     });
     expect(summary.stdout).toContain(tokenForHandle(record.handle));
     expect(summary.stdout).not.toContain(secret);

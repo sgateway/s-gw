@@ -116,7 +116,8 @@ export async function runOwnedSshSession(
   secretRecord: SecretRecord,
   secretValue: string,
   home = getSgwHome(),
-  assertAuthorized?: () => Promise<void>
+  assertAuthorized?: () => Promise<void>,
+  signal?: AbortSignal
 ): Promise<ExecutionSummary> {
   if (request.action.kind !== "ssh_session") {
     throw new Error("runOwnedSshSession requires an ssh_session action.");
@@ -155,13 +156,13 @@ export async function runOwnedSshSession(
         timeoutMs: request.action.timeoutMs,
         env: auth.env,
         maxOutputBytes: maxOutput + captureHeadroomBytes([secretValue, Buffer.from(secretValue).toString("base64")]),
-        rejectOnNonZero: false, assertAuthorized, stdin: upload?.stream
+        rejectOnNonZero: false, assertAuthorized, signal, stdin: upload?.stream
       });
       await assertAuthorized();
       return sshSummary(request, result, secretValue, maxOutput);
     }
     if (process.platform === "win32") {
-      return await runWindowsSshCommand(request, sshPath, target, port, auth, secretValue, maxOutput, captureCap, assertAuthorized, upload?.stream);
+      return await runWindowsSshCommand(request, sshPath, target, port, auth, secretValue, maxOutput, captureCap, assertAuthorized, upload?.stream, signal);
     }
     if (assertAuthorized) {
       await assertAuthorized();
@@ -174,7 +175,7 @@ export async function runOwnedSshSession(
         ...remoteArgs
       ], { timeoutMs: request.action.timeoutMs, env: auth.env,
         maxOutputBytes: maxOutput + captureHeadroomBytes([secretValue, Buffer.from(secretValue).toString("base64")]),
-        rejectOnNonZero: false, assertAuthorized, stdin: upload?.stream });
+        rejectOnNonZero: false, assertAuthorized, signal, stdin: upload?.stream });
       await assertAuthorized();
       return sshSummary(request, result, secretValue, maxOutput);
     }
@@ -265,7 +266,8 @@ async function runWindowsSshCommand(
   maxOutput: number,
   captureCap: number,
   assertAuthorized?: () => Promise<void>,
-  stdin?: ReadStream
+  stdin?: ReadStream,
+  signal?: AbortSignal
 ): Promise<ExecutionSummary> {
   const remoteArgs = request.action.ssh?.transfer ? [uploadCommand(request.action.ssh.transfer.destinationPath)] : request.action.args.length > 0 ? request.action.args : ["true"];
   const sshArgs = [
@@ -300,7 +302,7 @@ async function runWindowsSshCommand(
       timeoutMs: request.action.timeoutMs,
       env: auth.env,
       maxOutputBytes: captureCap,
-      rejectOnNonZero: false, assertAuthorized, stdin
+      rejectOnNonZero: false, assertAuthorized, signal, stdin
     }
   );
   await assertAuthorized?.();
@@ -548,9 +550,11 @@ async function runProcess(
     maxOutputBytes: number;
     rejectOnNonZero?: boolean;
     assertAuthorized?: () => Promise<void>;
+    signal?: AbortSignal;
     stdin?: ReadStream;
   }
 ): Promise<ProcessResult> {
+  if (options.signal?.aborted) throw new Error("Verified agent session ended.");
   const started = Date.now();
   const child = options.assertAuthorized
     ? spawnIsolated(command, args, { env: options.env, stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"] })
@@ -568,6 +572,12 @@ async function runProcess(
     options.stdin.pipe(child.stdin);
   }
   let authorizationError: Error | undefined;
+  const onSessionEnd = () => {
+    authorizationError = new Error("Verified agent session ended.");
+    killProcessTree(child, "SIGKILL");
+  };
+  options.signal?.addEventListener("abort", onSessionEnd, { once: true });
+  if (options.signal?.aborted) onSessionEnd();
   let checking = false;
   const authorizationMonitor = options.assertAuthorized ? setInterval(async () => {
     if (checking) return;
@@ -603,6 +613,7 @@ async function runProcess(
     });
   } finally {
     options.stdin?.destroy();
+    options.signal?.removeEventListener("abort", onSessionEnd);
     if (authorizationMonitor) clearInterval(authorizationMonitor);
     if (timeout) {
       clearTimeout(timeout);

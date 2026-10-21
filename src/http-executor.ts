@@ -12,6 +12,8 @@ import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 
 export interface OwnedHttpOptions {
   ca?: string;
+  signal?: AbortSignal;
+  assertActive?: () => void;
 }
 
 export async function runOwnedHttpRequest(store: SecretStore, record: RequestRecord, secret: SecretRecord, value: string, options: OwnedHttpOptions = {}): Promise<ExecutionSummary> {
@@ -22,13 +24,20 @@ export async function runOwnedHttpRequest(store: SecretStore, record: RequestRec
   const started = Date.now();
   const controller = new AbortController();
   const abort = (message: string) => controller.abort(new Error(message));
+  const onSessionEnd = () => abort("Verified agent session ended.");
+  if (options.signal?.aborted) onSessionEnd();
+  else options.signal?.addEventListener("abort", onSessionEnd, { once: true });
   let timedOut = false;
   const timeout = setTimeout(() => { timedOut = true; abort("HTTPS operation timed out."); }, record.action.timeoutMs);
   let checking = false;
   const checkAuthorization = async () => {
     if (checking) return;
     checking = true;
-    try { await store.assertOwnedRequestAuthorized(record.id); }
+    try {
+      options.assertActive?.();
+      await store.assertOwnedRequestAuthorized(record.id);
+      options.assertActive?.();
+    }
     catch { abort("HTTPS authorization expired or was revoked."); }
     finally { checking = false; }
   };
@@ -50,6 +59,7 @@ export async function runOwnedHttpRequest(store: SecretStore, record: RequestRec
     for (const [name, header] of Object.entries(headers)) validateHeaderValue(name, header);
     if (Buffer.byteLength(JSON.stringify(headers)) > 32_768) throw new Error("HTTPS authentication headers exceed the size limit.");
     await store.assertOwnedRequestAuthorized(record.id);
+    options.assertActive?.();
     controller.signal.throwIfAborted();
     const host = url.hostname.replace(/^\[|\]$/g, "");
     const literal = isIP(host);
@@ -94,6 +104,7 @@ export async function runOwnedHttpRequest(store: SecretStore, record: RequestRec
     });
     controller.signal.throwIfAborted();
     await store.assertOwnedRequestAuthorized(record.id);
+    options.assertActive?.();
     // An incomplete JSON body cannot be inspected reliably for newly returned credentials.
     const fields = redactHttpCredentialFields(result.truncated ? "<SGW_RESPONSE_TRUNCATED>" : result.body);
     const scanned = await scanText(fields.body, candidate => pairs.find(pair => pair.value === candidate.value)?.handle || previewHandle(candidate));
@@ -108,7 +119,11 @@ export async function runOwnedHttpRequest(store: SecretStore, record: RequestRec
   } catch (error) {
     const message = controller.signal.aborted ? (controller.signal.reason as Error).message : error instanceof Error ? error.message : "HTTPS operation failed.";
     throw new Error(sanitizeCapturedOutput(message, pairs, 16_384).text);
-  } finally { clearTimeout(timeout); clearInterval(monitor); }
+  } finally {
+    clearTimeout(timeout);
+    clearInterval(monitor);
+    options.signal?.removeEventListener("abort", onSessionEnd);
+  }
 }
 
 export function httpAddressAllowed(address: string, literal: boolean): boolean {

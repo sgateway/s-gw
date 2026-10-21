@@ -64,7 +64,8 @@ import type {
 
 const defaultApprovalSettings: ApprovalSettings = {
   mode: "per-transaction",
-  durationMs: 15 * 60 * 1000
+  durationMs: 15 * 60 * 1000,
+  requireVerifiedAgentForAutoApproval: true
 };
 
 const maxApprovalDurationMs = 30 * 24 * 60 * 60 * 1000;
@@ -774,21 +775,15 @@ export class SecretStore {
   }
 
   async setApprovalSettings(input: SetApprovalSettingsInput): Promise<ApprovalSettings> {
+    if (input.requireVerifiedAgentForAutoApproval === false) {
+      throw new Error("Automatic approval requires a verified agent. Approve ordinary agent requests once instead.");
+    }
     return this.mutate((store) => {
-      const previouslyRequired = Boolean(store.approvalSettings?.requireVerifiedAgentForAutoApproval);
-      const settings = normalizeApprovalSettings({
-        ...input,
-        requireVerifiedAgentForAutoApproval: input.requireVerifiedAgentForAutoApproval ??
-          store.approvalSettings?.requireVerifiedAgentForAutoApproval
-      });
+      const settings = normalizeApprovalSettings(input);
       store.approvalSettings = settings;
       store.approvalGrants = [];
       clearOnePasswordCaches(store);
-      const verifiedOnlyChanged = previouslyRequired !== Boolean(settings.requireVerifiedAgentForAutoApproval);
-      const message = verifiedOnlyChanged
-        ? `Verified-only automatic approval ${settings.requireVerifiedAgentForAutoApproval ? "enabled" : "disabled"}; approval mode is ${settings.mode}.`
-        : `Approval mode changed to ${settings.mode}.`;
-      store.audit.push(audit("approval.settings.updated", message));
+      store.audit.push(audit("approval.settings.updated", `Approval mode changed to ${settings.mode}.`));
       return settings;
     });
   }
@@ -1020,7 +1015,8 @@ export class SecretStore {
     routeId: string,
     input: ManagedSshRequestInput,
     reason: string,
-    agentContext: AgentIdentityContext = {}
+    agentContext: AgentIdentityContext = {},
+    assertCallerActive?: () => void
   ): Promise<RequestRecord> {
     const id = requireManagedSshRouteId(routeId);
     const action = buildSshSessionAction({
@@ -1030,16 +1026,20 @@ export class SecretStore {
     action.owned = true;
     action.ssh!.managedRouteId = id;
     if (input.transfer) action.ssh!.transfer = input.transfer;
-    return this.createRequest(handle, action, reason, agentContext);
+    return this.createRequest(handle, action, reason, agentContext, assertCallerActive);
   }
 
   async createRequest(
     handle: string,
     action: CommandAction,
     reason: string,
-    agentContext: AgentIdentityContext = {}
+    agentContext: AgentIdentityContext = {},
+    assertCallerActive?: () => void
   ): Promise<RequestRecord> {
-    return this.mutate((store) => createRequestInStore(store, handle, action, reason, agentContext));
+    return this.mutate((store) => {
+      assertCallerActive?.();
+      return createRequestInStore(store, handle, action, reason, agentContext);
+    });
   }
 
   async createModelRelayRequest(
@@ -1217,8 +1217,8 @@ export class SecretStore {
         throw new Error(`Unknown secret handle: ${request.handle}`);
       }
       const agent = identityFromRequest(request);
-      if (!canAutoApproveAgent(store, agent)) {
-        throw new Error("An allow policy requires a verified agent while verified-only automatic approval is enabled. Approve this request once instead.");
+      if (!canAutoApproveAgent(agent)) {
+        throw new Error("An allow policy requires a verified agent. Approve this request once instead.");
       }
       const agentName = agent.principalId ? agent.name : durablePolicyAgentName(request);
       let rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
@@ -1304,8 +1304,11 @@ export class SecretStore {
     if (error) throw new Error(error);
   }
 
-  async claimApprovedRequest(id: string, caller?: AgentIdentityContext): Promise<RequestRecord> {
+  async claimApprovedRequest(
+    id: string, caller?: AgentIdentityContext, assertCallerActive?: () => void
+  ): Promise<RequestRecord> {
     const claimed = await this.mutate((store) => {
+      assertCallerActive?.();
       // Reap any abandoned executions first so a previously-stranded request for the same
       // handle does not keep its approval grant alive or confuse the audit trail.
       const now = new Date().toISOString();
@@ -2827,7 +2830,7 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
     secrets: (parsed.secrets || []).map((secret) => normalizeSecretRecord(secret)),
     requests: migrateRequestApprovalSources(parsed.requests || [], audit),
     audit,
-    approvalSettings: normalizeApprovalSettings(parsed.approvalSettings),
+    approvalSettings: normalizeStoredApprovalSettings(parsed.approvalSettings),
     approvalGrants: Array.isArray(parsed.approvalGrants)
       ? parsed.approvalGrants.filter(isValidApprovalGrant)
       : [],
@@ -3007,12 +3010,21 @@ function normalizeApprovalSettings(input?: Partial<ApprovalSettings>): ApprovalS
   return {
     mode,
     durationMs: clampApprovalDuration(input?.durationMs),
-    ...(input?.requireVerifiedAgentForAutoApproval ? { requireVerifiedAgentForAutoApproval: true } : {})
+    requireVerifiedAgentForAutoApproval: true
   };
 }
 
-function canAutoApproveAgent(store: StoreFile, agent: AgentIdentity): boolean {
-  if (!store.approvalSettings?.requireVerifiedAgentForAutoApproval) return true;
+function normalizeStoredApprovalSettings(input?: Partial<ApprovalSettings>): ApprovalSettings {
+  const settings = normalizeApprovalSettings(input);
+  if (input?.requireVerifiedAgentForAutoApproval === undefined) {
+    delete settings.requireVerifiedAgentForAutoApproval;
+  } else {
+    settings.requireVerifiedAgentForAutoApproval = input.requireVerifiedAgentForAutoApproval;
+  }
+  return settings;
+}
+
+function canAutoApproveAgent(agent: AgentIdentity): boolean {
   return agent.source === "managed-peer" && Boolean(agent.principalId);
 }
 
@@ -3150,7 +3162,7 @@ function activeApprovalGrant(
 ): ApprovalGrant | undefined {
   const settings = normalizeApprovalSettings(store.approvalSettings);
   store.approvalSettings = settings;
-  if (!canAutoApproveAgent(store, agent)) return undefined;
+  if (!canAutoApproveAgent(agent)) return undefined;
 
   const actionKey = approvalActionKey(handle, action);
   return store.approvalGrants.find((grant) => {
@@ -3185,7 +3197,7 @@ function createApprovalGrant(
     return undefined;
   }
 
-  if (!canAutoApproveAgent(store, identityFromRequest(request))) {
+  if (!canAutoApproveAgent(identityFromRequest(request))) {
     store.audit.push(audit(
       "approval.grant.skipped",
       `Approved request ${request.id} once because reusable approval requires a verified agent.`,
@@ -3940,7 +3952,7 @@ function matchingApprovalPolicyRule(
     if (rule.expiresAt && rule.expiresAt <= nowIso) {
       continue;
     }
-    if (rule.decision === "allow" && !canAutoApproveAgent(store, agent)) {
+    if (rule.decision === "allow" && !canAutoApproveAgent(agent)) {
       continue;
     }
     if (approvalPolicyMatches(rule, secret, action, agent, envBindings)) {

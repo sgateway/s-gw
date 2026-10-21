@@ -5,6 +5,7 @@ import { createWriteStream, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { approvedPipeStream, discardPreparedSpool, hashUpload, openApprovedUpload, prepareUpload, uploadCommand } from "../src/ssh-upload.js";
 import { buildSshSessionAction, normalizeSshTransfer } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
@@ -183,7 +184,8 @@ it.skipIf(process.platform === "win32")("persists named-pipe scope in requests a
     const action = buildSshSessionAction({ target: "fixture@example.test" });
     action.owned = true;
     action.ssh!.transfer = await prepareUpload(source, "/tmp/output", home);
-    const request = await store.createRequest(secret.handle, action, "Synthetic named-pipe upload");
+    const caller = { managedPrincipal: principalForVerifiedPeer("test:named-pipe", "Codex"), env: {} };
+    const request = await store.createRequest(secret.handle, action, "Synthetic named-pipe upload", caller);
     expect(request.action.ssh?.transfer?.approvalScope).toBe("path-stream");
     expect(request.action.ssh?.transfer?.sha256).toBeUndefined();
     await store.approveRequest(request.id, { mode: "timed-session", durationMs: 60_000, agentScope: "same-agent" });
@@ -194,7 +196,7 @@ it.skipIf(process.platform === "win32")("persists named-pipe scope in requests a
 
     const oldAction = structuredClone(action);
     delete oldAction.ssh!.transfer!.approvalScope;
-    const reused = await store.createRequest(secret.handle, oldAction, "Legacy pipe request with the same scope");
+    const reused = await store.createRequest(secret.handle, oldAction, "Legacy pipe request with the same scope", caller);
     expect(reused.state).toBe("approved");
     expect(reused.action.ssh?.transfer?.approvalScope).toBe("path-stream");
     expect((await store.auditLog()).find((event) => event.requestId === reused.id)?.uploadApprovalScope).toBe("path-stream");

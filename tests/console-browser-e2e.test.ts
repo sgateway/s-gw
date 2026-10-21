@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { ReleaseChecker } from "../src/update-check.js";
 import { SecretStore } from "../src/store.js";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
+import { buildEnvCommandAction } from "../src/gateway.js";
 import { buildSshSessionAction } from "../src/ssh.js";
 import { prepareUpload } from "../src/ssh-upload.js";
 
@@ -444,7 +446,8 @@ describeBrowser("React local console (real headless Chrome)", () => {
 
   it("creates a scoped policy from the approval sheet without widening access", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "browser scoped policy passphrase";
-    running = await startConsoleServer({ port: 0 });
+    const store = new SecretStore();
+    running = await startConsoleServer({ port: 0, store });
 
     const created = await api<{ handle: string }>("api/secrets", {
       name: "react-scoped-policy",
@@ -453,15 +456,14 @@ describeBrowser("React local console (real headless Chrome)", () => {
       injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
       allowedCommands: [process.execPath]
     });
-    const request = await api<{ id: string; state: string }>("api/requests", {
-      handle: created.handle,
+    const action = buildEnvCommandAction({
       command: process.execPath,
       args: ["-e", "console.log('scoped policy')"],
       injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
-      workingDir: repoRoot,
-      reason: "Scoped policy browser e2e",
-      agentName: "Codex"
+      workingDir: repoRoot
     });
+    const codex = principalForVerifiedPeer("browser:codex", "Codex", "scoped-policy-browser");
+    const request = await store.createRequest(created.handle, action, "Scoped policy browser e2e", { managedPrincipal: codex });
     expect(request.state).toBe("pending");
 
     const launched = await launchChrome(new URL("approvals", running.url).toString());
@@ -503,6 +505,7 @@ describeBrowser("React local console (real headless Chrome)", () => {
         conditions: {
           handles?: string[];
           agents?: string[];
+          principalIds?: string[];
           actionKinds?: string[];
           commands?: string[];
           injectEnvs?: string[];
@@ -518,53 +521,52 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(rule.decision).toBe("allow");
     expect(rule.conditions).toMatchObject({
       handles: [created.handle],
-      agents: ["codex"],
+      principalIds: ["browser:codex"],
       actionKinds: ["env_command"],
       commands: [process.execPath],
       injectEnvs: ["SGW_REACT_SCOPED_POLICY_TOKEN"],
       workingDirs: [repoRoot]
     });
 
-    const matchingRequest = await api<{
-      state: string;
-      approvalSource?: string;
-      approvalPolicyRuleId?: string;
-    }>("api/requests", {
-      handle: created.handle,
+    const matchingRequest = await store.createRequest(created.handle, buildEnvCommandAction({
       command: process.execPath,
       args: ["-e", "console.log('matching scope')"],
       injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
-      workingDir: repoRoot,
-      reason: "Matching scoped policy browser e2e",
-      agentName: "Codex"
-    });
+      workingDir: repoRoot
+    }), "Matching scoped policy browser e2e", { managedPrincipal: codex });
     expect(matchingRequest).toMatchObject({
       state: "approved",
       approvalSource: "policy",
       approvalPolicyRuleId: rule.id
     });
 
-    const differentAgent = await api<{ state: string }>("api/requests", {
-      handle: created.handle,
+    const claude = principalForVerifiedPeer("browser:claude", "Claude", "scoped-policy-browser");
+    const differentAgent = await store.createRequest(created.handle, buildEnvCommandAction({
       command: process.execPath,
       args: ["-e", "console.log('different agent')"],
       injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
-      workingDir: repoRoot,
-      reason: "Different agent scoped policy browser e2e",
-      agentName: "Claude"
-    });
+      workingDir: repoRoot
+    }), "Different agent scoped policy browser e2e", { managedPrincipal: claude });
     expect(differentAgent.state).toBe("pending");
 
-    const differentDirectory = await api<{ state: string }>("api/requests", {
-      handle: created.handle,
+    const differentDirectory = await store.createRequest(created.handle, buildEnvCommandAction({
       command: process.execPath,
       args: ["-e", "console.log('different directory')"],
       injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
-      workingDir: path.join(repoRoot, "other-directory"),
-      reason: "Different directory scoped policy browser e2e",
+      workingDir: path.join(repoRoot, "other-directory")
+    }), "Different directory scoped policy browser e2e", { managedPrincipal: codex });
+    expect(differentDirectory.state).toBe("pending");
+
+    const nameOnlyImpostor = await api<{ state: string }>("api/requests", {
+      handle: created.handle,
+      command: process.execPath,
+      args: ["-e", "console.log('same name')"],
+      injectEnv: "SGW_REACT_SCOPED_POLICY_TOKEN",
+      workingDir: repoRoot,
+      reason: "Name-only policy browser e2e",
       agentName: "Codex"
     });
-    expect(differentDirectory.state).toBe("pending");
+    expect(nameOnlyImpostor.state).toBe("pending");
 
     await cdp.send("Page.navigate", { url: new URL("policies", running.url).toString() });
     await waitFor(
@@ -943,7 +945,8 @@ describeBrowser("React local console (real headless Chrome)", () => {
 
   it("uses a compact settings switcher and saves readable duration choices", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "browser settings passphrase";
-    running = await startConsoleServer({ port: 0 });
+    const store = new SecretStore();
+    running = await startConsoleServer({ port: 0, store });
 
     await api("api/approval", { mode: "per-transaction", durationMs: 42 * 60 * 1000 });
     const created = await api<{ handle: string }>("api/secrets", {
@@ -953,13 +956,12 @@ describeBrowser("React local console (real headless Chrome)", () => {
       injectEnv: "SGW_REACT_SETTINGS_TOKEN",
       allowedCommands: [process.execPath]
     });
-    const request = await api<{ id: string }>("api/requests", {
-      handle: created.handle,
+    const request = await store.createRequest(created.handle, buildEnvCommandAction({
       command: process.execPath,
       args: ["-e", "1"],
-      injectEnv: "SGW_REACT_SETTINGS_TOKEN",
-      reason: "Codex settings reusable grant",
-      agentName: "Codex"
+      injectEnv: "SGW_REACT_SETTINGS_TOKEN"
+    }), "Codex settings reusable grant", {
+      managedPrincipal: principalForVerifiedPeer("browser:codex", "Codex", "settings-browser")
     });
     await api(`api/requests/${request.id}/approve`, {
       mode: "timed-session",

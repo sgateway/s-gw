@@ -67,7 +67,12 @@ try {
     assert.match(httpResult.stdout, /SGW_SECRET/);
     await cannotExecute(first.id);
     const repeat = (await call('sgw_request_http', input)).request;
-    assert.equal(repeat.state, 'approved');
+    assert.equal(repeat.state, 'pending');
+    writeFileSync('repeat-pending.json', JSON.stringify({ id: repeat.id, state: repeat.state }));
+    while (!existsSync('repeat-approved')) {
+      if (Date.now() > deadline) throw new Error('E2E repeat approval timed out');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
     assert.equal((await call('sgw_execute_request', { requestId: repeat.id })).exitCode, 0);
     const sshResult = await call('sgw_execute_request', { requestId: ssh.id });
     assert.equal(sshResult.exitCode, 0);

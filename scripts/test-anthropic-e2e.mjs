@@ -234,15 +234,20 @@ try {
   const state = await api('api/state'); assert.equal(state.pendingRequests.length, 3);
   await api(`api/requests/${pending.changed}/deny`, {});
   const approved = await api(`api/requests/${pending.http}/approve`, { mode: 'timed-session', durationMs: 60000, agentScope: 'same-agent' });
+  assert.equal(approved.approvalGrantId, undefined);
   await api(`api/requests/${pending.ssh}/approve`, { mode: 'per-transaction', agentScope: 'same-agent' });
   await writeFile(path.join(workspace, 'approved'), 'synthetic operator approved');
+  const repeat = await waitFor(() => jsonFile('repeat-pending.json'), 'repeat HTTPS request');
+  assert.equal(repeat.state, 'pending');
+  assert.equal(httpHits, 1);
+  await api(`api/requests/${repeat.id}/approve`, { mode: 'per-transaction', agentScope: 'same-agent' });
+  await writeFile(path.join(workspace, 'repeat-approved'), 'synthetic operator approved repeat');
   const result = await Promise.race([first.completion, new Promise((_resolve, reject) => { const timer = setTimeout(() => reject(new Error('E2E launcher timed out')), 30000); timer.unref(); })]);
   assert.equal(result.code, 0, result.output);
   assert.equal(httpHits, 2); assert.equal(sshAuthentications, 1); assert.deepEqual(commands, ['hostname']);
   const outputs = await readFile(path.join(workspace, 'results.json'), 'utf8');
   for (const value of values) { assert(!outputs.includes(value)); assert(!result.output.includes(value)); }
   await closedSession(); await waitFor(() => clients.size === 0, 'SSH session cleanup');
-  await api(`api/approval/grants/${approved.approvalGrantId}`, undefined, 'DELETE');
   await writeFile(path.join(workspace, 'fresh-mode'), '1');
   const fresh = launch(); const freshResult = await fresh.completion;
   assert.equal(freshResult.code, 0, freshResult.output);
@@ -297,7 +302,7 @@ try {
   for (const value of values) assert(!JSON.stringify(finalState).includes(value));
   console.log(JSON.stringify({ packageInstalled: true, ordinaryMcp: true, legacyEnvExecution: true, compiledLauncher: true, realHttps: true, realOpenSsh: true,
     consoleApproval: true, pendingDenied: true, changedActionDenied: true, replayDenied: true,
-    exactGrantReused: true, freshRunAfterRevocationDenied: true, credentialsRedacted: true, cleanup: true,
+    unverifiedRepeatRequiresManualApproval: true, freshRunStillPending: true, credentialsRedacted: true, cleanup: true,
     cgroupRequired: process.platform === 'linux' && process.argv.includes('--require-cgroup'), isolatedAuth,
     realAgent: realAgent || 'not requested' }));
 } catch (error) {

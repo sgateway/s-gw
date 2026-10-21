@@ -6,6 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SecretStore } from "../src/store.js";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { executeApprovedRequest } from "../src/executor.js";
 import { buildHttpRequestAction, SGW_HTTP_COMMAND } from "../src/http-action.js";
 import { httpAddressAllowed } from "../src/http-executor.js";
@@ -132,26 +133,30 @@ describe("owned HTTPS operations", () => {
 
   it("binds method, body, headers and authentication to reusable approval", async () => {
     const f = await fixture((_req, res) => res.end("fixture"));
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:owned-http", "Codex", "session-1") };
     const spec = { ...f.spec, method: "POST" as const, body: "first body", headers: { "x-operation": "first" } };
-    const first = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "HTTP grant fixture");
+    const first = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "HTTP grant fixture", verified);
     await f.store.approveRequest(first.id, { mode: "timed-session", durationMs: 60_000, agentScope: "any-agent" });
-    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "same operation")).state).toBe("approved");
+    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "same operation", verified)).state).toBe("approved");
+    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "name-only operation", { mcpClientName: "Codex" })).state).toBe("pending");
     for (const change of [{ method: "PUT" as const }, { body: "second body" }, { headers: { "x-operation": "second" } }, { auth: { kind: "header" as const, name: "x-service-key" } }]) {
-      expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction({ ...spec, ...change }), "changed operation")).state).toBe("pending");
+      expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction({ ...spec, ...change }), "changed operation", verified)).state).toBe("pending");
     }
   });
 
   it("keeps a permanent HTTPS approval bound to the exact operation after a fresh store instance", async () => {
     const f = await fixture((_req, res) => res.end("exact policy fixture"));
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:owned-http", "Codex", "session-1") };
     const spec = { ...f.spec, method: "POST" as const, body: "approved body" };
-    const pending = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "Codex exact policy fixture", { agentName: "Codex" });
+    const pending = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "Codex exact policy fixture", verified);
     await f.store.approveRequestWithScopedPolicy(pending.id);
     const fresh = new SecretStore();
-    expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction(spec), "Codex same fixture", { agentName: "Codex" })).state).toBe("approved");
+    expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction(spec), "Codex same fixture", verified)).state).toBe("approved");
+    expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction(spec), "claimed Codex", { agentName: "Codex" })).state).toBe("pending");
     for (const change of [{ body: "changed body" }, { method: "DELETE" as const }, { headers: { "x-extra": "changed" } }, { url: spec.url + "?changed=1" }]) {
-      expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction({ ...spec, ...change }), "Codex changed fixture", { agentName: "Codex" })).state).toBe("pending");
+      expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction({ ...spec, ...change }), "Codex changed fixture", verified)).state).toBe("pending");
     }
-    expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction(spec, 1000), "Codex timeout fixture", { agentName: "Codex" })).state).toBe("pending");
+    expect((await fresh.createRequest(f.handle.handle, buildHttpRequestAction(spec, 1000), "Codex timeout fixture", verified)).state).toBe("pending");
   });
 
   it("does not follow redirects or accept an untrusted TLS certificate", async () => {
@@ -199,7 +204,8 @@ describe("owned HTTPS operations", () => {
   it("rejects expired grants before credential use and revokes an operation in flight", async () => {
     let reached: () => void = () => {};
     const f = await fixture((_req, _res) => reached());
-    const first = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "expiry fixture");
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:owned-http", "Codex", "session-1") };
+    const first = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "expiry fixture", verified);
     await f.store.approveRequest(first.id, { mode: "timed-session", durationMs: 60_000, agentScope: "any-agent" });
     const RealDate = Date;
     const future = RealDate.now() + 65_000;
@@ -208,12 +214,12 @@ describe("owned HTTPS operations", () => {
       static now() { return future; }
     });
     try {
-      await expect(executeApprovedRequest(f.store, first.id, { http: { ca: f.ca } })).rejects.toThrow(/expired|revoked/);
+      await expect(executeApprovedRequest(f.store, first.id, { http: { ca: f.ca }, caller: verified })).rejects.toThrow(/expired|revoked/);
     } finally { vi.unstubAllGlobals(); }
-    const next = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "revocation fixture");
+    const next = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "revocation fixture", verified);
     const approved = await f.store.approveRequest(next.id, { mode: "timed-session", durationMs: 60_000, agentScope: "any-agent" });
     const received = new Promise<void>(resolve => { reached = resolve; });
-    const run = executeApprovedRequest(f.store, next.id, { http: { ca: f.ca } });
+    const run = executeApprovedRequest(f.store, next.id, { http: { ca: f.ca }, caller: verified });
     const rejection = expect(run).rejects.toThrow("revoked");
     await received; await f.store.revokeApprovalGrant(approved.approvalGrantId!);
     await rejection; expect((await f.store.getRequest(next.id)).state).toBe("failed");
@@ -228,14 +234,16 @@ describe("owned HTTPS operations", () => {
     expect((await executeApprovedRequest(f.store, pending.id, { http: { ca: f.ca } })).exitCode).toBe(0);
     await f.store.setApprovalPolicyRuleEnabled(ask.id, false);
     const allow = await f.store.addApprovalPolicyRule({ name: "HTTPS allow fixture", decision: "allow", conditions: { handles: [f.handle.handle], actionKinds: ["http_request"] } });
-    const next = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "policy fixture");
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:owned-http", "Codex", "session-1") };
+    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "claimed allow", { mcpClientName: "Codex" })).state).toBe("pending");
+    const next = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "policy fixture", verified);
     expect(next.state).toBe("approved"); await f.store.setApprovalPolicyRuleEnabled(allow.id, false);
-    await expect(executeApprovedRequest(f.store, next.id, { http: { ca: f.ca } })).rejects.toThrow(/no longer|revoked/);
+    await expect(executeApprovedRequest(f.store, next.id, { http: { ca: f.ca }, caller: verified })).rejects.toThrow(/no longer|revoked/);
     await f.store.setApprovalPolicyRuleEnabled(allow.id, true);
-    const changed = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "changed allow fixture");
+    const changed = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "changed allow fixture", verified);
     expect(changed.state).toBe("approved");
     await f.store.updateApprovalPolicyRule(allow.id, { decision: "ask" });
-    await expect(executeApprovedRequest(f.store, changed.id, { http: { ca: f.ca } })).rejects.toThrow(/no longer|revoked/);
+    await expect(executeApprovedRequest(f.store, changed.id, { http: { ca: f.ca }, caller: verified })).rejects.toThrow(/no longer|revoked/);
     expect(hits).toBe(1);
   });
 

@@ -13,6 +13,7 @@ import {
   WINDOWS_SSH_KEY_ONLY_ERROR
 } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 
 let tmpHome = "";
 const originalPlatform = process.platform;
@@ -59,6 +60,7 @@ afterEach(async () => {
 describe.sequential("s-gw-owned SSH sessions", () => {
   it("reuses approval for the same SSH target but not a different target", async () => {
     const store = new SecretStore();
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:ssh-session", "Codex", "session-1") };
     const record = await store.addSecret({
       name: "owned ssh key",
       type: "private-key",
@@ -77,7 +79,8 @@ describe.sequential("s-gw-owned SSH sessions", () => {
         args: ["hostname"],
         injectEnv: "SGW_SSH_PRIVATE_KEY"
       }),
-      "Codex owned ssh first command"
+      "Codex owned ssh first command",
+      verified
     );
     expect(first.state).toBe("pending");
 
@@ -95,10 +98,13 @@ describe.sequential("s-gw-owned SSH sessions", () => {
         args: ["uptime"],
         injectEnv: "SGW_SSH_PRIVATE_KEY"
       }),
-      "Codex owned ssh follow-up"
+      "Codex owned ssh follow-up",
+      verified
     );
     expect(sameTarget.state).toBe("approved");
     expect(sameTarget.approvalGrantId).toBe(approved.approvalGrantId);
+
+    expect((await store.createRequest(record.handle, sameTarget.action, "claimed Codex", { mcpClientName: "Codex" })).state).toBe("pending");
 
     const otherTarget = await store.createRequest(
       record.handle,
@@ -108,13 +114,15 @@ describe.sequential("s-gw-owned SSH sessions", () => {
         args: ["uptime"],
         injectEnv: "SGW_SSH_PRIVATE_KEY"
       }),
-      "Codex owned ssh other host"
+      "Codex owned ssh other host",
+      verified
     );
     expect(otherTarget.state).toBe("pending");
   });
 
   it("keeps SSH one-shot execution durable after reusable approval", async () => {
     const store = new SecretStore();
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:ssh-session", "Codex", "session-1") };
     const record = await store.addSecret({
       name: "durable ssh one-shot key",
       type: "private-key",
@@ -129,7 +137,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
       args: ["hostname"],
       injectEnv: "SGW_SSH_PRIVATE_KEY"
     });
-    const first = await store.createRequest(record.handle, firstAction, "Codex durable ssh first run");
+    const first = await store.createRequest(record.handle, firstAction, "Codex durable ssh first run", verified);
     await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 8 * 60 * 60 * 1000,
@@ -143,7 +151,8 @@ describe.sequential("s-gw-owned SSH sessions", () => {
         args: ["uptime"],
         injectEnv: "SGW_SSH_PRIVATE_KEY"
       }),
-      "Codex durable ssh follow-up"
+      "Codex durable ssh follow-up",
+      verified
     );
 
     expect(admission.kind).toBe("request");
@@ -158,6 +167,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
     process.env.SGW_FAKE_SSH_LOG = fake.log;
 
     const store = new SecretStore();
+    const verified = { managedPrincipal: principalForVerifiedPeer("test:ssh-session", "Codex", "session-1") };
     const secret = fakePrivateKey();
     const record = await store.addSecret({
       name: "executor owned ssh key",
@@ -178,7 +188,8 @@ describe.sequential("s-gw-owned SSH sessions", () => {
         args: ["hostname"],
         injectEnv: "SGW_SSH_PRIVATE_KEY"
       }),
-      "Codex owned ssh execute"
+      "Codex owned ssh execute",
+      verified
     );
     await store.approveRequest(first.id, {
       mode: "timed-session",
@@ -186,7 +197,7 @@ describe.sequential("s-gw-owned SSH sessions", () => {
       agentScope: "same-agent"
     });
 
-    const summary = await executeApprovedRequest(store, first.id);
+    const summary = await executeApprovedRequest(store, first.id, { caller: verified });
     expect(summary.exitCode).toBe(0);
     expect(summary.stdout).toContain("remote:hostname");
     expect(summary.stdout).not.toContain(secret);
@@ -211,10 +222,11 @@ describe.sequential("s-gw-owned SSH sessions", () => {
         args: ["uptime"],
         injectEnv: "SGW_SSH_PRIVATE_KEY"
       }),
-      "Codex owned ssh execute again"
+      "Codex owned ssh execute again",
+      verified
     );
     expect(second.state).toBe("approved");
-    const secondSummary = await executeApprovedRequest(store, second.id);
+    const secondSummary = await executeApprovedRequest(store, second.id, { caller: verified });
     expect(secondSummary.exitCode).toBe(0);
     expect(secondSummary.stdout).toContain("remote:uptime");
 

@@ -4,6 +4,15 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Added
+
+- Added an opt-in verified Unix MCP listener and stdio bridge for broker-owned HTTPS and managed SSH actions. It binds requests to a kernel-verified agent session and cancels in-flight work when that session ends. Production launchers and network isolation are still required before this is a confinement boundary.
+
+### Changed
+
+- Automatic allow policies and reusable grants now require a verified OS agent principal, including when an older store has no setting or contains `requireVerifiedAgentForAutoApproval: false`. Ordinary MCP, CLI, and console requests may still use one-time manual approval; their existing name-scoped unattended approvals stop matching until migrated to a verified peer. Deny policies still apply. `--allow-unverified-agent` and API opt-out attempts now fail. To restore the former behavior, revert this change in a compatible broker deployment after stopping all store writers; the old flag no longer rolls it back. The current ordinary MCP transport and same-UID store access are not confinement boundaries.
+- Updated the Vitest development dependency to 4.1.12 to address two reported `@vitest/mocker` vulnerabilities.
+
 ## 0.1.22 - 2026-10-05
 
 ### Added

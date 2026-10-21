@@ -5,7 +5,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
+import { buildEnvCommandAction } from "../src/gateway.js";
 import { getSgwInstanceKey } from "../src/paths.js";
 import { buildSshSessionAction } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
@@ -52,6 +54,27 @@ describe("local console server", () => {
       name: "s-gw",
       instanceKey: getSgwInstanceKey(tmpHome)
     });
+  });
+
+  it("rejects attempts to disable verified-only automatic approval through the console API", async () => {
+    running = await startConsoleServer({ port: 0 });
+    const before = await fetchJson("api/approval");
+    expect(before.requireVerifiedAgentForAutoApproval).toBe(true);
+
+    const rejected = await fetch(consoleUrl("api/approval"), {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ mode: "timed-session", durationMs: 60_000, requireVerifiedAgentForAutoApproval: false })
+    });
+    expect(rejected.status).toBe(400);
+    expect((await rejected.json()).error).toMatch(/requires a verified agent/i);
+    expect(await fetchJson("api/approval")).toEqual(before);
+
+    const updated = await fetchJson("api/approval", {
+      method: "POST",
+      body: { mode: "timed-session", durationMs: 60_000, requireVerifiedAgentForAutoApproval: true }
+    });
+    expect(updated).toMatchObject({ mode: "timed-session", durationMs: 60_000, requireVerifiedAgentForAutoApproval: true });
   });
 
   it("serves the console with a session token and protects local API writes", async () => {
@@ -540,7 +563,7 @@ describe("local console server", () => {
     expect(state.requests.find((item: { id: string }) => item.id === request.id).state).toBe("failed");
   });
 
-  it("accepts scoped timed approval choices from the console API", async () => {
+  it("keeps name-only console timed approvals one-shot", async () => {
     running = await startConsoleServer({ port: 0 });
 
     const created = await fetchJson("api/secrets", {
@@ -573,14 +596,15 @@ describe("local console server", () => {
         agentScope: "same-agent"
       }
     });
-    expect(approved.approvalGrantId).toMatch(/^grant_/);
+    expect(approved).toMatchObject({ id: first.id, state: "approved", approvalSource: "manual" });
+    expect(approved.approvalGrantId).toBeUndefined();
 
     const sameAgent = await fetchJson("api/requests", {
       method: "POST",
       body: { ...commandBody, reason: "Console retry", agentName: "Codex" }
     });
-    expect(sameAgent.state).toBe("approved");
-    expect(sameAgent.approvalGrantId).toBe(approved.approvalGrantId);
+    expect(sameAgent.state).toBe("pending");
+    expect(sameAgent.approvalGrantId).toBeUndefined();
 
     const otherAgent = await fetchJson("api/requests", {
       method: "POST",
@@ -590,7 +614,8 @@ describe("local console server", () => {
   });
 
   it("lists and revokes approval grants through the console API", async () => {
-    running = await startConsoleServer({ port: 0 });
+    const store = new SecretStore();
+    running = await startConsoleServer({ port: 0, store });
 
     const created = await fetchJson("api/secrets", {
       method: "POST",
@@ -609,10 +634,9 @@ describe("local console server", () => {
       injectEnv: "SGW_REVOKE_GRANT_TOKEN"
     };
 
-    const first = await fetchJson("api/requests", {
-      method: "POST",
-      body: { ...commandBody, reason: "Codex console revoke grant" }
-    });
+    const agent = { managedPrincipal: principalForVerifiedPeer("test:console-grant", "Codex", "session-1"), env: {} };
+    const action = buildEnvCommandAction(commandBody);
+    const first = await store.createRequest(created.handle, action, "Codex console revoke grant", agent);
     const approved = await fetchJson(`api/requests/${first.id}/approve`, {
       method: "POST",
       body: {
@@ -622,6 +646,9 @@ describe("local console server", () => {
       }
     });
     expect(approved.approvalGrantId).toMatch(/^grant_/);
+
+    const reused = await store.createRequest(created.handle, action, "Codex console grant reuse", agent);
+    expect(reused).toMatchObject({ state: "approved", approvalSource: "grant", approvalGrantId: approved.approvalGrantId });
 
     const grants = await fetchJson("api/approval/grants");
     expect(grants.map((grant: { id: string }) => grant.id)).toEqual([approved.approvalGrantId]);
@@ -634,10 +661,7 @@ describe("local console server", () => {
     });
     expect(revoked.id).toBe(approved.approvalGrantId);
 
-    const afterRevoke = await fetchJson("api/requests", {
-      method: "POST",
-      body: { ...commandBody, reason: "Codex console after revoke" }
-    });
+    const afterRevoke = await store.createRequest(created.handle, action, "Codex console after revoke", agent);
     expect(afterRevoke.state).toBe("pending");
   });
 

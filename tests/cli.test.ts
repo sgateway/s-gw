@@ -111,7 +111,7 @@ describe("desktop instance identity command", () => {
 });
 
 describe("CLI verified-only automatic approval", () => {
-  it("persists the explicit opt-in, preserves it on ordinary settings changes, and requires an explicit opt-out", async () => {
+  it("requires a verified agent by default and rejects the removed opt-out", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-verified-approval-"));
     const env = {
       ...process.env,
@@ -127,7 +127,7 @@ describe("CLI verified-only automatic approval", () => {
     });
 
     try {
-      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBeUndefined();
+      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBe(true);
       expect(JSON.parse(run(["set", "--require-verified-agent", "--mode", "per-transaction"])))
         .toMatchObject({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
       expect(JSON.parse(run(["set", "--mode", "login-session"])).requireVerifiedAgentForAutoApproval).toBe(true);
@@ -138,9 +138,9 @@ describe("CLI verified-only automatic approval", () => {
       expect(() => run(["set", "--mode", "per-transaction", "--require-verified-agent", "false"]))
         .toThrow(/do not take values/i);
       expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBe(true);
-      expect(JSON.parse(run(["set", "--mode", "per-transaction", "--allow-unverified-agent"]))
-        .requireVerifiedAgentForAutoApproval).toBeUndefined();
-      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBeUndefined();
+      expect(() => run(["set", "--mode", "per-transaction", "--allow-unverified-agent"]))
+        .toThrow(/no longer supported/i);
+      expect(JSON.parse(run(["settings"])).requireVerifiedAgentForAutoApproval).toBe(true);
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
@@ -230,7 +230,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     }
   });
 
-  it("updates and auto-arranges approval policies, and documents both commands", async () => {
+  it("updates and auto-arranges approval policies, and requires a verified agent for approve-policy", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-policy-"));
     const recoveryHome = `${home}-recovery`;
     const cargoTarget = `${home}-cargo`;
@@ -397,22 +397,18 @@ describe("CLI unknown-command behavior (end to end)", () => {
       ]));
       expect(request.state).toBe("pending");
 
-      const policyApproval = JSON.parse(run(["approve-policy", request.id]));
-      expect(policyApproval.created).toBe(true);
-      expect(policyApproval.request).toMatchObject({
+      expect(() => run(["approve-policy", request.id]))
+        .toThrow(/allow policy requires a verified agent/i);
+      const oneShot = JSON.parse(run(["approve", request.id]));
+      expect(oneShot).toMatchObject({
         id: request.id,
         state: "approved",
-        approvalSource: "policy"
+        approvalSource: "manual"
       });
-      expect(policyApproval.rule).toMatchObject({
-        decision: "allow",
-        conditions: {
-          handles: [secret.handle],
-          agents: ["codex"],
-          commands: [process.execPath],
-          resolvedCommands: [realpathSync.native(process.execPath)]
-        }
-      });
+      expect(JSON.parse(run([
+        "request", "env-command", secret.handle, "--command", process.execPath,
+        "--inject-env", "SGW_CLI_SCOPED_POLICY", "--arg", "--version"
+      ])).state).toBe("pending");
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(recoveryHome, { recursive: true, force: true });
@@ -420,7 +416,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     }
   }, 15_000);
 
-  it("keeps CLI add without --any-command fail-closed while explicit --any-command approves", async () => {
+  it("keeps name-only CLI requests pending even with an explicit --any-command allow rule", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-any-command-"));
     const recoveryHome = `${home}-recovery`;
     const env = {
@@ -505,10 +501,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       ]));
       expect(explicit.conditions.commands).toEqual([]);
       expect(explicit.conditions.resolvedCommands).toEqual([]);
-      expect(JSON.parse(run(requestArgs))).toMatchObject({
-        state: "approved",
-        approvalSource: "policy"
-      });
+      expect(JSON.parse(run(requestArgs)).state).toBe("pending");
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(recoveryHome, { recursive: true, force: true });
@@ -990,7 +983,6 @@ public static class FakeAwsWrapper {
         stdio: ["ignore", "pipe", "pipe"]
       });
 
-      const beforeRun = await readFile(path.join(home, "store.json"), "utf8");
       const run = JSON.parse(runCliSync([
         "src/cli.ts",
         "aws",
@@ -1007,14 +999,28 @@ public static class FakeAwsWrapper {
         stdio: ["ignore", "pipe", "pipe"]
       }));
 
-      expect(run.approvalRequired).toBe(false);
-      expect(run.reusableAuthorization).toMatchObject({ kind: "grant" });
-      expect(run.summary.stdout).toContain(`<<SGW_SECRET:${secret.handle}>>`);
-      expect(run.summary.stdout).toContain(`<<SGW_SECRET:${access.handle}>>`);
-      expect(run.summary.stdout).not.toContain("aws-secret-shortcut-value-123456789");
-      expect(run.summary.stdout).not.toContain(fakeAwsAccessKey());
-      expect(run.summary.stdout).toContain("args=sts get-caller-identity");
-      expect(await readFile(path.join(home, "store.json"), "utf8")).toBe(beforeRun);
+      expect(run.approvalRequired).toBe(true);
+      expect(run.request.state).toBe("pending");
+      expect(run.reusableAuthorization).toBeUndefined();
+      expect(run.summary).toBeUndefined();
+
+      runCliSync(["src/cli.ts", "approve", run.request.id], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      const summary = JSON.parse(runCliSync(["src/cli.ts", "execute", run.request.id], {
+        cwd: repoRoot,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+      expect(summary.stdout).toContain(`<<SGW_SECRET:${secret.handle}>>`);
+      expect(summary.stdout).toContain(`<<SGW_SECRET:${access.handle}>>`);
+      expect(summary.stdout).not.toContain("aws-secret-shortcut-value-123456789");
+      expect(summary.stdout).not.toContain(fakeAwsAccessKey());
+      expect(summary.stdout).toContain("args=sts get-caller-identity");
 
       const changedArgs = JSON.parse(runCliSync([
         "src/cli.ts",
@@ -1043,7 +1049,7 @@ public static class FakeAwsWrapper {
         "us-west-2"
       ]);
 
-      const raw = runCliSync([
+      const raw = JSON.parse(runCliSync([
         "src/cli.ts",
         "aws",
         "run",
@@ -1058,13 +1064,11 @@ public static class FakeAwsWrapper {
         env,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"]
-      });
+      }));
 
-      expect(raw).toContain(`<<SGW_SECRET:${secret.handle}>>`);
-      expect(raw).toContain(`<<SGW_SECRET:${access.handle}>>`);
-      expect(raw).toContain("args=sts get-caller-identity");
-      expect(raw).not.toContain("aws-secret-shortcut-value-123456789");
-      expect(raw).not.toContain(fakeAwsAccessKey());
+      expect(raw.approvalRequired).toBe(true);
+      expect(raw.request.state).toBe("pending");
+      expect(raw.summary).toBeUndefined();
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });

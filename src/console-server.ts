@@ -612,12 +612,17 @@ async function handleApi(
 
   if (req.method === "POST" && url.pathname === "/api/approval") {
     const body = await readJson(req);
+    if (body.requireVerifiedAgentForAutoApproval !== undefined &&
+        body.requireVerifiedAgentForAutoApproval !== true) {
+      throw new HttpError(400, "Automatic approval requires a verified agent.");
+    }
     sendJson(
       res,
       200,
       await store.setApprovalSettings({
         mode: approvalMode(body.mode),
-        durationMs: numberValue(body.durationMs, 15 * 60 * 1000)
+        durationMs: numberValue(body.durationMs, 15 * 60 * 1000),
+        requireVerifiedAgentForAutoApproval: true
       })
     );
     return;

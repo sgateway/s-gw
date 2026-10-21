@@ -21,6 +21,7 @@ export interface ExecutionOptions {
   http?: OwnedHttpOptions;
   operationsOnly?: boolean;
   caller?: AgentIdentityContext;
+  agentSession?: { signal: AbortSignal; assertActive(): void };
 }
 
 export async function executeApprovedRequest(
@@ -28,13 +29,17 @@ export async function executeApprovedRequest(
   requestId: string,
   options: ExecutionOptions = {}
 ): Promise<ExecutionSummary> {
+  options.agentSession?.assertActive();
   if (options.operationsOnly) {
     const pending = await store.getRequest(requestId);
+    options.agentSession?.assertActive();
     if (!["http_request", "ssh_session"].includes(pending.action.kind)) throw new Error("Sandbox execution supports owned SSH and HTTPS operations only.");
   }
-  const request = await store.claimApprovedRequest(requestId, options.caller);
+  const request = await store.claimApprovedRequest(requestId, options.caller, options.agentSession?.assertActive);
   try {
+    options.agentSession?.assertActive();
     const summary = await executeRequest(store, request, options);
+    options.agentSession?.assertActive();
     await store.markExecuted(requestId, summary);
     return summary;
   } catch (error) {
@@ -99,10 +104,12 @@ async function executeRequest(
   options: ExecutionOptions,
   executionOptions: { cacheOnePassword?: boolean } = {}
 ): Promise<ExecutionSummary> {
+  options.agentSession?.assertActive();
   const command = request.action.kind === "env_command"
     ? commandForExecution(request)
     : undefined;
   const secretRecord = await store.getSecretRecord(request.handle);
+  options.agentSession?.assertActive();
   assertActionAllowed(secretRecord, request.action);
   if (request.action.kind === "ssh_session") {
     assertSshCredentialSupported(secretRecord);
@@ -110,12 +117,20 @@ async function executeRequest(
   const secretValue = await store.revealSecretForLocalUse(request.handle, request, {
     cache: executionOptions.cacheOnePassword !== false
   });
+  options.agentSession?.assertActive();
   if (request.action.kind === "http_request") {
-    return runOwnedHttpRequest(store, request, secretRecord, secretValue, options.http);
+    return runOwnedHttpRequest(store, request, secretRecord, secretValue, {
+      ...options.http, signal: options.agentSession?.signal, assertActive: options.agentSession?.assertActive
+    });
   }
   if (request.action.kind === "ssh_session") {
-    if (options.operationsOnly) await store.assertOwnedRequestAuthorized(request.id);
-    return runOwnedSshSession(request, secretRecord, secretValue, store.home, options.operationsOnly || request.action.owned ? () => store.assertOwnedRequestAuthorized(request.id) : undefined);
+    const assertOwned = options.operationsOnly || request.action.owned ? async () => {
+      options.agentSession?.assertActive();
+      await store.assertOwnedRequestAuthorized(request.id);
+      options.agentSession?.assertActive();
+    } : undefined;
+    if (options.operationsOnly) await assertOwned?.();
+    return runOwnedSshSession(request, secretRecord, secretValue, store.home, assertOwned, options.agentSession?.signal);
   }
   const extraSecrets = await resolveExtraSecrets(store, request, executionOptions);
   return runEnvCommand(request, command!, secretRecord, secretValue, extraSecrets, options);

@@ -16,6 +16,8 @@ import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-in
 let tmpHome = "";
 let originalNodeOptions: string | undefined;
 const resolvedNodeExecutable = realpathSync.native(process.execPath);
+const verifiedCodex = { managedPrincipal: principalForVerifiedPeer("test:codex", "Codex", "session-1"), env: {} };
+const verifiedClaude = { managedPrincipal: principalForVerifiedPeer("test:claude", "Claude Code", "session-1"), env: {} };
 
 function fakeAwsAccessKey(): string {
   return ["A", "KIA", "IOSFODNN7EXAMPLE"].join("");
@@ -235,6 +237,7 @@ describe("SecretStore", () => {
       conditions: {
         handles: [record.handle],
         agents: ["Codex"],
+        principalIds: ["test:codex"],
         actionKinds: ["env_command"],
         commands: [],
         resolvedCommands: []
@@ -245,7 +248,7 @@ describe("SecretStore", () => {
       command: process.execPath,
       args: ["-e", "0"],
       injectEnv: "ANY_COMMAND_POLICY_TOKEN"
-    }), "Codex any command policy request");
+    }), "Codex any command policy request", verifiedCodex);
 
     expect(rule.conditions.commands).toEqual([]);
     expect(rule.conditions.resolvedCommands).toEqual([]);
@@ -327,12 +330,12 @@ describe("SecretStore", () => {
         injectEnv: "PATH_BOUND_POLICY_TOKEN"
       });
 
-      const approved = await store.createRequest(record.handle, action, "Codex pinned policy request");
+      const approved = await store.createRequest(record.handle, action, "Codex pinned policy request", verifiedCodex);
       expect(approved.state).toBe("approved");
       expect(approved.action.resolvedCommand).toBe(realpathSync.native(firstTool));
 
       process.env.PATH = secondBin;
-      const pending = await store.createRequest(record.handle, action, "Codex changed PATH request");
+      const pending = await store.createRequest(record.handle, action, "Codex changed PATH request", verifiedCodex);
       expect(pending.state).toBe("pending");
       expect(pending.action.resolvedCommand).toBe(realpathSync.native(secondTool));
     } finally {
@@ -600,7 +603,7 @@ describe("SecretStore", () => {
       args: ["-e", "0"],
       injectEnv: "REUSABLE_REQUEST_BACKUP_TOKEN"
     });
-    const context = { agentName: "codex" };
+    const context = verifiedCodex;
     const first = await store.createRequest(secret.handle, action, "reusable request backup", context);
     await store.approveRequest(first.id, { mode: "timed-session", durationMs: 60 * 60 * 1000 });
 
@@ -963,6 +966,7 @@ describe("SecretStore", () => {
     const beforeHash = createHash("sha256").update(serialized).digest("hex");
     const upgraded = new SecretStore();
     expect(await upgraded.listHandles()).toHaveLength(installedV0112Counts.credentials);
+    expect((await upgraded.getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
     expect(await upgraded.listApprovalPolicyRules()).toHaveLength(installedV0112Counts.policies);
     expect(await upgraded.listRequests({ limit: 2_000 })).toHaveLength(1_000);
     expect(await upgraded.auditLog()).toHaveLength(installedV0112Counts.audit);
@@ -987,6 +991,41 @@ describe("SecretStore", () => {
     expect(sealed.fingerprint).not.toBe(oldFingerprint);
     expect(sealed.recoveryCheckpoint).toMatch(/^checkpoint-/);
     expect((await readdir(await externalControlPlaneDir())).some((entry) => entry === sealed.recoveryCheckpoint)).toBe(true);
+    await upgraded.addSecret({ name: "post-migration token", type: "api-token", value: fakeOpenAiToken("post_migration") });
+    expect((await new SecretStore().getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
+  }, 20_000);
+
+  it("ignores a legacy stored opt-out after sealing and across later writes", async () => {
+    const fixture = installedV0112Store();
+    fixture.approvalSettings.requireVerifiedAgentForAutoApproval = false;
+    const oldFingerprint = v0112Fingerprint(fixture);
+    const legacyRecovery = path.join(`${tmpHome}-recovery`, "control-plane");
+    await mkdir(legacyRecovery, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(tmpHome, "store.json"), `${JSON.stringify(fixture, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(path.join(tmpHome, ".store-initialized"), "s-gw store initialized\n", { mode: 0o600 });
+    await writeFile(path.join(tmpHome, ".store-control.json"), `${JSON.stringify({
+      version: 1, fingerprint: oldFingerprint, updatedAt: "2026-07-16T01:00:00.000Z",
+      secrets: installedV0112Counts.credentials, approvalPolicyRules: installedV0112Counts.policies
+    }, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(path.join(legacyRecovery, `store-20260716T010000-${oldFingerprint.slice(0, 12)}-fixture.json`),
+      `${JSON.stringify({ ...fixture, requests: [], audit: [] }, null, 2)}\n`, { mode: 0o600 });
+
+    const store = new SecretStore();
+    expect((await store.getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
+    expect(JSON.parse(await readFile(path.join(tmpHome, ".store-control.json"), "utf8")).recoverySealed).toBe(true);
+    const secret = await store.addSecret({
+      name: "legacy opt-out token", type: "api-token", value: fakeOpenAiToken("legacy_optout"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    await store.addApprovalPolicyRule({ decision: "allow", conditions: {
+      handles: [secret.handle], agents: ["Codex"], commands: [process.execPath],
+      resolvedCommands: [resolvedNodeExecutable]
+    } });
+    const action = buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "TOKEN" });
+    const ordinary = { mcpClientName: "Codex", env: {} };
+    expect((await store.createRequest(secret.handle, action, "ordinary MCP", ordinary)).state).toBe("pending");
+    expect((await new SecretStore().getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
+    expect((await new SecretStore().createRequest(secret.handle, action, "after restart", ordinary)).state).toBe("pending");
   }, 20_000);
 
   it("does not migrate an unsealed legacy manifest without a matching checkpoint", async () => {
@@ -1288,7 +1327,8 @@ describe("SecretStore", () => {
         args: ["-e", "0"],
         injectEnv: "SGW_REPEAT_APPROVAL_TOKEN"
       }),
-      "repeat approval test"
+      "repeat approval test",
+      verifiedCodex
     );
 
     const first = await store.approveRequest(request.id, {
@@ -1779,12 +1819,12 @@ describe("SecretStore", () => {
       injectEnv: "SGW_TIMED_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "timed session first");
+    const first = await store.createRequest(record.handle, action, "timed session first", verifiedCodex);
     expect(first.state).toBe("pending");
     const approved = await store.approveRequest(first.id);
     expect(approved.approvalGrantId).toMatch(/^grant_/);
 
-    const second = await store.createRequest(record.handle, action, "timed session second");
+    const second = await store.createRequest(record.handle, action, "timed session second", verifiedCodex);
     expect(second.state).toBe("approved");
     expect(second.approvalGrantId).toBe(approved.approvalGrantId);
   });
@@ -1805,12 +1845,12 @@ describe("SecretStore", () => {
       args: ["-e", "process.stdout.write('approved')"],
       injectEnv: "SGW_REVOKED_AUTO_APPROVED_REQUEST"
     });
-    const manual = await store.createRequest(record.handle, action, "Codex manual approval");
+    const manual = await store.createRequest(record.handle, action, "Codex manual approval", verifiedCodex);
     const approved = await store.approveRequest(manual.id, {
       mode: "timed-session",
       durationMs: 60 * 60 * 1000
     });
-    const automatic = await store.createRequest(record.handle, action, "Codex reusable approval");
+    const automatic = await store.createRequest(record.handle, action, "Codex reusable approval", verifiedCodex);
     expect(manual.approvalSource).toBeUndefined();
     expect(approved.approvalSource).toBe("manual");
     expect(automatic.approvalSource).toBe("grant");
@@ -1847,17 +1887,17 @@ describe("SecretStore", () => {
       injectEnv: "SGW_LOGIN_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "login session first");
+    const first = await store.createRequest(record.handle, action, "login session first", verifiedCodex);
     process.env.SGW_LOGIN_SESSION_ID = "login-session-b";
     const approved = await store.approveRequest(first.id);
     const grant = (await store.listApprovalGrants()).find((item) => item.id === approved.approvalGrantId);
     expect(grant?.loginSessionId).toBe("login-session-a");
 
-    const differentLogin = await store.createRequest(record.handle, action, "different login");
+    const differentLogin = await store.createRequest(record.handle, action, "different login", verifiedCodex);
     expect(differentLogin.state).toBe("pending");
 
     process.env.SGW_LOGIN_SESSION_ID = "login-session-a";
-    const sameLogin = await store.createRequest(record.handle, action, "same login");
+    const sameLogin = await store.createRequest(record.handle, action, "same login", verifiedCodex);
     expect(sameLogin.state).toBe("approved");
   });
 
@@ -1915,10 +1955,10 @@ describe("SecretStore", () => {
       record.handle,
       action,
       "Agent requested local secret-backed execution.",
-      { mcpClientName: "codex-mcp-client", env: {} }
+      verifiedCodex
     );
     expect(first.agentName).toBe("Codex");
-    expect(first.agentSource).toBe("mcp-client");
+    expect(first.agentSource).toBe("managed-peer");
     const approved = await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 8 * 60 * 60 * 1000,
@@ -1930,7 +1970,7 @@ describe("SecretStore", () => {
       record.handle,
       action,
       "Agent requested local secret-backed execution.",
-      { mcpClientName: "Codex", env: {} }
+      verifiedCodex
     );
     expect(sameAgent.state).toBe("approved");
     expect(sameAgent.approvalGrantId).toBe(approved.approvalGrantId);
@@ -1939,7 +1979,7 @@ describe("SecretStore", () => {
       record.handle,
       action,
       "Agent requested local secret-backed execution.",
-      { mcpClientName: "Claude Code", env: {} }
+      verifiedClaude
     );
     expect(otherAgent.state).toBe("pending");
   });
@@ -1961,6 +2001,7 @@ describe("SecretStore", () => {
       conditions: {
         handles: [record.handle],
         agents: ["Codex"],
+        principalIds: ["test:codex"],
         commands: [process.execPath],
         resolvedCommands: [resolvedNodeExecutable]
       }
@@ -1977,7 +2018,7 @@ describe("SecretStore", () => {
     const headBeforeMtime = (await stat(headPath)).mtimeMs;
 
     for (let index = 0; index < 12; index += 1) {
-      const admission = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run");
+      const admission = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run", verifiedCodex);
       expect(admission.kind).toBe("reusable");
       if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
       const summary = await executeReusablePermit(store, admission.permit, { engine: "typescript" });
@@ -1990,7 +2031,7 @@ describe("SecretStore", () => {
     expect((await stat(headPath)).mtimeMs).toBe(headBeforeMtime);
     await store.setApprovalPolicyRuleEnabled(rule.id, false);
 
-    const invalidated = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run");
+    const invalidated = await store.prepareOneShotExecution(record.handle, action, "Codex one-shot policy run", verifiedCodex);
     expect(invalidated.kind).toBe("request");
   }, 15_000);
 
@@ -2019,7 +2060,7 @@ describe("SecretStore", () => {
       args: ["-e", "process.stdout.write('opaque')"],
       injectEnv: "SGW_OPAQUE_ONE_SHOT_TOKEN"
     });
-    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex opaque permit run");
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex opaque permit run", verifiedCodex);
     expect(admission.kind).toBe("reusable");
     if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
 
@@ -2063,7 +2104,7 @@ describe("SecretStore", () => {
       args: ["-e", "process.stdout.write('must-not-run')"],
       injectEnv: "SGW_GATED_ONE_SHOT_TOKEN"
     });
-    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex gated permit run");
+    const admission = await store.prepareOneShotExecution(record.handle, action, "Codex gated permit run", verifiedCodex);
     expect(admission.kind).toBe("reusable");
     if (admission.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
 
@@ -2116,14 +2157,14 @@ describe("SecretStore", () => {
       injectEnv: "SGW_OP_POLICY_CACHED_TOKEN"
     });
 
-    const first = await store.prepareOneShotExecution(record.handle, action, "Codex policy-cached one-shot run");
+    const first = await store.prepareOneShotExecution(record.handle, action, "Codex policy-cached one-shot run", verifiedCodex);
     expect(first.kind).toBe("reusable");
     if (first.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
     const firstSummary = await executeReusablePermit(store, first.permit, { engine: "typescript" });
     expect(firstSummary.stdout).toContain(tokenForHandle(record.handle));
     const afterFirst = await readFile(store.storePath, "utf8");
 
-    const second = await store.prepareOneShotExecution(record.handle, action, "Codex policy-cached one-shot run");
+    const second = await store.prepareOneShotExecution(record.handle, action, "Codex policy-cached one-shot run", verifiedCodex);
     expect(second.kind).toBe("reusable");
     if (second.kind !== "reusable") throw new Error("Expected reusable one-shot admission.");
     const secondSummary = await executeReusablePermit(store, second.permit, { engine: "typescript" });
@@ -2153,7 +2194,7 @@ describe("SecretStore", () => {
       args: ["-e", "process.stdout.write('grant')"],
       injectEnv: "SGW_ONE_SHOT_GRANT_TOKEN"
     });
-    const context = { agentName: "Codex", env: {} };
+    const context = verifiedCodex;
     const first = await store.createRequest(record.handle, action, "Codex one-shot grant run", context);
     await store.approveRequest(first.id, { mode: "timed-session", durationMs: 60 * 60 * 1000 });
     const before = await readFile(store.storePath, "utf8");
@@ -2278,7 +2319,7 @@ describe("SecretStore", () => {
       }
     });
 
-    const incomplete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
+    const incomplete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run", verifiedCodex);
     expect(incomplete.kind).toBe("request");
     if (incomplete.kind !== "request") throw new Error("Expected a pending approval request.");
     expect(incomplete.request.state).toBe("pending");
@@ -2293,7 +2334,7 @@ describe("SecretStore", () => {
         resolvedCommands: [resolvedNodeExecutable]
       }
     });
-    const complete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run");
+    const complete = await store.prepareOneShotExecution(primary.handle, action, "Codex multi-handle policy run", verifiedCodex);
     expect(complete.kind).toBe("reusable");
   }, 15_000);
 
@@ -2398,6 +2439,7 @@ describe("SecretStore", () => {
       conditions: {
         handles: [record.handle],
         agents: ["Codex"],
+        principalIds: ["test:codex"],
         providers: ["github"],
         commands: [process.execPath],
         resolvedCommands: [resolvedNodeExecutable],
@@ -2410,7 +2452,7 @@ describe("SecretStore", () => {
       args: ["-e", "console.log(process.env.SGW_POLICY_CODEX_TOKEN)"],
       injectEnv: "SGW_POLICY_CODEX_TOKEN"
     });
-    const request = await store.createRequest(record.handle, action, "Codex policy run");
+    const request = await store.createRequest(record.handle, action, "Codex policy run", verifiedCodex);
     expect(request.state).toBe("approved");
     expect(request.approvalPolicyRuleId).toMatch(/^policy_/);
     expect(request.approvalGrantId).toBeUndefined();
@@ -2613,7 +2655,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_SCOPED_POLICY",
       workingDir: tmpHome
     });
-    const pending = await store.createRequest(record.handle, action, "Codex scoped policy run");
+    const pending = await store.createRequest(record.handle, action, "Codex scoped policy run", verifiedCodex);
 
     const approved = await store.approveRequestWithScopedPolicy(pending.id);
     expect(approved.created).toBe(true);
@@ -2623,7 +2665,7 @@ describe("SecretStore", () => {
     expect(approved.rule.conditions).toMatchObject({
       handles: [record.handle],
       envBindings: [{ handle: record.handle, injectEnv: "SGW_SCOPED_POLICY" }],
-      agents: ["codex"],
+      principalIds: ["test:codex"],
       actionKinds: ["env_command"],
       commands: [process.execPath],
       resolvedCommands: [resolvedNodeExecutable],
@@ -2631,7 +2673,7 @@ describe("SecretStore", () => {
       workingDirs: [tmpHome]
     });
 
-    const matching = await store.createRequest(record.handle, action, "Codex scoped policy retry");
+    const matching = await store.createRequest(record.handle, action, "Codex scoped policy retry", verifiedCodex);
     expect(matching.state).toBe("approved");
     expect(matching.approvalPolicyRuleId).toBe(approved.rule.id);
 
@@ -2643,7 +2685,8 @@ describe("SecretStore", () => {
         injectEnv: "SGW_SCOPED_POLICY",
         workingDir: path.join(tmpHome, "different-directory")
       }),
-      "Codex different directory"
+      "Codex different directory",
+      verifiedCodex
     );
     expect(differentDirectory.state).toBe("pending");
 
@@ -2677,7 +2720,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_BINDING_PRIMARY",
       env: [{ handle: secondary.handle, injectEnv: "SGW_BINDING_SECONDARY" }]
     });
-    const pending = await store.createRequest(primary.handle, action, "Codex binding policy run");
+    const pending = await store.createRequest(primary.handle, action, "Codex binding policy run", verifiedCodex);
     const approved = await store.approveRequestWithScopedPolicy(pending.id);
 
     expect(approved.rule.conditions.envBindings).toEqual([
@@ -2685,7 +2728,7 @@ describe("SecretStore", () => {
       { handle: secondary.handle, injectEnv: "SGW_BINDING_SECONDARY" }
     ]);
 
-    const matching = await store.createRequest(primary.handle, action, "Codex binding policy retry");
+    const matching = await store.createRequest(primary.handle, action, "Codex binding policy retry", verifiedCodex);
     expect(matching.state).toBe("approved");
     expect(matching.approvalPolicyRuleId).toBe(approved.rule.id);
 
@@ -2696,7 +2739,8 @@ describe("SecretStore", () => {
         args: ["-e", "0"],
         injectEnv: "SGW_BINDING_PRIMARY"
       }),
-      "Codex primary-only binding"
+      "Codex primary-only binding",
+      verifiedCodex
     );
     expect(primaryOnly.state).toBe("pending");
 
@@ -2708,7 +2752,8 @@ describe("SecretStore", () => {
         injectEnv: "SGW_BINDING_PRIMARY",
         env: [{ handle: secondary.handle, injectEnv: "SGW_BINDING_OTHER" }]
       }),
-      "Codex mixed binding"
+      "Codex mixed binding",
+      verifiedCodex
     );
     expect(mixedBinding.state).toBe("pending");
 
@@ -2723,7 +2768,8 @@ describe("SecretStore", () => {
           { handle: third.handle, injectEnv: "SGW_BINDING_THIRD" }
         ]
       }),
-      "Codex extra binding"
+      "Codex extra binding",
+      verifiedCodex
     );
     expect(extraBinding.state).toBe("pending");
   });
@@ -2741,7 +2787,7 @@ describe("SecretStore", () => {
       args: ["-e", "0"],
       injectEnv: "SGW_EXISTING_POLICY"
     });
-    const pending = await store.createRequest(record.handle, action, "Codex pending before policy");
+    const pending = await store.createRequest(record.handle, action, "Codex pending before policy", verifiedCodex);
     const rule = await store.addApprovalPolicyRule({
       name: "Existing Codex policy",
       decision: "allow",
@@ -2749,6 +2795,7 @@ describe("SecretStore", () => {
         handles: [record.handle],
         envBindings: [{ handle: record.handle, injectEnv: "SGW_EXISTING_POLICY" }],
         agents: ["Codex"],
+        principalIds: ["test:codex"],
         actionKinds: ["env_command"],
         commands: [process.execPath],
         resolvedCommands: [resolvedNodeExecutable],
@@ -2781,7 +2828,7 @@ describe("SecretStore", () => {
     expect(pending.agentName).toBe("Agent");
     expect(pending.agentSource).toBe("unknown");
 
-    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/could not identify the requesting agent/i);
+    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/requires a verified agent/i);
     expect(await store.listApprovalPolicyRules()).toEqual([]);
     expect((await store.getRequest(pending.id)).state).toBe("pending");
   });
@@ -2795,7 +2842,7 @@ describe("SecretStore", () => {
       policy: { injectEnv: "SGW_DENY_POLICY", allowedCommands: [process.execPath] }
     });
     const action = buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_DENY_POLICY" });
-    const pending = await store.createRequest(record.handle, action, "Codex denied policy run");
+    const pending = await store.createRequest(record.handle, action, "Codex denied policy run", verifiedCodex);
     await store.addApprovalPolicyRule({
       name: "Deny Codex commands",
       decision: "deny",
@@ -2824,7 +2871,7 @@ describe("SecretStore", () => {
       port: 2222,
       injectEnv: "SGW_SCOPED_SSH"
     });
-    const pending = await store.createRequest(record.handle, action, "Codex SSH scoped policy run");
+    const pending = await store.createRequest(record.handle, action, "Codex SSH scoped policy run", verifiedCodex);
 
     const approved = await store.approveRequestWithScopedPolicy(pending.id);
     expect(approved.rule.conditions).toMatchObject({
@@ -2834,13 +2881,14 @@ describe("SecretStore", () => {
       sshPorts: [2222]
     });
 
-    const matching = await store.createRequest(record.handle, action, "Codex SSH scoped policy retry");
+    const matching = await store.createRequest(record.handle, action, "Codex SSH scoped policy retry", verifiedCodex);
     expect(matching.state).toBe("approved");
 
     const differentPort = await store.createRequest(
       record.handle,
       buildSshSessionAction({ target: "deploy@example.test", port: 2223, injectEnv: "SGW_SCOPED_SSH" }),
-      "Codex SSH other port"
+      "Codex SSH other port",
+      verifiedCodex
     );
     expect(differentPort.state).toBe("pending");
   });
@@ -2870,7 +2918,7 @@ describe("SecretStore", () => {
       args: ["-e", "process.stdout.write('must-not-run')"],
       injectEnv: "SGW_REVOKED_POLICY_REQUEST"
     });
-    const automatic = await store.createRequest(record.handle, action, "Codex revocable policy request");
+    const automatic = await store.createRequest(record.handle, action, "Codex revocable policy request", verifiedCodex);
     expect(automatic.approvalSource).toBe("policy");
 
     await store.setApprovalPolicyRuleEnabled(rule.id, false);
@@ -2973,14 +3021,14 @@ describe("SecretStore", () => {
       injectEnv: "SGW_WRAPPER_PASSWORD"
     });
 
-    const first = await store.createRequest(record.handle, firstAction, "Codex wrapper first run");
+    const first = await store.createRequest(record.handle, firstAction, "Codex wrapper first run", verifiedCodex);
     const approved = await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 8 * 60 * 60 * 1000,
       agentScope: "same-agent"
     });
 
-    const next = await store.createRequest(record.handle, secondAction, "Codex wrapper follow-up");
+    const next = await store.createRequest(record.handle, secondAction, "Codex wrapper follow-up", verifiedCodex);
     expect(approved.approvalGrantId).toBeTruthy();
     expect(next.state).toBe("pending");
     expect(next.approvalGrantId).toBeUndefined();
@@ -3008,7 +3056,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_LEGACY_WRAPPER_PASSWORD"
     });
 
-    const first = await store.createRequest(record.handle, firstAction, "Codex legacy wrapper first run");
+    const first = await store.createRequest(record.handle, firstAction, "Codex legacy wrapper first run", verifiedCodex);
     const approved = await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 8 * 60 * 60 * 1000,
@@ -3020,13 +3068,13 @@ describe("SecretStore", () => {
     raw.approvalGrants[0].actionKey = legacyKey;
     await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
 
-    const matching = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat");
+    const matching = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat", verifiedCodex);
     expect(matching.kind).toBe("reusable");
 
-    const changed = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up");
+    const changed = await store.prepareOneShotExecution(record.handle, secondAction, "Codex legacy wrapper follow-up", verifiedCodex);
     expect(changed.kind).toBe("request");
 
-    const next = await store.createRequest(record.handle, secondAction, "Codex legacy wrapper follow-up");
+    const next = await store.createRequest(record.handle, secondAction, "Codex legacy wrapper follow-up", verifiedCodex);
     expect(approved.approvalGrantId).toBeTruthy();
     expect(next.state).toBe("pending");
     expect(next.approvalGrantId).toBeUndefined();
@@ -3105,14 +3153,14 @@ describe("SecretStore", () => {
       injectEnv: "SGW_ANY_AGENT_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "Codex initial approval");
+    const first = await store.createRequest(record.handle, action, "Codex initial approval", verifiedCodex);
     const approved = await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 60 * 60 * 1000,
       agentScope: "any-agent"
     });
 
-    const claude = await store.createRequest(record.handle, action, "Claude follow-up approval");
+    const claude = await store.createRequest(record.handle, action, "Claude follow-up approval", verifiedClaude);
     expect(claude.state).toBe("approved");
     expect(claude.approvalGrantId).toBe(approved.approvalGrantId);
   });
@@ -3134,7 +3182,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_REVOKE_GRANT_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "Codex grant first");
+    const first = await store.createRequest(record.handle, action, "Codex grant first", verifiedCodex);
     const approved = await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 60 * 60 * 1000,
@@ -3149,7 +3197,7 @@ describe("SecretStore", () => {
     expect(revoked.id).toBe(approved.approvalGrantId);
     expect(await store.listApprovalGrants()).toHaveLength(0);
 
-    const next = await store.createRequest(record.handle, action, "Codex grant after revoke");
+    const next = await store.createRequest(record.handle, action, "Codex grant after revoke", verifiedCodex);
     expect(next.state).toBe("pending");
   });
 
@@ -3170,7 +3218,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_CLEAR_GRANTS_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "Codex clear grants");
+    const first = await store.createRequest(record.handle, action, "Codex clear grants", verifiedCodex);
     await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
 
     const cleared = await store.clearApprovalGrants();
@@ -3195,7 +3243,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_DELETE_TOKEN"
     });
 
-    const approved = await store.createRequest(record.handle, action, "Codex approved before delete");
+    const approved = await store.createRequest(record.handle, action, "Codex approved before delete", verifiedCodex);
     await store.approveRequest(approved.id, {
       mode: "timed-session",
       durationMs: 60 * 60 * 1000,
@@ -3244,14 +3292,14 @@ describe("SecretStore", () => {
       injectEnv: "SGW_UNLIMITED_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "Codex persistent approval");
+    const first = await store.createRequest(record.handle, action, "Codex persistent approval", verifiedCodex);
     const approved = await store.approveRequest(first.id, {
       mode: "always",
       agentScope: "same-agent"
     });
 
     process.env.SGW_LOGIN_SESSION_ID = "login-session-b";
-    const afterLoginChange = await store.createRequest(record.handle, action, "Codex after login switch");
+    const afterLoginChange = await store.createRequest(record.handle, action, "Codex after login switch", verifiedCodex);
     expect(afterLoginChange.state).toBe("approved");
     expect(afterLoginChange.approvalGrantId).toBe(approved.approvalGrantId);
   });
@@ -3325,7 +3373,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_OP_CACHED_TOKEN"
     });
 
-    const first = await store.createRequest(record.handle, action, "Codex cached 1Password first run");
+    const first = await store.createRequest(record.handle, action, "Codex cached 1Password first run", verifiedCodex);
     const approved = await store.approveRequest(first.id, {
       mode: "timed-session",
       durationMs: 8 * 60 * 60 * 1000,
@@ -3334,7 +3382,7 @@ describe("SecretStore", () => {
     const firstSummary = await executeApprovedRequest(store, first.id);
     expect(firstSummary.stdout).toContain(tokenForHandle(record.handle));
 
-    const second = await store.createRequest(record.handle, action, "Codex cached 1Password second run");
+    const second = await store.createRequest(record.handle, action, "Codex cached 1Password second run", verifiedCodex);
     expect(second.state).toBe("approved");
     expect(second.approvalGrantId).toBe(approved.approvalGrantId);
     const secondSummary = await executeApprovedRequest(store, second.id);
@@ -3370,7 +3418,7 @@ describe("SecretStore", () => {
       injectEnv: "SGW_OP_REVOKE_CACHE"
     });
 
-    const first = await store.createRequest(record.handle, action, "Codex cached revoke first run");
+    const first = await store.createRequest(record.handle, action, "Codex cached revoke first run", verifiedCodex);
     const approved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
     await executeApprovedRequest(store, first.id);
 
@@ -3381,7 +3429,7 @@ describe("SecretStore", () => {
     raw = JSON.parse(await readFile(store.storePath, "utf8"));
     expect(raw.secrets[0].cache).toBeUndefined();
 
-    const next = await store.createRequest(record.handle, action, "Codex cached revoke after revoke");
+    const next = await store.createRequest(record.handle, action, "Codex cached revoke after revoke", verifiedCodex);
     expect(next.state).toBe("pending");
   });
 
@@ -3463,7 +3511,7 @@ describe("SecretStore", () => {
     })).state).toBe("pending");
   });
 
-  it("keeps legacy name policies working without granting them to managed principals", async () => {
+  it("keeps legacy name policies stored without allowing unattended use", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "legacy policy token", type: "api-token", value: fakeOpenAiToken("legacy_policy"),
@@ -3478,13 +3526,13 @@ describe("SecretStore", () => {
 
     expect((await store.createRequest(secret.handle, action, "legacy", {
       mcpClientName: "Codex", env: {}
-    })).state).toBe("approved");
+    })).state).toBe("pending");
     expect((await store.createRequest(secret.handle, action, "managed", {
       managedPrincipal: principalForVerifiedPeer("local:codex", "Codex"), env: {}
     })).state).toBe("pending");
   });
 
-  it("can require a verified peer before an allow policy approves automatically", async () => {
+  it("requires a verified peer before an allow policy approves automatically", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "verified-only policy token", type: "api-token", value: fakeOpenAiToken("verified_only_policy"),
@@ -3498,8 +3546,9 @@ describe("SecretStore", () => {
       resolvedCommands: [resolvedNodeExecutable]
     } });
     const claimed = { mcpClientName: "Codex", env: {} };
-    const oldApproval = await store.createRequest(secret.handle, action, "ordinary MCP", claimed);
-    expect(oldApproval.state).toBe("approved");
+    expect((await store.getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
+    const first = await store.createRequest(secret.handle, action, "ordinary MCP", claimed);
+    expect(first.state).toBe("pending");
 
     await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
     await store.setApprovalSettings({ mode: "per-transaction" });
@@ -3508,8 +3557,6 @@ describe("SecretStore", () => {
     expect(pending.state).toBe("pending");
     expect((await store.prepareOneShotExecution(secret.handle, action, "claimed name", claimed)).kind).toBe("request");
     await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/verified agent/i);
-    await expect(executeApprovedRequest(store, oldApproval.id, { caller: claimed, engine: "typescript" }))
-      .rejects.toThrow(/approval policy.*changed/i);
 
     await store.approveRequest(pending.id);
     expect((await executeApprovedRequest(store, pending.id, { caller: claimed, engine: "typescript" })).stdout).toBe("policy");
@@ -3526,11 +3573,13 @@ describe("SecretStore", () => {
     } });
     const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
     expect((await store.createRequest(secret.handle, action, "verified peer", verified)).state).toBe("approved");
-    await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: false });
-    expect((await store.createRequest(secret.handle, action, "claimed name after opt-out", claimed)).state).toBe("approved");
+    await expect(store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: false }))
+      .rejects.toThrow(/verified agent/i);
+    expect((await store.createRequest(secret.handle, action, "claimed name after rejected opt-out", claimed)).state)
+      .toBe("pending");
   });
 
-  it("can require a verified peer before a reusable grant approves automatically", async () => {
+  it("requires a verified peer before a reusable grant approves automatically", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "verified-only grant token", type: "api-token", value: fakeOpenAiToken("verified_only_grant"),
@@ -3539,7 +3588,6 @@ describe("SecretStore", () => {
     const action = buildEnvCommandAction({
       command: process.execPath, args: ["-e", "process.stdout.write('grant')"], injectEnv: "TOKEN"
     });
-    await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
     const claimed = { mcpClientName: "Codex", env: {} };
     const first = await store.createRequest(secret.handle, action, "claimed name", claimed);
     const manuallyApproved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
@@ -3684,7 +3732,7 @@ describe("SecretStore", () => {
       handles: [secret.handle], sshTargets: ["build-alias"], sshPorts: [22]
     } });
     expect((await store.createRequest(secret.handle,
-      buildSshSessionAction({ target: "build-alias", port: 22, args: ["id"] }), "legacy route")).state).toBe("approved");
+      buildSshSessionAction({ target: "build-alias", port: 22, args: ["id"] }), "legacy route")).state).toBe("pending");
     const input = { injectEnv: "SGW_SSH_CREDENTIAL", args: ["id"] };
     const managed = await store.createManagedSshRequest(secret.handle, route.id, input, "managed route", managedAgent);
     expect(managed.state).toBe("pending");

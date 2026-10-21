@@ -222,7 +222,7 @@ describe("MCP end-to-end flow", () => {
     }
   }, 20_000);
 
-  it("requires a verified peer for automatic MCP approval while preserving manual approval", async () => {
+  it("requires a verified peer by default for automatic MCP approval while preserving manual approval", async () => {
     runCli(["init"]);
     const secret = JSON.parse(runCli([
       "secret", "add", "--name", "verified MCP fixture", "--type", "api-token", "--value-stdin",
@@ -246,15 +246,11 @@ describe("MCP end-to-end flow", () => {
       reason: "ordinary MCP verified-only check"
     };
     try {
-      const allowed = await client.callTool({ name: "sgw_request_execution", arguments: args });
-      expect(allowed.isError).not.toBe(true);
-      expect(JSON.parse(allowed.content[0].text).request.state).toBe("approved");
+      const first = await client.callTool({ name: "sgw_request_execution", arguments: args });
+      expect(first.isError).not.toBe(true);
+      expect(JSON.parse(first.content[0].text).request.state).toBe("pending");
 
       runCli(["approval", "set", "--mode", "per-transaction", "--require-verified-agent"]);
-      const oldApproval = JSON.parse(allowed.content[0].text).request.id;
-      const revoked = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: oldApproval } });
-      expect(revoked.isError).toBe(true);
-      expect(revoked.content[0].text).toMatch(/approval policy.*changed/i);
 
       const pending = await client.callTool({ name: "sgw_request_execution", arguments: args });
       expect(pending.isError).not.toBe(true);

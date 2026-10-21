@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { principalForVerifiedPeer } from "../src/agent-context.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { SecretStore } from "../src/store.js";
 
@@ -73,7 +74,10 @@ describe("reusable approvals from a separate approval process", () => {
       args: ["-e", "process.stdout.write('ok')"],
       injectEnv: "SGW_REQUESTER_SESSION_TOKEN"
     });
-    const agentContext = { mcpClientName: "Codex", env: {} };
+    const agentContext = {
+      managedPrincipal: principalForVerifiedPeer("test:requester-session", "Codex", "agent-session-a"),
+      env: {}
+    };
 
     const first = await store.createRequest(secret.handle, action, "Codex requester session", agentContext);
     expect(first.loginSessionId).toBe(requesterSession);
@@ -90,6 +94,8 @@ describe("reusable approvals from a separate approval process", () => {
       mode,
       agentScope: "same-agent",
       agentName: "Codex",
+      principalId: "test:requester-session",
+      agentSessionId: "agent-session-a",
       loginSessionId: requesterSession,
       lastRequestId: first.id
     });
@@ -109,6 +115,10 @@ describe("reusable approvals from a separate approval process", () => {
     expect(fromRequesterSession.state).toBe("approved");
     expect(fromRequesterSession.approvalSource).toBe("grant");
     expect(fromRequesterSession.approvalGrantId).toBe(grant.id);
+    const claimedName = await store.createRequest(secret.handle, action, "Codex name claim", {
+      mcpClientName: "Codex", env: {}
+    });
+    expect(claimedName.state).toBe("pending");
   });
 });
 
