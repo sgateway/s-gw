@@ -26,6 +26,7 @@ struct ConsoleWebAppView: NSViewRepresentable {
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate {
+    private let cli = CLIRunner()
     private var requestedURL: URL?
     private var retryTask: Task<Void, Never>?
 
@@ -40,6 +41,28 @@ struct ConsoleWebAppView: NSViewRepresentable {
         requestedURL = url
       }
       webView.load(URLRequest(url: url))
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+      guard navigationAction.targetFrame?.isMainFrame == true,
+            let target = navigationAction.request.url,
+            let requestedURL else {
+        return .allow
+      }
+      guard target.host == "127.0.0.1" else { return .allow }
+      guard target.scheme == "http" else { return .cancel }
+      guard let port = target.port,
+            let root = URL(string: "http://127.0.0.1:\(port)/") else { return .cancel }
+
+      let result = await cli.run(arguments: ["console", "verify-listener", "--console-url", root.absoluteString])
+      if self.requestedURL != requestedURL {
+        return .cancel
+      }
+      if result.succeeded {
+        return .allow
+      }
+      retry(webView)
+      return .cancel
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

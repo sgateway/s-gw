@@ -35,6 +35,7 @@ import {
   installMenuBarLaunchAgent,
   installSystemdUserService,
   installWindowsLoginService,
+  installedConsolePort,
   installedConsoleRequiresOperatorProof,
   launchAgentStatus,
   normalizeMenuBarCountMode,
@@ -184,6 +185,12 @@ async function main(): Promise<void> {
   }
 
   if (first === "console") {
+    if (second === "verify-listener") {
+      const { url } = appConsoleEndpoint(parsed.flags);
+      await waitForInstalledConsoleAuthority(url);
+      printJson({ ok: true, consoleUrl: url });
+      return;
+    }
     if (second === "enroll") {
       if (!process.stdin.isTTY || !process.stderr.isTTY) {
         throw new Error("Operator enrollment requires a trusted interactive terminal.");
@@ -257,7 +264,8 @@ async function main(): Promise<void> {
   }
 
   if (first === "doctor" || first === "status") {
-    printJson(packageHealth(numericFlag(parsed.flags, "port", 8718)));
+    const defaultPort = process.platform === "darwin" ? installedConsolePort() ?? 8718 : 8718;
+    printJson(packageHealth(numericFlag(parsed.flags, "port", defaultPort)));
     return;
   }
 

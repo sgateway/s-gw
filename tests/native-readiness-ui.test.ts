@@ -40,18 +40,26 @@ describe("native readiness UI contract", () => {
   });
 
   it("shows native recovery UI while the console is stopped and retries transient web failures", async () => {
-    const [mainWindow, consoleWebApp] = await Promise.all([
+    const [mainWindow, consoleWebApp, appState, cli] = await Promise.all([
       readFile(path.join(appRoot, "Views/MainWindow.swift"), "utf8"),
-      readFile(path.join(appRoot, "Views/ConsoleWebAppView.swift"), "utf8")
+      readFile(path.join(appRoot, "Views/ConsoleWebAppView.swift"), "utf8"),
+      readFile(path.join(appRoot, "App/AppState.swift"), "utf8"),
+      readFile(path.resolve(here, "../src/cli.ts"), "utf8")
     ]);
 
     expect(mainWindow).toContain("if appState.daemonRunning, let url = appState.consoleURL()");
+    expect(mainWindow).toContain("ConsoleWebAppView(url: url)");
+    expect(appState).toContain('arguments: ["status"]');
+    expect(cli).toContain('installedConsolePort() ?? 8718');
     expect(mainWindow).toContain("SetupView()");
     expect(mainWindow).toContain("if !appState.initialStatusResolved");
     expect(mainWindow).toContain("Checking the local runtime");
     expect(mainWindow).toContain("Status is unavailable");
     expect(mainWindow).not.toContain("status == nil ? \"s-gw CLI not found\"");
     expect(consoleWebApp).toContain("webView.navigationDelegate = context.coordinator");
+    expect(consoleWebApp).toContain('"verify-listener", "--console-url", root.absoluteString');
+    expect(consoleWebApp).toContain("decidePolicyFor navigationAction: WKNavigationAction");
+    expect(consoleWebApp).toContain("if self.requestedURL != requestedURL");
     expect(consoleWebApp).toContain("didFailProvisionalNavigation");
     expect(consoleWebApp).toContain("try await Task.sleep(for: .milliseconds(500))");
   });

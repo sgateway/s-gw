@@ -1350,6 +1350,12 @@ export function installedConsoleRequiresOperatorProof(plistPath = launchAgentPat
   return args.includes("--operator-auth");
 }
 
+export function installedConsolePort(plistPath = launchAgentPath(consoleLabel)): number | undefined {
+  requireMac("installed console port lookup");
+  if (!existsSync(plistPath)) return undefined;
+  return numberAfter(launchAgentProgramArguments(plistPath), "--port");
+}
+
 export function openMenuBarHelper(options: MenuBarOptions = {}): { appPath: string; consoleUrl: string } {
   requireMac("menu-bar open");
   assertMacRuntimeForManagedSurfaces();

@@ -10,6 +10,7 @@ import {
   buildMenuBarLaunchAgentPlist,
   consoleLabel,
   getPackageLayout,
+  installedConsolePort,
   installedConsoleRequiresOperatorProof,
   macAppProcessRecordPath,
   menuBarLabel,
@@ -28,10 +29,13 @@ describe("customer package layout", () => {
     const plistPath = path.join(dir, "console.plist");
     try {
       expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(false);
+      expect(installedConsolePort(plistPath)).toBeUndefined();
       await writeFile(plistPath, buildConsoleLaunchAgentPlist(8718, dir));
       expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(false);
-      await writeFile(plistPath, buildConsoleLaunchAgentPlist(8718, dir, {}, true));
+      expect(installedConsolePort(plistPath)).toBe(8718);
+      await writeFile(plistPath, buildConsoleLaunchAgentPlist(9876, dir, {}, true));
       expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(true);
+      expect(installedConsolePort(plistPath)).toBe(9876);
       await writeFile(plistPath, "<key>ProgramArguments</key><array><string>--operator-auth</string></array>");
       expect(() => installedConsoleRequiresOperatorProof(plistPath)).toThrow("incomplete operator-auth configuration");
     } finally {
