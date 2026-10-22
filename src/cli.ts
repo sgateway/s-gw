@@ -68,6 +68,7 @@ import { listOnePasswordSecretReferences, onePasswordStatus, readOnePasswordRefe
 import { installPackageUpdate, planPackageUpdate } from "./package-update.js";
 import { getSgwInstanceKey } from "./paths.js";
 import { managedSshHostFingerprint } from "./managed-ssh.js";
+import { potentialBroadHttpAllows } from "./policy-audit.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
 import { normalizeCommandGrant, SecretStore } from "./store.js";
 import {
@@ -2240,6 +2241,11 @@ async function handleApprovalPolicyCommand(
     return;
   }
 
+  if (action === "audit") {
+    printJson({ potentialBroadHttpAllows: potentialBroadHttpAllows(await store.listApprovalPolicyRules()) });
+    return;
+  }
+
   if (action === "add") {
     assertAnyCommandFlag(flags);
     const duration = getFlag(flags, "duration") || getFlag(flags, "duration-ms");
@@ -2295,7 +2301,7 @@ async function handleApprovalPolicyCommand(
     return;
   }
 
-  throw new Error("approval policy requires list, add, update, arrange, delete, enable, or disable.");
+  throw new Error("approval policy requires list, audit, add, update, arrange, delete, enable, or disable.");
 }
 
 const approvalPolicyUpdateFlags = [
@@ -2779,6 +2785,7 @@ Commands:
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m] [--require-verified-agent]
   s-gw approval grants
   s-gw approval policy list
+  s-gw approval policy audit
   s-gw approval policy add --name NAME --decision allow|ask|deny [--handle HANDLE] [--binding ENV=HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--action-kind env_command|ssh_session|http_request|model_relay] [--duration 8h]
   s-gw approval policy update --id POLICY_ID [--name NAME] [--decision allow|ask|deny] [--handle HANDLE] [--agent Codex] [--command NAME] [--resolved-command /path/to/tool] [--any-command] [--clear-expiry]
   s-gw approval policy arrange

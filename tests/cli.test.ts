@@ -373,8 +373,11 @@ describe("CLI unknown-command behavior (end to end)", () => {
 
       const listed = JSON.parse(run(["approval", "policy", "list"]));
       expect(listed.map((rule: { id: string }) => rule.id)).toEqual([specific.id, broad.id]);
+      expect(JSON.parse(run(["approval", "policy", "audit"]))).toEqual({ potentialBroadHttpAllows: [] });
+      expect(JSON.parse(run(["approval", "policy", "list"]))).toEqual(listed);
 
       const help = run(["help"]);
+      expect(help).toContain("s-gw approval policy audit");
       expect(help).toContain("s-gw approval policy update --id POLICY_ID");
       expect(help).toContain("s-gw approval policy arrange");
       expect(help).toContain("--resolved-command /path/to/tool");
