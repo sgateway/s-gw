@@ -13,6 +13,7 @@ import {
   uninstallAgentIntegrations,
   type AgentIntegrationOptions
 } from "./agent-install.js";
+import { consoleControlPath, startConsoleControl } from "./console-control.js";
 import { executeApprovedRequest } from "./executor.js";
 import { requestAgentName } from "./agent-context.js";
 import {
@@ -76,7 +77,7 @@ export interface ConsoleServerOptions {
   agentHomeDir?: string;
   agentPathEnv?: string;
   agentSkillSourcePath?: string;
-  operatorAuth?: { displayCode: (code: string) => void };
+  operatorAuth?: { displayCode: (code: string) => void } | { background: true };
 }
 
 export interface RunningConsoleServer {
@@ -162,11 +163,15 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   if (options.operatorAuth && host !== "127.0.0.1") {
     throw new Error("Protected operator console requires 127.0.0.1.");
   }
+  const backgroundAuth = options.operatorAuth && "background" in options.operatorAuth;
+  if (backgroundAuth && process.platform !== "darwin") {
+    throw new Error("Background operator enrollment currently requires macOS peer verification.");
+  }
   const port = options.port ?? 8718;
   const token = options.operatorAuth ? "" : options.token || randomBytes(24).toString("base64url");
   const operatorAuth: OperatorAuthState | undefined = options.operatorAuth ? {
-    code: randomBytes(24).toString("base64url"),
-    codeExpiresAt: Date.now() + operatorCodeLifetimeMs,
+    code: backgroundAuth ? undefined : randomBytes(24).toString("base64url"),
+    codeExpiresAt: backgroundAuth ? 0 : Date.now() + operatorCodeLifetimeMs,
     attempts: 0,
     attemptsResetAt: 0,
     origin: ""
@@ -205,7 +210,19 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     });
   });
 
-  if (options.operatorAuth && operatorAuth?.code) {
+  let control: Awaited<ReturnType<typeof startConsoleControl>> | undefined;
+  if (backgroundAuth && operatorAuth) {
+    try {
+      const address = server.address() as AddressInfo;
+      control = await startConsoleControl(consoleControlPath(store.storePath, address.port), () => issueOperatorCode(operatorAuth));
+    } catch (error) {
+      clearInterval(updateTimer);
+      await closeServer(server);
+      throw error;
+    }
+  }
+
+  if (options.operatorAuth && "displayCode" in options.operatorAuth && operatorAuth?.code) {
     try {
       options.operatorAuth.displayCode(operatorAuth.code);
     } catch (error) {
@@ -223,11 +240,22 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     url,
     token,
     server,
-    close: () => {
+    close: async () => {
       clearInterval(updateTimer);
-      return closeServer(server);
+      if (control) {
+        await Promise.all([control.close(), closeServer(server)]);
+        return;
+      }
+      await closeServer(server);
     }
   };
+}
+
+function issueOperatorCode(auth: OperatorAuthState): string {
+  if (auth.code && Date.now() < auth.codeExpiresAt) return auth.code;
+  auth.code = randomBytes(24).toString("base64url");
+  auth.codeExpiresAt = Date.now() + operatorCodeLifetimeMs;
+  return auth.code;
 }
 
 async function closeServer(server: Server): Promise<void> {
@@ -254,6 +282,11 @@ async function handleRequest(
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (operatorAuth) {
     await handleProtectedRequest(req, res, url, store, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/auth/status" && !url.search) {
+    sendJson(res, 200, { ok: true, name: "s-gw", instanceKey });
     return;
   }
 
@@ -301,6 +334,11 @@ async function handleProtectedRequest(
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+
+  if (req.method === "GET" && url.pathname === "/auth/status" && !url.search) {
+    sendJson(res, 200, { ok: true, name: "s-gw", instanceKey });
+    return;
+  }
 
   if (url.pathname === "/auth/enroll") {
     if (req.method !== "POST" || url.search) {
@@ -439,7 +477,7 @@ function serveOperatorLogin(req: IncomingMessage, res: ServerResponse): void {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>s-gw operator sign-in</title>
 <style>body{font:16px system-ui,sans-serif;max-width:32rem;margin:12vh auto;padding:1.5rem;background:#111827;color:#f9fafb}input,button{font:inherit;padding:.7rem;width:100%;box-sizing:border-box;margin:.5rem 0}input{background:#1f2937;border:1px solid #6b7280;color:inherit}button{background:#2563eb;border:0;color:white;cursor:pointer}p{line-height:1.5}</style></head>
-<body><main><h1>s-gw operator sign-in</h1><p>Enter the one-time code shown in the foreground s-gw terminal. It expires after five minutes.</p>
+<body><main><h1>s-gw operator sign-in</h1><p>Enter the one-time code shown by s-gw console enroll or in the foreground s-gw terminal. It expires after five minutes.</p>
 <form id="login"><label for="code">One-time code</label><input id="code" type="password" autocomplete="off" required autofocus><button type="submit">Sign in</button></form><p id="error" role="alert"></p></main>
 <script nonce="${nonce}">
 (function () {

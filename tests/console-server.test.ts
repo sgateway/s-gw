@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
+import { consoleControlPath, requestConsoleCode } from "../src/console-control.js";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { getSgwInstanceKey } from "../src/paths.js";
@@ -50,6 +51,11 @@ describe("local console server", () => {
 
     const health = await fetchJson("api/health");
     expect(health).toMatchObject({
+      ok: true,
+      name: "s-gw",
+      instanceKey: getSgwInstanceKey(tmpHome)
+    });
+    expect(await fetchJson("auth/status")).toMatchObject({
       ok: true,
       name: "s-gw",
       instanceKey: getSgwInstanceKey(tmpHome)
@@ -116,6 +122,10 @@ describe("local console server", () => {
     expect(before.headers.get("cache-control")).toBe("no-store");
     expect(before.headers.get("x-frame-options")).toBe("DENY");
     expect((await fetch(`${running.url}api/health`)).status).toBe(401);
+    const status = await fetch(`${running.url}auth/status`);
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ ok: true, name: "s-gw", instanceKey: getSgwInstanceKey(tmpHome) });
+    expect((await fetch(`${running.url}auth/status`, { method: "POST" })).status).toBe(403);
     expect((await fetch(`${running.url}api/state`, {
       headers: { "X-SGW-Console-Token": "guessed" }
     })).status).toBe(401);
@@ -175,6 +185,68 @@ describe("local console server", () => {
     expect((await action({ Cookie: sessionCookie, Origin: "http://malicious.example", "X-SGW-Console-Token": proof })).status).toBe(403);
     expect((await action({ Origin: new URL(running.url).origin, "X-SGW-Console-Token": proof })).status).toBe(401);
     expect((await action({ Cookie: sessionCookie, Origin: new URL(running.url).origin, "X-SGW-Console-Token": proof })).status).toBe(200);
+  });
+
+  it.skipIf(process.platform !== "darwin")("enrolls a background operator from a private local control socket", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const port = Number(new URL(running.url).port);
+    const socketPath = consoleControlPath(path.join(tmpHome, "store.json"), port);
+    const socketInfo = lstatSync(socketPath);
+    expect(socketInfo.isSocket()).toBe(true);
+    expect(socketInfo.mode & 0o077).toBe(0);
+    expect(running.token).toBe("");
+    expect(await (await fetch(running.url)).text()).not.toContain("s-gw one-time operator code");
+    expect((await fetch(`${running.url}api/state`)).status).toBe(401);
+
+    const code = await requestConsoleCode(socketPath);
+    expect(code).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+    const enroll = (submitted: string) => fetch(`${running!.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: new URL(running!.url).origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: submitted })
+    });
+    expect((await enroll(code)).status).toBe(200);
+    expect((await enroll(code)).status).toBe(401);
+
+    const nextCode = await requestConsoleCode(socketPath);
+    expect(nextCode).not.toBe(code);
+    expect((await enroll(nextCode)).status).toBe(200);
+    await running.close();
+    running = undefined;
+    expect(existsSync(socketPath)).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "darwin")("expires a background enrollment code and issues a replacement", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const socketPath = consoleControlPath(path.join(tmpHome, "store.json"), Number(new URL(running.url).port));
+    const code = await requestConsoleCode(socketPath);
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(startedAt + 5 * 60_000 + 1);
+      const expired = await fetch(`${running.url}auth/enroll`, {
+        method: "POST",
+        headers: { Origin: new URL(running.url).origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ code })
+      });
+      expect(expired.status).toBe(401);
+      const replacement = await requestConsoleCode(socketPath);
+      expect(replacement).not.toBe(code);
+      const signedIn = await fetch(`${running.url}auth/enroll`, {
+        method: "POST",
+        headers: { Origin: new URL(running.url).origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ code: replacement })
+      });
+      expect(signedIn.status).toBe(200);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("limits operator code guesses and requires loopback binding", async () => {

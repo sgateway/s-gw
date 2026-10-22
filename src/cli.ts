@@ -12,6 +12,7 @@ import {
 } from "./agent-install.js";
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { unknownCommandMessage } from "./command-suggest.js";
+import { consoleControlPath, requestConsoleCode } from "./console-control.js";
 import { startConsoleServer } from "./console-server.js";
 import { executeApprovedRequest, executeReusablePermit } from "./executor.js";
 import {
@@ -181,19 +182,37 @@ async function main(): Promise<void> {
   }
 
   if (first === "console") {
+    if (second === "enroll") {
+      if (!process.stdin.isTTY || !process.stderr.isTTY) {
+        throw new Error("Operator enrollment requires a trusted interactive terminal.");
+      }
+      const port = numericFlag(parsed.flags, "port", 8718);
+      const code = await requestConsoleCode(consoleControlPath(store.storePath, port));
+      process.stderr.write(`s-gw one-time operator code: ${code}\n`);
+      process.stderr.write("The code expires in five minutes and can be used once.\n");
+      return;
+    }
+
     const host = getFlag(parsed.flags, "host") || "127.0.0.1";
     const port = numericFlag(parsed.flags, "port", 8718);
     const protectedOperator = hasFlag(parsed.flags, "operator-auth");
-    if (protectedOperator && (!process.stdin.isTTY || !process.stderr.isTTY)) {
+    const backgroundAuth = hasFlag(parsed.flags, "background");
+    if (backgroundAuth && (!protectedOperator || !hasFlag(parsed.flags, "no-open"))) {
+      throw new Error("Background operator mode requires --operator-auth and --no-open.");
+    }
+    if (backgroundAuth && process.platform !== "darwin") {
+      throw new Error("Background operator enrollment currently requires macOS peer verification.");
+    }
+    if (protectedOperator && !backgroundAuth && (!process.stdin.isTTY || !process.stderr.isTTY)) {
       throw new Error("--operator-auth requires a trusted foreground terminal.");
     }
-    const operatorAuth = protectedOperator ? {
+    const operatorAuth = !protectedOperator ? undefined : backgroundAuth ? { background: true as const } : {
       displayCode: (code: string) => {
         process.stderr.write(`s-gw one-time operator code: ${code}\n`);
         process.stderr.write("The code expires in five minutes. Restart the console to get a new code.\n");
         process.stderr.write("Stop any ordinary console serving this credential store before relying on protected mode.\n");
       }
-    } : undefined;
+    };
 
     let running;
     try {
@@ -1453,6 +1472,14 @@ async function handleServiceCommand(
   action: string | undefined,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
+  const protectedService = hasFlag(flags, "operator-auth");
+  const ordinaryService = hasFlag(flags, "ordinary");
+  if (protectedService && ordinaryService) {
+    throw new Error("Choose either --operator-auth or --ordinary for the console service.");
+  }
+  if ((protectedService || ordinaryService) && (process.platform !== "darwin" || action !== "install")) {
+    throw new Error("Console service authentication mode can currently be selected only during macOS installation.");
+  }
   if (process.platform === "win32") {
     if (action === "install") {
       printJson(await installWindowsLoginService({
@@ -1512,7 +1539,8 @@ async function handleServiceCommand(
     printJson(
       await installConsoleLaunchAgent({
         port: numericFlag(flags, "port", 8718),
-        start: hasFlag(flags, "start")
+        start: hasFlag(flags, "start"),
+        operatorAuth: protectedService ? true : ordinaryService ? false : undefined
       })
     );
     return;
@@ -2683,7 +2711,8 @@ Commands:
   s-gw update plan [--package PATH_OR_SPEC]
   s-gw update install [--package PATH_OR_SPEC] [--dry-run]
   s-gw mcp
-  s-gw console [--host 127.0.0.1] [--port 8718] [--no-open] [--operator-auth]
+  s-gw console [--host 127.0.0.1] [--port 8718] [--no-open] [--operator-auth] [--background]
+  s-gw console enroll [--port 8718]
   s-gw app app-path
   s-gw app install
   s-gw app open [--port 8718] [--console-url URL] [--browser]
@@ -2694,7 +2723,7 @@ Commands:
   s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
-  s-gw service install [--port 8718] [--start] [--menubar]
+  s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary]
   s-gw service start|stop|status|uninstall
   s-gw menubar app-path
   s-gw menubar open [--port 8718] [--console-url URL] [--count pending|credentials|none] [--show] [--no-notify]

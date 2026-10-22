@@ -149,20 +149,36 @@ struct HelperSnapshotLoader: Sendable {
   }
 
   private func checkDaemon() -> Bool {
+    return checkDaemonPath("auth/status") || checkDaemonPath("api/health")
+  }
+
+  private func checkDaemonPath(_ path: String) -> Bool {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
     process.arguments = [
       "-fsS",
       "--max-time", "0.6",
-      consoleURL.appendingPathComponent("api/health").absoluteString
+      "--max-filesize", "4096",
+      consoleURL.appendingPathComponent(path).absoluteString
     ]
-    process.standardOutput = Pipe()
+    let out = Pipe()
+    process.standardOutput = out
     process.standardError = Pipe()
 
     do {
       try process.run()
+      let data = out.fileHandleForReading.readData(ofLength: 4097)
+      if data.count > 4096 {
+        process.terminate()
+        process.waitUntilExit()
+        return false
+      }
       process.waitUntilExit()
-      return process.terminationStatus == 0
+      guard process.terminationStatus == 0,
+            let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return false
+      }
+      return response["ok"] as? Bool == true && response["name"] as? String == "s-gw"
     } catch {
       return false
     }

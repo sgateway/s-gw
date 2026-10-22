@@ -188,7 +188,7 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
   };
 }
 
-async function readUnixPeer(socket: Socket): Promise<UnixPeer> {
+export async function readUnixPeer(socket: Socket): Promise<UnixPeer> {
   const helper = await checkedPeerHelper(false);
   return new Promise((resolve, reject) => {
     const child = spawn(helper, [], { stdio: ["ignore", "pipe", "pipe", socket], env: {}, timeout: 1500 });
@@ -222,6 +222,10 @@ async function checkedPeerHelper(checkAcl: boolean): Promise<string> {
   return helper;
 }
 
+export async function checkUnixPeerHelper(): Promise<void> {
+  await checkedPeerHelper(true);
+}
+
 export function principalIdForPeerSession(session: PeerSession): string {
   if (session.linuxIdentityGeneration !== undefined &&
       (process.platform !== "linux" || typeof session.linuxIdentityGeneration !== "string" ||
@@ -245,7 +249,7 @@ async function isInCgroup(pid: number | undefined, expected: string): Promise<bo
   return actual === expected || actual?.startsWith(`${expected}/`) === true;
 }
 
-async function checkedSocketPath(value: string): Promise<string> {
+export async function checkedSocketPath(value: string): Promise<string> {
   if (!path.isAbsolute(value)) throw new Error("Broker socket path must be absolute.");
   const socketPath = path.resolve(value);
   const parent = path.dirname(socketPath);

@@ -108,6 +108,7 @@ interface LaunchAgentDefinition {
 export interface ServiceInstallOptions {
   port?: number;
   start?: boolean;
+  operatorAuth?: boolean;
 }
 
 export interface MenuBarOptions {
@@ -381,7 +382,16 @@ export async function installConsoleLaunchAgent(options: ServiceInstallOptions =
   const port = options.port || 8718;
   const plistPath = launchAgentPath(consoleLabel);
   const logs = await ensureLogDir();
-  await writeFile(plistPath, buildConsoleLaunchAgentPlist(port, logs), { mode: 0o644 });
+  const oldArgs = existsSync(plistPath) ? launchAgentProgramArguments(plistPath) : [];
+  if (oldArgs.includes("--operator-auth") !== oldArgs.includes("--background")) {
+    throw new Error("Existing console service has an incomplete operator-auth configuration.");
+  }
+  const oldMode = oldArgs.includes("--operator-auth") && oldArgs.includes("--background");
+  const operatorAuth = options.operatorAuth ?? oldMode;
+  if (oldArgs.length && oldMode !== operatorAuth && launchAgentStatus("console").loaded && !options.start) {
+    throw new Error("Changing console authentication requires --start to restart the existing service.");
+  }
+  await writeFile(plistPath, buildConsoleLaunchAgentPlist(port, logs, {}, operatorAuth), { mode: 0o644 });
 
   if (options.start) {
     startLaunchAgent(consoleLabel, plistPath);
@@ -459,6 +469,7 @@ export async function installSystemdUserService(
   options: ServiceInstallOptions = {}
 ): Promise<SystemdUserServiceStatus> {
   requireLinux("systemd user service install");
+  if (options.operatorAuth) throw new Error("Background operator enrollment is not available in the Linux user service.");
   assertLinuxServiceUnlock();
   const unitPath = systemdUserServicePath();
   const sgwHome = getSgwHome();
@@ -639,11 +650,15 @@ async function refreshConsoleLaunchAgent(status: LaunchAgentStatus): Promise<Lau
   if (!status.installed) return status;
 
   const args = launchAgentProgramArguments(status.plistPath);
+  if (args.includes("--operator-auth") !== args.includes("--background")) {
+    throw new Error("Existing console service has an incomplete operator-auth configuration.");
+  }
   const env = launchAgentEnvironment(status.plistPath);
   const port = numberAfter(args, "--port") || 8718;
   const logs = await ensureLogDir(env.SGW_HOME);
   if (status.loaded) stopLaunchAgent(consoleLabel);
-  await writeFile(status.plistPath, buildConsoleLaunchAgentPlist(port, logs, env), { mode: 0o644 });
+  const operatorAuth = args.includes("--operator-auth") && args.includes("--background");
+  await writeFile(status.plistPath, buildConsoleLaunchAgentPlist(port, logs, env, operatorAuth), { mode: 0o644 });
   if (status.loaded) startLaunchAgent(consoleLabel, status.plistPath);
   return launchAgentStatus("console");
 }
@@ -1491,12 +1506,16 @@ export async function waitForConsoleAuthority(
     || endpoint.hash) {
     throw new Error("The desktop console must use explicit IPv4 loopback HTTP.");
   }
-  const healthUrl = new URL("api/health", endpoint);
+  const statusUrl = new URL("auth/status", endpoint);
+  const oldHealthUrl = new URL("api/health", endpoint);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let response: Response;
     try {
-      response = await fetch(healthUrl, { signal: AbortSignal.timeout(750) });
+      response = await fetch(statusUrl, { signal: AbortSignal.timeout(750) });
+      if (response.status === 404) {
+        response = await fetch(oldHealthUrl, { signal: AbortSignal.timeout(750) });
+      }
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 200));
       continue;
@@ -2251,7 +2270,8 @@ function stringValue(value: unknown): string | undefined {
 export function buildConsoleLaunchAgentPlist(
   port: number,
   logsDir: string,
-  inheritedEnvironment: Record<string, string> = {}
+  inheritedEnvironment: Record<string, string> = {},
+  operatorAuth = false
 ): string {
   const layout = getPackageLayout();
   return buildLaunchAgentPlist({
@@ -2264,7 +2284,8 @@ export function buildConsoleLaunchAgentPlist(
       "127.0.0.1",
       "--port",
       String(port),
-      "--no-open"
+      "--no-open",
+      ...(operatorAuth ? ["--operator-auth", "--background"] : [])
     ],
     environment: launchdBaseEnvironment(inheritedEnvironment),
     runAtLoad: true,

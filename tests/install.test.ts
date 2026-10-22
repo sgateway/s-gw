@@ -258,6 +258,16 @@ describe("launch-agent packaging", () => {
     expect(plist).toContain("<string>8718</string>");
     expect(plist).toContain("<true/>");
     expect(plist).not.toContain("SGW_MASTER_PASSPHRASE");
+    expect(plist).not.toContain("--operator-auth");
+    expect(plist).not.toContain("--background");
+  });
+
+  it("adds protected background enrollment only when selected", () => {
+    const plist = buildConsoleLaunchAgentPlist(8718, "/tmp/s-gw logs", {}, true);
+    expect(plist).toContain("<string>--operator-auth</string>");
+    expect(plist).toContain("<string>--background</string>");
+    expect(plist).toContain("<string>--no-open</string>");
+    expect(plist).not.toContain("s-gw one-time operator code");
   });
 
   it("generates a menu-bar plist with CLI and console environment", () => {

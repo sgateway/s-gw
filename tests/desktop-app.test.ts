@@ -417,7 +417,18 @@ describe("Windows and Linux desktop app", () => {
   it("opens browser backup only for the expected local authority", async () => {
     const expectedKey = "a".repeat(64);
     let servedKey = expectedKey;
-    const server = createServer((_request, response) => {
+    let protectedMode = false;
+    const server = createServer((request, response) => {
+      if (request.url === "/auth/status" && !protectedMode) {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
+      if (request.url === "/api/health" && protectedMode) {
+        response.writeHead(401);
+        response.end();
+        return;
+      }
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ ok: true, name: "s-gw", instanceKey: servedKey }));
     });
@@ -426,6 +437,8 @@ describe("Windows and Linux desktop app", () => {
     const url = `http://127.0.0.1:${port}/`;
 
     try {
+      await expect(waitForConsoleAuthority(url, expectedKey, 500)).resolves.toBeUndefined();
+      protectedMode = true;
       await expect(waitForConsoleAuthority(url, expectedKey, 500)).resolves.toBeUndefined();
       servedKey = "b".repeat(64);
       await expect(waitForConsoleAuthority(url, expectedKey, 500)).rejects.toThrow(

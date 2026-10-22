@@ -110,6 +110,23 @@ describe("desktop instance identity command", () => {
   });
 });
 
+describe("operator enrollment CLI", () => {
+  it("refuses to issue a background console code through a pipe", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-console-enroll-cli-"));
+    try {
+      expect(() => runCliSync(["src/cli.ts", "console", "enroll"], {
+        cwd: repoRoot,
+        env: { ...process.env, SGW_HOME: home, SGW_RECOVERY_HOME: `${home}-recovery` },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      })).toThrow("Operator enrollment requires a trusted interactive terminal.");
+      expect(existsSync(path.join(home, "store.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("CLI verified-only automatic approval", () => {
   it("requires a verified agent by default and rejects the removed opt-out", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-verified-approval-"));
