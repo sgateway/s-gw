@@ -1303,8 +1303,10 @@ try {
     ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
   let rootEnvironmentFiles = "not staged";
   if (unitsInstalled) {
-    try { rootEnvironmentFiles = JSON.stringify(unitProperties(controlUnit, ["EnvironmentFiles"]).get("EnvironmentFiles")); }
-    catch (inspectError) { rootEnvironmentFiles = `inspection failed: ${String(inspectError)}`; }
+    const check = run("systemctl", ["--system", "--no-pager", "--all", "show", controlUnit,
+      "-p", "EnvironmentFiles"], true);
+    rootEnvironmentFiles = JSON.stringify({ status: check.status, error: check.error?.message,
+      stdout: check.stdout.slice(0, 1000), stderr: check.stderr.slice(0, 300) });
   }
   primaryFailure = new Error(`${String(error)}\nRoot EnvironmentFiles=${rootEnvironmentFiles}\n${logs}`);
   throw primaryFailure;
