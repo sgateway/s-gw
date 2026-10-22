@@ -88,6 +88,30 @@ describe("Linux broker agent leases", () => {
     expect(events.at(-1)).toBe("revoke");
   });
 
+  it("waits for both asynchronous registrations and revokes them before teardown", async () => {
+    const location = await leases();
+    const p = { ...plan(), launchGate: true };
+    const units = manager(p);
+    const events: string[] = [];
+    let finishRegistration: (() => void) | undefined;
+    const registration = new Promise<void>(resolve => { finishRegistration = resolve; });
+    units.release.mockImplementation(async () => { events.push("release"); });
+    units.stop.mockImplementation(async () => { events.push("stop"); });
+    const pending = new LinuxAgentSessionLeases(location, units).launch(p, "A", async () => {
+      events.push("register relay");
+      await registration;
+      events.push("register MCP");
+      return () => { events.push("revoke both"); };
+    });
+    await vi.waitFor(() => expect(events).toContain("register relay"));
+    expect(events).not.toContain("release");
+    finishRegistration!();
+    const stop = await pending;
+    expect(events).toEqual(["register relay", "register MCP", "release"]);
+    await stop();
+    expect(events).toEqual(["register relay", "register MCP", "release", "revoke both", "stop"]);
+  });
+
   it("passes an opted-in generation through the attested Linux launch", async () => {
     const location = await leases();
     const p = { ...plan(), launchGate: true, activatedSocket: true,

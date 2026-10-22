@@ -9,7 +9,7 @@ export class LinuxAgentSessionLeases {
   constructor(private readonly leaseDir: string, private readonly units: LinuxAgentUnitManager) {}
 
   async launch(plan: LinuxAgentUnitPlan, name: string,
-    registerPeer: (session: PeerSession) => () => void,
+    registerPeer: (session: PeerSession) => (() => void) | Promise<() => void>,
     assertSocketBinding?: () => Promise<void>): Promise<() => Promise<void>> {
     validateLinuxAgentPlan(plan);
     if (plan.activatedSocket && !assertSocketBinding) {
@@ -42,7 +42,7 @@ export class LinuxAgentSessionLeases {
         throw new Error("Linux agent unit identity changed before peer registration.");
       }
       if (plan.activatedSocket) await assertSocketBinding!();
-      stopPeer = registerPeer({ uid: plan.uid, gid: plan.gid, sessionId: plan.sessionId,
+      stopPeer = await registerPeer({ uid: plan.uid, gid: plan.gid, sessionId: plan.sessionId,
         name, linuxCgroup: state.cgroup,
         ...(plan.identityGeneration ? { linuxIdentityGeneration: plan.identityGeneration } : {}) });
       if (plan.launchGate) {

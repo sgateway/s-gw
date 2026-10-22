@@ -82,6 +82,10 @@ function request(port: number, headers: Record<string, string> = {}): Promise<{ 
 describe("Linux agent-local model forwarder boundary", () => {
   it("requires the gated launcher proof and checks the actual UID, network namespace and broker socket", () => {
     expect(checkLinuxForwarderBoundary(proof, state)).toEqual(proof);
+    const model = { ...proof, socketPath: "/run/s-gw/model.sock" as const };
+    expect(checkLinuxForwarderBoundary(model, state)).toEqual(model);
+    expect(() => checkLinuxForwarderBoundary({ ...proof,
+      socketPath: "/run/s-gw/agent-control.sock" }, state)).toThrow();
     const legacy = { ...proof, brokerSocketOwnerUid: proof.brokerUid };
     expect(checkLinuxForwarderBoundary(legacy,
       { ...state, brokerSocketOwnerUid: proof.brokerUid })).toEqual(legacy);

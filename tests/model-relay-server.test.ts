@@ -479,6 +479,25 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     await approvals.onSessionEnded(session);
   });
 
+  it("fails a claimed relay when the approved grant differs from the root plan", async () => {
+    const handle = (await store.addSecret({ name: "Changed root grant fixture", type: "api-token", value: credential,
+      policy: { allowedCommands: [SGW_MODEL_RELAY_COMMAND], allowedDestinations: ["api.openai.com:443"] } })).handle;
+    const session = await ownSession();
+    const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
+    const grant = { provider: "openai" as const, handle, ttlMs: 20_000,
+      payloadProfile: "strict" as const, routes: ["POST /v1/responses"] };
+    const request = await store.createModelRelayRequest(grant, principal);
+    await store.approveRequest(request.id);
+    const registerSession = vi.fn(() => () => {});
+    const listener: VerifiedModelRelayServer = { registerSession,
+      async assertSocketBinding() {}, async close() {} };
+    await expect(registerDurableModelRelaySession(listener,
+      new StoreBackedModelRelayApprovals(store), session, request.id,
+      { ...grant, maxRequests: 1 })).rejects.toThrow(/differs from the root-managed agent plan/);
+    expect(registerSession).not.toHaveBeenCalled();
+    expect((await store.getRequest(request.id)).state).toBe("failed");
+  });
+
   it("surfaces a failed session-end audit when the listener closes", async () => {
     const report = vi.fn();
     server = await startVerifiedModelRelayServer({ socketPath, store,

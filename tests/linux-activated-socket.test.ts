@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { linuxListenerRecordMatches, systemdAgentSocketFd } from "../src/linux-activated-socket.js";
+import { linuxListenerRecordMatches, systemdAgentSocketFd,
+  systemdManagedSocketFds } from "../src/linux-activated-socket.js";
 
 const socket = "/run/s-gw/agents/session-123/broker.sock";
 const table = [
@@ -35,6 +36,24 @@ describe("Linux activated agent sockets", () => {
       { ...good, LISTEN_FDS: "2", LISTEN_FDNAMES: `${good.LISTEN_FDNAMES}:${good.LISTEN_FDNAMES}` }
     ]) expect(() => systemdAgentSocketFd("session-123", env)).toThrow();
     expect(() => systemdAgentSocketFd("../session", good)).toThrow();
+  });
+
+  it("requires exactly one MCP and one model listener for the combined service", () => {
+    const good = { LISTEN_PID: String(process.pid), LISTEN_FDS: "2",
+      LISTEN_FDNAMES: "s-gw-agent-session-123:s-gw-model-session-123" };
+    expect(systemdManagedSocketFds("session-123", good)).toEqual({ mcp: 3, model: 4 });
+    expect(systemdManagedSocketFds("session-123", { ...good,
+      LISTEN_FDNAMES: "s-gw-model-session-123:s-gw-agent-session-123" }))
+      .toEqual({ mcp: 4, model: 3 });
+    for (const env of [
+      { ...good, LISTEN_FDS: "1" },
+      { ...good, LISTEN_FDNAMES: "s-gw-agent-session-123:s-gw-agent-session-123" },
+      { ...good, LISTEN_FDNAMES: "s-gw-model-session-123:s-gw-model-session-123" },
+      { ...good, LISTEN_FDNAMES: "s-gw-agent-session-123:s-gw-model-other" }
+    ]) expect(() => systemdManagedSocketFds("session-123", env)).toThrow();
+    const modelPath = "/run/s-gw/agents/session-123/model.sock";
+    expect(linuxListenerRecordMatches(table.replace(socket, modelPath), "12345", modelPath)).toBe(true);
+    expect(linuxListenerRecordMatches(table, "12345", modelPath)).toBe(false);
   });
 
   it("matches only a listening stream FD bound to the exact agent path", () => {

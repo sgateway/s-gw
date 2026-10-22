@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertControlUnitPreflight, brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
+import { assertControlUnitPreflight, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
   stopTrackedManagedUnit, validateLinuxManagedPlan,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
 import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
@@ -84,6 +84,27 @@ describe("Linux managed MCP control", () => {
     expect(() => validateLinuxManagedMcpConfig({ ...good, name: " " })).toThrow();
   });
 
+  it("requires a strict durable relay grant and matching second socket", () => {
+    const managed = { ...plan(), logicalAgentId: "managed-session",
+      identityGeneration: "a".repeat(32),
+      modelRelaySocket: "/run/s-gw/agents/managed-session/model.sock" };
+    const relay = { grant: { handle: "s-gw:api-token:fixture", provider: "anthropic" as const,
+      ttlMs: 30_000, payloadProfile: "strict" as const }, requestId: "request-123" };
+    const config = { name: "Managed agent", leaseDir: "/run/s-gw/managed-leases",
+      plan: managed, relay };
+    expect(() => validateLinuxManagedMcpConfig(config)).not.toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config, relay: { grant: relay.grant } })).not.toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config, relay: undefined })).toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config,
+      relay: { ...relay, requestId: "../other" } })).toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config,
+      relay: { ...relay, grant: { ...relay.grant, payloadProfile: undefined } } })).toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config,
+      plan: { ...managed, identityGeneration: undefined } })).toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config,
+      plan: { ...managed, modelRelaySocket: "/run/s-gw/agents/other/model.sock" } })).toThrow();
+  });
+
   it("pins each broker unit and exact launch plan to a root registration", () => {
     const first = record();
     const second = record("another-session");
@@ -104,6 +125,35 @@ describe("Linux managed MCP control", () => {
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, brokerNode: "/tmp/node" },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
+  });
+
+  it("attests the model socket unit belongs to the same root-registered service", () => {
+    const first = record();
+    first.plan = { ...first.plan, logicalAgentId: "managed-session",
+      identityGeneration: "a".repeat(32),
+      modelRelaySocket: "/run/s-gw/agents/managed-session/model.sock" };
+    first.modelRelaySocketUnitFile = "/run/systemd/system/s-gw-managed-model-managed-session.socket";
+    const gid = process.getgid?.() ?? 1000;
+    expect(() => validateLinuxManagedPlanRecord(first, first.plan.sessionId,
+      first.plan.brokerUid, gid)).not.toThrow();
+    const state = `Id=s-gw-managed-model-managed-session.socket\nActiveState=active\n` +
+      `FragmentPath=${first.modelRelaySocketUnitFile}\nService=${first.brokerUnit}\n` +
+      "BindsTo=s-gw-agent-control.service\nAfter=network.target s-gw-agent-control.service\n";
+    expect(() => assertModelSocketUnit(first, state)).not.toThrow();
+    for (const changed of [
+      state.replace("ActiveState=active", "ActiveState=inactive"),
+      state.replace(`Service=${first.brokerUnit}`, "Service=other.service"),
+      state.replace(`FragmentPath=${first.modelRelaySocketUnitFile}`, "FragmentPath=/tmp/other.socket"),
+      state.replace("BindsTo=s-gw-agent-control.service", "BindsTo="),
+      state.replace("After=network.target s-gw-agent-control.service", "After=network.target"),
+      state + "Service=other.service\n"
+    ]) expect(() => assertModelSocketUnit(first, changed)).toThrow();
+    expect(() => validateLinuxManagedPlanRecord({ ...first,
+      modelRelaySocketUnitFile: "/tmp/model.socket" }, first.plan.sessionId,
+    first.plan.brokerUid, gid)).toThrow();
+    expect(() => validateLinuxManagedPlanRecord({ ...first,
+      modelRelaySocketUnitFile: undefined }, first.plan.sessionId,
+    first.plan.brokerUid, gid)).toThrow();
   });
 
   it("rejects broker unit replacement, a foreign PID, and a new invocation", () => {

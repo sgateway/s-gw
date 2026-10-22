@@ -22,11 +22,26 @@ export function systemdAgentSocketFd(sessionId: string, env: NodeJS.ProcessEnv =
   return 3 + matching[0];
 }
 
+export function systemdManagedSocketFds(sessionId: string,
+  env: NodeJS.ProcessEnv = process.env): { mcp: number; model: number } {
+  const mcp = systemdAgentSocketFd(sessionId, env);
+  if (env.LISTEN_FDS !== "2") {
+    throw new Error("Managed model relay needs exactly two activated sockets.");
+  }
+  const names = (env.LISTEN_FDNAMES || "").split(":");
+  const modelName = `s-gw-model-${sessionId}`;
+  if (names.filter(name => name === modelName).length !== 1 ||
+      names.some(name => name !== `s-gw-agent-${sessionId}` && name !== modelName)) {
+    throw new Error("Managed model relay socket names do not match this agent session.");
+  }
+  return { mcp, model: 3 + names.indexOf(modelName) };
+}
+
 export async function checkLinuxActivatedSocket(socketPath: string, fd: number, agentGid: number): Promise<void> {
   if (process.platform !== "linux") throw new Error("Linux socket activation is unavailable on this platform.");
   if (!Number.isSafeInteger(fd) || fd < 3 || fd > 66 ||
       !Number.isSafeInteger(agentGid) || agentGid < 1 ||
-      !/^\/run\/s-gw\/agents\/[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\/broker\.sock$/.test(socketPath) ||
+      !/^\/run\/s-gw\/agents\/[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\/(?:broker|model)\.sock$/.test(socketPath) ||
       path.posix.normalize(socketPath) !== socketPath || !socketPath.startsWith(socketPrefix)) {
     throw new Error("Invalid activated Linux agent socket plan.");
   }

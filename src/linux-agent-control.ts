@@ -23,6 +23,7 @@ export interface LinuxManagedPlanRecord {
   plan: LinuxAgentUnitPlan;
   brokerUnit: string;
   brokerUnitFile: string;
+  modelRelaySocketUnitFile?: string;
   brokerEntry: string;
   brokerConfig: string;
   brokerNode: string;
@@ -54,11 +55,18 @@ export function validateLinuxManagedPlan(plan: LinuxAgentUnitPlan, brokerUid: nu
 
 export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
   sessionId: string, brokerUid: number, brokerGid: number): void {
+  const modelUnit = `s-gw-managed-model-${sessionId}.socket`;
+  const modelFile = value?.modelRelaySocketUnitFile;
+  const modelExpected = value?.plan?.modelRelaySocket !== undefined;
   if (!value || typeof value !== "object" || !value.plan ||
       value.plan.sessionId !== sessionId ||
       value.brokerUnit !== `s-gw-managed-mcp-${sessionId}.service` ||
       !["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"].includes(path.dirname(value.brokerUnitFile || "")) ||
       path.basename(value.brokerUnitFile) !== value.brokerUnit ||
+      (modelExpected !== (modelFile !== undefined)) ||
+      (modelFile !== undefined &&
+        (!["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"]
+          .includes(path.dirname(modelFile)) || path.basename(modelFile) !== modelUnit)) ||
       !canonicalFile(value.brokerEntry) || path.basename(value.brokerEntry) !== "linux-managed-mcp.js" ||
       !canonicalFile(value.brokerConfig) || !canonicalFile(value.brokerNode) ||
       !canonicalFile(value.brokerRuntimeRoot) || !canonicalFile(value.brokerPreflight) ||
@@ -67,7 +75,10 @@ export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
       !value.brokerNode.startsWith(`${value.brokerRuntimeRoot}/`) ||
       !value.brokerEntry.startsWith(`${value.brokerRuntimeRoot}/`) ||
       !value.brokerPreflight.startsWith(`${value.brokerRuntimeRoot}/`) ||
-      Object.keys(value).sort().join(",") !== "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,plan") {
+      Object.keys(value).sort().join(",") !==
+        (modelExpected
+          ? "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,modelRelaySocketUnitFile,plan"
+          : "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,plan")) {
     throw new Error("Invalid root-provisioned Linux managed plan record.");
   }
   validateLinuxManagedPlan(value.plan, brokerUid, brokerGid);
@@ -104,6 +115,12 @@ async function registeredPlan(sessionId: string, brokerUid: number,
   validateLinuxManagedPlanRecord(value, sessionId, brokerUid, brokerGid);
   await attestDurableLinuxAgentIdentity(value.plan);
   await checkedRootFile(value.brokerUnitFile);
+  if (value.modelRelaySocketUnitFile) {
+    await checkedRootFile(value.modelRelaySocketUnitFile);
+    assertModelSocketUnit(value, await systemctlProperties(
+      path.basename(value.modelRelaySocketUnitFile),
+      ["Id", "ActiveState", "FragmentPath", "Service", "BindsTo", "After"]));
+  }
   await checkedBrokerFile(value.brokerNode);
   await checkedBrokerFile(value.brokerPreflight);
   await checkedRootFile(value.brokerEnvironmentFile);
@@ -117,9 +134,14 @@ async function registeredPlan(sessionId: string, brokerUid: number,
     throw new Error("Linux broker config is not root-provisioned.");
   }
   await checkedRootFile(value.brokerConfig);
-  const brokerConfig = JSON.parse(await readFile(value.brokerConfig, "utf8")) as { plan?: LinuxAgentUnitPlan };
+  const brokerConfig = JSON.parse(await readFile(value.brokerConfig, "utf8")) as {
+    plan?: LinuxAgentUnitPlan; relay?: { grant?: unknown; requestId?: unknown };
+  };
   if (!brokerConfig?.plan || lifecyclePlanKey(brokerConfig.plan) !== lifecyclePlanKey(value.plan)) {
     throw new Error("Linux broker config differs from its root plan registration.");
+  }
+  if (Boolean(brokerConfig.relay) !== Boolean(value.plan.modelRelaySocket)) {
+    throw new Error("Linux broker relay config differs from its root plan registration.");
   }
   await checkedBrokerFile(value.brokerEntry);
   return value;
@@ -280,10 +302,9 @@ function firstFrame(socket: Socket): Promise<unknown> {
   });
 }
 
-async function systemctlProperties(unit: string): Promise<string> {
-  const names = ["Id", "ActiveState", "MainPID", "ControlGroup", "InvocationID",
+async function systemctlProperties(unit: string, names = ["Id", "ActiveState", "MainPID", "ControlGroup", "InvocationID",
     "FragmentPath", "BindsTo", "After", "ExecStart", "ExecStartPre",
-    "EnvironmentFiles", "UnsetEnvironment"];
+    "EnvironmentFiles", "UnsetEnvironment"]): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
       ...names.flatMap(name => ["-p", name])], { stdio: ["ignore", "pipe", "pipe"], env: {}, timeout: 3000 });
@@ -304,6 +325,18 @@ async function systemctlProperties(unit: string): Promise<string> {
       } else resolve(output);
     });
   });
+}
+
+export function assertModelSocketUnit(record: LinuxManagedPlanRecord, output: string): void {
+  const file = record.modelRelaySocketUnitFile;
+  if (!file) throw new Error("No managed Linux model socket unit is registered.");
+  const values = parseUnitProperties(output);
+  if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== "active" ||
+      values.get("FragmentPath") !== file || values.get("Service") !== record.brokerUnit ||
+      !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
+      !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
+    throw new Error("Linux model socket unit is not bound to the registered broker service.");
+  }
 }
 
 function parseUnitProperties(output: string): Map<string, string> {

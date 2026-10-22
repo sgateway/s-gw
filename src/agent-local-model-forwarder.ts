@@ -5,6 +5,7 @@ import path from "node:path";
 
 const attestationPath = "/run/s-gw/launch-gate/forwarder-attestation.json";
 const brokerSocketPath = "/run/s-gw/broker.sock";
+const modelSocketPath = "/run/s-gw/model.sock";
 const maxConnections = 8;
 
 export interface LinuxForwarderAttestation {
@@ -21,6 +22,7 @@ export interface LinuxForwarderAttestation {
   mainPid: number;
   brokerSocketDevice: string;
   brokerSocketInode: string;
+  socketPath?: typeof modelSocketPath;
 }
 
 export interface LinuxForwarderSnapshot {
@@ -53,6 +55,7 @@ export function checkLinuxForwarderBoundary(raw: unknown, state: LinuxForwarderS
       proof.networkNamespace === proof.hostNetworkNamespace ||
       !/^[a-f0-9]{32}$/.test(proof.invocationId) ||
       !Number.isSafeInteger(proof.mainPid) || proof.mainPid < 1 ||
+      (proof.socketPath !== undefined && proof.socketPath !== modelSocketPath) ||
       !/^[0-9]+$/.test(proof.brokerSocketDevice) || !/^[0-9]+$/.test(proof.brokerSocketInode)) {
     throw new Error("Invalid Linux forwarder attestation.");
   }
@@ -108,7 +111,6 @@ async function currentBoundary(): Promise<LinuxForwarderAttestation> {
     throw new Error("A Linux agent UID is required for this forwarder.");
   }
   await rootOwnedPath(attestationPath, "file");
-  await rootOwnedPath(brokerSocketPath, "socket");
   const proofFile = await open(attestationPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   let raw: unknown;
   try {
@@ -119,7 +121,10 @@ async function currentBoundary(): Promise<LinuxForwarderAttestation> {
     }
     raw = JSON.parse(await proofFile.readFile("utf8"));
   } finally { await proofFile.close(); }
-  const socket = await lstat(brokerSocketPath);
+  const socketPath = (raw as LinuxForwarderAttestation)?.socketPath === modelSocketPath
+    ? modelSocketPath : brokerSocketPath;
+  await rootOwnedPath(socketPath, "socket");
+  const socket = await lstat(socketPath);
   const [status, cgroup, networkNamespace, mountinfo] = await Promise.all([
     readFile("/proc/self/status", "utf8"), readFile("/proc/self/cgroup", "utf8"),
     readlink("/proc/self/ns/net"), readFile("/proc/self/mountinfo", "utf8")
@@ -165,7 +170,7 @@ export async function startLinuxAgentLocalModelForwarder(port = 0): Promise<Agen
         client.destroy();
         return;
       }
-      bridgeModelRelaySocket(client, brokerSocketPath);
+      bridgeModelRelaySocket(client, proof.socketPath || brokerSocketPath);
     }).catch(() => client.destroy());
   });
   try {

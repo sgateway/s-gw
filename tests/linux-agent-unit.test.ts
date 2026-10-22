@@ -23,6 +23,7 @@ function plan(): LinuxAgentUnitPlan {
 
 function attestation(p: LinuxAgentUnitPlan): string {
   const binds = `${p.brokerSocket}:/run/s-gw/broker.sock` +
+    (p.modelRelaySocket ? ` ${p.modelRelaySocket}:/run/s-gw/model.sock` : "") +
     (p.launchGate ? ` /run/s-gw/launch-gates/${p.sessionId}:/run/s-gw/launch-gate` : "");
   return [
     `Id=${linuxAgentUnitName(p.sessionId)}`, "ActiveState=active", "Type=exec",
@@ -34,7 +35,8 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `StandardInput=${p.sealedStdio ? "null" : "tty"}`,
     `StandardOutput=${p.sealedStdio ? "null" : "journal"}`,
     `StandardError=${p.sealedStdio ? "null" : "inherit"}`,
-    "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock",
+    `Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock${p.modelRelaySocket ?
+      " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`,
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
     `BindsTo=${p.supervisedControlUnit ? "s-gw-agent-control.service" : ""}`,
     `After=${p.supervisedControlUnit ? "s-gw-agent-control.service" : ""}`,
@@ -94,6 +96,29 @@ describe("Linux systemd agent unit plan", () => {
     expect(() => parseSystemdAgentState(managed, attestation(managed).replace(
       "BindsTo=s-gw-agent-control.service", "BindsTo="))).toThrow("did not attest");
     expect(() => validateLinuxAgentPlan({ ...managed, isolatedSharedMemory: false })).toThrow();
+  });
+
+  it("attests both mounted sockets and the model relay path before a gated launch", () => {
+    const p: LinuxAgentUnitPlan = { ...plan(), launchGate: true, activatedSocket: true,
+      isolatedSharedMemory: true, serializedLifecycle: true, sealedStdio: true,
+      supervisedControlUnit: true, logicalAgentId: "session-123",
+      identityGeneration: "a".repeat(32),
+      modelRelaySocket: "/run/s-gw/agents/session-123/model.sock" };
+    const mount = `${p.modelRelaySocket}:/run/s-gw/model.sock`;
+    expect(systemdRunArgs(p)).toContain(
+      `--property=BindReadOnlyPaths=${p.brokerSocket}:/run/s-gw/broker.sock ${mount} /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate`);
+    expect(systemdRunArgs(p)).toContain(
+      "--property=Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock");
+    expect(parseSystemdAgentState(p, attestation(p)).mainPid).toBe(1234);
+    expect(() => parseSystemdAgentState(p, attestation(p).replace(` ${mount}`, ""))).toThrow("did not attest");
+    expect(() => parseSystemdAgentState(p, attestation(p).replace(
+      " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock", ""))).toThrow("did not attest");
+    expect(lifecyclePlanKey({ ...p, modelRelaySocket: undefined })).not.toBe(lifecyclePlanKey(p));
+    for (const changed of [
+      { modelRelaySocket: "/run/s-gw/agents/session-123/broker.sock" },
+      { identityGeneration: undefined }, { activatedSocket: false },
+      { launchGate: false }, { serializedLifecycle: false }
+    ]) expect(() => validateLinuxAgentPlan({ ...p, ...changed })).toThrow();
   });
 
   it("uses a new policy identity generation when a managed UID is reassigned", () => {

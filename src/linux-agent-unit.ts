@@ -12,6 +12,7 @@ export interface LinuxAgentUnitPlan {
   brokerUid: number;
   rootDirectory: string;
   brokerSocket: string;
+  modelRelaySocket?: string;
   executable: string;
   args: readonly string[];
   launchGate?: boolean;
@@ -75,7 +76,12 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
   }
   if (!canonicalPath(plan.rootDirectory) || plan.rootDirectory !== `${rootPrefix}${plan.sessionId}` ||
       !canonicalPath(plan.brokerSocket) ||
-      plan.brokerSocket !== `${socketPrefix}${plan.sessionId}/broker.sock`) {
+      plan.brokerSocket !== `${socketPrefix}${plan.sessionId}/broker.sock` ||
+      (plan.modelRelaySocket !== undefined &&
+        (!canonicalPath(plan.modelRelaySocket) ||
+          plan.modelRelaySocket !== `${socketPrefix}${plan.sessionId}/model.sock` ||
+          !plan.activatedSocket || !plan.launchGate || !plan.serializedLifecycle ||
+          !plan.sealedStdio || !plan.supervisedControlUnit || !plan.identityGeneration))) {
     throw new Error("Linux agent root and broker socket must use managed paths.");
   }
   if (!canonicalPath(plan.executable) || !plan.executable.startsWith("/usr/") ||
@@ -123,7 +129,8 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): st
     ...(plan.isolatedSharedMemory ? [`TemporaryFileSystem=${privateSharedMemoryMount}`] : []),
     ...(plan.sealedStdio ? ["StandardInput=null", "StandardOutput=null", "StandardError=null"] : []),
     ...(plan.supervisedControlUnit ? ["BindsTo=s-gw-agent-control.service", "After=s-gw-agent-control.service"] : []),
-    "Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock"
+    `Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
+      " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`
   ];
   return ["--system", "--no-ask-password", `--unit=${unit}`,
     ...(attemptId ? [`--description=s-gw-agent-start:${attemptId}`] : []),
@@ -180,6 +187,7 @@ export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
     linuxLaunchAttemptFenceEnabled(plan), plan.sealedStdio === true,
     plan.supervisedControlUnit === true];
   if (plan.identityGeneration) fields.push(plan.logicalAgentId!, plan.identityGeneration);
+  if (plan.modelRelaySocket) fields.push(plan.modelRelaySocket);
   return JSON.stringify(fields);
 }
 
@@ -231,7 +239,8 @@ function gateDirectory(plan: LinuxAgentUnitPlan): string {
 
 function bindReadOnlyPaths(plan: LinuxAgentUnitPlan): string {
   const broker = `${plan.brokerSocket}:/run/s-gw/broker.sock`;
-  return plan.launchGate ? `${broker} ${gateDirectory(plan)}:${gateMount}` : broker;
+  const model = plan.modelRelaySocket ? ` ${plan.modelRelaySocket}:/run/s-gw/model.sock` : "";
+  return plan.launchGate ? `${broker}${model} ${gateDirectory(plan)}:${gateMount}` : `${broker}${model}`;
 }
 
 function attestedReadOnlyPaths(plan: LinuxAgentUnitPlan, value: string | undefined): boolean {
@@ -268,7 +277,8 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       (plan.sealedStdio && (!matches("StandardInput", "null") ||
         !matches("StandardOutput", "null") || !matches("StandardError", "null"))) ||
       !matches("BindPaths", "") ||
-      !matches("Environment", "SGW_BROKER_SOCKET=/run/s-gw/broker.sock") ||
+      !matches("Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
+        " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`) ||
       !matches("Restart", "no") || !matches("KillMode", "control-group") ||
       !enabled("SendSIGKILL") || !disabled("Delegate") || !disabled("DynamicUser") ||
       !disabled("PrivateUsers") || !enabled("PrivateNetwork") ||
@@ -472,7 +482,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     }
     const networkNamespace = await readlink(`/proc/${current.mainPid}/ns/net`);
     const hostNetworkNamespace = await readlink("/proc/self/ns/net");
-    const brokerSocket = await lstat(plan.brokerSocket);
+    const brokerSocket = await lstat(plan.modelRelaySocket || plan.brokerSocket);
     if (!/^net:\[\d+\]$/.test(networkNamespace) || networkNamespace === hostNetworkNamespace ||
         !brokerSocket.isSocket() || brokerSocket.uid !== (plan.activatedSocket ? 0 : plan.brokerUid)) {
       throw new Error("Linux agent forwarder boundary changed before release.");
@@ -484,6 +494,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       await attestation.writeFile(JSON.stringify({ version: 1, sessionId: plan.sessionId,
         uid: current.uid, gid: current.gid, brokerUid: plan.brokerUid,
         brokerSocketOwnerUid: brokerSocket.uid,
+        ...(plan.modelRelaySocket ? { socketPath: "/run/s-gw/model.sock" } : {}),
         cgroup: current.cgroup, networkNamespace, hostNetworkNamespace,
         invocationId: current.invocationId, mainPid: current.mainPid,
         brokerSocketDevice: String(brokerSocket.dev), brokerSocketInode: String(brokerSocket.ino) }) + "\n");
@@ -839,6 +850,7 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
   const root = await lstat(plan.rootDirectory);
   const workspace = await lstat(path.join(plan.rootDirectory, "workspace"));
   const socket = await lstat(plan.brokerSocket);
+  const modelSocket = plan.modelRelaySocket ? await lstat(plan.modelRelaySocket) : undefined;
   const executable = await lstat(path.join(plan.rootDirectory, plan.executable));
   if (!root.isDirectory() || root.uid !== 0 || (root.mode & 0o022) !== 0 ||
       await realpath(plan.rootDirectory) !== plan.rootDirectory ||
@@ -847,6 +859,8 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
       (executable.mode & 0o022) !== 0 || (executable.mode & 0o111) === 0 ||
       !socket.isSocket() || socket.uid !== (plan.activatedSocket ? 0 : plan.brokerUid) ||
       socket.gid !== plan.gid ||
+      (plan.modelRelaySocket && (!modelSocket?.isSocket() || modelSocket.uid !== 0 ||
+        modelSocket.gid !== plan.gid || (modelSocket.mode & 0o777) !== 0o660)) ||
       (plan.activatedSocket ? (socket.mode & 0o777) !== 0o660 :
         (socket.mode & 0o007) !== 0 || (socket.mode & 0o060) !== 0o060)) {
     throw new Error("Linux agent root, workspace, or broker socket is not privately staged.");
@@ -865,6 +879,7 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
   await checkedExecutableParents(plan.rootDirectory, plan.executable);
   const markers = [root.dev, root.ino, workspace.dev, workspace.ino, socket.dev, socket.ino,
     socketParent.dev, socketParent.ino, executable.dev, executable.ino];
+  if (modelSocket) markers.push(modelSocket.dev, modelSocket.ino);
   if (plan.launchGate) {
     const binary = await lstat(path.join(plan.rootDirectory, gateExecutable));
     const mount = await lstat(path.join(plan.rootDirectory, gateMount));

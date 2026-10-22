@@ -95,10 +95,15 @@ export async function registerDurableModelRelaySession(
   server: VerifiedModelRelayServer,
   approval: StoreBackedModelRelayApprovals,
   session: PeerSession,
-  requestId: string
+  requestId: string,
+  expectedGrant?: ModelRelayGrant
 ): Promise<() => void> {
   const grant = await approval.claim(requestId, session);
   try {
+    if (expectedGrant && JSON.stringify(normalizeModelRelayGrant(grant)) !==
+        JSON.stringify(normalizeModelRelayGrant(expectedGrant))) {
+      throw new Error("Approved model relay grant differs from the root-managed agent plan.");
+    }
     return server.registerSession(session, grant);
   } catch (error) {
     try { await approval.abandon(session); }
