@@ -181,10 +181,22 @@ int main(int argc, char **argv) {
     strcmp(argv[8], "--") == 0;
   if (!execute && (argc != 8 || strcmp(argv[1], "verify") != 0)) return 64;
   trusted_root = argv[2];
-  if (strcmp(trusted_root, "/") == 0 || !check_path(trusted_root, 1) ||
-      !inside_root(argv[3]) || !check_path(argv[3], 2) ||
-      !inside_root(argv[4]) || !check_path(argv[4], 2) ||
-      !check_path(argv[5], 2)) return 65;
+  if (strcmp(trusted_root, "/") == 0 || !check_path(trusted_root, 1)) {
+    fputs("unsafe runtime root\n", stderr);
+    return 65;
+  }
+  if (!inside_root(argv[3]) || !check_path(argv[3], 2)) {
+    fputs("unsafe Node executable\n", stderr);
+    return 65;
+  }
+  if (!inside_root(argv[4]) || !check_path(argv[4], 2)) {
+    fputs("unsafe broker entry\n", stderr);
+    return 65;
+  }
+  if (!check_path(argv[5], 2)) {
+    fputs("unsafe broker config\n", stderr);
+    return 65;
+  }
 
   const char *ca_path = strcmp(argv[6], "-") == 0 ? NULL : argv[6];
   const char *env_path = strcmp(argv[7], "-") == 0 ? NULL : argv[7];

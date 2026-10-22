@@ -351,6 +351,26 @@ static DWORD probe_suspended_image(const wchar_t *image, const wchar_t *cwd, voi
     return ERROR_SUCCESS;
 }
 
+static DWORD probe_suspended_alt(const wchar_t *image, const wchar_t *cwd,
+    LPSTARTUPINFOW startup, DWORD flags, int as_user) {
+    wchar_t command[MAX_PATH + 3];
+    int length = swprintf(command, MAX_PATH + 3, L"\"%ls\"", image);
+    if (length < 1 || length >= MAX_PATH + 3) return ERROR_BAD_PATHNAME;
+    PROCESS_INFORMATION probe = { 0 };
+    BOOL launched = as_user
+        ? CreateProcessAsUserW(NULL, NULL, command, NULL, NULL, FALSE,
+            flags | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+            NULL, cwd, startup, &probe)
+        : CreateProcessW(NULL, command, NULL, NULL, FALSE,
+            flags | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+            NULL, cwd, startup, &probe);
+    if (!launched) return GetLastError();
+    TerminateProcess(probe.hProcess, 1);
+    CloseHandle(probe.hThread);
+    CloseHandle(probe.hProcess);
+    return ERROR_SUCCESS;
+}
+
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
     const wchar_t *shared_path, const wchar_t *canary_path, const wchar_t *job_name,
@@ -451,6 +471,17 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         ? probe_suspended_image(system_image, system_dir, NULL,
             &startup.StartupInfo, EXTENDED_STARTUPINFO_PRESENT)
         : ERROR_BAD_PATHNAME;
+    DWORD null_image_error = ERROR_BAD_PATHNAME;
+    DWORD new_console_error = ERROR_BAD_PATHNAME;
+    DWORD as_user_error = ERROR_BAD_PATHNAME;
+    if (image_size > 0 && image_size < MAX_PATH) {
+        null_image_error = probe_suspended_alt(system_image, system_dir,
+            &startup.StartupInfo, CREATE_NO_WINDOW, 0);
+        new_console_error = probe_suspended_alt(system_image, system_dir,
+            &startup.StartupInfo, CREATE_NEW_CONSOLE, 0);
+        as_user_error = probe_suspended_alt(system_image, system_dir,
+            &startup.StartupInfo, CREATE_NEW_CONSOLE, 1);
+    }
     DWORD wfp_error = sgw_wfp_start(sid, &wfp);
     if (wfp_error != ERROR_SUCCESS) {
         fprintf(stderr, "AppContainer WFP deny setup failed: 0x%08lx\n", (unsigned long)wfp_error);
@@ -487,6 +518,9 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
             (unsigned long)launch_error, (unsigned long)before_wfp_error, (unsigned long)agent_cwd_error,
             (unsigned long)system_cwd_error, (unsigned long)inherited_env_error,
             (unsigned long)plain_error);
+        fprintf(stderr, "AppContainer launch variants (null image, new console, AsUser): %lu, %lu, %lu\n",
+            (unsigned long)null_image_error, (unsigned long)new_console_error,
+            (unsigned long)as_user_error);
         CloseHandle(job);
         goto done;
     }
