@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
-import { access, lstat, open, readFile, realpath, readdir } from "node:fs/promises";
+import { access, chmod, lstat, mkdtemp, open, readFile, realpath, readdir, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { BlockList, createConnection, createServer, isIP } from "node:net";
-import { networkInterfaces } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -137,6 +137,28 @@ async function checkedPath(value, type, owner, mode) {
 async function assertNoAclAllow(value) {
   const { assertNoMacAclAllow } = await import("../dist/macos-path-acl.js");
   await assertNoMacAclAllow(value);
+}
+
+function requireNoExtendedAcl(value) {
+  requireValue(!/[\x00-\x1f\x7f]/.test(value), "The Unix canary path has a control character.");
+  const result = spawnSync("/bin/ls", ["-ldne", "--", value], {
+    encoding: "utf8", env: { LC_ALL: "C" }, timeout: 1500, maxBuffer: 64 * 1024
+  });
+  const lines = result.stdout?.endsWith("\n") ? result.stdout.slice(0, -1).split("\n") : [];
+  const mode = /^\S+/.exec(lines[0] || "")?.[0];
+  requireValue(!result.error && result.status === 0 && !result.stderr &&
+    lines.length === 1 && mode && !mode.includes("+"),
+  `A Unix canary ACL could mask the agent's network access: ${value}`);
+}
+
+function requireNoExtendedAclParents(value) {
+  let current = path.dirname(value);
+  while (true) {
+    requireNoExtendedAcl(current);
+    const next = path.dirname(current);
+    if (next === current) return;
+    current = next;
+  }
 }
 
 async function checkedRootParents(value, agentNeedsTraverse = false) {
@@ -287,6 +309,7 @@ async function preflight(plan) {
       catch (error) { if (error?.code !== "ENOENT") throw error; }
     }
   }
+  requireNoExtendedAclParents(plan.agents[0].socketPath);
 }
 
 function startLoopback(host) {
@@ -310,7 +333,7 @@ function startLoopback(host) {
 
 function canConnect(host, port) {
   return new Promise(resolve => {
-    const socket = createConnection({ host, port });
+    const socket = port === undefined ? createConnection(host) : createConnection({ host, port });
     let done = false;
     function finish(value) {
       if (done) return;
@@ -322,6 +345,29 @@ function canConnect(host, port) {
     socket.once("connect", () => finish(true));
     socket.once("error", () => finish(false));
   });
+}
+
+async function startLocalUnixCanary(parent) {
+  const socketPath = path.join(parent, `proxy-${randomBytes(6).toString("hex")}.sock`);
+  requireValue(Buffer.byteLength(socketPath) < 100, "The local Unix canary path is too long.");
+  let hits = 0;
+  const server = createServer(socket => { hits++; socket.destroy(); });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => { server.off("error", reject); resolve(); });
+  });
+  try {
+    await chmod(socketPath, 0o666);
+    if (process.platform === "darwin") requireNoExtendedAcl(socketPath);
+    requireValue(await canConnect(socketPath), "The broker cannot reach its local Unix canary.");
+    await delay(50);
+    requireValue(hits > 0, "The broker did not observe its local Unix control connection.");
+    hits = 0;
+    return { socketPath, hits: () => hits, close: () => new Promise(done => server.close(done)) };
+  } catch (error) {
+    await new Promise(done => server.close(done));
+    throw error;
+  }
 }
 
 async function checkTcpCanaries(plan) {
@@ -478,6 +524,7 @@ async function runBroker(plan) {
   let hostIpv4Tcp;
   let hostIpv4Udp;
   let consoleCanary;
+  let unixCanary;
   let deadlineTimer;
   function interrupted() { failed.resolve(new Error("Native acceptance was interrupted.")); }
   process.once("SIGINT", interrupted);
@@ -487,6 +534,8 @@ async function runBroker(plan) {
     ipv6 = await startLoopback("::1");
     udp4 = await startUdpLoopback("127.0.0.1");
     udp6 = await startUdpLoopback("::1");
+    requireNoExtendedAclParents(plan.agents[0].socketPath);
+    unixCanary = await startLocalUnixCanary(path.dirname(plan.agents[0].socketPath));
     if (plan.hostIpv4Probe) {
       hostIpv4Tcp = await startLoopback(plan.hostIpv4Probe);
       hostIpv4Udp = await startUdpLoopback(plan.hostIpv4Probe);
@@ -558,7 +607,8 @@ async function runBroker(plan) {
             if (result.phase === "initial") {
               requireValue(result.wrongClaimDenied === true && result.crossIdentityDenied === true &&
                 result.ownAccepted === true && result.ipv4Denied === true && result.ipv6Denied === true &&
-                result.brokerCanaryDenied === true && result.otherWorkspaceDenied === true,
+                result.unixProxyDenied === true && result.brokerCanaryDenied === true &&
+                result.otherWorkspaceDenied === true,
               `Agent ${agent.uid} failed a native isolation probe.`);
               if (plan.protectedCanaries) {
                 requireValue(result.storeReadDenied === true && result.storeWriteDenied === true &&
@@ -620,6 +670,7 @@ async function runBroker(plan) {
     const launchPlans = plan.agents.map((agent, i) => {
       const other = plan.agents[1 - i];
       const extraChecks = {
+        unixProxyCanary: unixCanary.socketPath,
         ...(plan.protectedCanaries ? { protectedCanaries: plan.protectedCanaries } : {}),
         ...(plan.consoleCanary ? { consoleCanary: { host: "127.0.0.1", port: consoleCanary.port } } : {}),
         ...(plan.remoteTcpCanaries ? { remoteTcpCanaries: plan.remoteTcpCanaries } : {})
@@ -666,8 +717,8 @@ async function runBroker(plan) {
     ]);
     await delay(200);
     requireValue(ipv4.hits() === 0 && ipv6.hits() === 0 &&
-      udp4.hits() === 0 && udp6.hits() === 0,
-      "An agent reached a host-loopback listener directly.");
+      udp4.hits() === 0 && udp6.hits() === 0 && unixCanary.hits() === 0,
+      "An agent reached a host-loopback or local Unix listener directly.");
     if (plan.hostIpv4Probe) {
       requireValue(hostIpv4Tcp.hits() === 0 && hostIpv4Udp.hits() === 0,
         "An agent reached the host's non-loopback IPv4 listener directly.");
@@ -697,7 +748,7 @@ async function runBroker(plan) {
     }));
     process.stdout.write(`${JSON.stringify({ event: "passed", uids: plan.agents.map(agent => agent.uid),
       brokerLeasesRetained: true, livePeerRevocation: true,
-      hostLoopbackDenied: true, udpHostLoopbackDenied: true,
+      hostLoopbackDenied: true, udpHostLoopbackDenied: true, localUnixProxyDenied: true,
       ...(plan.hostIpv4Probe ? { hostIpv4Denied: true } : {}),
       ...(plan.protectedCanaries ? { protectedStoreAndRecoveryDenied: true } : {}),
       ...(plan.consoleCanary ? { syntheticConsoleCanaryDenied: true } : {}),
@@ -716,6 +767,7 @@ async function runBroker(plan) {
     await hostIpv4Tcp?.close();
     await hostIpv4Udp?.close();
     await consoleCanary?.close();
+    await unixCanary?.close();
   }
 }
 
@@ -791,8 +843,24 @@ async function selfTestReport() {
     invalid(() => parseAgentChecks("not-base64!")) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ consoleCanary: { host: "localhost", port: 12345 } })).toString("base64url"))) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ remoteTcpCanaries: [{ host: "127.0.0.1", port: 80 }] })).toString("base64url"))) &&
+    invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ unixProxyCanary: "/tmp/proxy.sock" })).toString("base64url"))) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ unexpected: true })).toString("base64url"))),
   "Malformed optional agent check payloads were accepted.");
+  const unixDir = await mkdtemp(path.join(tmpdir(), "sgw-unix-canary-"));
+  try {
+    const unix = await startLocalUnixCanary(unixDir);
+    try {
+      requireValue(await canConnect(unix.socketPath), "The local Unix canary did not accept a control connection.");
+      await delay(50);
+      requireValue(unix.hits() > 0, "The local Unix canary missed a permitted connection.");
+    } finally { await unix.close(); }
+    const aclFile = path.join(unixDir, "deny-acl");
+    await writeFile(aclFile, "test");
+    const acl = spawnSync("/bin/chmod", ["+a", "everyone deny read", aclFile], { encoding: "utf8" });
+    requireValue(acl.status === 0, "Could not stage the local Unix ACL rejection control.");
+    requireValue(invalid(() => requireNoExtendedAcl(aclFile)),
+      "An extended ACL could mask the local Unix denial probe.");
+  } finally { await rm(unixDir, { recursive: true, force: true }); }
   const udp4 = await startUdpLoopback("127.0.0.1");
   const udp6 = await startUdpLoopback("::1");
   try {
@@ -909,8 +977,12 @@ function parseAgentChecks(encoded) {
   const checks = JSON.parse(bytes.toString("utf8"));
   requireValue(checks && typeof checks === "object" && !Array.isArray(checks) &&
     Object.keys(checks).length > 0 &&
-    Object.keys(checks).every(key => ["protectedCanaries", "consoleCanary", "remoteTcpCanaries"].includes(key)),
+    Object.keys(checks).every(key => ["protectedCanaries", "consoleCanary", "remoteTcpCanaries", "unixProxyCanary"].includes(key)),
   "Unknown optional agent check.");
+  if (checks.unixProxyCanary !== undefined) {
+    requireValue(isFixturePath(checks.unixProxyCanary) &&
+      Buffer.byteLength(checks.unixProxyCanary) < 100, "Malformed local Unix canary path.");
+  }
   if (checks.protectedCanaries !== undefined) {
     requireValue(validProtectedCanaries(checks.protectedCanaries), "Malformed protected agent canaries.");
   }
@@ -994,6 +1066,7 @@ async function runAgent(args) {
     ownAccepted: ownReply === `READY-V1 ${uid} ${sessionId}\n`,
     ipv4Denied: !await canConnect("127.0.0.1", ipv4Port),
     ipv6Denied: !await canConnect("::1", ipv6Port),
+    ...(checks.unixProxyCanary ? { unixProxyDenied: !await canConnect(checks.unixProxyCanary) } : {}),
     ...(hostIpv4Probe ? { hostIpv4Denied: !await canConnect(hostIpv4Probe.address, hostIpv4Probe.tcpPort) } : {}),
     brokerCanaryDenied, otherWorkspaceDenied,
     ...(checks.protectedCanaries ? {
