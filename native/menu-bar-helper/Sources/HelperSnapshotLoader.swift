@@ -31,6 +31,15 @@ struct HelperLoadResult: Sendable {
   let status: StatusPayload?
 }
 
+func consoleVerificationArguments(for target: URL) -> [String]? {
+  guard target.scheme == "http", target.host == "127.0.0.1",
+        target.user == nil, target.password == nil,
+        let port = target.port, port > 0, port <= 65535 else {
+    return nil
+  }
+  return ["console", "verify-listener", "--console-url", "http://127.0.0.1:\(port)/"]
+}
+
 func runSgwCli(
   node: String,
   cli: String,

@@ -40,11 +40,13 @@ describe("native readiness UI contract", () => {
   });
 
   it("shows native recovery UI while the console is stopped and retries transient web failures", async () => {
-    const [mainWindow, consoleWebApp, appState, cli] = await Promise.all([
+    const [mainWindow, consoleWebApp, appState, cli, listenerVerifier, usageFlow] = await Promise.all([
       readFile(path.join(appRoot, "Views/MainWindow.swift"), "utf8"),
       readFile(path.join(appRoot, "Views/ConsoleWebAppView.swift"), "utf8"),
       readFile(path.join(appRoot, "App/AppState.swift"), "utf8"),
-      readFile(path.resolve(here, "../src/cli.ts"), "utf8")
+      readFile(path.resolve(here, "../src/cli.ts"), "utf8"),
+      readFile(path.join(appRoot, "Services/ConsoleListenerVerifier.swift"), "utf8"),
+      readFile(path.join(appRoot, "Views/UsageFlowView.swift"), "utf8")
     ]);
 
     expect(mainWindow).toContain("if appState.daemonRunning, let url = appState.consoleURL()");
@@ -57,7 +59,13 @@ describe("native readiness UI contract", () => {
     expect(mainWindow).toContain("Status is unavailable");
     expect(mainWindow).not.toContain("status == nil ? \"s-gw CLI not found\"");
     expect(consoleWebApp).toContain("webView.navigationDelegate = context.coordinator");
-    expect(consoleWebApp).toContain('"verify-listener", "--console-url", root.absoluteString');
+    expect(consoleWebApp).toContain("ConsoleListenerVerifier.verify(target, using: cli)");
+    expect(listenerVerifier).toContain('"verify-listener", "--console-url", root.absoluteString');
+    expect(consoleWebApp).toContain("ConsoleListenerVerifier.navigation(to: target, from: requestedURL)");
+    expect(appState).toContain("openVerifiedConsole(url)");
+    expect(usageFlow).toContain("webView.navigationDelegate = context.coordinator");
+    expect(usageFlow).toContain("ConsoleListenerVerifier.verify(target, using: cli)");
+    expect(usageFlow).toContain("ConsoleListenerVerifier.navigation(to: target, from: expected)");
     expect(consoleWebApp).toContain("decidePolicyFor navigationAction: WKNavigationAction");
     expect(consoleWebApp).toContain("if self.requestedURL != requestedURL");
     expect(consoleWebApp).toContain("didFailProvisionalNavigation");

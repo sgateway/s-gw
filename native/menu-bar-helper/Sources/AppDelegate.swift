@@ -389,7 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
   private func openAppAction(_ route: HelperRoute) {
     guard let appURL, FileManager.default.fileExists(atPath: appURL.path) else {
-      NSWorkspace.shared.open(consoleURL(for: route))
+      openConfiguredConsole(consoleURL(for: route))
       return
     }
 
@@ -420,7 +420,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   private func openConsoleAction() {
-    NSWorkspace.shared.open(consoleURL)
+    openConfiguredConsole(consoleURL)
+  }
+
+  private func openConfiguredConsole(_ target: URL) {
+    guard let args = consoleVerificationArguments(for: target) else {
+      NSWorkspace.shared.open(target)
+      return
+    }
+    let node = nodePath
+    let cli = cliPath
+    let root = repoRoot
+    let environment = ProcessInfo.processInfo.environment
+    Task {
+      let result = await Task.detached(priority: .utility) {
+        runSgwCli(node: node, cli: cli, repoRoot: root, args: args, environment: environment)
+      }.value
+      guard result.ok else {
+        model.showFeedback(DecisionOutcome(title: "Console unavailable", body: "Could not verify the local console.", succeeded: false))
+        return
+      }
+      NSWorkspace.shared.open(target)
+    }
   }
 
   private func showTestNotificationAction() {

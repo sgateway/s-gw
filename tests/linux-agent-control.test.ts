@@ -122,6 +122,10 @@ describe("Linux managed MCP control", () => {
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, mcpSocketUnitFile: "/tmp/agent.socket" },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
+    const oldRecord: Partial<LinuxManagedPlanRecord> = { ...first };
+    delete oldRecord.mcpSocketUnitFile;
+    expect(() => validateLinuxManagedPlanRecord(oldRecord as LinuxManagedPlanRecord,
+      first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, plan: { ...first.plan, uid: first.plan.brokerUid } },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, brokerPreflight: "/tmp/verify" },

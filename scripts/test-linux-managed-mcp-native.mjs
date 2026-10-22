@@ -1202,6 +1202,12 @@ try {
   await until(() => ["inactive", "failed"].includes(unitProperties(agents[1].socketUnit,
     ["ActiveState"]).get("ActiveState")), "second MCP socket teardown after root control death");
   for (const agent of agents) {
+    await until(() => {
+      const broker = unitProperties(agent.brokerUnit, ["ActiveState", "MainPID"]);
+      return ["inactive", "failed"].includes(broker.get("ActiveState")) && broker.get("MainPID") === "0";
+    }, `${agent.sessionId} broker exit after root control death`);
+  }
+  for (const agent of agents) {
     const refused = await new Promise(resolve => {
       const socket = createConnection(agent.socketPath);
       socket.setTimeout(3000, () => { socket.destroy(); resolve(false); });
@@ -1217,10 +1223,6 @@ try {
     throw new Error("An MCP socket restarted the root control after revocation.");
   }
   if (testRelay) {
-    await until(() => {
-      const broker = unitProperties(agents[1].brokerUnit, ["ActiveState", "MainPID"]);
-      return ["inactive", "failed"].includes(broker.get("ActiveState")) && broker.get("MainPID") === "0";
-    }, "second broker exit after root control death");
     await until(() => run("systemctl", ["--system", "is-active", agents[1].modelSocketUnit], true).status !== 0,
       "second model socket teardown after root control death");
     await until(() => modelStreams.get(`${agents[1].sessionId}:fixture-cancel`)?.closed,

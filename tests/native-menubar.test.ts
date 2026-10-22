@@ -167,6 +167,16 @@ describe("menu-bar helper approval surface contract", () => {
     expect(source).toContain("let openApp: (HelperRoute) -> Void");
   });
 
+  it("verifies canonical local links and preserves other configured URLs", () => {
+    const source = helperSource();
+    expect(source).toContain("consoleVerificationArguments(for: target)");
+    expect(source).toContain('"console", "verify-listener", "--console-url"');
+    expect(source).toContain("openConfiguredConsole(consoleURL(for: route))");
+    expect(source).toContain("openConfiguredConsole(consoleURL)");
+    expect(source).toMatch(/guard let args = consoleVerificationArguments\(for: target\) else \{\s*NSWorkspace\.shared\.open\(target\)/);
+    expect(source).not.toContain("NSWorkspace.shared.open(consoleURL)");
+  });
+
   it("uses actor-safe async notification APIs", () => {
     const source = helperSource();
 

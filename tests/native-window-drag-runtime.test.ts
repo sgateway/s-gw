@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const root = process.cwd();
 const productionSource = path.join(root, "native/macos-app/Sources/SgwMac/Views/ConsoleWebAppView.swift");
+const listenerVerifier = path.join(root, "native/macos-app/Sources/SgwMac/Services/ConsoleListenerVerifier.swift");
 const testSource = path.join(root, "native/macos-app/Tests/WindowDragTests.swift");
 
 function hasSwift(): boolean {
@@ -27,7 +28,7 @@ describeNative("native macOS window dragging (real WebKit surface)", () => {
     binary = path.join(workDir, "window-drag-tests");
     const compile = spawnSync(
       "swiftc",
-      ["-O", "-parse-as-library", productionSource, testSource, "-o", binary],
+      ["-O", "-parse-as-library", productionSource, listenerVerifier, testSource, "-o", binary],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
     );
     if (compile.status !== 0) {

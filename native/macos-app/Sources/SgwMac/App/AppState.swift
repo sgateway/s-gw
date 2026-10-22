@@ -581,7 +581,7 @@ final class AppState {
     guard let urlText = status?.consoleUrl, let url = URL(string: urlText) else {
       return
     }
-    NSWorkspace.shared.open(url)
+    openVerifiedConsole(url)
   }
 
   func consoleURL(for panel: PanelID? = nil) -> URL? {
@@ -623,7 +623,17 @@ final class AppState {
     guard let url = usageFlowConsoleURL() else {
       return
     }
-    NSWorkspace.shared.open(url)
+    openVerifiedConsole(url)
+  }
+
+  private func openVerifiedConsole(_ url: URL) {
+    Task {
+      guard await ConsoleListenerVerifier.verify(url, using: cli) else {
+        lastError = "Refusing to open an unverified local console."
+        return
+      }
+      NSWorkspace.shared.open(url)
+    }
   }
 
   func revealStore() {

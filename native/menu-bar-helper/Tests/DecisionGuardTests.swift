@@ -163,6 +163,7 @@ struct DecisionGuardTests {
     runApprovalFlowTest()
     runLaunchLockTest(scratch)
     runRuntimeStatusScheduleTest()
+    runConsoleVerificationArgumentsTest()
     await runPersistentUpdateMonitorTest()
 
     print("ALL_MENUBAR_TESTS_OK")
@@ -178,6 +179,18 @@ struct DecisionGuardTests {
           "four-second helper polls must reuse cached runtime status")
     check(schedule.isDue(at: start.addingTimeInterval(5 * 60)),
           "menu helper should refresh runtime status after five minutes")
+  }
+
+  static func runConsoleVerificationArgumentsTest() {
+    let route = URL(string: "http://127.0.0.1:9842/approvals?native-shell=1")!
+    check(consoleVerificationArguments(for: route) ==
+          ["console", "verify-listener", "--console-url", "http://127.0.0.1:9842/"],
+          "menu helper must verify the configured console port before opening a route")
+    for raw in ["http://localhost:9842/", "http://127.0.0.2:9842/",
+                "https://127.0.0.1:9842/", "http://user@127.0.0.1:9842/"] {
+      check(consoleVerificationArguments(for: URL(string: raw)!) == nil,
+            "menu helper accepted an untrusted console origin")
+    }
   }
 
   // Test 1: a double-fire while a decision is in flight reaches the CLI exactly

@@ -44,21 +44,28 @@ struct ConsoleWebAppView: NSViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-      guard navigationAction.targetFrame?.isMainFrame == true,
-            let target = navigationAction.request.url,
-            let requestedURL else {
-        return .allow
+      if navigationAction.targetFrame?.isMainFrame == false { return .allow }
+      guard let target = navigationAction.request.url, let requestedURL else { return .cancel }
+      switch ConsoleListenerVerifier.navigation(to: target, from: requestedURL) {
+      case .reject:
+        return .cancel
+      case .external:
+        if navigationAction.navigationType == .linkActivated {
+          NSWorkspace.shared.open(target)
+        }
+        return .cancel
+      case .console:
+        break
       }
-      guard target.host == "127.0.0.1" else { return .allow }
-      guard target.scheme == "http" else { return .cancel }
-      guard let port = target.port,
-            let root = URL(string: "http://127.0.0.1:\(port)/") else { return .cancel }
-
-      let result = await cli.run(arguments: ["console", "verify-listener", "--console-url", root.absoluteString])
+      let verified = await ConsoleListenerVerifier.verify(target, using: cli)
       if self.requestedURL != requestedURL {
         return .cancel
       }
-      if result.succeeded {
+      if verified {
+        if navigationAction.targetFrame == nil {
+          if navigationAction.navigationType == .linkActivated { NSWorkspace.shared.open(target) }
+          return .cancel
+        }
         return .allow
       }
       retry(webView)

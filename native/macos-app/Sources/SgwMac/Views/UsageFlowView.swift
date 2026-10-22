@@ -61,19 +61,57 @@ struct UsageFlowWebChart: View {
 private struct SankeyWebView: NSViewRepresentable {
   let url: URL
 
+  func makeCoordinator() -> Coordinator {
+    Coordinator(expectedURL: url)
+  }
+
   func makeNSView(context: Context) -> WKWebView {
     let configuration = WKWebViewConfiguration()
     configuration.websiteDataStore = .nonPersistent()
 
     let webView = WKWebView(frame: .zero, configuration: configuration)
+    webView.navigationDelegate = context.coordinator
     webView.load(URLRequest(url: url))
     return webView
   }
 
   func updateNSView(_ webView: WKWebView, context: Context) {
+    context.coordinator.expectedURL = url
     if webView.url?.absoluteString == url.absoluteString {
       return
     }
     webView.load(URLRequest(url: url))
+  }
+
+  @MainActor
+  final class Coordinator: NSObject, WKNavigationDelegate {
+    private let cli = CLIRunner()
+    var expectedURL: URL
+
+    init(expectedURL: URL) {
+      self.expectedURL = expectedURL
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+      if navigationAction.targetFrame?.isMainFrame == false { return .allow }
+      guard let target = navigationAction.request.url else { return .cancel }
+      let expected = expectedURL
+      switch ConsoleListenerVerifier.navigation(to: target, from: expected) {
+      case .reject:
+        return .cancel
+      case .external:
+        if navigationAction.navigationType == .linkActivated { NSWorkspace.shared.open(target) }
+        return .cancel
+      case .console:
+        break
+      }
+      let verified = await ConsoleListenerVerifier.verify(target, using: cli)
+      if expectedURL != expected || !verified { return .cancel }
+      if navigationAction.targetFrame == nil {
+        if navigationAction.navigationType == .linkActivated { NSWorkspace.shared.open(target) }
+        return .cancel
+      }
+      return .allow
+    }
   }
 }

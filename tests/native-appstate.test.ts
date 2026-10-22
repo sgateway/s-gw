@@ -28,6 +28,7 @@ const sources = [
   "Sources/SgwMac/App/AppState.swift",
   "Sources/SgwMac/Models/Models.swift",
   "Sources/SgwMac/Services/CLIRunner.swift",
+  "Sources/SgwMac/Services/ConsoleListenerVerifier.swift",
   "Sources/SgwMac/Services/CommandActivityStore.swift",
   "Sources/SgwMac/Services/CommandRegistry.swift",
   "Sources/SgwMac/Stores/StoreReader.swift",
