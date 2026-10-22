@@ -136,7 +136,7 @@ async function executeRequest(
   const command = request.action.kind === "env_command"
     ? commandForExecution(request)
     : undefined;
-  const secretRecord = await store.getSecretRecord(request.handle);
+  const secretRecord = await store.getSecretRecord(request.handle, request.id);
   options.agentSession?.assertActive();
   assertActionAllowed(secretRecord, request.action);
   if (request.action.kind === "ssh_session") {
@@ -174,7 +174,7 @@ interface PreparedEnvExecution {
 
 async function prepareEnvExecution(store: SecretStore, request: RequestRecord): Promise<PreparedEnvExecution> {
   const command = commandForExecution(request);
-  const secretRecord = await store.getSecretRecord(request.handle);
+  const secretRecord = await store.getSecretRecord(request.handle, request.id);
   assertActionAllowed(secretRecord, request.action);
   const secretValue = await store.revealSecretForLocalUse(request.handle, request);
   const extraSecrets = await resolveExtraSecrets(store, request);
@@ -650,7 +650,7 @@ async function resolveExtraSecrets(
 ): Promise<ResolvedEnvSecret[]> {
   const out: ResolvedEnvSecret[] = [];
   for (const binding of request.action.env || []) {
-    const secret = await store.getSecretRecord(binding.handle);
+    const secret = await store.getSecretRecord(binding.handle, request.id);
     assertActionAllowed(secret, {
       ...request.action,
       injectEnv: binding.injectEnv,

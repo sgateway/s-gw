@@ -372,6 +372,7 @@ export class ConsoleSessionExpiredError extends Error {
 interface ConsoleRequestAccess {
   mode: "ordinary" | "protected";
   sessionActive?: () => boolean;
+  claimedRequest?: { id: string; handles: Set<string> };
 }
 
 export class SecretStore {
@@ -719,8 +720,8 @@ export class SecretStore {
     });
   }
 
-  async getSecretRecord(handle: string): Promise<SecretRecord> {
-    const store = await this.read();
+  async getSecretRecord(handle: string, executionRequestId?: string): Promise<SecretRecord> {
+    const store = await this.read(executionRequestId, handle);
     const found = store.secrets.find((secret) => secret.handle === handle);
     if (!found) {
       throw new Error(`Unknown secret handle: ${handle}`);
@@ -743,7 +744,7 @@ export class SecretStore {
     request?: RequestRecord,
     options: { cache?: boolean } = {}
   ): Promise<string> {
-    const record = await this.getSecretRecord(handle);
+    const record = await this.getSecretRecord(handle, request?.id);
     if (record.backend === "onepassword") {
       const cached = cachedOnePasswordValue(record, request);
       if (cached) {
@@ -844,7 +845,7 @@ export class SecretStore {
       };
       secret.updatedAt = now;
       store.audit.push(audit("secret.cache.updated", `Cached 1Password value for ${secret.name}.`, handle, request.id));
-    });
+    }, request.id, handle);
   }
 
   async deleteSecret(handle: string): Promise<DeleteSecretResult> {
@@ -1344,7 +1345,7 @@ export class SecretStore {
   }
 
   async getRequest(id: string): Promise<RequestRecord> {
-    const store = await this.read();
+    const store = await this.read(id);
     const found = store.requests.find((request) => request.id === id);
     if (!found) {
       throw new Error(`Unknown request: ${id}`);
@@ -1443,7 +1444,7 @@ export class SecretStore {
   }
 
   async assertOwnedRequestAuthorized(id: string): Promise<void> {
-    const store = await this.read();
+    const store = await this.read(id);
     const request = store.requests.find(item => item.id === id);
     if (!request || !["http_request", "ssh_session"].includes(request.action.kind) ||
         !["approved", "executing"].includes(request.state)) {
@@ -1466,7 +1467,7 @@ export class SecretStore {
   }
 
   async assertLegacyRequestAuthorized(id: string): Promise<void> {
-    const store = await this.read();
+    const store = await this.read(id);
     const request = store.requests.find(item => item.id === id);
     if (!request || !["env_command", "ssh_session"].includes(request.action.kind) ||
         request.action.owned || request.state !== "executing") {
@@ -1558,6 +1559,13 @@ export class SecretStore {
     if (claimed.error) {
       throw new Error(claimed.error);
     }
+    const consoleRequest = this.consoleAccess.getStore();
+    if (consoleRequest) {
+      consoleRequest.claimedRequest = {
+        id,
+        handles: new Set([claimed.request.handle, ...(claimed.request.action.env || []).map((binding) => binding.handle)])
+      };
+    }
     return claimed.request;
   }
 
@@ -1617,7 +1625,7 @@ export class SecretStore {
   }
 
   async markExecuted(id: string, summary: ExecutionSummary): Promise<RequestRecord> {
-    return this.updateRequest(id, (request, store) => {
+    const result = await this.updateRequest(id, (request, store) => {
       if (request.state !== "executing" && request.state !== "approved") {
         throw new Error(`Only approved or executing requests can be marked executed. Current state: ${request.state}`);
       }
@@ -1629,11 +1637,13 @@ export class SecretStore {
       request.resultSummary = summary;
       request.error = undefined;
       store.audit.push(audit("request.executed", `Executed request ${id}.`, request.handle, id, request));
-    });
+    }, true);
+    this.clearConsoleClaim(id);
+    return result;
   }
 
   async markFailed(id: string, errorMessage: string): Promise<RequestRecord> {
-    return this.updateRequest(id, (request, store) => {
+    const result = await this.updateRequest(id, (request, store) => {
       if (request.state !== "executing" && request.state !== "approved") {
         throw new Error(`Only approved or executing requests can be marked failed. Current state: ${request.state}`);
       }
@@ -1642,7 +1652,9 @@ export class SecretStore {
       request.updatedAt = new Date().toISOString();
       request.error = errorMessage;
       store.audit.push(audit("request.failed", `Request ${id} failed: ${errorMessage}`, request.handle, id, request));
-    });
+    }, true);
+    this.clearConsoleClaim(id);
+    return result;
   }
 
   async auditLog(): Promise<AuditEvent[]> {
@@ -1652,7 +1664,8 @@ export class SecretStore {
 
   private async updateRequest(
     id: string,
-    updater: (request: RequestRecord, store: StoreFile) => void
+    updater: (request: RequestRecord, store: StoreFile) => void,
+    claimedContinuation = false
   ): Promise<RequestRecord> {
     return this.mutate((store) => {
       const found = store.requests.find((request) => request.id === id);
@@ -1662,7 +1675,7 @@ export class SecretStore {
 
       updater(found, store);
       return found;
-    });
+    }, claimedContinuation ? id : undefined);
   }
 
   private async exists(): Promise<boolean> {
@@ -1674,12 +1687,12 @@ export class SecretStore {
     }
   }
 
-  private async read(): Promise<StoreFile> {
+  private async read(continuationRequestId?: string, continuationHandle?: string): Promise<StoreFile> {
     if (await this.exists()) {
       try {
         const store = await this.readUnlocked();
         if (await controlStateMatches(this.home, store)) {
-          this.assertConsoleAccess(store);
+          this.assertConsoleAccess(store, continuationRequestId, continuationHandle);
           return store;
         }
       } catch (error) {
@@ -1691,7 +1704,7 @@ export class SecretStore {
     await ensureSgwHome(this.home);
     return this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
-      this.assertConsoleAccess(store);
+      this.assertConsoleAccess(store, continuationRequestId, continuationHandle);
       return store;
     });
   }
@@ -1766,11 +1779,15 @@ export class SecretStore {
     await appendLedgerJournal(this.home, store, previous).catch(() => undefined);
   }
 
-  private async mutate<T>(updater: (store: StoreFile) => T | Promise<T>): Promise<T> {
+  private async mutate<T>(
+    updater: (store: StoreFile) => T | Promise<T>,
+    continuationRequestId?: string,
+    continuationHandle?: string
+  ): Promise<T> {
     await ensureSgwHome(this.home);
     return this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
-      this.assertConsoleAccess(store);
+      this.assertConsoleAccess(store, continuationRequestId, continuationHandle);
       const revision = await captureStoreRevision(this.home, this.storePath);
       const before = serializeStore(store);
       const result = await updater(store);
@@ -1781,14 +1798,21 @@ export class SecretStore {
     });
   }
 
-  private assertConsoleAccess(store: StoreFile): void {
+  private assertConsoleAccess(store: StoreFile, continuationRequestId?: string, continuationHandle?: string): void {
     const request = this.consoleAccess.getStore();
+    if (continuationRequestId && request?.claimedRequest?.id === continuationRequestId &&
+        (!continuationHandle || request.claimedRequest.handles.has(continuationHandle))) return;
     if (request?.sessionActive && !request.sessionActive()) {
       throw new ConsoleSessionExpiredError();
     }
     if (request?.mode === "ordinary" && store.consoleAccess === "protected") {
       throw new ConsoleAccessDeniedError();
     }
+  }
+
+  private clearConsoleClaim(id: string): void {
+    const request = this.consoleAccess.getStore();
+    if (request?.claimedRequest?.id === id) request.claimedRequest = undefined;
   }
 
   private async loadOrRecoverUnlocked(lock: StoreLock): Promise<StoreFile> {

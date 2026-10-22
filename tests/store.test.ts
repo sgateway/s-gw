@@ -210,6 +210,134 @@ describe("SecretStore", () => {
     await expect(attempt).rejects.toThrow(/session expired or was replaced/u);
   });
 
+  it("lets an admitted console execution finish its bookkeeping after session expiry", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "admitted execution",
+      type: "api-token",
+      value: fakeOpenAiToken("admitted_execution"),
+      policy: { injectEnv: "SGW_ADMITTED", allowedCommands: [process.execPath] }
+    });
+    const request = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_ADMITTED"
+    }), "Console execution admission");
+    const pendingB = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "1"], injectEnv: "SGW_ADMITTED"
+    }), "Unrelated pending request");
+    const approvedB = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "2"], injectEnv: "SGW_ADMITTED"
+    }), "Unrelated approved request");
+    await store.approveRequest(request.id);
+    await store.approveRequest(approvedB.id);
+
+    let active = true;
+    await store.runConsoleRequest("protected", () => store.runConsoleSession(() => active, async () => {
+      expect((await store.claimApprovedRequest(request.id)).state).toBe("executing");
+      active = false;
+      await expect(store.approveRequest(pendingB.id)).rejects.toThrow(/session expired or was replaced/u);
+      await expect(store.claimApprovedRequest(approvedB.id)).rejects.toThrow(/session expired or was replaced/u);
+      await expect(store.addApprovalPolicyRule({ decision: "ask" })).rejects.toThrow(/session expired or was replaced/u);
+      await expect(store.getSecretRecord(secret.handle, approvedB.id)).rejects.toThrow(/session expired or was replaced/u);
+      expect((await store.getSecretRecord(secret.handle, request.id)).handle).toBe(secret.handle);
+      await store.markFailed(request.id, "Test runner stopped after admission.");
+      await expect(store.getSecretRecord(secret.handle, request.id)).rejects.toThrow(/session expired or was replaced/u);
+    }));
+    expect((await store.getRequest(request.id)).state).toBe("failed");
+    expect((await store.getRequest(pendingB.id)).state).toBe("pending");
+    expect((await store.getRequest(approvedB.id)).state).toBe("approved");
+  });
+
+  it("completes a delayed claimed command after its console session expires", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "delayed claimed command",
+      type: "api-token",
+      value: fakeOpenAiToken("delayed_claim"),
+      policy: { injectEnv: "SGW_DELAYED_CLAIM", allowedCommands: [process.execPath] }
+    });
+    const request = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => console.log('finished'), 20)"],
+      injectEnv: "SGW_DELAYED_CLAIM"
+    }), "Delayed console execution");
+    await store.approveRequest(request.id);
+
+    let active = true;
+    const originalClaim = store.claimApprovedRequest.bind(store);
+    const claimSpy = vi.spyOn(store, "claimApprovedRequest").mockImplementation(async (id, caller, assertActive) => {
+      const claimed = await originalClaim(id, caller, assertActive);
+      active = false;
+      return claimed;
+    });
+    try {
+      const result = await store.runConsoleRequest("protected", () => store.runConsoleSession(
+        () => active,
+        () => executeApprovedRequest(store, request.id, { engine: "typescript" })
+      ));
+      expect(result.stdout).toContain("finished");
+      expect((await store.getRequest(request.id)).state).toBe("executed");
+    } finally {
+      claimSpy.mockRestore();
+    }
+  });
+
+  it("finishes a claimed command when its ordinary console is protected mid-execution", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "console migration command",
+      type: "api-token",
+      value: fakeOpenAiToken("migration_claim"),
+      policy: { injectEnv: "SGW_MIGRATION_CLAIM", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => console.log('finished'), 20)"],
+      injectEnv: "SGW_MIGRATION_CLAIM"
+    });
+    const request = await store.createRequest(secret.handle, action, "Execution crossing console migration");
+    const pendingB = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "1"], injectEnv: "SGW_MIGRATION_CLAIM"
+    }), "Unrelated pending request");
+    const approvedB = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "2"], injectEnv: "SGW_MIGRATION_CLAIM"
+    }), "Unrelated approved request");
+    await store.approveRequest(request.id);
+    await store.approveRequest(approvedB.id);
+
+    let claimed = () => {};
+    let resume = () => {};
+    const started = new Promise<void>((resolve) => { claimed = resolve; });
+    const blocked = new Promise<void>((resolve) => { resume = resolve; });
+    const originalClaim = store.claimApprovedRequest.bind(store);
+    const claimSpy = vi.spyOn(store, "claimApprovedRequest").mockImplementation(async (id, caller, assertActive) => {
+      const result = await originalClaim(id, caller, assertActive);
+      if (id === request.id) {
+        claimed();
+        await blocked;
+      }
+      return result;
+    });
+    try {
+      const execution = store.runConsoleRequest("ordinary", async () => {
+        const result = await executeApprovedRequest(store, request.id, { engine: "typescript" });
+        await expect(store.approveRequest(pendingB.id)).rejects.toThrow(/protected operator console/u);
+        await expect(store.claimApprovedRequest(approvedB.id)).rejects.toThrow(/protected operator console/u);
+        await expect(store.addApprovalPolicyRule({ decision: "ask" })).rejects.toThrow(/protected operator console/u);
+        return result;
+      });
+      await started;
+      await store.enableProtectedConsole();
+      resume();
+      expect((await execution).stdout).toContain("finished");
+      expect((await store.getRequest(request.id)).state).toBe("executed");
+      expect((await store.getRequest(pendingB.id)).state).toBe("pending");
+      expect((await store.getRequest(approvedB.id)).state).toBe("approved");
+    } finally {
+      resume();
+      claimSpy.mockRestore();
+    }
+  });
+
   it("stores encrypted secret values and lists only handle metadata", async () => {
     const store = new SecretStore();
     await store.init();
