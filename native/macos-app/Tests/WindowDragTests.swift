@@ -2,6 +2,15 @@ import AppKit
 import Foundation
 import WebKit
 
+// This standalone build tests window dragging without the app's CLI runtime.
+actor CLIRunner {
+  func run(arguments: [String]) -> CLIResult { CLIResult() }
+}
+
+struct CLIResult {
+  let succeeded = true
+}
+
 private func fail(_ message: String) -> Never {
   FileHandle.standardError.write(Data(("FAIL: \(message)\n").utf8))
   exit(1)
