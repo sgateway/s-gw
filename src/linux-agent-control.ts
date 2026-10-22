@@ -6,7 +6,7 @@ import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { lifecyclePlanKey, SystemdRunAgentUnitManager, validateLinuxAgentPlan,
-  linuxAgentUnitName, traceLinuxManagedStart,
+  linuxAgentUnitName, traceLinuxManagedStart, traceLinuxManagedStop,
   type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
 import { attestDurableLinuxAgentIdentity } from "./linux-agent-identity.js";
 import { verifyLinuxPeerProcess } from "./linux-peer-identity.js";
@@ -606,6 +606,7 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
         if (++queued > 8) { socket.destroy(); return; }
         chain = chain.then(async () => {
           const call = controlCall(raw);
+          if (call.method === "stop") traceLinuxManagedStop("root control stop frame");
           traceLinuxManagedStart(plan.uid, `control ${call.method} frame`);
           if (call.plan.sessionId !== sessionId ||
               lifecyclePlanKey(call.plan) !== lifecyclePlanKey(plan)) {
@@ -803,6 +804,7 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
     const id = ++nextId;
     return new Promise((resolve, reject) => {
       pending = { id, method, resolve, reject };
+      if (method === "stop") traceLinuxManagedStop("broker control stop call send");
       traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call send`);
       try { sendFrame(socket, { id, method, plan, state },
         () => traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call flushed`)); }

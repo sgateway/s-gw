@@ -7,7 +7,7 @@ import { systemdAgentSocketFd, systemdManagedSocketFds } from "./linux-activated
 import { connectLinuxAgentControl, validateLinuxManagedPlan,
   type LinuxAgentControlClient } from "./linux-agent-control.js";
 import { LinuxAgentSessionLeases } from "./linux-agent-session.js";
-import type { LinuxAgentUnitPlan } from "./linux-agent-unit.js";
+import { traceLinuxManagedStop, type LinuxAgentUnitPlan } from "./linux-agent-unit.js";
 import { grantFromModelRelayAction, normalizeModelRelayGrant, type ModelRelayGrant } from "./model-relay-action.js";
 import { registerDurableModelRelaySession, StoreBackedModelRelayApprovals } from "./model-relay-approval.js";
 import { startVerifiedModelRelayServer, type VerifiedModelRelayServer } from "./model-relay-server.js";
@@ -181,9 +181,16 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
   const liveStop = stopAgent;
   const close = () => {
     if (closing) return closing;
+    traceLinuxManagedStop("session close entered");
     closing = (async () => {
       const failures: unknown[] = [];
-      const cleanup = [liveStop(), liveMcp.close()];
+      traceLinuxManagedStop("agent stop call entering");
+      const agentStop = liveStop();
+      traceLinuxManagedStop("agent stop call returned");
+      void agentStop.then(() => traceLinuxManagedStop("agent stop resolved"),
+        () => traceLinuxManagedStop("agent stop rejected"));
+      const cleanup = [agentStop, liveMcp.close()];
+      traceLinuxManagedStop("mcp close call returned");
       if (liveRelay) cleanup.push(liveRelay.close());
       for (const result of await Promise.allSettled(cleanup)) {
         if (result.status === "rejected") failures.push(result.reason);
@@ -212,6 +219,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   session.controlLost.addEventListener("abort", () => { process.exitCode = 1; }, { once: true });
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => {
+      traceLinuxManagedStop("process signal received");
       void session.close().then(() => { process.exitCode = 0; }, error => {
         process.stderr.write(`${String(error)}\n`);
         process.exitCode = 1;
