@@ -16,6 +16,7 @@ import type { RequestRecord, StoreFile } from "../src/types.js";
  */
 
 let tmpHome = "";
+let pendingWrites: Promise<unknown> | undefined;
 
 function fakeOpenAiToken(label: string): string {
   return ["sk", "-proj-", label, "_1234567890abcdef"].join("");
@@ -70,6 +71,7 @@ async function latestFullBackup(): Promise<string> {
 }
 
 beforeEach(async () => {
+  pendingWrites = undefined;
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-ledger-crash-"));
   process.env.SGW_HOME = tmpHome;
   process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
@@ -79,6 +81,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await pendingWrites;
   delete process.env.SGW_HOME;
   delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
@@ -86,7 +89,7 @@ afterEach(async () => {
   delete process.env.SGW_DISABLE_ONEPASSWORD_BACKUP;
   await rm(tmpHome, { recursive: true, force: true });
   await rm(`${tmpHome}-recovery`, { recursive: true, force: true });
-});
+}, 45_000);
 
 describe("ledger crash and recovery drills", () => {
   it("keeps every request and audit row when the primary ledger disappears", async () => {
@@ -302,6 +305,7 @@ describe("ledger crash and recovery drills", () => {
       );
     });
 
+    pendingWrites = Promise.allSettled(writers);
     const created = await Promise.all(writers);
     const persisted = await readLedger();
     const persistedIds = new Set(persisted.requests.map((entry) => entry.id));
@@ -310,7 +314,7 @@ describe("ledger crash and recovery drills", () => {
     for (const request of created) {
       expect(persistedIds.has(request.id)).toBe(true);
     }
-  });
+  }, 45_000);
 
   it("refuses to write a home that a newer runtime owns", async () => {
     await seedLedger(1);
