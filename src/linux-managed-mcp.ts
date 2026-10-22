@@ -118,6 +118,23 @@ export interface LinuxManagedMcpSession {
   close(): Promise<void>;
 }
 
+export async function closeLinuxManagedMcpResources(stopAgent: () => Promise<void>,
+  mcp: Pick<VerifiedMcpServer, "close">, control: Pick<LinuxAgentControlClient, "close">,
+  relay?: Pick<VerifiedModelRelayServer, "close">): Promise<void> {
+  traceLinuxManagedStop("agent stop call entering");
+  const agentStop = Promise.resolve().then(stopAgent);
+  void agentStop.then(() => traceLinuxManagedStop("agent stop resolved"),
+    () => traceLinuxManagedStop("agent stop rejected"));
+  const controlClose = agentStop.then(() => control.close(), () => control.close());
+  const cleanup = [agentStop, Promise.resolve().then(() => mcp.close()), controlClose];
+  if (relay) cleanup.push(Promise.resolve().then(() => relay.close()));
+  const failures: unknown[] = [];
+  for (const result of await Promise.allSettled(cleanup)) {
+    if (result.status === "rejected") failures.push(result.reason);
+  }
+  if (failures.length) throw new AggregateError(failures, "Linux managed MCP teardown failed.");
+}
+
 export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
   store: SecretStore): Promise<LinuxManagedMcpSession> {
   if (process.platform !== "linux" || process.geteuid?.() === 0) {
@@ -182,22 +199,7 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
   const close = () => {
     if (closing) return closing;
     traceLinuxManagedStop("session close entered");
-    closing = (async () => {
-      const failures: unknown[] = [];
-      traceLinuxManagedStop("agent stop call entering");
-      const agentStop = liveStop();
-      traceLinuxManagedStop("agent stop call returned");
-      void agentStop.then(() => traceLinuxManagedStop("agent stop resolved"),
-        () => traceLinuxManagedStop("agent stop rejected"));
-      const cleanup = [agentStop, liveMcp.close()];
-      traceLinuxManagedStop("mcp close call returned");
-      if (liveRelay) cleanup.push(liveRelay.close());
-      for (const result of await Promise.allSettled(cleanup)) {
-        if (result.status === "rejected") failures.push(result.reason);
-      }
-      try { await liveControl.close(); } catch (error) { failures.push(error); }
-      if (failures.length) throw new AggregateError(failures, "Linux managed MCP teardown failed.");
-    })();
+    closing = closeLinuxManagedMcpResources(liveStop, liveMcp, liveControl, liveRelay);
     return closing;
   };
   liveControl.signal.addEventListener("abort", () => { void close().catch(() => {}); }, { once: true });
