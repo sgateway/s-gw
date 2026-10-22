@@ -54,7 +54,7 @@ const privateSharedMemoryMount = "/dev/shm:rw,nosuid,nodev,noexec,mode=1777";
 let tracedStartStages = 0;
 
 export function traceLinuxManagedStart(uid: number, stage: string): void {
-  if (process.env.SGW_CI_LINUX_START_TRACE !== "1" || tracedStartStages++ >= 32) return;
+  if (process.env.SGW_CI_LINUX_START_TRACE !== "1" || tracedStartStages++ >= 48) return;
   process.stderr.write(`Linux managed start trace uid=${uid} stage=${stage}\n`);
 }
 

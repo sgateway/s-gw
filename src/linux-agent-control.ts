@@ -466,14 +466,17 @@ export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number
 }
 
 async function attestBroker(socket: Socket, record: LinuxManagedPlanRecord,
-  brokerUid: number, brokerGid: number, expected?: string): Promise<string> {
+  brokerUid: number, brokerGid: number, expected?: string, diagnosticUid?: number): Promise<string> {
   const cgroup = `/system.slice/${record.brokerUnit}`;
+  if (diagnosticUid !== undefined) traceLinuxManagedStart(diagnosticUid, "broker peer check call");
   const peer = await verifyLinuxPeerProcess(socket, cgroup);
+  if (diagnosticUid !== undefined) traceLinuxManagedStart(diagnosticUid, "broker peer check returned");
   if (peer.uid !== brokerUid || peer.gid !== brokerGid) {
     throw new Error("Linux control peer has the wrong broker identity.");
   }
-  const invocation = brokerUnitInvocation(record, peer.pid,
-    await systemctlProperties(record.brokerUnit), expected);
+  const properties = await systemctlProperties(record.brokerUnit);
+  if (diagnosticUid !== undefined) traceLinuxManagedStart(diagnosticUid, "broker unit show returned");
+  const invocation = brokerUnitInvocation(record, peer.pid, properties, expected);
   const command = (await readFile(`/proc/${peer.pid}/cmdline`)).toString("utf8").split("\0");
   if (command.at(-1) === "") command.pop();
   if (command.length !== 3 || command[1] !== record.brokerEntry ||
@@ -485,6 +488,7 @@ async function attestBroker(socket: Socket, record: LinuxManagedPlanRecord,
     throw new Error("Linux broker Node binary differs from its root registration.");
   }
   await checkedBrokerFile(executable);
+  if (diagnosticUid !== undefined) traceLinuxManagedStart(diagnosticUid, "broker attestation returned");
   return invocation;
 }
 
@@ -506,10 +510,10 @@ function readFrames(socket: Socket, onFrame: (value: unknown) => void): void {
   });
 }
 
-function sendFrame(socket: Socket, value: unknown): void {
+function sendFrame(socket: Socket, value: unknown, onWritten?: () => void): void {
   const frame = JSON.stringify(value) + "\n";
   if (Buffer.byteLength(frame) > maxFrame) throw new Error("Linux control response is too large.");
-  socket.write(frame);
+  socket.write(frame, onWritten);
 }
 
 export function sendControlReply(socket: Socket, id: unknown,
@@ -602,12 +606,14 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
         if (++queued > 8) { socket.destroy(); return; }
         chain = chain.then(async () => {
           const call = controlCall(raw);
+          traceLinuxManagedStart(plan.uid, `control ${call.method} frame`);
           if (call.plan.sessionId !== sessionId ||
               lifecyclePlanKey(call.plan) !== lifecyclePlanKey(plan)) {
             throw new Error("Linux control plan differs from its root registration.");
           }
           if (closing) throw new Error("Linux root control service is stopping.");
-          await attestBroker(socket, record, brokerUid, brokerGid, invocation);
+          await attestBroker(socket, record, brokerUid, brokerGid, invocation,
+            call.method === "start" ? undefined : plan.uid);
           if (closing || socket.destroyed) throw new Error("Linux root control service is stopping.");
           if (call.method === "start") {
             if (used) throw new Error("This Linux agent session was already launched.");
@@ -794,7 +800,8 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
     return new Promise((resolve, reject) => {
       pending = { id, method, resolve, reject };
       traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call send`);
-      try { sendFrame(socket, { id, method, plan, state }); }
+      try { sendFrame(socket, { id, method, plan, state },
+        () => traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call flushed`)); }
       catch (error) { pending = undefined; reject(error as Error); }
     });
   };
