@@ -515,6 +515,76 @@ describe("local console server", () => {
     expect(await escaped.text()).not.toContain("untrusted script");
   });
 
+  it("serves only manifest-verified protected UI bytes after files change", async () => {
+    const uiDir = path.join(tmpHome, "pinned-ui");
+    mkdirSync(uiDir);
+    const html = '<html><head><script src="/payload.js"></script></head><body>trusted UI</body></html>';
+    const script = "window.SGW_ORIGINAL_ASSET = true;";
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    writeFileSync(path.join(uiDir, "payload.js"), script);
+    const protectedUiManifest = {
+      "index.html": createHash("sha256").update(html).digest("hex"),
+      "payload.js": createHash("sha256").update(script).digest("hex")
+    };
+    let code = "";
+    running = await startConsoleServer({ port: 0, uiDir, protectedUiManifest,
+      operatorAuth: { displayCode: (value) => { code = value; } } });
+    const origin = new URL(running.url).origin;
+    const signedIn = await fetch(`${running.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code })
+    });
+    expect(signedIn.status).toBe(200);
+    const cookie = (signedIn.headers.get("set-cookie") || "").split(";")[0];
+
+    writeFileSync(path.join(uiDir, "payload.js"), "window.SGW_CHANGED_ASSET = true;");
+    writeFileSync(path.join(uiDir, "index.html"), "<html>changed page</html>");
+    const app = await fetch(`${running.url}auth/app`, { headers: { Cookie: cookie } });
+    expect(app.status).toBe(200);
+    expect(await app.text()).toContain(`integrity="sha256-${createHash("sha256").update(script).digest("base64")}"`);
+    const servedScript = await fetch(`${running.url}payload.js`, { headers: { Cookie: cookie } });
+    expect(servedScript.status).toBe(200);
+    expect(await servedScript.text()).toBe(script);
+    const unlisted = await fetch(`${running.url}unlisted.js`, { headers: { Cookie: cookie } });
+    expect(unlisted.status).toBe(404);
+  });
+
+  it("rejects a changed or incomplete protected UI manifest before listening", async () => {
+    const uiDir = path.join(tmpHome, "bad-pinned-ui");
+    mkdirSync(uiDir);
+    const html = '<html><head><script src="/payload.js"></script></head></html>';
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    writeFileSync(path.join(uiDir, "payload.js"), "original script");
+    const digest = createHash("sha256").update(html).digest("hex");
+    await expect(startConsoleServer({ port: 0, uiDir, protectedUiManifest: { "index.html": "0".repeat(64) },
+      operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/digest mismatch/u);
+    await expect(startConsoleServer({ port: 0, uiDir, protectedUiManifest: { "../index.html": digest },
+      operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/manifest entry/u);
+    await expect(startConsoleServer({ port: 0, uiDir, protectedUiManifest: { "index.html": digest } }))
+      .rejects.toThrow(/requires operator authentication/u);
+
+    await expect(startConsoleServer({ port: 0, uiDir, protectedUiManifest: { "index.html": digest },
+      operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/outside the pinned bundle/u);
+  });
+
+  it("rejects external and noncanonical script sources in a pinned UI", async () => {
+    const uiDir = path.join(tmpHome, "external-pinned-ui");
+    mkdirSync(uiDir);
+    for (const source of ["https://example.invalid/payload.js", "//example.invalid/payload.js", "data:text/javascript,alert(1)"]) {
+      const html = `<html><head><script src="${source}"></script></head></html>`;
+      writeFileSync(path.join(uiDir, "index.html"), html);
+      const protectedUiManifest = { "index.html": createHash("sha256").update(html).digest("hex") };
+      await expect(startConsoleServer({ port: 0, uiDir, protectedUiManifest,
+        operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/noncanonical asset URL/u);
+    }
+    const html = '<html><head><base href="https://example.invalid/"><script src="/payload.js"></script></head></html>';
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    await expect(startConsoleServer({ port: 0, uiDir,
+      protectedUiManifest: { "index.html": createHash("sha256").update(html).digest("hex") },
+      operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/asset base URL/u);
+  });
+
   it("shows why every listener for one store needs the protected mode", async () => {
     const store = new SecretStore();
     let code = "";

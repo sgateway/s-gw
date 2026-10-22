@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { constants, existsSync } from "node:fs";
+import { open, readFile, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -74,6 +74,10 @@ interface OperatorAuthState {
   statusReservations?: Map<string, number>;
 }
 
+interface ProtectedUiBundle {
+  files: ReadonlyMap<string, Buffer>;
+}
+
 export interface ConsoleServerOptions {
   host?: string;
   port?: number;
@@ -86,6 +90,7 @@ export interface ConsoleServerOptions {
   agentPathEnv?: string;
   agentSkillSourcePath?: string;
   operatorAuth?: { displayCode: (code: string) => void } | { background: true };
+  protectedUiManifest?: Readonly<Record<string, string>>;
 }
 
 export interface RunningConsoleServer {
@@ -192,6 +197,11 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   } : undefined;
   const store = options.store || new SecretStore();
   const uiDir = options.uiDir || defaultUiDir();
+  if (options.protectedUiManifest && !operatorAuth) {
+    throw new Error("A pinned UI bundle requires operator authentication.");
+  }
+  const protectedUi = options.protectedUiManifest
+    ? await loadProtectedUiBundle(uiDir, options.protectedUiManifest) : undefined;
   const updateChecker = options.updateChecker || new ReleaseChecker();
   const agentOptions: AgentIntegrationOptions = {
     homeDir: options.agentHomeDir,
@@ -212,7 +222,7 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
       req.destroy();
       return;
     }
-    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth).catch((error) => {
+    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth, protectedUi).catch((error) => {
       sendError(res, error);
     });
   });
@@ -378,11 +388,12 @@ async function handleRequest(
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
   agentOptions: AgentIntegrationOptions,
   instanceKey: string,
-  operatorAuth?: OperatorAuthState
+  operatorAuth?: OperatorAuthState,
+  protectedUi?: ProtectedUiBundle
 ): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (operatorAuth) {
-    await handleProtectedRequest(req, res, url, store, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth);
+    await handleProtectedRequest(req, res, url, store, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth, protectedUi);
     return;
   }
 
@@ -418,7 +429,8 @@ async function handleProtectedRequest(
   updateChecker: Pick<ReleaseChecker, "check" | "current">,
   agentOptions: AgentIntegrationOptions,
   instanceKey: string,
-  auth: OperatorAuthState
+  auth: OperatorAuthState,
+  protectedUi?: ProtectedUiBundle
 ): Promise<void> {
   if (req.headers.host !== auth.origin.slice("http://".length)) {
     throw new HttpError(403, "Invalid local console host.");
@@ -473,7 +485,7 @@ async function handleProtectedRequest(
 
   const session = operatorSession(req, auth);
   if (!session) {
-    if ((req.method === "GET" || req.method === "HEAD") && operatorUiRoute(url.pathname, uiDir)) {
+    if ((req.method === "GET" || req.method === "HEAD") && operatorUiRoute(url.pathname, uiDir, protectedUi)) {
       serveOperatorLogin(req, res);
       return;
     }
@@ -481,7 +493,7 @@ async function handleProtectedRequest(
   }
 
   if (url.pathname === "/auth/app") {
-    await serveUi(req, res, "/", uiDir, "", true, session.proof);
+    await serveUi(req, res, "/", uiDir, "", true, session.proof, protectedUi);
     return;
   }
 
@@ -493,7 +505,7 @@ async function handleProtectedRequest(
     return;
   }
 
-  if ((req.method === "GET" || req.method === "HEAD") && operatorUiRoute(url.pathname, uiDir)) {
+  if ((req.method === "GET" || req.method === "HEAD") && operatorUiRoute(url.pathname, uiDir, protectedUi)) {
     serveOperatorLogin(req, res);
     return;
   }
@@ -508,12 +520,12 @@ async function handleProtectedRequest(
     return;
   }
 
-  await serveUi(req, res, url.pathname, uiDir, "", true);
+  await serveUi(req, res, url.pathname, uiDir, "", true, undefined, protectedUi);
 }
 
-function operatorUiRoute(pathname: string, uiDir: string): boolean {
+function operatorUiRoute(pathname: string, uiDir: string, protectedUi?: ProtectedUiBundle): boolean {
   if (pathname.startsWith("/api/") || pathname.startsWith("/auth/")) return false;
-  return pathname === "/" || pathname === "/index.html" || shouldServeSpaFallback(pathname, uiDir);
+  return pathname === "/" || pathname === "/index.html" || shouldServeSpaFallback(pathname, uiDir, protectedUi);
 }
 
 async function enrollOperator(req: IncomingMessage, res: ServerResponse, auth: OperatorAuthState): Promise<void> {
@@ -1429,6 +1441,58 @@ async function auditCsv(store: SecretStore): Promise<string> {
   return rows.map((row) => row.map(csvCell).join(",")).join("\n") + "\n";
 }
 
+async function loadProtectedUiBundle(
+  uiDir: string,
+  manifest: Readonly<Record<string, string>>
+): Promise<ProtectedUiBundle> {
+  const files = new Map<string, Buffer>();
+  const root = await realpath(uiDir);
+  let totalBytes = 0;
+  const entries = Object.entries(manifest);
+  if (entries.length > 512) throw new Error("Protected console UI manifest has too many entries.");
+  for (const [relative, expected] of entries) {
+    if (!relative || relative.startsWith("/") || relative.includes("\\") ||
+        relative.split("/").some((part) => !part || part === "." || part === "..") ||
+        !/^[a-f0-9]{64}$/u.test(expected)) {
+      throw new Error("Invalid protected console UI manifest entry.");
+    }
+    const target = await realpath(path.resolve(uiDir, relative));
+    if (!target.startsWith(`${root}${path.sep}`)) {
+      throw new Error("Protected console UI manifest references a path outside its directory.");
+    }
+    const file = await open(target, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW || 0));
+    try {
+      const info = await file.stat();
+      if (!info.isFile()) throw new Error("Protected console UI manifest requires regular files.");
+      const size = info.size;
+      totalBytes += size;
+      if (!Number.isSafeInteger(size) || size > 16 * 1024 * 1024 || totalBytes > 32 * 1024 * 1024) {
+        throw new Error("Protected console UI bundle is too large.");
+      }
+      const body = Buffer.alloc(size + 1);
+      let length = 0;
+      while (length < body.length) {
+        const { bytesRead } = await file.read(body, length, body.length - length, length);
+        if (!bytesRead) break;
+        length += bytesRead;
+      }
+      if (length !== size || createHash("sha256").update(body.subarray(0, length)).digest("hex") !== expected) {
+        throw new Error(`Protected console UI digest mismatch: ${relative}`);
+      }
+      files.set(relative, body.subarray(0, length));
+    } finally {
+      await file.close();
+    }
+  }
+  if (!files.has("index.html") && !files.has("local-console.html")) {
+    throw new Error("Protected console UI manifest needs an entry page.");
+  }
+  const bundle = { files };
+  const entry = files.get(files.has("index.html") ? "index.html" : "local-console.html")!;
+  await addUiIntegrity(entry.toString("utf8"), uiDir, bundle);
+  return bundle;
+}
+
 async function serveUi(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1436,25 +1500,27 @@ async function serveUi(
   uiDir: string,
   token: string,
   operatorAuth = false,
-  operatorProof?: string
+  operatorProof?: string,
+  protectedUi?: ProtectedUiBundle
 ): Promise<void> {
   if (req.method !== "GET" && req.method !== "HEAD") {
     throw new HttpError(405, "Only GET is supported for local console assets.");
   }
 
   const safeRoot = path.resolve(uiDir);
-  let relative = uiRelativePath(pathname, uiDir);
+  let relative = uiRelativePath(pathname, uiDir, protectedUi);
   let target = path.resolve(uiDir, relative);
   if (target !== safeRoot && !target.startsWith(`${safeRoot}${path.sep}`)) {
     throw new HttpError(403, "Path is outside the local console directory.");
   }
 
-  if (!existsSync(target) && shouldServeSpaFallback(pathname, uiDir)) {
+  if (!(protectedUi ? protectedUi.files.has(relative) : existsSync(target)) &&
+      shouldServeSpaFallback(pathname, uiDir, protectedUi)) {
     relative = "index.html";
     target = path.resolve(uiDir, relative);
   }
 
-  if (operatorAuth) {
+  if (operatorAuth && !protectedUi) {
     const actualRoot = await realpath(safeRoot);
     const actualTarget = await realpath(target);
     if (actualTarget !== actualRoot && !actualTarget.startsWith(`${actualRoot}${path.sep}`)) {
@@ -1462,14 +1528,18 @@ async function serveUi(
     }
   }
 
-  let body = await readFile(target);
+  const pinnedBody = protectedUi?.files.get(relative);
+  if (protectedUi && !pinnedBody) {
+    throw new HttpError(404, "Protected console asset is not in the pinned bundle.");
+  }
+  let body = pinnedBody || await readFile(target);
   const scriptNonce = randomBytes(18).toString("base64");
   if (path.basename(target) === "local-console.html" || path.basename(target) === "index.html") {
     body = Buffer.from(injectConsoleToken(body.toString("utf8"), token, scriptNonce, operatorAuth));
   }
 
   if (operatorProof) {
-    body = Buffer.from(await addUiIntegrity(body.toString("utf8"), uiDir));
+    body = Buffer.from(await addUiIntegrity(body.toString("utf8"), uiDir, protectedUi));
     res.setHeader("X-SGW-App-Proof", createHmac("sha256", operatorProof).update(body).digest("base64url"));
   }
 
@@ -1489,23 +1559,44 @@ async function serveUi(
   res.end(body);
 }
 
-async function addUiIntegrity(html: string, uiDir: string): Promise<string> {
+async function addUiIntegrity(html: string, uiDir: string, protectedUi?: ProtectedUiBundle): Promise<string> {
+  if (protectedUi && /<base\b/iu.test(html)) {
+    throw new HttpError(503, "Protected console page cannot change its asset base URL.");
+  }
   const tags = [...html.matchAll(/<(script|link)\b[^>]*>/giu)];
-  const root = await realpath(uiDir);
+  const root = protectedUi ? "" : await realpath(uiDir);
   let result = html;
   for (let index = tags.length - 1; index >= 0; index--) {
     const match = tags[index];
     const tag = match[0];
-    if (match[1].toLowerCase() === "link" && !/\brel=["']stylesheet["']/iu.test(tag)) continue;
-    const asset = /\b(?:src|href)=["']([^"']+)["']/iu.exec(tag)?.[1];
-    if (!asset) continue;
-    const url = new URL(asset, "http://127.0.0.1/");
-    if (url.origin !== "http://127.0.0.1") continue;
-    const target = await realpath(path.resolve(uiDir, uiRelativePath(url.pathname, uiDir)));
-    if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
-      throw new HttpError(403, "Protected console asset is outside its directory.");
+    const isLink = match[1].toLowerCase() === "link";
+    if (isLink && !protectedUi && !/\brel=["']stylesheet["']/iu.test(tag)) continue;
+    const attribute = isLink ? "href" : "src";
+    const asset = new RegExp(`\\b${attribute}\\s*=\\s*["']([^"']+)["']`, "iu").exec(tag)?.[1];
+    if (!asset) {
+      if (protectedUi && new RegExp(`\\b${attribute}\\s*=`, "iu").test(tag)) {
+        throw new HttpError(503, "Protected console page has an invalid asset URL.");
+      }
+      continue;
     }
-    const digest = createHash("sha256").update(await readFile(target)).digest("base64");
+    const url = new URL(asset, "http://127.0.0.1/");
+    if (protectedUi && (url.origin !== "http://127.0.0.1" || asset !== url.pathname)) {
+      throw new HttpError(503, "Protected console page references a noncanonical asset URL.");
+    }
+    if (url.origin !== "http://127.0.0.1") continue;
+    const relative = uiRelativePath(url.pathname, uiDir, protectedUi);
+    let assetBody = protectedUi?.files.get(relative);
+    if (protectedUi && !assetBody) {
+      throw new HttpError(503, "Protected console page references an asset outside the pinned bundle.");
+    }
+    if (!assetBody) {
+      const target = await realpath(path.resolve(uiDir, relative));
+      if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+        throw new HttpError(403, "Protected console asset is outside its directory.");
+      }
+      assetBody = await readFile(target);
+    }
+    const digest = createHash("sha256").update(assetBody).digest("base64");
     const updated = tag.replace(/\s+integrity=["'][^"']*["']/iu, "")
       .replace(/>$/u, ` integrity="sha256-${digest}">`);
     result = result.slice(0, match.index) + updated + result.slice(match.index + tag.length);
@@ -1513,18 +1604,19 @@ async function addUiIntegrity(html: string, uiDir: string): Promise<string> {
   return result;
 }
 
-function uiRelativePath(pathname: string, uiDir: string): string {
+function uiRelativePath(pathname: string, uiDir: string, protectedUi?: ProtectedUiBundle): string {
+  const hasIndex = protectedUi ? protectedUi.files.has("index.html") : existsSync(path.join(uiDir, "index.html"));
   if (pathname === "/" || pathname === "") {
-    return existsSync(path.join(uiDir, "index.html")) ? "index.html" : "local-console.html";
+    return hasIndex ? "index.html" : "local-console.html";
   }
 
   let cleaned = decodeURIComponent(pathname).replace(/^\/+/, "");
   cleaned = cleaned.replace(/^docs\/ui\//, "");
-  return cleaned || (existsSync(path.join(uiDir, "index.html")) ? "index.html" : "local-console.html");
+  return cleaned || (hasIndex ? "index.html" : "local-console.html");
 }
 
-function shouldServeSpaFallback(pathname: string, uiDir: string): boolean {
-  if (!existsSync(path.join(uiDir, "index.html"))) {
+function shouldServeSpaFallback(pathname: string, uiDir: string, protectedUi?: ProtectedUiBundle): boolean {
+  if (!(protectedUi ? protectedUi.files.has("index.html") : existsSync(path.join(uiDir, "index.html")))) {
     return false;
   }
 

@@ -287,6 +287,35 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(await cdp.eval<boolean>("Boolean(window.SGW_ORIGINAL_ASSET || window.SGW_CHANGED_ASSET)")).toBe(false);
   }, 30_000);
 
+  it("runs only the pinned script when protected UI files change after startup", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "pinned-asset-swap-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    const uiDir = path.join(tmpHome, "pinned-ui");
+    mkdirSync(uiDir);
+    const html = '<!doctype html><html><head><script src="/payload.js"></script></head><body>Pinned fixture</body></html>';
+    const script = "window.SGW_ORIGINAL_ASSET = true;";
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    writeFileSync(path.join(uiDir, "payload.js"), script);
+    const protectedUiManifest = {
+      "index.html": createHash("sha256").update(html).digest("hex"),
+      "payload.js": createHash("sha256").update(script).digest("hex")
+    };
+    let code = "";
+    running = await startConsoleServer({ port: 0, uiDir, protectedUiManifest,
+      operatorAuth: { displayCode: (value) => { code = value; } } });
+    const launched = await launchChrome(running.url);
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "operator sign-in page");
+    writeFileSync(path.join(uiDir, "payload.js"), "window.SGW_CHANGED_ASSET = true;");
+    await cdp.eval(`(() => {
+      document.querySelector('#code').value = ${JSON.stringify(code)};
+      document.querySelector('#login').requestSubmit();
+      return true;
+    })()`);
+    await waitFor(() => cdp!.eval<boolean>("Boolean(window.SGW_ORIGINAL_ASSET)"), "pinned script");
+    expect(await cdp.eval<boolean>("Boolean(window.SGW_CHANGED_ASSET)")).toBe(false);
+  }, 30_000);
+
   it("keeps the operator proof out of requests after the listener is replaced", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "protected-rebind-fixture";
     process.env.SGW_SECRET_BACKEND = "local";

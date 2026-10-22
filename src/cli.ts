@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
+import path from "node:path";
 import { stdin } from "node:process";
 import {
   agentIntegrationStatus,
@@ -206,6 +209,17 @@ async function main(): Promise<void> {
     const host = getFlag(parsed.flags, "host") || "127.0.0.1";
     const port = numericFlag(parsed.flags, "port", 8718);
     const protectedOperator = hasFlag(parsed.flags, "operator-auth");
+    const uiManifestPath = getFlag(parsed.flags, "ui-manifest");
+    if (hasFlag(parsed.flags, "ui-manifest") && !uiManifestPath) {
+      throw new Error("--ui-manifest requires a file path.");
+    }
+    if (uiManifestPath && !protectedOperator) {
+      throw new Error("--ui-manifest requires --operator-auth.");
+    }
+    if (uiManifestPath && !path.isAbsolute(uiManifestPath)) {
+      throw new Error("--ui-manifest requires an absolute path.");
+    }
+    const protectedUiManifest = uiManifestPath ? await readProtectedUiManifest(uiManifestPath) : undefined;
     const backgroundAuth = hasFlag(parsed.flags, "background");
     const launchdSocket = hasFlag(parsed.flags, "launchd-socket");
     if (backgroundAuth && (!protectedOperator || !hasFlag(parsed.flags, "no-open"))) {
@@ -230,7 +244,8 @@ async function main(): Promise<void> {
 
     let running;
     try {
-      running = await startConsoleServer({ host, port, store, operatorAuth, activatedFd: launchdSocket ? 3 : undefined });
+      running = await startConsoleServer({ host, port, store, operatorAuth, protectedUiManifest,
+        activatedFd: launchdSocket ? 3 : undefined });
     } catch (error) {
       if (isAddressInUse(error)) {
         if (protectedOperator) {
@@ -695,6 +710,32 @@ async function main(): Promise<void> {
   throw new Error(unknownCommandMessage(parsed.command));
 }
 
+async function readProtectedUiManifest(filePath: string): Promise<Record<string, string>> {
+  const file = await open(filePath, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW || 0));
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 256 * 1024) {
+      throw new Error("--ui-manifest must be a regular file no larger than 256 KiB.");
+    }
+    const bytes = Buffer.alloc(256 * 1024 + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const { bytesRead } = await file.read(bytes, length, bytes.length - length, length);
+      if (!bytesRead) break;
+      length += bytesRead;
+    }
+    if (length > 256 * 1024) throw new Error("--ui-manifest is too large.");
+    const value: unknown = JSON.parse(bytes.subarray(0, length).toString("utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.getPrototypeOf(value) !== Object.prototype) {
+      throw new Error("--ui-manifest must contain an object of relative paths and SHA-256 digests.");
+    }
+    return value as Record<string, string>;
+  } finally {
+    await file.close();
+  }
+}
+
 function parseArgs(args: string[]): ParsedArgs {
   const command: string[] = [];
   const flags: Record<string, string | boolean | string[]> = {};
@@ -798,6 +839,7 @@ const valueFlags = new Set([
   "target",
   "timeout-ms",
   "type",
+  "ui-manifest",
   "user",
   "vault",
   "with-env",
@@ -2774,7 +2816,7 @@ Commands:
   s-gw update plan [--package PATH_OR_SPEC]
   s-gw update install [--package PATH_OR_SPEC] [--dry-run]
   s-gw mcp
-  s-gw console [--host 127.0.0.1] [--port 8718] [--no-open] [--operator-auth] [--background]
+  s-gw console [--host 127.0.0.1] [--port 8718] [--no-open] [--operator-auth] [--ui-manifest /absolute/trusted.json] [--background]
   s-gw console enroll [--port 8718]
   s-gw app app-path
   s-gw app install
