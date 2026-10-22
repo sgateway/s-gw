@@ -152,7 +152,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
     const scrubbed = await scrubEnvironment(store, profile, guardedEnv, {
       persist: options.persist === true,
       allowedCommands: options.allowedCommands || [],
-      strictNpmEnv: options.strictNpmEnv === true
+      strictNpmEnv: options.strictNpmEnv !== false
     });
     guardedEnv = scrubbed.env;
     scrubbedEnv.push(...scrubbed.findings);
@@ -178,6 +178,9 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   const warnings: string[] = [];
   if (scrubbedEnv.length === 0) {
     warnings.push("No credential-like environment variables were detected.");
+  }
+  if (options.strictNpmEnv === false) {
+    warnings.push("Legacy npm environment compatibility passes npm-prefixed credentials to the agent unchanged.");
   }
   if (profile.mcp.status !== "supported") {
     warnings.push(`${profile.displayName} MCP setup is marked ${profile.mcp.status}; install/config may need manual review.`);

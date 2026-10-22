@@ -86,7 +86,7 @@ describe("guard mode", () => {
     expect(await store.listHandles()).toHaveLength(0);
   });
 
-  it("keeps the existing npm environment behavior unless strict npm scanning is selected", async () => {
+  it("scans credential-like npm environment values by default", async () => {
     const store = new SecretStore(tmpHome);
     await store.init();
     const raw = fakeGithubToken();
@@ -98,8 +98,21 @@ describe("guard mode", () => {
       persist: false
     });
 
+    expect(prepared.env.npm_config_password).toMatch(/^<<SGW_SECRET:/);
+    expect(prepared.plan.scrubbedEnv.map(item => item.name)).toContain("npm_config_password");
+    expect(JSON.stringify(prepared)).not.toContain(raw);
+  });
+
+  it("keeps raw npm values only in the explicit compatibility mode", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    const raw = fakeGithubToken();
+    const prepared = await prepareGuardedRun(store, {
+      agent: "codex", command: process.execPath, env: { npm_config_password: raw },
+      strictNpmEnv: false, persist: false
+    });
     expect(prepared.env.npm_config_password).toBe(raw);
-    expect(prepared.plan.scrubbedEnv).toHaveLength(0);
+    expect(prepared.plan.warnings).toContain("Legacy npm environment compatibility passes npm-prefixed credentials to the agent unchanged.");
   });
 
   it("scans npm values and tokenizes short auth fields in strict npm mode", async () => {
@@ -255,10 +268,10 @@ describe("guard mode", () => {
     expect(plan.dryRun).toBe(true);
   });
 
-  it("CLI strict npm dry-run replaces npm authentication values", () => {
+  it("CLI dry-run replaces npm authentication values by default", () => {
     const out = execFileSync(
       process.execPath,
-      [tsxCli, "src/cli.ts", "guard", "run", "codex", "--dry-run", "--strict-npm-env", "--command", process.execPath],
+      [tsxCli, "src/cli.ts", "guard", "run", "codex", "--dry-run", "--command", process.execPath],
       {
         cwd: repoRoot,
         env: {
@@ -278,12 +291,12 @@ describe("guard mode", () => {
     expect(plan.scrubbedEnv.some((item: { name: string }) => item.name === "npm_config_password")).toBe(true);
   });
 
-  it("passes a handle to a launched child in strict npm mode", () => {
+  it("passes a handle to a launched child in the default npm mode", () => {
     const raw = "short-private-registry-password";
     const out = execFileSync(
       process.execPath,
       [
-        tsxCli, "src/cli.ts", "guard", "run", "codex", "--strict-npm-env", "--command", process.execPath,
+        tsxCli, "src/cli.ts", "guard", "run", "codex", "--command", process.execPath,
         "--", "-e", "process.stdout.write(process.env.npm_config_password || '')"
       ],
       {
@@ -302,6 +315,19 @@ describe("guard mode", () => {
 
     expect(out).toMatch(/^<<SGW_SECRET:s-gw:password:/);
     expect(out).not.toContain(raw);
+  });
+
+  it("keeps the CLI raw npm compatibility path explicit", () => {
+    const raw = "short-private-registry-password";
+    const out = execFileSync(process.execPath, [
+      tsxCli, "src/cli.ts", "guard", "run", "codex", "--allow-raw-npm-env",
+      "--command", process.execPath, "--", "-e", "process.stdout.write(process.env.npm_config_password || '')"
+    ], { cwd: repoRoot, env: {
+      ...process.env, SGW_HOME: tmpHome, SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
+      SGW_MASTER_PASSPHRASE: "guard cli passphrase", SGW_DISABLE_KEYCHAIN: "1",
+      npm_config_password: raw
+    }, encoding: "utf8" });
+    expect(out).toBe(raw);
   });
 
   it("launches canonical npm cmd shims without a command shell", async () => {

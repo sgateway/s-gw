@@ -88,7 +88,7 @@ s-gw guard run cursor --command cursor --dry-run
 
 `--dry-run` uses preview handles and does not write to the store. A real run may use `--allow-command CMD` to attach an initial approved-execution policy to any handles created from environment variables, but production policies should remain narrow.
 
-Use `--strict-npm-env` to scan `npm_` environment values too. It tokenizes known credential patterns, npm authentication fields (including short opaque values), and registry URLs containing credentials. Existing runs continue to pass `npm_` variables through for compatibility. Pattern scanning cannot identify every secret placed in a harmless-looking variable; review the dry-run before using this option with a private registry.
+Guarded runs scan `npm_` environment values by default. They tokenize known credential patterns, npm authentication fields (including short opaque values), and registry URLs containing credentials. A private registry that needs one of those raw values must use an s-gw-approved action or the explicit `--allow-raw-npm-env` compatibility flag. The latter restores the old pass-through behavior and its credential exposure. `--strict-npm-env` remains accepted for existing scripts. Pattern scanning cannot identify every secret placed in a harmless-looking variable; review the dry-run before using a private registry.
 
 ## Agent Profile Registry
 

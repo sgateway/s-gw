@@ -2604,6 +2604,9 @@ async function handleGuardRun(
   if (!agent) {
     throw new Error("guard run requires an agent name.");
   }
+  if (hasFlag(flags, "strict-npm-env") && hasFlag(flags, "allow-raw-npm-env")) {
+    throw new Error("Choose either --strict-npm-env or --allow-raw-npm-env.");
+  }
 
   const options: GuardRunOptions = {
     agent,
@@ -2612,7 +2615,7 @@ async function handleGuardRun(
     cwd: getFlag(flags, "cwd") || process.cwd(),
     extraEnv: parseEnvFlags(getFlagList(flags, "env")),
     scrubEnv: !hasFlag(flags, "no-scrub-env"),
-    strictNpmEnv: hasFlag(flags, "strict-npm-env"),
+    strictNpmEnv: hasFlag(flags, "allow-raw-npm-env") ? false : undefined,
     allowedCommands: getFlagList(flags, "allow-command"),
     sandbox: (getFlag(flags, "sandbox") || "builtin") as GuardRunOptions["sandbox"],
     sandboxOptions: {
@@ -2780,8 +2783,8 @@ Commands:
   s-gw app refresh-agents [--lock-timeout-ms 35000]
   s-gw guard doctor
   s-gw guard status
-  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
-  s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env|--allow-raw-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env|--allow-raw-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--strict-legacy-revocation] [--raw]
   s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary] [--launchd-socket|--direct-bind]
   s-gw service start|stop|status|uninstall
