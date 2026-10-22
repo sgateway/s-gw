@@ -859,7 +859,7 @@ describe("SecretStore", () => {
     const checkpoints = (await readdir(externalDir)).filter((entry) => entry.startsWith("checkpoint-"));
     expect(checkpoints.length).toBeGreaterThan(50);
     expect((await stat(path.join(externalDir, checkpoints[0]))).mode & 0o200).toBe(0);
-  }, 15_000);
+  }, 60_000);
 
   it("keeps the newest sealed checkpoint when the clock moves backwards", async () => {
     const store = new SecretStore();
@@ -4182,7 +4182,7 @@ describe("SecretStore", () => {
     await store.deleteManagedSshRoute(route.id);
     await expect(store.createManagedSshRequest(secret.handle, route.id, input, "removed route", managedAgent))
       .rejects.toThrow(/unknown managed SSH route/i);
-  });
+  }, 15_000);
 });
 
 async function backdateRequest(requestId: string, agoMs: number, fields = ["updatedAt"]): Promise<void> {

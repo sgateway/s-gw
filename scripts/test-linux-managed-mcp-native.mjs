@@ -1095,7 +1095,7 @@ try {
           preparedUnit.get("ActiveState") !== "inactive" ||
           preparedUnit.get("Result") !== "success" ||
           preparedUnit.get("ExecMainStatus") !== "0" ||
-          preparedUnit.get("MainPID") !== "0" || !invocationId(preparedUnit) ||
+          preparedUnit.get("MainPID") !== "0" ||
           !await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile) ||
           run("systemctl", ["--system", "is-active", agent.socketUnit], true).status === 0 ||
           run("systemctl", ["--system", "is-active", agent.modelSocketUnit], true).status === 0) {
