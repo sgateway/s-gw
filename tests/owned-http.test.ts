@@ -79,6 +79,50 @@ describe("owned HTTPS operations", () => {
     expect((await readFile(f.store.storePath, "utf8"))).not.toContain(f.value);
   });
 
+  it("finishes claimed HTTPS after console protection changes without allowing other edits", async () => {
+    let hits = 0;
+    const f = await fixture((_req, res) => { hits++; res.end("protected migration fixture"); });
+    const action = buildHttpRequestAction(f.spec);
+    const request = await f.store.createRequest(f.handle.handle, action, "HTTPS crossing console migration");
+    const pendingB = await f.store.createRequest(f.handle.handle,
+      buildHttpRequestAction({ ...f.spec, url: `${f.spec.url}?pending` }), "Unrelated pending HTTPS");
+    const approvedB = await f.store.createRequest(f.handle.handle,
+      buildHttpRequestAction({ ...f.spec, url: `${f.spec.url}?approved` }), "Unrelated approved HTTPS");
+    await f.store.approveRequest(request.id);
+    await f.store.approveRequest(approvedB.id);
+
+    let claimed = () => {};
+    let resume = () => {};
+    const started = new Promise<void>(resolve => { claimed = resolve; });
+    const blocked = new Promise<void>(resolve => { resume = resolve; });
+    const originalClaim = f.store.claimApprovedRequest.bind(f.store);
+    const claimSpy = vi.spyOn(f.store, "claimApprovedRequest").mockImplementation(async (id, caller, assertActive) => {
+      const result = await originalClaim(id, caller, assertActive);
+      if (id === request.id) {
+        claimed();
+        await blocked;
+        await expect(f.store.approveRequest(pendingB.id)).rejects.toThrow(/protected operator console/u);
+        await expect(f.store.claimApprovedRequest(approvedB.id)).rejects.toThrow(/protected operator console/u);
+        await expect(f.store.addApprovalPolicyRule({ decision: "ask" })).rejects.toThrow(/protected operator console/u);
+      }
+      return result;
+    });
+    try {
+      const execution = f.store.runConsoleRequest("ordinary", () => executeApprovedRequest(f.store, request.id, { http: { ca: f.ca } }));
+      await started;
+      await f.store.enableProtectedConsole();
+      resume();
+      expect((await execution).stdout).toContain("protected migration fixture");
+      expect(hits).toBe(1);
+      expect((await f.store.getRequest(request.id)).state).toBe("executed");
+      expect((await f.store.getRequest(pendingB.id)).state).toBe("pending");
+      expect((await f.store.getRequest(approvedB.id)).state).toBe("approved");
+    } finally {
+      resume();
+      claimSpy.mockRestore();
+    }
+  });
+
   it("owns basic and API-key authentication and withholds credentials issued in JSON", async () => {
     const received: string[] = [];
     const issued = randomUUID();

@@ -1065,7 +1065,11 @@ try {
         run("systemctl", ["--system", "stop", unsealed.socketUnit]);
         run("systemctl", ["--system", "stop", unsealed.modelSocketUnit]);
         run("systemctl", ["--system", "stop", unsealed.brokerUnit]);
-        run("systemctl", ["--system", "reset-failed", unsealed.brokerUnit]);
+        const reset = run("systemctl", ["--system", "reset-failed", unsealed.brokerUnit], true);
+        const state = unitProperties(unsealed.brokerUnit, ["ActiveState"]).get("ActiveState");
+        if (state !== "inactive") {
+          throw new Error(`The unsealed broker stayed ${state} after reset-failed (exit ${reset.status}).`);
+        }
       }
       run("systemctl", ["--system", "start", unsealed.socketUnit]);
       run("systemctl", ["--system", "start", unsealed.modelSocketUnit]);
@@ -1090,16 +1094,23 @@ try {
       }
       const preparedUnit = unitProperties(agent.brokerUnit, ["Id", "FragmentPath", "ActiveState",
         "Result", "ExecMainStatus", "InvocationID", "MainPID"]);
-      if (preparedUnit.get("Id") !== agent.brokerUnit ||
-          preparedUnit.get("FragmentPath") !== agent.brokerUnitFile ||
-          preparedUnit.get("ActiveState") !== "inactive" ||
-          preparedUnit.get("Result") !== "success" ||
-          preparedUnit.get("ExecMainStatus") !== "0" ||
-          preparedUnit.get("MainPID") !== "0" ||
-          !await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile) ||
-          run("systemctl", ["--system", "is-active", agent.socketUnit], true).status === 0 ||
-          run("systemctl", ["--system", "is-active", agent.modelSocketUnit], true).status === 0) {
-        throw new Error("Preapproval request was not prepared by the verified broker with both sockets stopped.");
+      const preparedState = {
+        id: preparedUnit.get("Id"), fragment: preparedUnit.get("FragmentPath"),
+        active: preparedUnit.get("ActiveState"), result: preparedUnit.get("Result"),
+        exitStatus: preparedUnit.get("ExecMainStatus"), pid: preparedUnit.get("MainPID"),
+        invocationId: preparedUnit.get("InvocationID"),
+        unitFile: await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile),
+        mcpSocket: unitProperties(agent.socketUnit, ["ActiveState"]).get("ActiveState"),
+        modelSocket: unitProperties(agent.modelSocketUnit, ["ActiveState"]).get("ActiveState")
+      };
+      if (preparedState.id !== agent.brokerUnit ||
+          preparedState.fragment !== agent.brokerUnitFile ||
+          preparedState.active !== "inactive" || preparedState.result !== "success" ||
+          preparedState.exitStatus !== "0" || preparedState.pid !== "0" ||
+          !preparedState.unitFile || preparedState.mcpSocket !== "inactive" ||
+          preparedState.modelSocket !== "inactive") {
+        throw new Error("Preapproval request was not prepared by the verified broker with both sockets stopped: " +
+          JSON.stringify(preparedState));
       }
       for (const socketPath of [agent.socketPath, agent.modelSocketPath]) {
         await new Promise((resolve, reject) => {
@@ -1133,7 +1144,6 @@ try {
       await rename(sealed, agent.configPath);
       await remember(agent.configPath);
       await checkedInstalledFile(agent.configPath);
-      run("systemctl", ["--system", "reset-failed", agent.brokerUnit]);
       run("systemctl", ["--system", "start", agent.socketUnit]);
       run("systemctl", ["--system", "start", agent.modelSocketUnit]);
       for (const [unit, file] of [[agent.socketUnit, agent.socketUnitFile],
