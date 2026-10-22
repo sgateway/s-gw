@@ -1340,7 +1340,7 @@ try {
   }
   run("systemctl", ["--system", "stop", agents[0].socketUnit]);
   if (testRelay) run("systemctl", ["--system", "stop", agents[0].modelSocketUnit]);
-  run("systemctl", ["--system", "stop", agents[0].brokerUnit]);
+  run("systemctl", ["--system", "--no-block", "stop", agents[0].brokerUnit]);
   await until(() => run("systemctl", ["--system", "is-active", agents[0].agentUnit], true).status !== 0,
     "first agent teardown after its broker stopped");
   if (testRelay) {
