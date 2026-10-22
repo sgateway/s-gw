@@ -1038,8 +1038,20 @@ try {
       await rename(sealed, agent.configPath);
       await remember(agent.configPath);
       await checkedInstalledFile(agent.configPath);
-      run("systemctl", ["--system", "reset-failed", agent.brokerUnit], true);
-      run("systemctl", ["--system", "start", agent.brokerUnit]);
+      run("systemctl", ["--system", "reset-failed", agent.brokerUnit]);
+      for (const [unit, file] of [[agent.socketUnit, agent.socketUnitFile],
+        [agent.modelSocketUnit, agent.modelSocketUnitFile]]) {
+        const socket = unitProperties(unit, ["ActiveState", "Triggers"]);
+        if (socket.get("ActiveState") !== "active" || socket.get("Triggers") !== agent.brokerUnit ||
+            !await fixtureUnitFile(unit, file)) {
+          throw new Error("The managed model relay socket changed before activation.");
+        }
+      }
+      await new Promise((resolve, reject) => {
+        const socket = createConnection(agent.socketPath);
+        socket.once("error", reject);
+        socket.once("connect", () => { socket.destroy(); resolve(); });
+      });
       await until(() => {
         try { return asBroker("assert-relay-state", [agent.relay.requestId, "executing"]) === "executing"; }
         catch { return false; }
