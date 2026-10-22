@@ -883,6 +883,10 @@ try {
   }
   unitsInstalled = true;
   run("systemctl", ["--system", "daemon-reload"]);
+  const brokerEnvironmentFiles = unitProperties(agents[0].brokerUnit, ["EnvironmentFiles"]);
+  if (brokerEnvironmentFiles.get("EnvironmentFiles") !== `${envFile} (ignore_errors=no)`) {
+    throw new Error("The native fixture cannot observe a configured broker environment file.");
+  }
   await rejectWritableImport(controlUnit, path.join(controlDir, "linux-agent-unit.js"),
     path.join(installed, "control-preexec-marker"));
   controlStartAttempted = true;

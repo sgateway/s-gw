@@ -393,7 +393,9 @@ export function assertControlUnitPreflight(output: string, runtime: {
   if (unit.get("Id") !== "s-gw-agent-control.service") failed.push("Id");
   if (unit.get("ActiveState") !== "active") failed.push("ActiveState");
   if (unit.get("FragmentPath") !== runtime.unitFile) failed.push("FragmentPath");
-  if (unit.get("EnvironmentFiles") !== "") failed.push("EnvironmentFiles");
+  // Some systemd versions omit an unconfigured EnvironmentFiles property, even with --all.
+  const environmentFiles = unit.get("EnvironmentFiles");
+  if (environmentFiles !== undefined && environmentFiles !== "") failed.push("EnvironmentFiles");
   if (!unitCommand(unit.get("ExecStartPre"), runtime.preflight,
     ["verify", runtime.runtimeRoot, runtime.node, runtime.entry, runtime.unitFile, "-", "-"])) {
     failed.push("ExecStartPre");
