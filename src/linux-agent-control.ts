@@ -614,6 +614,8 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
           if (closing) throw new Error("Linux root control service is stopping.");
           await attestBroker(socket, record, brokerUid, brokerGid, invocation,
             call.method === "start" ? undefined : plan.uid);
+          traceLinuxManagedStart(plan.uid,
+            socket.isPaused() ? "control socket paused after attestation" : "control socket flowing after attestation");
           if (closing || socket.destroyed) throw new Error("Linux root control service is stopping.");
           if (call.method === "start") {
             if (used) throw new Error("This Linux agent session was already launched.");
