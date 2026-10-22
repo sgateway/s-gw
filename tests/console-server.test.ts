@@ -621,6 +621,237 @@ describe("local console server", () => {
     }
   });
 
+  it("revokes an already-running ordinary console when its store becomes protected", async () => {
+    const store = new SecretStore();
+    const uiDir = path.join(tmpHome, "sealed-console-ui");
+    mkdirSync(uiDir);
+    const html = "<html><head></head><body>sealed operator UI</body></html>";
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    const protectedUiManifest = { "index.html": createHash("sha256").update(html).digest("hex") };
+    const ordinary = await startConsoleServer({ port: 0, store });
+    let code = "";
+    try {
+      running = await startConsoleServer({ port: 0, store, uiDir, protectedUiManifest,
+        operatorAuth: { displayCode: (value) => { code = value; } } });
+      expect((await fetch(`${ordinary.url}api/state`, {
+        headers: { "X-SGW-Console-Token": ordinary.token }
+      })).status).toBe(200);
+
+      await store.enableProtectedConsole();
+      const rejectedPage = await fetch(ordinary.url);
+      const rejectedApi = await fetch(`${ordinary.url}api/state`, {
+        headers: { "X-SGW-Console-Token": ordinary.token }
+      });
+      expect(rejectedPage.status).toBe(503);
+      expect(rejectedApi.status).toBe(503);
+
+      const origin = new URL(running.url).origin;
+      const enrolled = await fetch(`${running.url}auth/enroll`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ code })
+      });
+      expect(enrolled.status).toBe(200);
+      const proof = (await enrolled.json() as { proof: string }).proof;
+      const cookie = (enrolled.headers.get("set-cookie") || "").split(";")[0];
+      expect((await fetch(`${running.url}api/state`, {
+        headers: { Cookie: cookie, "X-SGW-Console-Token": proof }
+      })).status).toBe(200);
+    } finally {
+      await ordinary.close();
+    }
+  });
+
+  it("refuses an ordinary or unpinned listener before binding a protected store", async () => {
+    const store = new SecretStore();
+    await store.enableProtectedConsole();
+    const uiDir = path.join(tmpHome, "required-console-ui");
+    mkdirSync(uiDir);
+    const html = "<html><head></head><body>operator UI</body></html>";
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    const protectedUiManifest = { "index.html": createHash("sha256").update(html).digest("hex") };
+
+    const probe = createHttpServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+
+    await expect(startConsoleServer({ port, store: new SecretStore() }))
+      .rejects.toThrow(/requires operator sign-in and a pinned UI bundle/u);
+    await expect(startConsoleServer({ port, store, uiDir,
+      operatorAuth: { displayCode: () => {} } }))
+      .rejects.toThrow(/requires operator sign-in and a pinned UI bundle/u);
+
+    running = await startConsoleServer({ port, store, uiDir, protectedUiManifest,
+      operatorAuth: { displayCode: () => {} } });
+    expect(new URL(running.url).port).toBe(String(port));
+  });
+
+  it("rejects approvals held across migration on ordinary and unpinned operator listeners", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "held console approval",
+      type: "api-token",
+      value: fakeOpenAiToken(),
+      policy: { injectEnv: "SGW_HELD_APPROVAL", allowedCommands: [process.execPath] }
+    });
+    const request = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "0"],
+      injectEnv: "SGW_HELD_APPROVAL"
+    }), "Held console approval");
+    const ordinary = await startConsoleServer({ port: 0, store });
+    let code = "";
+    const unpinned = await startConsoleServer({ port: 0, store,
+      operatorAuth: { displayCode: (value) => { code = value; } } });
+    const held: Array<{ finish: () => void; result: Promise<number> }> = [];
+    const originalMode = store.getConsoleAccessMode.bind(store);
+    let observed = 0;
+    let countHeld = false;
+    let bothChecked = () => {};
+    const checked = new Promise<void>((resolve) => { bothChecked = resolve; });
+    const modeSpy = vi.spyOn(store, "getConsoleAccessMode").mockImplementation(async () => {
+      const mode = await originalMode();
+      if (countHeld && mode === "ordinary" && ++observed === 2) bothChecked();
+      return mode;
+    });
+    try {
+      const origin = new URL(unpinned.url).origin;
+      const enrolled = await fetch(`${unpinned.url}auth/enroll`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ code })
+      });
+      expect(enrolled.status).toBe(200);
+      const proof = (await enrolled.json() as { proof: string }).proof;
+      const cookie = (enrolled.headers.get("set-cookie") || "").split(";")[0];
+      countHeld = true;
+
+      held.push(heldJsonPost(`${ordinary.url}api/requests/${request.id}/approve`, {
+        "X-SGW-Console-Token": ordinary.token
+      }));
+      held.push(heldJsonPost(`${unpinned.url}api/requests/${request.id}/approve`, {
+        Origin: origin, Cookie: cookie, "X-SGW-Console-Token": proof
+      }));
+      await checked;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await store.enableProtectedConsole();
+      for (const item of held) item.finish();
+
+      expect(await Promise.all(held.map((item) => item.result))).toEqual([503, 503]);
+      expect((await store.getRequest(request.id)).state).toBe("pending");
+    } finally {
+      modeSpy.mockRestore();
+      for (const item of held) item.finish();
+      await Promise.allSettled(held.map((item) => item.result));
+      await Promise.all([ordinary.close(), unpinned.close()]);
+    }
+  });
+
+  it("rejects a protected approval whose operator session expires while the body is held", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "expiring console approval",
+      type: "api-token",
+      value: fakeOpenAiToken(),
+      policy: { injectEnv: "SGW_EXPIRING_APPROVAL", allowedCommands: [process.execPath] }
+    });
+    const request = await store.createRequest(secret.handle, buildEnvCommandAction({
+      command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_EXPIRING_APPROVAL"
+    }), "Expiring console approval");
+    const uiDir = path.join(tmpHome, "expiry-ui");
+    mkdirSync(uiDir);
+    const html = "<html><head></head><body>operator UI</body></html>";
+    writeFileSync(path.join(uiDir, "index.html"), html);
+    let code = "";
+    running = await startConsoleServer({ port: 0, store, uiDir,
+      protectedUiManifest: { "index.html": createHash("sha256").update(html).digest("hex") },
+      operatorAuth: { displayCode: (value) => { code = value; } } });
+    const origin = new URL(running.url).origin;
+    const enrolled = await fetch(`${running.url}auth/enroll`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ code })
+    });
+    expect(enrolled.status).toBe(200);
+    const proof = (await enrolled.json() as { proof: string }).proof;
+    const cookie = (enrolled.headers.get("set-cookie") || "").split(";")[0];
+
+    const originalMode = store.getConsoleAccessMode.bind(store);
+    let checked = () => {};
+    const reached = new Promise<void>((resolve) => { checked = resolve; });
+    const modeSpy = vi.spyOn(store, "getConsoleAccessMode").mockImplementation(async () => {
+      const mode = await originalMode();
+      checked();
+      return mode;
+    });
+    const held = heldJsonPost(`${running.url}api/requests/${request.id}/approve`, {
+      Origin: origin, Cookie: cookie, "X-SGW-Console-Token": proof
+    });
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    try {
+      await reached;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      clock.mockReturnValue(now + 15 * 60_000 + 1);
+      held.finish();
+      expect(await held.result).toBe(401);
+      expect((await store.getRequest(request.id)).state).toBe("pending");
+    } finally {
+      clock.mockRestore();
+      modeSpy.mockRestore();
+      held.finish();
+      await Promise.allSettled([held.result]);
+    }
+  });
+
+  for (const action of ["install", "uninstall"] as const) {
+    it(`rejects a held agent ${action} after console migration`, async () => {
+      const binDir = path.join(tmpHome, "agent-bin");
+      mkdirSync(binDir, { recursive: true });
+      for (const name of ["codex", "s-gw-mcp"]) {
+        const commandPath = path.join(binDir, process.platform === "win32" ? `${name}.cmd` : name);
+        writeFileSync(commandPath, process.platform === "win32" ? "@exit /b 0\r\n" : "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        if (process.platform !== "win32") chmodSync(commandPath, 0o755);
+      }
+      const store = new SecretStore();
+      running = await startConsoleServer({ port: 0, store, agentHomeDir: tmpHome, agentPathEnv: binDir });
+      const configPath = path.join(tmpHome, ".codex", "config.toml");
+      if (action === "uninstall") {
+        const installed = await fetch(`${running.url}api/agents/codex/install`, {
+          method: "POST", headers: authHeaders(), body: "{}"
+        });
+        expect(installed.status).toBe(200);
+        expect(existsSync(configPath)).toBe(true);
+      }
+      const before = existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined;
+
+      const originalMode = store.getConsoleAccessMode.bind(store);
+      let checked = () => {};
+      const reached = new Promise<void>((resolve) => { checked = resolve; });
+      const modeSpy = vi.spyOn(store, "getConsoleAccessMode").mockImplementation(async () => {
+        const mode = await originalMode();
+        checked();
+        return mode;
+      });
+      const held = heldJsonPost(`${running.url}api/agents/codex/${action}`, {
+        "X-SGW-Console-Token": running.token
+      });
+      try {
+        await reached;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await store.enableProtectedConsole();
+        held.finish();
+        expect(await held.result).toBe(503);
+        expect(existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined).toBe(before);
+      } finally {
+        modeSpy.mockRestore();
+        held.finish();
+        await Promise.allSettled([held.result]);
+      }
+    });
+  }
+
   it("expires the one-time code and operator session", async () => {
     let code = "";
     running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
@@ -1499,4 +1730,25 @@ function authHeaders(): Record<string, string> {
     "Content-Type": "application/json",
     "X-SGW-Console-Token": running!.token
   };
+}
+
+function heldJsonPost(url: string, headers: Record<string, string>, body = "{}") {
+  let client: ReturnType<typeof httpRequest>;
+  const result = new Promise<number>((resolve, reject) => {
+    client = httpRequest(url, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(body)) }
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode || 0));
+    });
+    client.on("error", reject);
+    client.write(body.slice(0, 1));
+  });
+  let finished = false;
+  return { result, finish: () => {
+    if (finished) return;
+    finished = true;
+    client.end(body.slice(1));
+  } };
 }

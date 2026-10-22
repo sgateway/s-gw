@@ -27,7 +27,10 @@ import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolv
 import { assertMacRuntimeForManagedSurfaces, getPackageLayout, readinessForUnlock } from "./install.js";
 import { getSgwInstanceKey } from "./paths.js";
 import { managedSshHostFingerprint, type ManagedSshRoute } from "./managed-ssh.js";
-import { SecretStore, type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput } from "./store.js";
+import {
+  ConsoleAccessDeniedError, ConsoleSessionExpiredError, SecretStore,
+  type AddApprovalPolicyRuleInput, type UpdateApprovalPolicyRuleInput
+} from "./store.js";
 import { unlockStatus } from "./unlock.js";
 import { ReleaseChecker, UPDATE_CHECK_INTERVAL_MS, type UpdateCheckResult } from "./update-check.js";
 import { CURRENT_VERSION } from "./version.js";
@@ -211,6 +214,9 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   };
 
   await store.init();
+  if (await store.getConsoleAccessMode() === "protected" && (!operatorAuth || !protectedUi)) {
+    throw new Error("This credential store requires operator sign-in and a pinned UI bundle for every console listener.");
+  }
   const instanceKey = getSgwInstanceKey(path.dirname(store.storePath));
   void updateChecker.check();
   const updateTimer = setInterval(() => void updateChecker.check(true), UPDATE_CHECK_INTERVAL_MS);
@@ -222,7 +228,13 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
       req.destroy();
       return;
     }
-    handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth, protectedUi).catch((error) => {
+    const serve = async () => {
+      if (await store.getConsoleAccessMode() === "protected" && (!operatorAuth || !protectedUi)) {
+        throw new HttpError(503, "This credential store requires a protected operator console with a pinned UI bundle.");
+      }
+      await handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth, protectedUi);
+    };
+    store.runConsoleRequest(operatorAuth && protectedUi ? "protected" : "ordinary", serve).catch((error) => {
       sendError(res, error);
     });
   });
@@ -501,7 +513,10 @@ async function handleProtectedRequest(
     if (!validConsoleToken(req, session.proof) && !await validSignedOperatorRequest(req, url, session)) {
       throw new HttpError(403, "Invalid operator request token.");
     }
-    await handleApi(req, res, url, store, updateChecker, agentOptions, instanceKey);
+    await store.runConsoleSession(
+      () => auth.session === session && Date.now() < session.expiresAt,
+      () => handleApi(req, res, url, store, updateChecker, agentOptions, instanceKey)
+    );
     return;
   }
 
@@ -737,9 +752,9 @@ async function handleApi(
       agentIds: [decodeURIComponent(agentMatch[1])],
       dryRun: body.dryRun === true
     };
-    const results = agentMatch[2] === "install"
+    const results = await store.runConsoleExternalChange(() => agentMatch[2] === "install"
       ? installAgentIntegrations(options)
-      : uninstallAgentIntegrations(options);
+      : uninstallAgentIntegrations(options));
     sendJson(res, 200, { ok: results[0]?.state !== "conflict", result: results[0] });
     return;
   }
@@ -2223,7 +2238,9 @@ function sendCsv(res: ServerResponse, csv: string): void {
 
 function sendError(res: ServerResponse, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
-  const status = error instanceof HttpError ? error.status : statusForErrorMessage(message);
+  const status = error instanceof HttpError ? error.status
+    : error instanceof ConsoleAccessDeniedError ? 503
+    : error instanceof ConsoleSessionExpiredError ? 401 : statusForErrorMessage(message);
   sendJson(res, status, { error: message });
 }
 

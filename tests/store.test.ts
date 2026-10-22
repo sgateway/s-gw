@@ -12,6 +12,7 @@ import { tokenForHandle } from "../src/scanner.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
 import { assertActionAllowed, SecretStore } from "../src/store.js";
 import type { CommandAction, StoreFile } from "../src/types.js";
+import { CURRENT_VERSION } from "../src/version.js";
 import { installedV0112Counts, installedV0112Store } from "./fixtures/v0.1.12-installed-upgrade.js";
 
 let tmpHome = "";
@@ -121,6 +122,94 @@ afterEach(async () => {
 });
 
 describe("SecretStore", () => {
+  it("keeps legacy homes ordinary until a sealed protected-console migration", async () => {
+    const store = new SecretStore();
+    await writeFile(store.storePath, `${JSON.stringify({
+      version: 1,
+      secrets: [],
+      requests: [],
+      audit: [],
+      approvalSettings: { mode: "per-transaction", durationMs: 15 * 60 * 1000 },
+      approvalGrants: [],
+      approvalPolicyRules: []
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    expect(await store.getConsoleAccessMode()).toBe("ordinary");
+    await store.enableProtectedConsole();
+    await store.enableProtectedConsole();
+    await store.setApprovalSettings({ mode: "per-transaction" });
+    expect(await new SecretStore().getConsoleAccessMode()).toBe("protected");
+
+    const persisted = JSON.parse(await readFile(store.storePath, "utf8")) as StoreFile;
+    expect(persisted.consoleAccess).toBe("protected");
+    expect(persisted.audit.filter((event) => event.type === "console.access.protected")).toHaveLength(1);
+
+    const control = JSON.parse(await readFile(path.join(tmpHome, ".store-control.json"), "utf8"));
+    expect(control.writerVersion).toBe(CURRENT_VERSION);
+    const sealed = await readFile(path.join(await externalControlPlaneDir(), control.recoveryCheckpoint), "utf8");
+    expect(JSON.parse(sealed).consoleAccess).toBe("protected");
+  });
+
+  it("restores protected-console access when the primary ledger loses its policy", async () => {
+    const store = new SecretStore();
+    await store.enableProtectedConsole();
+    const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    delete raw.consoleAccess;
+    await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
+
+    expect(await new SecretStore().getConsoleAccessMode()).toBe("protected");
+    expect(JSON.parse(await readFile(store.storePath, "utf8")).consoleAccess).toBe("protected");
+  });
+
+  it("serializes external console changes with the protected-store migration", async () => {
+    const store = new SecretStore();
+    await store.init();
+    let entered = () => {};
+    let release = () => {};
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const external = store.runConsoleRequest("ordinary", () => store.runConsoleExternalChange(async () => {
+      entered();
+      await blocked;
+    }));
+    await started;
+
+    let migrated = false;
+    const migration = store.enableProtectedConsole().then(() => { migrated = true; });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(migrated).toBe(false);
+    } finally {
+      release();
+      await external;
+      await migration;
+    }
+    expect(await store.getConsoleAccessMode()).toBe("protected");
+    await expect(store.runConsoleRequest("ordinary", () => store.runConsoleExternalChange(() => "blocked")))
+      .rejects.toThrow(/protected operator console/u);
+    await expect(store.runConsoleRequest("ordinary", () => store.setApprovalSettings({ mode: "per-transaction" })))
+      .rejects.toThrow(/protected operator console/u);
+  });
+
+  it("rejects a held console mutation after its operator session is replaced", async () => {
+    const store = new SecretStore();
+    await store.init();
+    let active = true;
+    let entered = () => {};
+    let release = () => {};
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const attempt = store.runConsoleRequest("protected", () => store.runConsoleSession(() => active, async () => {
+      entered();
+      await blocked;
+      return store.setApprovalSettings({ mode: "per-transaction" });
+    }));
+    await started;
+    active = false;
+    release();
+    await expect(attempt).rejects.toThrow(/session expired or was replaced/u);
+  });
+
   it("stores encrypted secret values and lists only handle metadata", async () => {
     const store = new SecretStore();
     await store.init();

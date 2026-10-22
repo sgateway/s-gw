@@ -3,6 +3,7 @@ import { parseAllowedDestination } from "./destinations.js";
 import { normalizeManagedSshRoute, type ManagedSshRoute } from "./managed-ssh.js";
 import { buildModelRelayAction, grantFromModelRelayAction, normalizeModelRelayAction, SGW_MODEL_RELAY_COMMAND, type ModelRelayGrant } from "./model-relay-action.js";
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -356,9 +357,27 @@ interface VerifiedRecoveryCandidate extends RecoveryCandidate {
   fingerprint: string;
 }
 
+export class ConsoleAccessDeniedError extends Error {
+  constructor() {
+    super("This credential store requires a protected operator console with a pinned UI bundle.");
+  }
+}
+
+export class ConsoleSessionExpiredError extends Error {
+  constructor() {
+    super("Operator session expired or was replaced. Sign in again.");
+  }
+}
+
+interface ConsoleRequestAccess {
+  mode: "ordinary" | "protected";
+  sessionActive?: () => boolean;
+}
+
 export class SecretStore {
   readonly home: string;
   readonly storePath: string;
+  private readonly consoleAccess = new AsyncLocalStorage<ConsoleRequestAccess>();
 
   constructor(home = getSgwHome()) {
     this.home = home;
@@ -369,6 +388,25 @@ export class SecretStore {
     await ensureSgwHome(this.home);
     await this.withStoreLock(async (lock) => {
       await this.loadOrRecoverUnlocked(lock);
+    });
+  }
+
+  runConsoleRequest<T>(mode: "ordinary" | "protected", action: () => Promise<T>): Promise<T> {
+    return this.consoleAccess.run({ mode }, action);
+  }
+
+  runConsoleSession<T>(sessionActive: () => boolean, action: () => Promise<T>): Promise<T> {
+    const current = this.consoleAccess.getStore();
+    if (!current) throw new Error("Operator session must be bound to a console request.");
+    return this.consoleAccess.run({ ...current, sessionActive }, action);
+  }
+
+  async runConsoleExternalChange<T>(action: () => T | Promise<T>): Promise<T> {
+    await ensureSgwHome(this.home);
+    return this.withStoreLock(async (lock) => {
+      const store = await this.loadOrRecoverUnlocked(lock);
+      this.assertConsoleAccess(store);
+      return action();
     });
   }
 
@@ -882,6 +920,19 @@ export class SecretStore {
   async getApprovalSettings(): Promise<ApprovalSettings> {
     const store = await this.read();
     return normalizeApprovalSettings(store.approvalSettings);
+  }
+
+  async getConsoleAccessMode(): Promise<"ordinary" | "protected"> {
+    const store = await this.read();
+    return store.consoleAccess || "ordinary";
+  }
+
+  async enableProtectedConsole(): Promise<void> {
+    await this.mutate((store) => {
+      if (store.consoleAccess === "protected") return;
+      store.consoleAccess = "protected";
+      store.audit.push(audit("console.access.protected", "This store now requires operator sign-in and a pinned UI bundle."));
+    });
   }
 
   async setApprovalSettings(input: SetApprovalSettingsInput): Promise<ApprovalSettings> {
@@ -1628,15 +1679,21 @@ export class SecretStore {
       try {
         const store = await this.readUnlocked();
         if (await controlStateMatches(this.home, store)) {
+          this.assertConsoleAccess(store);
           return store;
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof ConsoleAccessDeniedError || error instanceof ConsoleSessionExpiredError) throw error;
         // Recovery runs under the store lock below.
       }
     }
 
     await ensureSgwHome(this.home);
-    return this.withStoreLock((lock) => this.loadOrRecoverUnlocked(lock));
+    return this.withStoreLock(async (lock) => {
+      const store = await this.loadOrRecoverUnlocked(lock);
+      this.assertConsoleAccess(store);
+      return store;
+    });
   }
 
   private async readUnlocked(): Promise<StoreFile> {
@@ -1713,6 +1770,7 @@ export class SecretStore {
     await ensureSgwHome(this.home);
     return this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
+      this.assertConsoleAccess(store);
       const revision = await captureStoreRevision(this.home, this.storePath);
       const before = serializeStore(store);
       const result = await updater(store);
@@ -1721,6 +1779,16 @@ export class SecretStore {
       }
       return result;
     });
+  }
+
+  private assertConsoleAccess(store: StoreFile): void {
+    const request = this.consoleAccess.getStore();
+    if (request?.sessionActive && !request.sessionActive()) {
+      throw new ConsoleSessionExpiredError();
+    }
+    if (request?.mode === "ordinary" && store.consoleAccess === "protected") {
+      throw new ConsoleAccessDeniedError();
+    }
   }
 
   private async loadOrRecoverUnlocked(lock: StoreLock): Promise<StoreFile> {
@@ -2083,6 +2151,7 @@ function controlPlaneFingerprint(store: StoreFile): string {
   const control = {
     version: store.version,
     secrets,
+    ...(store.consoleAccess === "protected" ? { consoleAccess: store.consoleAccess } : {}),
     approvalSettings: store.approvalSettings,
     approvalGrants: grants,
     approvalPolicyRules: rules,
@@ -2121,6 +2190,7 @@ function controlPlaneSnapshot(store: StoreFile): StoreFile {
     secrets,
     requests: [],
     audit: [],
+    consoleAccess: store.consoleAccess,
     approvalSettings: store.approvalSettings,
     approvalGrants: store.approvalGrants,
     approvalPolicyRules: store.approvalPolicyRules,
@@ -2968,6 +3038,9 @@ async function pruneStoreBackups(backupDir: string): Promise<void> {
 }
 
 function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
+  if (parsed.consoleAccess !== undefined && parsed.consoleAccess !== "protected") {
+    throw new Error("Invalid console access policy in s-gw store.");
+  }
   const audit = parsed.audit || [];
   const secrets = (parsed.secrets || []).map((secret) => normalizeSecretRecord(secret));
   return {
@@ -2975,6 +3048,7 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
     secrets,
     requests: migrateRequestApprovalSources(parsed.requests || [], audit),
     audit,
+    consoleAccess: parsed.consoleAccess,
     approvalSettings: normalizeStoredApprovalSettings(parsed.approvalSettings),
     approvalGrants: Array.isArray(parsed.approvalGrants)
       ? parsed.approvalGrants.filter(isValidApprovalGrant)

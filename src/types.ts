@@ -264,6 +264,7 @@ export interface StoreFile {
   secrets: SecretRecord[];
   requests: RequestRecord[];
   audit: AuditEvent[];
+  consoleAccess?: "protected";
   approvalSettings: ApprovalSettings;
   approvalGrants: ApprovalGrant[];
   approvalPolicyRules: ApprovalPolicyRule[];
