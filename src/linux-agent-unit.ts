@@ -22,6 +22,7 @@ export interface LinuxAgentUnitPlan {
   launchAttemptFence?: boolean;
   sealedStdio?: boolean;
   restrictedSocketFamilies?: boolean;
+  requirePtracePolicy?: boolean;
   supervisedControlUnit?: boolean;
   logicalAgentId?: string;
   identityGeneration?: string;
@@ -98,6 +99,8 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
       (plan.sealedStdio === true && plan.launchGate !== true) ||
       (plan.restrictedSocketFamilies !== undefined && typeof plan.restrictedSocketFamilies !== "boolean") ||
       (plan.restrictedSocketFamilies === true && plan.launchGate !== true) ||
+      (plan.requirePtracePolicy !== undefined && typeof plan.requirePtracePolicy !== "boolean") ||
+      (plan.requirePtracePolicy === true && plan.launchGate !== true) ||
       (plan.supervisedControlUnit !== undefined && typeof plan.supervisedControlUnit !== "boolean") ||
       (plan.supervisedControlUnit === true && (!plan.launchGate || !plan.activatedSocket ||
         !plan.serializedLifecycle || !plan.sealedStdio || !plan.isolatedSharedMemory)) ||
@@ -194,7 +197,19 @@ export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
   if (plan.identityGeneration) fields.push(plan.logicalAgentId!, plan.identityGeneration);
   if (plan.modelRelaySocket) fields.push(plan.modelRelaySocket);
   if (plan.restrictedSocketFamilies) fields.push("restricted-socket-families");
+  if (plan.requirePtracePolicy) fields.push("host-ptrace-policy");
   return JSON.stringify(fields);
+}
+
+export function linuxHostPtraceRestricted(value: string): boolean {
+  return /^[123]\n?$/.test(value);
+}
+
+async function assertHostPtracePolicy(): Promise<void> {
+  const value = await readFile("/proc/sys/kernel/yama/ptrace_scope", "utf8");
+  if (!linuxHostPtraceRestricted(value)) {
+    throw new Error("Linux agent launch needs host same-UID ptrace restrictions.");
+  }
 }
 
 export async function stopOwnedLinuxAgentUnit(plan: LinuxAgentUnitPlan, attemptId: string,
@@ -337,6 +352,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
     const attemptId = randomBytes(16).toString("hex");
     const args = systemdRunArgs(plan, attemptId);
     await checkedAgentAccount(plan);
+    if (plan.requirePtracePolicy) await assertHostPtracePolicy();
     if (plan.launchGate) await assertNoUidProcesses(plan.uid);
     const before = await checkedHostPaths(plan);
     const unit = linuxAgentUnitName(plan.sessionId);
@@ -474,6 +490,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
   private async releaseUnit(plan: LinuxAgentUnitPlan, expected: LinuxAgentUnitState,
     lease?: LinuxUnitLifecycleLease): Promise<void> {
     if (!plan.launchGate) throw new Error("This Linux agent unit has no launch gate.");
+    if (plan.requirePtracePolicy) await assertHostPtracePolicy();
     const currentPaths = await checkedHostPaths(plan);
     if (plan.activatedSocket && this.launchPaths.get(plan.sessionId) !== currentPaths) {
       throw new Error("Linux activated socket path changed before launch gate release.");

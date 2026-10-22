@@ -213,6 +213,7 @@ const agents = [0, 1].map(index => {
     executable: "/usr/bin/managed-mcp-probe", args: [],
     launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
     serializedLifecycle: true, sealedStdio: true, restrictedSocketFamilies: true,
+    requirePtracePolicy: true,
     supervisedControlUnit: true,
     logicalAgentId, identityGeneration };
   const identityRecord = { logicalAgentId, identityGeneration, uid: agentUid, gid: agentUid };
@@ -918,6 +919,9 @@ try {
       throw new Error(`The ${agent.sessionId} handoff donor is not a live managed agent.`);
     }
     agentMainPids.set(agent.sessionId, mainPid);
+    run("runuser", ["-u", agent.userName, "--", `${agent.root}/usr/bin/managed-mcp-probe`,
+      "--ptrace-out-of-cgroup", String(mainPid)], false,
+    { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
   }
   for (const agent of agents) {
     await startHandoffHelper(agent);
@@ -1432,5 +1436,5 @@ try {
   }
 }
 if (passed) {
-  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, restricted AF_NETLINK socket creation, connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.${testRelay ? " Opt-in model relay: durable approval and claim, strict-body rejection, cross-session/UID/cgroup/FD-transfer denial, broker-owned authenticated TLS streaming and redaction, and active-stream cancellation on both teardown paths." : ""}`);
+  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, restricted AF_NETLINK socket creation, same-UID outsider ptrace denial, connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.${testRelay ? " Opt-in model relay: durable approval and claim, strict-body rejection, cross-session/UID/cgroup/FD-transfer denial, broker-owned authenticated TLS streaming and redaction, and active-stream cancellation on both teardown paths." : ""}`);
 }

@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { beginLinuxUnitLaunchAttempt, linuxAgentUnitName, linuxLaunchAttemptFenceEnabled, linuxPrivateSharedMemoryMount,
+import { beginLinuxUnitLaunchAttempt, linuxAgentUnitName, linuxHostPtraceRestricted, linuxLaunchAttemptFenceEnabled, linuxPrivateSharedMemoryMount,
   linuxProcessGroupsAreDedicated, linuxUnitIsAbsent,
   linuxUnitOwnedByStartAttempt, lifecyclePlanKey, rejectUnresolvedUnitLaunchFences,
   parseSystemdAgentState, releaseLinuxUnitLaunchFence, reserveLinuxUnitLaunchFence,
@@ -187,6 +187,21 @@ describe("Linux systemd agent unit plan", () => {
     expect(() => validateLinuxAgentPlan({ ...ordinary, restrictedSocketFamilies: true }))
       .toThrow("arguments");
     expect(() => validateLinuxAgentPlan({ ...restricted, restrictedSocketFamilies: "yes" as never }))
+      .toThrow("arguments");
+  });
+
+  it("requires an explicit host ptrace check for plans that opt in", () => {
+    const ordinary = plan();
+    const guarded = { ...ordinary, launchGate: true, requirePtracePolicy: true };
+    validateLinuxAgentPlan(guarded);
+    expect(lifecyclePlanKey(guarded)).not.toBe(lifecyclePlanKey(ordinary));
+    expect(["1\n", "2\n", "3\n"].every(linuxHostPtraceRestricted)).toBe(true);
+    for (const value of ["0\n", "", "1 2\n", "4\n", "1\n0\n"]) {
+      expect(linuxHostPtraceRestricted(value)).toBe(false);
+    }
+    expect(() => validateLinuxAgentPlan({ ...ordinary, requirePtracePolicy: true }))
+      .toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...guarded, requirePtracePolicy: "yes" as never }))
       .toThrow("arguments");
   });
 

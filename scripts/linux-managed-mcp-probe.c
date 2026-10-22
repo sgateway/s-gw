@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -427,6 +428,15 @@ static int model_handoff_probe(const char *socket_path, const char *handoff_path
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--netlink-positive") == 0)
         return netlink_route_socket() ? 0 : 47;
+    if (argc == 3 && strcmp(argv[1], "--ptrace-out-of-cgroup") == 0) {
+        int pid = positive_number(argv[2]);
+        if (pid < 1) return 48;
+        if (ptrace(PTRACE_SEIZE, (pid_t)pid, NULL, NULL) == 0) {
+            ptrace(PTRACE_DETACH, (pid_t)pid, NULL, NULL);
+            return 49;
+        }
+        return errno == EPERM || errno == EACCES ? 0 : 50;
+    }
     int claimant = argc == 2 && strcmp(argv[1], "--out-of-cgroup") == 0;
     int model_claimant = argc == 2 && strcmp(argv[1], "--model-out-of-cgroup") == 0;
     int model_cross_uid = argc == 2 && strcmp(argv[1], "--model-cross-uid") == 0;
