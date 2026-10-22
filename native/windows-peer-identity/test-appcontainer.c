@@ -445,6 +445,12 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
             goto done;
         }
     }
+    wchar_t system_image[MAX_PATH];
+    int image_size = swprintf(system_image, MAX_PATH, L"%ls\\System32\\whoami.exe", system_dir);
+    DWORD before_wfp_error = image_size > 0 && image_size < MAX_PATH
+        ? probe_suspended_image(system_image, system_dir, NULL,
+            &startup.StartupInfo, EXTENDED_STARTUPINFO_PRESENT)
+        : ERROR_BAD_PATHNAME;
     DWORD wfp_error = sgw_wfp_start(sid, &wfp);
     if (wfp_error != ERROR_SUCCESS) {
         fprintf(stderr, "AppContainer WFP deny setup failed: 0x%08lx\n", (unsigned long)wfp_error);
@@ -465,8 +471,6 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         DWORD system_cwd_error = ERROR_BAD_PATHNAME;
         DWORD inherited_env_error = ERROR_BAD_PATHNAME;
         DWORD plain_error = ERROR_BAD_PATHNAME;
-        wchar_t system_image[MAX_PATH];
-        int image_size = swprintf(system_image, MAX_PATH, L"%ls\\System32\\whoami.exe", system_dir);
         if (image_size > 0 && image_size < MAX_PATH) {
             DWORD app_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
             agent_cwd_error = probe_suspended_image(system_image, agent_dir, environment,
@@ -479,8 +483,8 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
             plain.cb = sizeof(plain);
             plain_error = probe_suspended_image(system_image, system_dir, NULL, &plain, 0);
         }
-        fprintf(stderr, "AppContainer process launch failed: %lu; system image probes (agent cwd, system cwd, inherited env, plain): %lu, %lu, %lu, %lu\n",
-            (unsigned long)launch_error, (unsigned long)agent_cwd_error,
+        fprintf(stderr, "AppContainer process launch failed: %lu; system image probes (before WFP, agent cwd, system cwd, inherited env, plain): %lu, %lu, %lu, %lu, %lu\n",
+            (unsigned long)launch_error, (unsigned long)before_wfp_error, (unsigned long)agent_cwd_error,
             (unsigned long)system_cwd_error, (unsigned long)inherited_env_error,
             (unsigned long)plain_error);
         CloseHandle(job);

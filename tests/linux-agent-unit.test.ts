@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beginLinuxUnitLaunchAttempt, linuxAgentUnitName, linuxHostPtraceRestricted, linuxLaunchAttemptFenceEnabled, linuxPrivateSharedMemoryMount,
+  expectedLinuxAgentImage,
   linuxProcessGroupsAreDedicated, linuxUnitIsAbsent,
   linuxUnitOwnedByStartAttempt, lifecyclePlanKey, rejectUnresolvedUnitLaunchFences,
   parseSystemdAgentState, releaseLinuxUnitLaunchFence, reserveLinuxUnitLaunchFence,
@@ -86,6 +87,27 @@ describe("Linux systemd agent unit plan", () => {
     expect(() => parseSystemdAgentState(p, attestation(p).replace(
       " /run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate", ""))).toThrow("did not attest");
     expect(args.some(arg => arg.startsWith("--property=Standard"))).toBe(false);
+  });
+
+  it("attests the held gate and the released agent against the exact release marker", () => {
+    const p = { ...plan(), launchGate: true };
+    const state = { unit: linuxAgentUnitName(p.sessionId), uid: p.uid, gid: p.gid,
+      cgroup: `/system.slice/${linuxAgentUnitName(p.sessionId)}`, mainPid: 1234,
+      invocationId: "a".repeat(32) };
+    expect(expectedLinuxAgentImage(p, state, "WAIT\n")).toEqual({
+      executable: "/usr/libexec/s-gw/agent-launch-gate",
+      command: ["/usr/libexec/s-gw/agent-launch-gate", "--", p.executable, ...p.args].join("\0") + "\0"
+    });
+    expect(expectedLinuxAgentImage(p, state, `GO ${state.invocationId} ${state.mainPid}\n`)).toEqual({
+      executable: p.executable,
+      command: [p.executable, ...p.args].join("\0") + "\0"
+    });
+    for (const marker of ["WAIT", `GO ${state.invocationId} 1235\n`,
+      `GO ${"b".repeat(32)} ${state.mainPid}\n`, `GO ${state.invocationId} ${state.mainPid}\nextra`]) {
+      expect(() => expectedLinuxAgentImage(p, state, marker)).toThrow("release marker");
+    }
+    expect(() => expectedLinuxAgentImage(p, { ...state, unit: "other.service" }, "WAIT\n"))
+      .toThrow("state is invalid");
   });
 
   it("binds a fully isolated managed unit to its trusted root control service", () => {

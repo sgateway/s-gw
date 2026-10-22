@@ -306,6 +306,13 @@ async function rootRun() {
       throw new Error("The two agents did not attest distinct UIDs and cgroups.");
     }
     for (const item of plans) {
+      const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/result")),
+        `${item.sessionId} native result`);
+      if (!/^own=1 cross=1 ipv4=1 ipv6=1 host=1 udp4=[01] udphost=[01]\n$/.test(result)) {
+        throw new Error(`${item.sessionId} escaped its own socket, cross-session, or network boundary: ${result}`);
+      }
+    }
+    for (const item of plans) {
       let fenced = false;
       try {
         await rejectUnresolvedUnitLaunchFences("/run/s-gw/agent-unit-lifecycle",
@@ -332,13 +339,6 @@ async function rootRun() {
     if (shmRoots.some(item => !item.isDirectory() || item.dev === hostShm.dev) ||
         shmRoots[0].dev === shmRoots[1].dev) {
       throw new Error("The two Linux agents did not receive distinct private shared-memory mounts.");
-    }
-    for (const item of plans) {
-      const result = await until(() => textFile(path.join(item.rootDirectory, "workspace/result")),
-        `${item.sessionId} native result`);
-      if (!/^own=1 cross=1 ipv4=1 ipv6=1 host=1 udp4=[01] udphost=[01]\n$/.test(result)) {
-        throw new Error(`${item.sessionId} escaped its own socket, cross-session, or network boundary: ${result}`);
-      }
     }
     for (const item of plans) {
       const ready = await until(() => textFile(path.join(item.rootDirectory, "workspace/transfer-ready")),

@@ -1058,7 +1058,7 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
   if (failed.length > 0) {
     throw new Error(`Linux agent main process did not attest its OS identity and namespaces: ${failed.join(", ")}.`);
   }
-  if (plan.launchGate) await assertHeldLaunchGate(plan, state);
+  if (plan.launchGate) await assertLaunchGate(plan, state);
   if (plan.isolatedSharedMemory) await assertPrivateSharedMemory(state);
   if (plan.sealedStdio) await assertSealedStandardDescriptors(state.mainPid);
 }
@@ -1102,29 +1102,53 @@ export function linuxPrivateSharedMemoryMount(mountinfo: string, agentDev: numbe
     options.includes("nodev") && options.includes("noexec");
 }
 
-async function assertHeldLaunchGate(plan: LinuxAgentUnitPlan, state: LinuxAgentUnitState): Promise<void> {
+async function assertLaunchGate(plan: LinuxAgentUnitPlan, state: LinuxAgentUnitState): Promise<void> {
+  await checkedGateFiles(plan);
+  const releasePath = path.join(gateDirectory(plan), "release");
+  const marker = await readFile(releasePath, "utf8");
+  const image = expectedLinuxAgentImage(plan, state, marker);
   const [cmdline, mountinfo, inside, outside, executable, staged] = await Promise.all([
     readFile(`/proc/${state.mainPid}/cmdline`),
     readFile(`/proc/${state.mainPid}/mountinfo`, "utf8"),
     lstat(`/proc/${state.mainPid}/root${gateMount}`),
     lstat(gateDirectory(plan)),
     stat(`/proc/${state.mainPid}/exe`),
-    stat(path.join(plan.rootDirectory, gateExecutable))
+    stat(path.join(plan.rootDirectory, image.executable))
   ]);
-  const expected = [gateExecutable, "--", plan.executable, ...plan.args].join("\0") + "\0";
   const readOnlyMount = mountinfo.split("\n").some(line => {
     const fields = line.split(" ");
     return fields[4] === gateMount && fields[5]?.split(",").includes("ro");
   });
   const failed = [];
-  if (cmdline.toString("utf8") !== expected) failed.push("command");
+  if (cmdline.toString("utf8") !== image.command) failed.push("command");
   if (!inside.isDirectory()) failed.push("mounted directory");
   if (inside.dev !== outside.dev || inside.ino !== outside.ino) failed.push("bind mount identity");
   if (!readOnlyMount) failed.push("read-only mount");
-  if (executable.dev !== staged.dev || executable.ino !== staged.ino) failed.push("gate executable");
+  if (executable.dev !== staged.dev || executable.ino !== staged.ino) failed.push("process executable");
+  if (await readFile(releasePath, "utf8") !== marker) failed.push("release transition");
   if (failed.length > 0) {
     throw new Error(`Linux agent launch gate did not attest its command and read-only release mount: ${failed.join(", ")}.`);
   }
+}
+
+export function expectedLinuxAgentImage(plan: LinuxAgentUnitPlan, state: LinuxAgentUnitState,
+  marker: string): { command: string; executable: string } {
+  validateLinuxAgentPlan(plan);
+  if (!plan.launchGate || state.unit !== linuxAgentUnitName(plan.sessionId) ||
+      state.uid !== plan.uid || state.gid !== plan.gid ||
+      !Number.isSafeInteger(state.mainPid) || state.mainPid < 1 ||
+      !/^[a-f0-9]{32}$/.test(state.invocationId)) {
+    throw new Error("Linux agent launch gate state is invalid.");
+  }
+  if (marker === "WAIT\n") {
+    return { executable: gateExecutable,
+      command: [gateExecutable, "--", plan.executable, ...plan.args].join("\0") + "\0" };
+  }
+  if (marker === `GO ${state.invocationId} ${state.mainPid}\n`) {
+    return { executable: plan.executable,
+      command: [plan.executable, ...plan.args].join("\0") + "\0" };
+  }
+  throw new Error("Linux agent launch gate release marker did not attest its phase.");
 }
 
 export function linuxProcessGroupsAreDedicated(status: string, gid: number): boolean {

@@ -23,7 +23,9 @@ it("the opt-in CLI flag revokes a running legacy command after a new deny", asyn
     SGW_DISABLE_KEYCHAIN: "1",
     SGW_DISABLE_ONEPASSWORD_BACKUP: "1",
     SGW_DISABLE_UPDATE_CHECK: "1",
-    SGW_EXECUTION_ENGINE: "typescript"
+    SGW_EXECUTION_ENGINE: "typescript",
+    ...(process.platform === "linux" && process.env.SGW_ALLOW_NO_CGROUP === "1"
+      ? { SGW_ALLOW_NO_CGROUP: "1" } : {})
   };
   const run = (args: string[], input?: string): string => execFileSync(process.execPath,
     [tsxCli, "src/cli.ts", ...args], {
@@ -49,7 +51,10 @@ it("the opt-in CLI flag revokes a running legacy command after a new deny", asyn
       cli!.once("error", reject);
       cli!.once("exit", resolve);
     });
-    await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 6_000 });
+    await Promise.race([
+      vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 6_000 }),
+      finished.then(code => { throw new Error(`CLI exited before the fixture was ready (${code}): ${stderr.trim()}`); })
+    ]);
     run(["approval", "policy", "add", "--name", "Stop running CLI fixture",
       "--decision", "deny", "--handle", secret.handle, "--action-kind", "env_command"]);
     const code = await finished;
