@@ -270,13 +270,13 @@ static int disposable_dacl_check(const wchar_t *system_drive,
     int result = 0, file_exists = 1, directory_exists = 0;
     int mirror_attempted = 0, grant_attempted = 0;
     PSECURITY_DESCRIPTOR original = NULL, mirrored = NULL, current = NULL, restored = NULL;
-    PACL prepared = NULL;
+    PACL prepared = NULL, old_dacl = NULL;
     if (!DeleteFileW(scratch)) goto done;
     file_exists = 0;
     if (!CreateDirectoryW(scratch, NULL)) goto done;
     directory_exists = 1;
     original = read_root_security(scratch);
-    PACL old_dacl = descriptor_dacl(original);
+    old_dacl = descriptor_dacl(original);
     if (!old_dacl) goto done;
     mirror_attempted = 1;
     if (!SetFileSecurityW(scratch, DACL_SECURITY_INFORMATION, root_baseline)) {

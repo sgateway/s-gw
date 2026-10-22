@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, chown, copyFile, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { createSocket } from "node:dgram";
 import { createServer as createHttpsServer } from "node:https";
@@ -23,6 +24,8 @@ if (process.env.SGW_TEST_MANAGED_RELAY && process.env.SGW_TEST_MANAGED_RELAY !==
   throw new Error("Invalid native fixture model-relay option.");
 }
 const testRelay = process.env.SGW_TEST_MANAGED_RELAY === "1";
+const runuser = ["/usr/sbin/runuser", "/usr/bin/runuser"].find(candidate => existsSync(candidate));
+if (!runuser) throw new Error("The native Linux fixture requires runuser in a system directory.");
 
 function run(command, args, allowFailure = false, env = process.env) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000, env });
@@ -657,7 +660,7 @@ try {
     const check = 'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"r+");' +
       'const byte=Buffer.alloc(1);if(fs.readSync(fd,byte,0,1,0)!==1)process.exit(1);' +
       'if(fs.writeSync(fd,byte,0,1,0)!==1)process.exit(1);fs.closeSync(fd)';
-    run("runuser", ["-u", brokerUser, "--", process.execPath, "-e", check, filename],
+    run(runuser, ["-u", brokerUser, "--", process.execPath, "-e", check, filename],
       false, { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
     if (await readFile(filename, "utf8") !== value) {
       throw new Error(`Broker canary positive control changed its content: ${filename}`);
@@ -799,7 +802,7 @@ try {
   const operatorEnv = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", CI: "true", SGW_HOME: storeHome,
     SGW_RECOVERY_HOME: recoveryHome, SGW_MASTER_PASSPHRASE: secret,
     SGW_DISABLE_KEYCHAIN: "1", SGW_DISABLE_ONEPASSWORD_BACKUP: "1" };
-  const asBroker = (mode, args) => run("runuser", ["-u", brokerUser, "--", process.execPath,
+  const asBroker = (mode, args) => run(runuser, ["-u", brokerUser, "--", process.execPath,
     operatorEntry, mode, ...args], false, operatorEnv).stdout.trim();
   for (const agent of agents) {
     agent.seeded = JSON.parse(asBroker("seed", [String(upstreamPort)]));
@@ -961,7 +964,7 @@ try {
       throw new Error(`The ${agent.sessionId} handoff donor is not a live managed agent.`);
     }
     agentMainPids.set(agent.sessionId, mainPid);
-    run("runuser", ["-u", agent.userName, "--", `${agent.root}/usr/bin/managed-mcp-probe`,
+    run(runuser, ["-u", agent.userName, "--", `${agent.root}/usr/bin/managed-mcp-probe`,
       "--ptrace-out-of-cgroup", String(mainPid)], false,
     { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
   }
@@ -1128,21 +1131,21 @@ try {
   }
   for (const agent of agents) {
     const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
-    const claimant = run("runuser", ["-u", agent.userName, "--", "/usr/bin/env",
+    const claimant = run(runuser, ["-u", agent.userName, "--", "/usr/bin/env",
       `SGW_BROKER_SOCKET=${agent.socketPath}`, probe, "--out-of-cgroup"], true,
       { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
     if (claimant.error || claimant.status !== 0) {
       throw new Error(`The same-UID out-of-cgroup process reached ${agent.sessionId}: ${claimant.stderr || claimant.status}`);
     }
     if (testRelay) {
-      const outsider = run("runuser", ["-u", agent.userName, "--", "/usr/bin/env",
+      const outsider = run(runuser, ["-u", agent.userName, "--", "/usr/bin/env",
         `SGW_MODEL_RELAY_SOCKET=${agent.modelSocketPath}`, probe, "--model-out-of-cgroup"], true,
         { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
       if (outsider.error || outsider.status !== 0) {
         throw new Error(`The same-UID out-of-cgroup process reached ${agent.sessionId}'s model relay: ${outsider.stderr || outsider.status}`);
       }
       const other = agents.find(item => item !== agent);
-      const foreign = run("runuser", ["-u", other.userName, "--", "/usr/bin/env",
+      const foreign = run(runuser, ["-u", other.userName, "--", "/usr/bin/env",
         `SGW_MODEL_RELAY_SOCKET=${agent.modelSocketPath}`, probe, "--model-cross-uid"], true,
         { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
       if (foreign.error || foreign.status !== 0) {
