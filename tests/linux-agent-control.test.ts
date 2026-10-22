@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
+import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, controlHandshakeFailure, sendControlReply, startTrackedManagedUnit,
   stopTrackedManagedUnit, validateLinuxManagedPlan,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
 import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
@@ -65,6 +65,15 @@ function controlState(): string {
 }
 
 describe.skipIf(process.platform === "win32")("Linux managed MCP control", () => {
+  it("keeps control handshake diagnostics bounded to fixed reasons", () => {
+    expect(controlHandshakeFailure(new Error("Linux control peer is not the registered broker unit invocation.")))
+      .toBe("Linux control peer is not the registered broker unit invocation.");
+    expect(controlHandshakeFailure(new Error("parse failed near private-token")))
+      .toBe("Linux control attestation failed.");
+    expect(controlHandshakeFailure({ message: "private-token" }))
+      .toBe("Linux control attestation failed.");
+  });
+
   it("requires the full supervised profile and a separate agent identity", () => {
     const good = plan();
     expect(() => validateLinuxManagedPlan(good, good.brokerUid, process.getgid?.() ?? 1000)).not.toThrow();

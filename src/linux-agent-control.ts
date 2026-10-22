@@ -18,6 +18,32 @@ const maxFrame = 32 * 1024;
 const unsafeStartupEnv = ["NODE_OPTIONS", "NODE_PATH", "NODE_TLS_REJECT_UNAUTHORIZED",
   "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "OPENSSL_CONF", "SSL_CERT_FILE", "SSL_CERT_DIR",
   "GLIBC_TUNABLES", "MALLOC_CHECK_", "MALLOC_PERTURB_", "TZDIR"];
+const handshakeReasons = new Set([
+  "Linux agent plan registry is not root-private.",
+  "Linux agent plan registration is not root-private.",
+  "Invalid root-provisioned Linux managed plan record.",
+  "Linux agent identity registry is not root-private.",
+  "Linux agent identity registry has an untrusted parent.",
+  "Linux agent identity record is not root-private.",
+  "Linux agent identity record differs from the root plan.",
+  "Linux managed MCP socket unit is not bound to the registered broker service and root control.",
+  "Linux model socket unit is not bound to the registered broker service.",
+  "Linux broker environment file is not root-private.",
+  "Linux broker config is not root-provisioned.",
+  "Linux broker config differs from its root plan registration.",
+  "Linux broker relay config differs from its root plan registration.",
+  "Invalid Linux broker unit attestation.",
+  "Could not verify live Linux peer in its cgroup.",
+  "Linux control peer has the wrong broker identity.",
+  "Linux control peer is not the registered broker unit invocation.",
+  "Linux broker command does not match its root registration.",
+  "Linux broker Node binary differs from its root registration."
+]);
+
+export function controlHandshakeFailure(error: unknown): string {
+  if (error instanceof Error && handshakeReasons.has(error.message)) return error.message;
+  return "Linux control attestation failed.";
+}
 
 export interface LinuxManagedPlanRecord {
   plan: LinuxAgentUnitPlan;
@@ -540,12 +566,14 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
   const connections = new Set<Socket>();
   const cleanups = new Set<Promise<void>>();
   let closing = false;
+  let loggedHandshakes = 0;
   const server = createServer(socket => {
     if (closing || connections.size >= 32) { socket.destroy(); return; }
     connections.add(socket);
     socket.pause();
     socket.on("error", () => socket.destroy());
     socket.once("close", () => connections.delete(socket));
+    let stage = "frame";
     void firstFrame(socket).then(async raw => {
       const hello = raw as { sessionId?: unknown };
       if (!hello || typeof hello !== "object" || Object.keys(hello).length !== 1 ||
@@ -553,8 +581,11 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
         throw new Error("Linux control needs one registered session ID.");
       }
       const sessionId = hello.sessionId;
+      stage = "registration";
       const record = await registeredPlan(sessionId, brokerUid, brokerGid);
+      stage = "broker";
       const invocation = await attestBroker(socket, record, brokerUid, brokerGid);
+      stage = "admission";
       if (closing || socket.destroyed || owners.has(sessionId) || draining.has(sessionId) ||
           usedSessions.has(sessionId)) {
         throw new Error("Linux control session is already owned or ended.");
@@ -620,7 +651,12 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
       });
       sendFrame(socket, { sessionId, ok: true });
       socket.resume();
-    }).catch(() => socket.destroy());
+    }).catch(error => {
+      if (loggedHandshakes++ < 4) {
+        process.stderr.write(`Linux control handshake rejected during ${stage}: ${controlHandshakeFailure(error)}\n`);
+      }
+      socket.destroy();
+    });
   });
   const oldMask = process.umask(0o117);
   try {
