@@ -81,6 +81,7 @@ static int recv_fd(int socket_fd) {
         .msg_control = control, .msg_controllen = sizeof(control) };
     ssize_t count = recvmsg(socket_fd, &message, 0);
     if (count < 0) return -1;
+    if (count == 0) { errno = ECONNRESET; return -1; }
     if (count != 1 || payload != 'x' || (message.msg_flags & MSG_CTRUNC)) {
         errno = EPROTO;
         return -1;
@@ -181,18 +182,20 @@ static int receiver(const char *rendezvous) {
     int broker = recv_fd(peer);
     if (broker < 0) {
         if (denied(errno)) result = status("denied");
-        else if (errno == EAGAIN || errno == EWOULDBLOCK) result = status("unreachable");
+        else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNRESET)
+            result = status("unreachable");
+        if (result == 0) write_text(peer, "XFER-DONE-V1\n");
         goto done;
     }
     if (!deadline_for(broker)) { close(broker); goto done; }
-    if (write_text(broker, "XFER-USE-V1\n") && read_text(broker, "XFER-ACK-V1\n") &&
-        write_text(peer, "XFER-DONE-V1\n")) {
+    if (write_text(broker, "XFER-USE-V1\n") && read_text(broker, "XFER-ACK-V1\n")) {
         result = status("used");
     } else if (denied(errno)) {
         result = status("denied");
     } else {
         perror("receive: broker exchange");
     }
+    if (!write_text(peer, "XFER-DONE-V1\n")) result = 1;
     close(broker);
 done:
     close(peer);
