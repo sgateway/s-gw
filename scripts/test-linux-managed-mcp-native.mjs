@@ -284,7 +284,8 @@ async function checkedBrokerTree() {
     }
     if (stat.uid !== 0 || (stat.mode & 0o022) !== 0 ||
         (!stat.isFile() && !stat.isDirectory())) {
-      throw new Error(`Native broker package is writable or not root-owned: ${filename}`);
+      throw new Error(`Native broker package is writable or not root-owned: ${filename} ` +
+        `(uid=${stat.uid}, mode=${(stat.mode & 0o777).toString(8)})`);
     }
     if (stat.isDirectory()) {
       for (const name of await readdir(filename)) pending.push(path.join(filename, name));
@@ -631,6 +632,7 @@ try {
   run("cp", ["-R", path.join(project, "tools/desktop-packager"),
     path.join(brokerPackage, "tools")]);
   await copyFile(path.join(project, "package.json"), path.join(brokerPackage, "package.json"));
+  run("chown", ["-R", "0:0", brokerPackage]);
   run("chmod", ["-R", "go-w", brokerPackage]);
   for (const agent of agents) {
     await mkdir(agent.root, { mode: 0o755 });
@@ -1470,7 +1472,17 @@ try {
       await removeOwned(recoveryHome, true);
       await removeOwned(installed, true);
       for (const name of accountsCreated.reverse()) run("userdel", [name]);
-      for (const name of groupsCreated.reverse()) run("groupdel", [name]);
+      for (const name of groupsCreated.reverse()) {
+        const before = run("getent", ["group", name], true);
+        if (before.error || (before.status !== 0 && before.status !== 2)) {
+          throw new Error(`Could not check fixture group ${name}: ${before.error?.message || before.status}`);
+        }
+        if (before.status === 0) run("groupdel", [name]);
+        const after = run("getent", ["group", name], true);
+        if (after.error || after.status !== 2) {
+          throw new Error(`Fixture group remains after cleanup: ${name}`);
+        }
+      }
     }
   } catch (error) {
     cleanupError = error;
