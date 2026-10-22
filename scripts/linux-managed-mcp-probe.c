@@ -140,7 +140,7 @@ static int initialized_broker_socket(const char *socket_path) {
         return -1;
     }
     char reply[16384];
-    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"handoff-probe\",\"version\":\"1\"}}\n") != 0 ||
+    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"handoff-probe\",\"version\":\"1\"}}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":81") ||
         !strstr(reply, "\"result\"") ||
         send_line(fd, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n") != 0 ||
@@ -525,7 +525,7 @@ int main(int argc, char **argv) {
     if (read_field("/workspace/handle", handle, sizeof(handle)) != 0 ||
         read_field("/workspace/url", url, sizeof(url)) != 0) return 11;
     if (write_probe_stage("initialize-send\n") != 0) return 48;
-    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"forged-agent\",\"version\":\"1\"}}\n") != 0) return 6;
+    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"forged-agent\",\"version\":\"1\"}}}\n") != 0) return 6;
     if (write_probe_stage("initialize-receive\n") != 0) return 48;
     int initialized = receive_line(fd, reply, sizeof(reply));
     if (initialized != 0) {

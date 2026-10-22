@@ -1070,6 +1070,8 @@ try {
     }
     await assertSafeNodeEnv(broker, certFile);
     brokerInvocations.set(agent.sessionId, brokerInvocation);
+  }
+  for (const agent of agents) {
     const ready = await until(() => maybeText(`${agent.root}/workspace/handoff-ready`),
       `${agent.sessionId} initialized MCP handoff gate`);
     if (ready !== "ready\n") throw new Error(`Unexpected MCP handoff gate: ${ready}`);
