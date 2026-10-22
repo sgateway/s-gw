@@ -17,6 +17,13 @@ if (operation === "add-secret") {
     value: "synthetic-keychain-value-123456789",
     policy: { injectEnv: "SYNTHETIC_TOKEN" }
   });
+} else if (operation === "add-keychain-staged") {
+  await store.addKeychainSecretStaged({
+    name: "synthetic staged item",
+    type: "api-token",
+    value: "synthetic-staged-value-123456789",
+    policy: { injectEnv: "SYNTHETIC_TOKEN" }
+  });
 } else if (operation === "add-onepassword") {
   await store.addOnePasswordReference({
     name: "synthetic reference",

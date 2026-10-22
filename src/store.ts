@@ -48,6 +48,7 @@ import type {
   AuditEvent,
   CommandAction,
   CommandEnvBinding,
+  CredentialOperation,
   ExecutionSummary,
   HandleSummary,
   ManagedSshRouteRecord,
@@ -379,6 +380,7 @@ export class SecretStore {
     const passphrase = requirePassphrase();
     return this.mutate(async (store) => {
       const fingerprint = fingerprintSecret(input.value, passphrase);
+      assertNoPendingCredentialAdd(store, fingerprint);
       const now = new Date().toISOString();
       const existing = store.secrets.find((secret) => secret.fingerprint === fingerprint);
       if (existing) {
@@ -427,6 +429,7 @@ export class SecretStore {
     const passphrase = requirePassphrase();
     return this.mutate(async (store) => {
       const fingerprint = fingerprintSecret(input.value, passphrase);
+      assertNoPendingCredentialAdd(store, fingerprint);
       const now = new Date().toISOString();
       const existing = store.secrets.find((secret) => secret.fingerprint === fingerprint);
       const handle = existing?.handle || makeHandle(input.type);
@@ -479,11 +482,118 @@ export class SecretStore {
     });
   }
 
+  async addKeychainSecretStaged(input: AddKeychainSecretInput): Promise<SecretRecord> {
+    if (!input.value) throw new Error("Cannot add an empty secret.");
+
+    const passphrase = requirePassphrase();
+    const fingerprint = fingerprintSecret(input.value, passphrase);
+    const service = input.service || defaultSecretKeychainService();
+    const operation = await this.mutate((store) => {
+      const pending = (store.credentialOps || []).find((item) => item.record.fingerprint === fingerprint);
+      if (pending) return pending;
+      if (store.secrets.some((secret) => secret.fingerprint === fingerprint)) {
+        throw new Error("Staged credential-store add currently requires a new credential.");
+      }
+
+      const now = new Date().toISOString();
+      const id = randomUUID();
+      const handle = makeHandle(input.type);
+      const ref: MacKeychainItemRef = {
+        service,
+        account: `${handle}:stage:${id}`,
+        label: keychainSecretLabel(input.name || handle)
+      };
+      const record: SecretRecord = {
+        handle,
+        name: input.name,
+        type: input.type,
+        backend: "keychain",
+        provider: credentialStoreProvider(),
+        ruleId: input.ruleId,
+        severity: input.severity,
+        confidence: input.confidence,
+        createdAt: now,
+        updatedAt: now,
+        source: input.source || credentialStoreProvider(),
+        fingerprint,
+        encrypted: encryptSecret(JSON.stringify(keychainRefPayload(ref)), passphrase),
+        policy: normalizePolicy(input.policy)
+      };
+      const prepared: CredentialOperation = { id, kind: "keychain-add", phase: "prepared", record, createdAt: now };
+      store.credentialOps = [...(store.credentialOps || []), prepared];
+      return prepared;
+    });
+
+    const intended = {
+      name: input.name,
+      type: input.type,
+      ruleId: input.ruleId,
+      severity: input.severity,
+      confidence: input.confidence,
+      source: input.source || credentialStoreProvider(),
+      policy: normalizePolicy(input.policy)
+    };
+    const original = {
+      name: operation.record.name,
+      type: operation.record.type,
+      ruleId: operation.record.ruleId,
+      severity: operation.record.severity,
+      confidence: operation.record.confidence,
+      source: operation.record.source,
+      policy: operation.record.policy
+    };
+    if (JSON.stringify(canonicalValue(intended)) !== JSON.stringify(canonicalValue(original))) {
+      throw new Error(`Pending credential-store add ${operation.id} requires its original metadata and policy.`);
+    }
+    const ref = keychainRefFromRecord(operation.record);
+    if (ref.service !== service || ref.account !== `${operation.record.handle}:stage:${operation.id}`) {
+      throw new Error(`Pending credential-store add ${operation.id} has a different service or staging account.`);
+    }
+
+    try {
+      setMacKeychainItem(ref, input.value);
+      if (fingerprintSecret(getMacKeychainItem(ref), passphrase) !== fingerprint) {
+        throw new Error("Credential-store readback did not match the submitted value.");
+      }
+    } catch {
+      throw new Error(`Credential-store add ${operation.id} is pending because its staged value was not verified. Retry with the same value.`);
+    }
+
+    return this.mutate((store) => {
+      const pending = (store.credentialOps || []).find((item) => item.id === operation.id);
+      if (!pending) {
+        const committed = store.secrets.find((secret) => secret.handle === operation.record.handle);
+        if (committed?.fingerprint === fingerprint &&
+            JSON.stringify(committed.encrypted) === JSON.stringify(operation.record.encrypted)) return committed;
+        throw new Error(`Credential-store add ${operation.id} changed before commit; inspect the pending operation.`);
+      }
+      if (JSON.stringify(pending) !== JSON.stringify(operation) ||
+          store.secrets.some((secret) => secret.handle === pending.record.handle || secret.fingerprint === fingerprint)) {
+        throw new Error(`Credential-store add ${operation.id} changed before commit; inspect the pending operation.`);
+      }
+      store.secrets.push(pending.record);
+      store.credentialOps = (store.credentialOps || []).filter((item) => item.id !== pending.id);
+      store.audit.push(audit("secret.added", `Added OS credential-store-backed handle for ${pending.record.name}.`, pending.record.handle));
+      return pending.record;
+    });
+  }
+
+  async listPendingCredentialOperations(): Promise<Array<{ id: string; handle: string; name: string; createdAt: string }>> {
+    const store = await this.read();
+    return (store.credentialOps || []).map((item) => ({
+      id: item.id,
+      handle: item.record.handle,
+      name: item.record.name,
+      createdAt: item.createdAt
+    }));
+  }
+
   async addOnePasswordReference(input: AddOnePasswordReferenceInput): Promise<SecretRecord> {
     const reference = normalizeOnePasswordReference(input.reference);
     const passphrase = requirePassphrase();
     return this.mutate(async (store) => {
       const fingerprint = fingerprintSecret(`onepassword:${reference}`, passphrase);
+      assertNoPendingCredentialAdd(store, fingerprint);
       const now = new Date().toISOString();
       const existing = store.secrets.find((secret) => secret.fingerprint === fingerprint);
       if (existing) {
@@ -1976,7 +2086,8 @@ function controlPlaneFingerprint(store: StoreFile): string {
     approvalSettings: store.approvalSettings,
     approvalGrants: grants,
     approvalPolicyRules: rules,
-    ...(store.managedSshRoutes?.length ? { managedSshRoutes: [...store.managedSshRoutes].sort((a, b) => a.id.localeCompare(b.id)) } : {})
+    ...(store.managedSshRoutes?.length ? { managedSshRoutes: [...store.managedSshRoutes].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
+    ...(store.credentialOps?.length ? { credentialOps: [...store.credentialOps].sort((a, b) => a.id.localeCompare(b.id)) } : {})
   };
   return createHash("sha256").update(JSON.stringify(canonicalValue(control))).digest("hex");
 }
@@ -2013,7 +2124,8 @@ function controlPlaneSnapshot(store: StoreFile): StoreFile {
     approvalSettings: store.approvalSettings,
     approvalGrants: store.approvalGrants,
     approvalPolicyRules: store.approvalPolicyRules,
-    managedSshRoutes: store.managedSshRoutes
+    managedSshRoutes: store.managedSshRoutes,
+    credentialOps: store.credentialOps?.length ? store.credentialOps : undefined
   };
 }
 
@@ -2857,9 +2969,10 @@ async function pruneStoreBackups(backupDir: string): Promise<void> {
 
 function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
   const audit = parsed.audit || [];
+  const secrets = (parsed.secrets || []).map((secret) => normalizeSecretRecord(secret));
   return {
     version: 1,
-    secrets: (parsed.secrets || []).map((secret) => normalizeSecretRecord(secret)),
+    secrets,
     requests: migrateRequestApprovalSources(parsed.requests || [], audit),
     audit,
     approvalSettings: normalizeStoredApprovalSettings(parsed.approvalSettings),
@@ -2867,8 +2980,88 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
       ? parsed.approvalGrants.filter(isValidApprovalGrant)
       : [],
     approvalPolicyRules: storedApprovalPolicyRules(parsed.approvalPolicyRules),
-    managedSshRoutes: storedManagedSshRoutes(parsed.managedSshRoutes)
+    managedSshRoutes: storedManagedSshRoutes(parsed.managedSshRoutes),
+    credentialOps: storedCredentialOps(parsed.credentialOps, secrets)
   };
+}
+
+function storedCredentialOps(value: unknown, secrets: SecretRecord[]): CredentialOperation[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("credentialOps must be an array.");
+  const ids = new Set<string>();
+  const handles = new Set(secrets.map((secret) => secret.handle));
+  const fingerprints = new Set(secrets.map((secret) => secret.fingerprint));
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Invalid credential operation at index ${index}.`);
+    }
+    const op = item as Partial<CredentialOperation>;
+    const record = op.record;
+    if (Object.keys(op).sort().join(",") !== "createdAt,id,kind,phase,record" ||
+        op.kind !== "keychain-add" || op.phase !== "prepared" || typeof op.id !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(op.id) ||
+        !isCanonicalPolicyTimestamp(op.createdAt) || !isValidStagedCredentialRecord(record, op.createdAt) ||
+        ids.has(op.id) || handles.has(record.handle) || fingerprints.has(record.fingerprint)) {
+      throw new Error(`Invalid credential operation at index ${index}.`);
+    }
+    ids.add(op.id);
+    handles.add(record.handle);
+    fingerprints.add(record.fingerprint);
+    return op as CredentialOperation;
+  });
+}
+
+function isValidStagedCredentialRecord(value: unknown, createdAt: string): value is SecretRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as SecretRecord;
+  const keys = new Set([
+    "handle", "name", "type", "backend", "provider", "ruleId", "severity", "confidence",
+    "createdAt", "updatedAt", "source", "fingerprint", "encrypted", "policy"
+  ]);
+  if (Object.keys(record).some((key) => !keys.has(key)) || record.backend !== "keychain" ||
+      !isSecretType(record.type) || typeof record.handle !== "string" ||
+      !/^s-gw:[a-z-]+:[A-Za-z0-9_-]{12}$/.test(record.handle) ||
+      !record.handle.startsWith(`s-gw:${record.type}:`) ||
+      typeof record.name !== "string" || typeof record.provider !== "string" ||
+      !["macos-keychain", "linux-secret-service", "windows-credential-manager"].includes(record.provider) ||
+      (record.ruleId !== undefined && typeof record.ruleId !== "string") ||
+      (record.severity !== undefined && !isSecretSeverity(record.severity)) ||
+      (record.confidence !== undefined && (!Number.isFinite(record.confidence) || record.confidence < 0 || record.confidence > 1)) ||
+      (record.source !== undefined && typeof record.source !== "string") ||
+      record.createdAt !== createdAt || record.updatedAt !== createdAt ||
+      typeof record.fingerprint !== "string" || !/^[A-Za-z0-9_-]{24}$/.test(record.fingerprint) ||
+      !isValidCredentialOperationBox(record.encrypted) ||
+      !record.policy || typeof record.policy !== "object" || Array.isArray(record.policy)) return false;
+
+  const policy = record.policy;
+  if (Object.keys(policy).some((key) => !["injectEnv", "allowedCommands", "allowedDestinations", "maxOutputBytes"].includes(key)) ||
+      !Array.isArray(policy.allowedCommands) || !policy.allowedCommands.every((value) => typeof value === "string") ||
+      (policy.allowedDestinations !== undefined &&
+        (!Array.isArray(policy.allowedDestinations) || !policy.allowedDestinations.every((value) => typeof value === "string"))) ||
+      !Number.isSafeInteger(policy.maxOutputBytes) || policy.maxOutputBytes < 0) return false;
+  try {
+    return JSON.stringify(canonicalValue(policy)) === JSON.stringify(canonicalValue(normalizePolicy(policy)));
+  } catch {
+    return false;
+  }
+}
+
+function isValidCredentialOperationBox(value: unknown): boolean {
+  if (!isEncryptedBox(value)) return false;
+  const box = value as SecretRecord["encrypted"];
+  if (Object.keys(box).sort().join(",") !== "alg,authTag,ciphertext,iv,kdf,salt") return false;
+  for (const [part, expectedBytes] of [[box.salt, 16], [box.iv, 12], [box.authTag, 16]] as const) {
+    if (Buffer.from(part, "base64").length !== expectedBytes || Buffer.from(part, "base64").toString("base64") !== part) return false;
+  }
+  return box.ciphertext.length > 0 && box.ciphertext.length < 32_768 &&
+    Buffer.from(box.ciphertext, "base64").toString("base64") === box.ciphertext;
+}
+
+function assertNoPendingCredentialAdd(store: StoreFile, fingerprint: string): void {
+  const pending = (store.credentialOps || []).find((op) => op.record.fingerprint === fingerprint);
+  if (pending) {
+    throw new Error(`Credential-store add ${pending.id} is pending; retry it before changing this credential.`);
+  }
 }
 
 function storedManagedSshRoutes(value: unknown): ManagedSshRouteRecord[] {

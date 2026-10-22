@@ -120,6 +120,14 @@ export interface SecretRecord {
   policy: SecretPolicy;
 }
 
+export interface CredentialOperation {
+  id: string;
+  kind: "keychain-add";
+  phase: "prepared";
+  record: SecretRecord;
+  createdAt: string;
+}
+
 export interface HandleSummary {
   handle: string;
   name: string;
@@ -260,6 +268,7 @@ export interface StoreFile {
   approvalGrants: ApprovalGrant[];
   approvalPolicyRules: ApprovalPolicyRule[];
   managedSshRoutes?: ManagedSshRouteRecord[];
+  credentialOps?: CredentialOperation[];
 }
 
 export interface ScanCandidate {
