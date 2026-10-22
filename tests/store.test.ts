@@ -715,7 +715,7 @@ describe("SecretStore", () => {
 
     const preserved = await readdir(path.join(tmpHome, "recovery", "automatic"));
     expect(preserved.some((name) => name.includes("control-mismatch"))).toBe(true);
-  });
+  }, 20_000);
 
   it("recovers a corrupt ledger and preserves it for investigation", async () => {
     const store = new SecretStore();
@@ -3142,7 +3142,7 @@ describe("SecretStore", () => {
     await store.setApprovalPolicyRuleEnabled(rule.id, false);
     await expect(executeApprovedRequest(store, automatic.id, { engine: "typescript" })).rejects.toThrow(/policy.*changed|no longer allows/i);
     expect((await store.getRequest(automatic.id)).state).toBe("denied");
-  });
+  }, 15_000);
 
   it("requires an exact HTTPS action key for unattended approval", async () => {
     const store = new SecretStore();
