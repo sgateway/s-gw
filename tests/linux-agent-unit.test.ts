@@ -588,6 +588,10 @@ describe.skipIf(process.platform === "win32")("Linux systemd agent unit plan", (
     ]) {
       expect(() => parseSystemdAgentState(p, good.replace(before, after))).toThrow("did not attest");
     }
+    for (const name of ["SupplementaryGroups", "BindPaths", "NetworkNamespacePath",
+      "IPCNamespacePath", "JoinsNamespaceOf"]) {
+      expect(() => parseSystemdAgentState(p, good.replace(`${name}=\n`, ""))).toThrow("did not attest");
+    }
     expect(() => parseSystemdAgentState(p, good + "User=231001\n")).toThrow("Duplicate");
   });
 

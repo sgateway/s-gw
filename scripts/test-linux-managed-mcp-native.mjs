@@ -315,17 +315,84 @@ async function checkedInstalledFile(filename) {
   }
 }
 
-async function rememberClaimMarkers(agent) {
+async function rememberClaimMarkers(agent, presentOnly = false) {
   const expected = `${agent.sessionId} ${agent.uid} ${agent.plan.gid}\n`;
   for (const filename of agent.claimPaths) {
-    const value = await until(() => maybeText(filename), `${agent.sessionId} identity claim`);
+    const value = presentOnly ? await maybeText(filename) :
+      await until(() => maybeText(filename), `${agent.sessionId} identity claim`);
+    if (presentOnly && value === undefined) continue;
     const info = await lstat(filename);
     if (value !== expected || !info.isFile() || info.uid !== 0 ||
         (info.mode & 0o777) !== 0o600 || info.nlink !== 1) {
       throw new Error(`The root identity claim changed: ${filename}`);
     }
-    await remember(filename);
+    owned.set(filename, { dev: info.dev, ino: info.ino });
   }
+}
+
+function agentAttestationSummary(agent) {
+  const p = agent.plan;
+  const exact = new Map([
+    ["Id", agent.agentUnit], ["ActiveState", "active"], ["Type", "exec"],
+    ["User", String(p.uid)], ["Group", String(p.gid)], ["SupplementaryGroups", ""],
+    ["RootDirectory", p.rootDirectory], ["WorkingDirectory", "/workspace"],
+    ["ReadWritePaths", `${p.rootDirectory}/workspace`], ["BindPaths", ""],
+    ["Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${p.modelRelaySocket ?
+      " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`],
+    ["Restart", "no"], ["KillMode", "control-group"], ["ProtectSystem", "strict"],
+    ["NetworkNamespacePath", ""], ["IPCNamespacePath", ""], ["JoinsNamespaceOf", ""],
+    ["ControlGroup", `/system.slice/${agent.agentUnit}`]
+  ]);
+  if (p.isolatedSharedMemory) exact.set("TemporaryFileSystem", "/dev/shm:rw,nosuid,nodev,noexec,mode=1777");
+  if (p.sealedStdio) {
+    for (const name of ["StandardInput", "StandardOutput", "StandardError"]) exact.set(name, "null");
+  }
+  if (p.restrictedSocketFamilies) {
+    exact.set("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6");
+    exact.set("SystemCallArchitectures", "native");
+  }
+  const checks = new Map([...exact].map(([name, wanted]) => [name, value => value === wanted]));
+  const readOnly = [`${p.brokerSocket}:/run/s-gw/broker.sock`];
+  if (p.modelRelaySocket) readOnly.push(`${p.modelRelaySocket}:/run/s-gw/model.sock`);
+  if (p.launchGate) readOnly.push(`/run/s-gw/launch-gates/${p.sessionId}:/run/s-gw/launch-gate`);
+  checks.set("BindReadOnlyPaths", value => {
+    const paths = value.split(" ");
+    return paths.length === readOnly.length && paths.every((item, index) =>
+      item === readOnly[index] || item === `${readOnly[index]}:rbind`);
+  });
+  for (const name of ["SendSIGKILL", "PrivateNetwork", "PrivateIPC", "PrivateTmp", "ProtectHome",
+    "PrivateDevices", "NoNewPrivileges", "ProtectKernelTunables", "ProtectKernelModules",
+    "ProtectControlGroups", "RestrictNamespaces", "RestrictSUIDSGID"]) {
+    checks.set(name, value => ["yes", "true", "1"].includes(value));
+  }
+  for (const name of ["Delegate", "DynamicUser", "PrivateUsers"]) {
+    checks.set(name, value => ["no", "false", "0"].includes(value));
+  }
+  for (const name of ["CapabilityBoundingSet", "AmbientCapabilities"]) {
+    checks.set(name, value => value === "" || value === "0");
+  }
+  if (p.supervisedControlUnit) {
+    for (const name of ["BindsTo", "After"]) {
+      checks.set(name, value => value.split(/\s+/).includes(controlUnit));
+    }
+  }
+  checks.set("MainPID", value => Number.isSafeInteger(Number(value)) && Number(value) > 0);
+  checks.set("InvocationID", value => /^[a-f0-9]{32}$/.test(value));
+  const names = [...checks.keys()];
+  const result = run("systemctl", ["--system", "--no-pager", "--all", "show", agent.agentUnit,
+    ...names.flatMap(name => ["-p", name])], true);
+  const values = new Map();
+  const duplicate = [];
+  for (const line of result.stdout.split("\n")) {
+    const separator = line.indexOf("=");
+    const name = line.slice(0, separator);
+    if (separator < 1 || !checks.has(name)) continue;
+    if (values.has(name)) duplicate.push(name);
+    values.set(name, line.slice(separator + 1));
+  }
+  const missing = names.filter(name => !values.has(name));
+  const mismatch = names.filter(name => values.has(name) && !checks.get(name)(values.get(name)));
+  return { status: result.status, missing, mismatch, duplicate };
 }
 
 function fixtureControl(properties) {
@@ -1326,6 +1393,7 @@ try {
           .flatMap(name => ["-p", name])], true);
       states[kind] = { status: check.status, stdout: check.stdout.slice(0, 1200) };
     }
+    states.attestation = agentAttestationSummary(agent);
     states.boundary = await maybeText(`${agent.root}/workspace/boundary`);
     states.handoffReady = await maybeText(`${agent.root}/workspace/handoff-ready`);
     states.probeStage = await maybeText(`${agent.root}/workspace/probe-stage`);
@@ -1512,6 +1580,7 @@ try {
           }
           await removeOwned(filename);
         }
+        await rememberClaimMarkers(agent, true);
         for (const filename of agent.claimPaths) {
           if (owned.has(filename)) {
             const value = await readFile(filename, "utf8");

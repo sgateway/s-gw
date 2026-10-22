@@ -446,7 +446,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
 
   private async inspectUnit(plan: LinuxAgentUnitPlan,
     lease?: LinuxUnitLifecycleLease): Promise<LinuxAgentUnitState> {
-    const output = await run("/usr/bin/systemctl", ["--system", "--no-pager", "show", linuxAgentUnitName(plan.sessionId),
+    const output = await run("/usr/bin/systemctl", ["--system", "--no-pager", "--all", "show", linuxAgentUnitName(plan.sessionId),
       "-p", "Id", "-p", "Description", "-p", "ActiveState", "-p", "Type", "-p", "User", "-p", "Group",
       "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "ReadWritePaths", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
       "-p", "TemporaryFileSystem", "-p", "StandardInput", "-p", "StandardOutput", "-p", "StandardError",
