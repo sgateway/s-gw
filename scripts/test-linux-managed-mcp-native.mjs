@@ -1314,6 +1314,22 @@ try {
   const rootLogs = run("journalctl", ["--no-pager", "-n", "20", "-u", controlUnit], true).stdout;
   const brokerLogs = run("journalctl", ["--no-pager", "-n", "30",
     ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
+  const agentLogs = run("journalctl", ["--no-pager", "-n", "20",
+    ...agents.flatMap(agent => ["-u", agent.agentUnit])], true).stdout;
+  const liveUnits = [];
+  for (const agent of agents) {
+    const states = {};
+    for (const [kind, unit] of [["agent", agent.agentUnit], ["broker", agent.brokerUnit]]) {
+      const check = run("systemctl", ["--system", "--no-pager", "--all", "show", unit,
+        ...["Id", "ActiveState", "SubState", "MainPID", "Result", "ExecMainCode",
+          "ExecMainStatus", "InvocationID", "ControlGroup"]
+          .flatMap(name => ["-p", name])], true);
+      states[kind] = { status: check.status, stdout: check.stdout.slice(0, 1200) };
+    }
+    states.boundary = await maybeText(`${agent.root}/workspace/boundary`);
+    states.handoffReady = await maybeText(`${agent.root}/workspace/handoff-ready`);
+    liveUnits.push({ sessionId: agent.sessionId, ...states });
+  }
   let rootEnvironmentFiles = "not staged";
   let managedSocketState = "not staged";
   if (unitsInstalled) {
@@ -1329,7 +1345,9 @@ try {
   }
   primaryFailure = new Error(`${String(error)}\nRoot EnvironmentFiles=${rootEnvironmentFiles}` +
     `\nManaged MCP socket=${managedSocketState}` +
-    `\nRoot control journal:\n${rootLogs}\nBroker journal:\n${brokerLogs}`);
+    `\nLive units=${JSON.stringify(liveUnits)}` +
+    `\nRoot control journal:\n${rootLogs}\nBroker journal:\n${brokerLogs}` +
+    `\nAgent journal:\n${agentLogs}`);
   throw primaryFailure;
 } finally {
   let cleanupError;
