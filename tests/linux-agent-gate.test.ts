@@ -132,11 +132,13 @@ int main(void) {
 #include <unistd.h>
 int main(int argc, char **argv) {
   if (argc < 2) return 64;
+  if (dup2(7, 64) != 64) return 68;
+  close(7);
   struct rlimit limit;
   if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return 65;
-  limit.rlim_cur = 5;
+  limit.rlim_cur = 32;
   if (setrlimit(RLIMIT_NOFILE, &limit) != 0) return 66;
-  for (int fd = 3; fd < 7; fd++) close(fd);
+  for (int fd = 3; fd < 32; fd++) close(fd);
   execv(argv[1], argv + 1);
   return 67;
 }
@@ -144,7 +146,7 @@ int main(int argc, char **argv) {
     await writeFile(probeSource, `#include <errno.h>
 #include <fcntl.h>
 int main(void) {
-  if (fcntl(7, F_GETFD) >= 0) return 91;
+  if (fcntl(64, F_GETFD) >= 0) return 91;
   if (errno != EBADF) return 92;
   return 0;
 }
