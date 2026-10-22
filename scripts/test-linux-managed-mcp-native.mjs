@@ -225,9 +225,24 @@ const agents = [0, 1].map(index => {
     identityRecord, identityPaths, name, plan };
 });
 const owned = new Map();
+const unitFileTexts = new Map();
 async function remember(filename) {
   const info = await lstat(filename);
   owned.set(filename, { dev: info.dev, ino: info.ino });
+}
+
+async function rememberUnitFile(filename) {
+  await remember(filename);
+  unitFileTexts.set(filename, await readFile(filename, "utf8"));
+}
+
+async function assertFixtureUnitFile(filename) {
+  if (!unitFileTexts.has(filename)) return false;
+  if (!(await assertOwned(filename)) || await readFile(filename, "utf8") !== unitFileTexts.get(filename)) {
+    throw new Error(`Native fixture unit file changed: ${filename}`);
+  }
+  await checkedInstalledFile(filename);
+  return true;
 }
 
 async function removeOwned(filename, recursive = false) {
@@ -320,8 +335,15 @@ function fixtureControl(properties) {
 const controlProperties = ["Id", "Description", "FragmentPath", "ExecStart", "ExecStartPre",
   "UnsetEnvironment", "ControlGroup", "ActiveState", "InvocationID", "MainPID"];
 
+function activeFixtureUnit(unit) {
+  const state = unitProperties(unit, ["ActiveState"]).get("ActiveState");
+  if (state === "active") return true;
+  if (state === "inactive" || state === "failed") return false;
+  throw new Error(`Native fixture unit has an unsettled state: ${unit} (${state}).`);
+}
+
 async function fixtureUnitFile(unit, filename) {
-  if (!(await assertOwned(filename))) return false;
+  if (!(await assertFixtureUnitFile(filename))) return false;
   const properties = unitProperties(unit, ["Id", "FragmentPath"]);
   return properties.get("Id") === unit && properties.get("FragmentPath") === filename;
 }
@@ -378,6 +400,25 @@ function modelAliasEntries() {
     throw new Error("Could not inspect the disposable model relay IP alias.");
   }
   return interfaces[0].addr_info.filter(item => item.local === modelAddress);
+}
+
+async function closeNetworkFixtures() {
+  try {
+    if (modelAliasAdded) {
+      const liveBroker = agents.some(agent => activeFixtureUnit(agent.brokerUnit) &&
+        Number(unitProperties(agent.brokerUnit, ["MainPID"]).get("MainPID")) > 0);
+      if (liveBroker) {
+        throw new Error("A managed broker is still live; its local model IP alias was preserved.");
+      }
+      const aliases = modelAliasEntries();
+      if (aliases.length !== 1 || aliases[0].prefixlen !== 32 || aliases[0].label !== modelAliasLabel) {
+        throw new Error("The native model relay IP alias changed before cleanup.");
+      }
+      run("ip", ["-4", "address", "del", `${modelAddress}/32`, "dev", "lo"]);
+    }
+  } finally {
+    for (const canary of networkCanaries.reverse()) await canary.close();
+  }
 }
 
 async function modelFixtureResponse(request, response) {
@@ -485,6 +526,7 @@ async function stopHandoffHelper(helper) {
 }
 
 let passed = false;
+let primaryFailure;
 try {
   let controlSocketExists = false;
   try { await lstat("/run/s-gw/agent-control.sock"); controlSocketExists = true; }
@@ -792,17 +834,17 @@ try {
   await writeFile(envFile, `CI=true\nSGW_HOME=${storeHome}\nSGW_RECOVERY_HOME=${recoveryHome}\nSGW_MASTER_PASSPHRASE=${secret}\nSGW_DISABLE_KEYCHAIN=1\nSGW_DISABLE_ONEPASSWORD_BACKUP=1\nNODE_EXTRA_CA_CERTS=${certFile}\n`, { mode: 0o600 });
   await remember(envFile);
   await writeFile(controlUnitFile, `[Unit]\nDescription=${controlDescription}\n[Service]\nType=exec\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - -\nUnsetEnvironment=${loaderUnset} NODE_EXTRA_CA_CERTS\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - - -- --serve ${brokerUid} ${brokerGid}\nRestart=no\n`, { mode: 0o644 });
-  await remember(controlUnitFile);
+  await rememberUnitFile(controlUnitFile);
   for (const agent of agents) {
     const config = safeUnitValue(agent.configPath);
     await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
-    await remember(agent.socketUnitFile);
+    await rememberUnitFile(agent.socketUnitFile);
     if (testRelay) {
       await writeFile(agent.modelSocketUnitFile, `[Unit]\nDescription=Native s-gw managed model fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.modelSocketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-model-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
-      await remember(agent.modelSocketUnitFile);
+      await rememberUnitFile(agent.modelSocketUnitFile);
     }
     await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=${loaderUnset}\n${testRelay ? `BindReadOnlyPaths=${modelHostsFile}:/etc/hosts\nExecCondition=/usr/bin/grep -qFx "${modelAddress} api.anthropic.com" /etc/hosts\n` : ""}ExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile}\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile} -- ${config}\nRestart=no\n`, { mode: 0o644 });
-    await remember(agent.brokerUnitFile);
+    await rememberUnitFile(agent.brokerUnitFile);
     await writeFile(agent.planPath, JSON.stringify({ plan: agent.plan, brokerUnit: agent.brokerUnit,
       brokerUnitFile: agent.brokerUnitFile, mcpSocketUnitFile: agent.socketUnitFile,
       brokerEntry: entry, brokerConfig: config,
@@ -1247,8 +1289,10 @@ try {
 } catch (error) {
   const logs = run("journalctl", ["--no-pager", "-n", "80", "-u", "s-gw-agent-control.service",
     ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
-  throw new Error(`${String(error)}\n${logs}`);
+  primaryFailure = new Error(`${String(error)}\n${logs}`);
+  throw primaryFailure;
 } finally {
+  let cleanupError;
   try {
     for (const helper of handoffHelpers.values()) await stopHandoffHelper(helper);
     if (modelUpstream) {
@@ -1261,45 +1305,50 @@ try {
     }
     if (fixtureOwned) {
       if (controlStartAttempted && !controlStarted) {
-        const uncertain = unitProperties(controlUnit, controlProperties);
-        if (uncertain.get("ActiveState") === "active" && fixtureControl(uncertain) &&
-            invocationId(uncertain)) {
-          run("systemctl", ["--system", "stop", controlUnit], true);
+        if (activeFixtureUnit(controlUnit)) {
+          const uncertain = unitProperties(controlUnit, controlProperties);
+          if (fixtureControl(uncertain) && invocationId(uncertain)) {
+            run("systemctl", ["--system", "stop", controlUnit], true);
+          }
         }
         throw new Error("Root control start was ambiguous; its root-owned fixture tree was preserved.");
       }
       if ([...socketStartAttempted].some(session => !socketStarted.has(session)) ||
           [...modelSocketStartAttempted].some(session => !modelSocketStarted.has(session))) {
-        const currentControl = unitProperties(controlUnit, controlProperties);
-        if (currentControl.get("ActiveState") === "active" && fixtureControl(currentControl) &&
-            invocationId(currentControl) === controlInvocation) {
-          run("systemctl", ["--system", "stop", controlUnit], true);
+        if (activeFixtureUnit(controlUnit)) {
+          const currentControl = unitProperties(controlUnit, controlProperties);
+          if (fixtureControl(currentControl) && invocationId(currentControl) === controlInvocation) {
+            run("systemctl", ["--system", "stop", controlUnit], true);
+          }
         }
         for (const agent of agents) {
-          if (await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile)) {
+          if (activeFixtureUnit(agent.socketUnit) &&
+              await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile)) {
             run("systemctl", ["--system", "stop", agent.socketUnit], true);
           }
-          if (testRelay && await fixtureUnitFile(agent.modelSocketUnit, agent.modelSocketUnitFile)) {
+          if (testRelay && activeFixtureUnit(agent.modelSocketUnit) &&
+              await fixtureUnitFile(agent.modelSocketUnit, agent.modelSocketUnitFile)) {
             run("systemctl", ["--system", "stop", agent.modelSocketUnit], true);
           }
-          if (await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile)) {
+          if (activeFixtureUnit(agent.brokerUnit) &&
+              await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile)) {
             run("systemctl", ["--system", "stop", agent.brokerUnit], true);
           }
         }
         throw new Error("Managed MCP socket start was ambiguous; its fixture paths were preserved.");
       }
-      const currentControl = unitProperties(controlUnit, controlProperties);
-      const controlActive = currentControl.get("ActiveState") === "active";
-      const controlOwned = controlStarted && controlInvocation && fixtureControl(currentControl) &&
+      const controlActive = activeFixtureUnit(controlUnit);
+      const currentControl = controlActive ? unitProperties(controlUnit, controlProperties) : undefined;
+      const controlOwned = controlActive && controlStarted && controlInvocation && fixtureControl(currentControl) &&
         invocationId(currentControl) === controlInvocation;
       if (controlActive && !controlOwned) {
         throw new Error("Root control unit changed; native fixture state was preserved.");
       }
       const states = [];
       for (const agent of agents) {
-        const agentState = unitProperties(agent.agentUnit, ["Id", "Description", "ActiveState", "User",
-          "RootDirectory", "InvocationID"]);
-        const agentActive = agentState.get("ActiveState") === "active";
+        const agentActive = activeFixtureUnit(agent.agentUnit);
+        const agentState = agentActive ? unitProperties(agent.agentUnit, ["Id", "Description", "ActiveState", "User",
+          "RootDirectory", "InvocationID"]) : undefined;
         if (agentActive && (agentState.get("Id") !== agent.agentUnit ||
             !/^s-gw-agent-start:[a-f0-9]{32}$/.test(agentState.get("Description") ?? "") ||
             agentState.get("User") !== String(agent.uid) || agentState.get("RootDirectory") !== agent.root ||
@@ -1308,27 +1357,26 @@ try {
           if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
           throw new Error("Agent unit changed; native fixture state was preserved.");
         }
-        const brokerState = unitProperties(agent.brokerUnit,
-          ["Id", "FragmentPath", "ActiveState", "InvocationID"]);
-        const brokerActive = brokerState.get("ActiveState") === "active";
-        const brokerOwned = await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile);
+        const brokerActive = activeFixtureUnit(agent.brokerUnit);
+        const brokerState = brokerActive ? unitProperties(agent.brokerUnit,
+          ["Id", "FragmentPath", "ActiveState", "InvocationID"]) : undefined;
+        const brokerOwned = brokerActive && await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile);
         if (brokerActive && (!brokerOwned || !brokerInvocations.get(agent.sessionId) ||
             invocationId(brokerState) !== brokerInvocations.get(agent.sessionId))) {
           if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
           throw new Error("Broker unit changed; native fixture state was preserved.");
         }
-        const socketState = unitProperties(agent.socketUnit, ["Id", "FragmentPath", "ActiveState"]);
-        const socketActive = socketState.get("ActiveState") === "active";
-        const socketOwned = await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile);
+        const socketActive = activeFixtureUnit(agent.socketUnit);
+        const socketOwned = socketActive && await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile);
         if (socketActive && !socketOwned) {
           if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
           throw new Error("Socket unit changed; native fixture state was preserved.");
         }
         let modelSocketActive = false;
         if (testRelay) {
-          const modelState = unitProperties(agent.modelSocketUnit, ["Id", "FragmentPath", "ActiveState"]);
-          modelSocketActive = modelState.get("ActiveState") === "active";
-          const modelOwned = await fixtureUnitFile(agent.modelSocketUnit, agent.modelSocketUnitFile);
+          modelSocketActive = activeFixtureUnit(agent.modelSocketUnit);
+          const modelOwned = modelSocketActive &&
+            await fixtureUnitFile(agent.modelSocketUnit, agent.modelSocketUnitFile);
           if (modelSocketActive && !modelOwned) {
             if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
             throw new Error("Model socket unit changed; native fixture state was preserved.");
@@ -1361,10 +1409,14 @@ try {
         }
       }
       for (const agent of agents) {
+        await assertFixtureUnitFile(agent.socketUnitFile);
+        if (testRelay) await assertFixtureUnitFile(agent.modelSocketUnitFile);
+        await assertFixtureUnitFile(agent.brokerUnitFile);
         await removeOwned(agent.socketUnitFile);
         if (testRelay) await removeOwned(agent.modelSocketUnitFile);
         await removeOwned(agent.brokerUnitFile);
       }
+      await assertFixtureUnitFile(controlUnitFile);
       await removeOwned(controlUnitFile);
       if (unitsInstalled) run("systemctl", ["--system", "daemon-reload"], true);
       for (const agent of agents) {
@@ -1417,22 +1469,22 @@ try {
       for (const name of accountsCreated.reverse()) run("userdel", [name]);
       for (const name of groupsCreated.reverse()) run("groupdel", [name]);
     }
-  } finally {
-    try {
-      if (modelAliasAdded) {
-        const liveBroker = agents.some(agent => Number(unitProperties(agent.brokerUnit, ["MainPID"]).get("MainPID")) > 0);
-        if (liveBroker) {
-          throw new Error("A managed broker is still live; its local model IP alias was preserved.");
-        }
-        const aliases = modelAliasEntries();
-        if (aliases.length !== 1 || aliases[0].prefixlen !== 32 || aliases[0].label !== modelAliasLabel) {
-          throw new Error("The native model relay IP alias changed before cleanup.");
-        }
-        run("ip", ["-4", "address", "del", `${modelAddress}/32`, "dev", "lo"]);
-      }
-    } finally {
-      for (const canary of networkCanaries.reverse()) await canary.close();
+  } catch (error) {
+    cleanupError = error;
+  }
+  try {
+    await closeNetworkFixtures();
+  } catch (error) {
+    cleanupError = cleanupError
+      ? new AggregateError([cleanupError, error], "Native fixture teardown and network cleanup both failed.")
+      : error;
+  }
+  if (cleanupError) {
+    if (primaryFailure) {
+      throw new AggregateError([primaryFailure, cleanupError],
+        "Native Linux managed MCP test and cleanup both failed.");
     }
+    throw cleanupError;
   }
 }
 if (passed) {
