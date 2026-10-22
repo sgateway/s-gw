@@ -207,11 +207,15 @@ async function main(): Promise<void> {
     const port = numericFlag(parsed.flags, "port", 8718);
     const protectedOperator = hasFlag(parsed.flags, "operator-auth");
     const backgroundAuth = hasFlag(parsed.flags, "background");
+    const launchdSocket = hasFlag(parsed.flags, "launchd-socket");
     if (backgroundAuth && (!protectedOperator || !hasFlag(parsed.flags, "no-open"))) {
       throw new Error("Background operator mode requires --operator-auth and --no-open.");
     }
     if (backgroundAuth && process.platform !== "darwin") {
       throw new Error("Background operator enrollment currently requires macOS peer verification.");
+    }
+    if (launchdSocket && (!backgroundAuth || !protectedOperator || process.env.SGW_CONSOLE_ACTIVATED_FD !== "3")) {
+      throw new Error("The protected launchd console requires its inherited listener on fd 3.");
     }
     if (protectedOperator && !backgroundAuth && (!process.stdin.isTTY || !process.stderr.isTTY)) {
       throw new Error("--operator-auth requires a trusted foreground terminal.");
@@ -226,7 +230,7 @@ async function main(): Promise<void> {
 
     let running;
     try {
-      running = await startConsoleServer({ host, port, store, operatorAuth });
+      running = await startConsoleServer({ host, port, store, operatorAuth, activatedFd: launchdSocket ? 3 : undefined });
     } catch (error) {
       if (isAddressInUse(error)) {
         if (protectedOperator) {
@@ -1485,11 +1489,19 @@ async function handleServiceCommand(
 ): Promise<void> {
   const protectedService = hasFlag(flags, "operator-auth");
   const ordinaryService = hasFlag(flags, "ordinary");
+  const launchdSocket = hasFlag(flags, "launchd-socket");
+  const directBind = hasFlag(flags, "direct-bind");
   if (protectedService && ordinaryService) {
     throw new Error("Choose either --operator-auth or --ordinary for the console service.");
   }
   if ((protectedService || ordinaryService) && (process.platform !== "darwin" || action !== "install")) {
     throw new Error("Console service authentication mode can currently be selected only during macOS installation.");
+  }
+  if (launchdSocket && directBind) {
+    throw new Error("Choose either --launchd-socket or --direct-bind for the console service.");
+  }
+  if ((launchdSocket || directBind) && (process.platform !== "darwin" || action !== "install" || ordinaryService)) {
+    throw new Error("Console socket mode can currently be selected only for a protected macOS service install.");
   }
   if (process.platform === "win32") {
     if (action === "install") {
@@ -1551,7 +1563,8 @@ async function handleServiceCommand(
       await installConsoleLaunchAgent({
         port: numericFlag(flags, "port", 8718),
         start: hasFlag(flags, "start"),
-        operatorAuth: protectedService ? true : ordinaryService ? false : undefined
+        operatorAuth: protectedService ? true : ordinaryService ? false : undefined,
+        socketActivated: launchdSocket ? true : directBind ? false : undefined
       })
     );
     return;
@@ -2750,7 +2763,7 @@ Commands:
   s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
-  s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary]
+  s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary] [--launchd-socket|--direct-bind]
   s-gw service start|stop|status|uninstall
   s-gw menubar app-path
   s-gw menubar open [--port 8718] [--console-url URL] [--count pending|credentials|none] [--show] [--no-notify]

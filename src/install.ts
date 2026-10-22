@@ -59,6 +59,7 @@ export interface PackageLayout {
   cliPath: string;
   mcpPath: string;
   keychainHelperPath: string;
+  consoleActivatorPath: string;
   packagedMacAppPath: string;
   packagedMacAppBinaryPath: string;
   installedMacAppPath: string;
@@ -104,12 +105,14 @@ interface LaunchAgentDefinition {
   stdoutPath: string;
   stderrPath: string;
   limitToAqua?: boolean;
+  protectedSocketPort?: number;
 }
 
 export interface ServiceInstallOptions {
   port?: number;
   start?: boolean;
   operatorAuth?: boolean;
+  socketActivated?: boolean;
 }
 
 export interface MenuBarOptions {
@@ -243,6 +246,7 @@ export function getPackageLayout(): PackageLayout {
     cliPath: runtime?.cliPath || path.join(packageRoot, "dist", "cli.js"),
     mcpPath: runtime?.mcpPath || path.join(packageRoot, "dist", "mcp-server.js"),
     keychainHelperPath: path.join(packageRoot, "dist", "native", nativeTarget, "s-gw-keychain-helper"),
+    consoleActivatorPath: path.join(packageRoot, "dist", "native", nativeTarget, "s-gw-console-activate"),
     packagedMacAppPath,
     packagedMacAppBinaryPath: macAppBinaryPath(packagedMacAppPath),
     installedMacAppPath,
@@ -389,10 +393,19 @@ export async function installConsoleLaunchAgent(options: ServiceInstallOptions =
   }
   const oldMode = oldArgs.includes("--operator-auth") && oldArgs.includes("--background");
   const operatorAuth = options.operatorAuth ?? oldMode;
-  if (oldArgs.length && oldMode !== operatorAuth && launchAgentStatus("console").loaded && !options.start) {
-    throw new Error("Changing console authentication requires --start to restart the existing service.");
+  const oldSocketMode = oldArgs.includes("--launchd-socket");
+  const socketActivated = options.socketActivated ?? (operatorAuth && oldSocketMode);
+  if (socketActivated && !operatorAuth) {
+    throw new Error("launchd socket activation requires protected console authentication.");
   }
-  await writeFile(plistPath, buildConsoleLaunchAgentPlist(port, logs, {}, operatorAuth), { mode: 0o644 });
+  if (socketActivated) accessSync(getPackageLayout().consoleActivatorPath, constants.X_OK);
+  const oldPort = numberAfter(oldArgs, "--port");
+  const socketPortChanged = (oldSocketMode || socketActivated) && oldPort !== undefined && oldPort !== port;
+  if (oldArgs.length && (oldMode !== operatorAuth || oldSocketMode !== socketActivated || socketPortChanged) &&
+      launchAgentStatus("console").loaded && !options.start) {
+    throw new Error("Changing console authentication, socket mode, or activated port requires --start to restart the existing service.");
+  }
+  await writeFile(plistPath, buildConsoleLaunchAgentPlist(port, logs, {}, operatorAuth, socketActivated), { mode: 0o644 });
 
   if (options.start) {
     startLaunchAgent(consoleLabel, plistPath);
@@ -659,7 +672,10 @@ async function refreshConsoleLaunchAgent(status: LaunchAgentStatus): Promise<Lau
   const logs = await ensureLogDir(env.SGW_HOME);
   if (status.loaded) stopLaunchAgent(consoleLabel);
   const operatorAuth = args.includes("--operator-auth") && args.includes("--background");
-  await writeFile(status.plistPath, buildConsoleLaunchAgentPlist(port, logs, env, operatorAuth), { mode: 0o644 });
+  const socketActivated = args.includes("--launchd-socket");
+  if (socketActivated) accessSync(getPackageLayout().consoleActivatorPath, constants.X_OK);
+  await writeFile(status.plistPath,
+    buildConsoleLaunchAgentPlist(port, logs, env, operatorAuth, socketActivated), { mode: 0o644 });
   if (status.loaded) startLaunchAgent(consoleLabel, status.plistPath);
   return launchAgentStatus("console");
 }
@@ -2357,27 +2373,34 @@ export function buildConsoleLaunchAgentPlist(
   port: number,
   logsDir: string,
   inheritedEnvironment: Record<string, string> = {},
-  operatorAuth = false
+  operatorAuth = false,
+  socketActivated = false
 ): string {
+  if (socketActivated && (!operatorAuth || !Number.isInteger(port) || port < 1 || port > 65_535)) {
+    throw new Error("launchd socket activation requires a protected console and an exact port.");
+  }
   const layout = getPackageLayout();
+  const consoleArgs = [
+    layout.nodePath,
+    layout.cliPath,
+    "console",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--no-open",
+    ...(operatorAuth ? ["--operator-auth", "--background"] : []),
+    ...(socketActivated ? ["--launchd-socket"] : [])
+  ];
   return buildLaunchAgentPlist({
     label: consoleLabel,
-    programArguments: [
-      layout.nodePath,
-      layout.cliPath,
-      "console",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(port),
-      "--no-open",
-      ...(operatorAuth ? ["--operator-auth", "--background"] : [])
-    ],
+    programArguments: socketActivated ? [layout.consoleActivatorPath, ...consoleArgs] : consoleArgs,
     environment: launchdBaseEnvironment(inheritedEnvironment),
     runAtLoad: true,
     keepAlive: true,
     stdoutPath: path.join(logsDir, "console.log"),
-    stderrPath: path.join(logsDir, "console.err.log")
+    stderrPath: path.join(logsDir, "console.err.log"),
+    protectedSocketPort: socketActivated ? port : undefined
   });
 }
 
@@ -2417,6 +2440,17 @@ function buildLaunchAgentPlist(definition: LaunchAgentDefinition): string {
   const aqua = definition.limitToAqua
     ? "  <key>LimitLoadToSessionType</key>\n  <string>Aqua</string>\n"
     : "";
+  const socket = definition.protectedSocketPort === undefined ? "" : `  <key>Sockets</key>
+  <dict>
+    <key>ProtectedConsole</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>${definition.protectedSocketPort}</string>
+      <key>SockFamily</key><string>IPv4</string>
+      <key>SockType</key><string>stream</string>
+    </dict>
+  </dict>
+`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2436,7 +2470,7 @@ ${envPairs}
   <${definition.runAtLoad ? "true" : "false"}/>
   <key>KeepAlive</key>
   <${definition.keepAlive ? "true" : "false"}/>
-${aqua}  <key>StandardOutPath</key>
+${aqua}${socket}  <key>StandardOutPath</key>
   <string>${xmlEscape(definition.stdoutPath)}</string>
   <key>StandardErrorPath</key>
   <string>${xmlEscape(definition.stderrPath)}</string>

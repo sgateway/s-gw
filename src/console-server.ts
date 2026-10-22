@@ -75,6 +75,7 @@ interface OperatorAuthState {
 export interface ConsoleServerOptions {
   host?: string;
   port?: number;
+  activatedFd?: number;
   store?: SecretStore;
   token?: string;
   uiDir?: string;
@@ -173,6 +174,11 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     throw new Error("Background operator enrollment currently requires macOS peer verification.");
   }
   const port = options.port ?? 8718;
+  if (options.activatedFd !== undefined && (!backgroundAuth || host !== "127.0.0.1" ||
+      !Number.isInteger(port) || port < 1 || port > 65_535 ||
+      !Number.isInteger(options.activatedFd) || options.activatedFd < 3)) {
+    throw new Error("An inherited console listener requires a protected macOS background service and an exact port.");
+  }
   const token = options.operatorAuth ? "" : options.token || randomBytes(24).toString("base64url");
   const operatorAuth: OperatorAuthState | undefined = options.operatorAuth ? {
     code: backgroundAuth ? undefined : randomBytes(24).toString("base64url"),
@@ -198,7 +204,12 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   const updateTimer = setInterval(() => void updateChecker.check(true), UPDATE_CHECK_INTERVAL_MS);
   updateTimer.unref();
 
+  let listenerReady = false;
   const server = createServer((req, res) => {
+    if (!listenerReady) {
+      req.destroy();
+      return;
+    }
     handleRequest(req, res, store, token, uiDir, updateChecker, agentOptions, instanceKey, operatorAuth).catch((error) => {
       sendError(res, error);
     });
@@ -206,15 +217,25 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => {
+    const onListening = () => {
       server.off("error", reject);
+      const boundAddress = server.address();
+      if (!boundAddress || typeof boundAddress === "string" ||
+          (options.activatedFd !== undefined &&
+            (boundAddress.family !== "IPv4" || boundAddress.address !== "127.0.0.1" || boundAddress.port !== port))) {
+        server.close();
+        reject(new Error("Inherited console listener does not match the protected loopback endpoint."));
+        return;
+      }
       if (operatorAuth) {
-        const boundAddress = server.address() as AddressInfo;
         operatorAuth.origin = `http://127.0.0.1:${boundAddress.port}`;
         if (backgroundAuth) operatorAuth.statusPort = boundAddress.port;
       }
+      listenerReady = true;
       resolve();
-    });
+    };
+    if (options.activatedFd === undefined) server.listen(port, host, onListening);
+    else server.listen({ fd: options.activatedFd }, onListening);
   });
 
   let control: Awaited<ReturnType<typeof startConsoleControl>> | undefined;

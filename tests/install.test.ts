@@ -292,6 +292,22 @@ describe("launch-agent packaging", () => {
     expect(plist).not.toContain("s-gw one-time operator code");
   });
 
+  it("offers launchd ownership of the exact protected loopback listener only when selected", () => {
+    const normal = buildConsoleLaunchAgentPlist(9842, "/tmp/s-gw logs", {}, true);
+    const activated = buildConsoleLaunchAgentPlist(9842, "/tmp/s-gw logs", {}, true, true);
+    expect(normal).not.toContain("<key>Sockets</key>");
+    expect(normal).not.toContain("--launchd-socket");
+    expect(activated).toContain("s-gw-console-activate</string>");
+    expect(activated).toContain("<key>ProtectedConsole</key>");
+    expect(activated).toContain("<key>SockNodeName</key><string>127.0.0.1</string>");
+    expect(activated).toContain("<key>SockServiceName</key><string>9842</string>");
+    expect(activated).toContain("<key>SockFamily</key><string>IPv4</string>");
+    expect(activated).toContain("<key>SockType</key><string>stream</string>");
+    expect(activated).toContain("<string>--launchd-socket</string>");
+    expect(() => buildConsoleLaunchAgentPlist(9842, "/tmp/s-gw logs", {}, false, true))
+      .toThrow("requires a protected console");
+  });
+
   it("generates a menu-bar plist with CLI and console environment", () => {
     const plist = buildMenuBarLaunchAgentPlist({
       consoleUrl: "http://127.0.0.1:9900/",
