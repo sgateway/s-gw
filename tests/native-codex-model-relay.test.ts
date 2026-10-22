@@ -61,6 +61,8 @@ function runCodex(root: string, port: number): Promise<{ code: number | null; st
     "-c", 'model_providers.fixture.wire_api="responses"',
     "-c", "model_providers.fixture.requires_openai_auth=false",
     "-c", "model_providers.fixture.supports_websockets=false",
+    "-c", 'web_search="disabled"',
+    "-c", "features.multi_agent=false",
     "Reply exactly HELLO."];
   const child = spawn(codex, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: {
     PATH: process.env.PATH || "/usr/bin:/bin", HOME: root, CODEX_HOME: path.join(root, "codex"),
@@ -124,7 +126,7 @@ it.skipIf(!existsSync(codex) || !hasCompiler || !canRegister)(
       if (process.platform === "linux") session.linuxCgroup = linuxCgroup;
       const principal = principalForVerifiedPeer(principalIdForPeerSession(session), session.name, session.sessionId);
       const request = await store.createModelRelayRequest({ provider: "openai", handle, ttlMs: 30_000,
-        routes: ["POST /v1/responses"] }, principal);
+        routes: ["POST /v1/responses"], payloadProfile: "strict" }, principal);
       await store.approveRequest(request.id, { mode: "per-transaction" });
       const approvals = new StoreBackedModelRelayApprovals(store);
       relay = await startVerifiedModelRelayServer({ socketPath, store, approval: approvals, requestUpstream });
@@ -160,6 +162,9 @@ it.skipIf(!existsSync(codex) || !hasCompiler || !canRegister)(
       expect(upstreamPath).toBe("POST /v1/responses");
       expect(upstreamAuth).toBe(`Bearer ${brokerCredential}`);
       expect(upstreamBody).not.toContain("synthetic-client-placeholder");
+      const forwarded = JSON.parse(upstreamBody) as { store?: boolean; tools?: Array<{ type: string }> };
+      expect(forwarded.store).toBe(false);
+      expect(forwarded.tools?.every(tool => tool.type === "function" || tool.type === "custom")).toBe(true);
       stop();
       stop = undefined;
       await relay.close();
