@@ -23,17 +23,19 @@ export function isLiveConsole(): boolean {
 }
 
 export async function apiJson<T>(pathName: string, options: ApiOptions = {}): Promise<T> {
-  const headers: Record<string, string> = {
-    "X-SGW-Console-Token": consoleToken()
-  };
+  const method = options.method || "GET";
+  const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+  const headers: Record<string, string> = isProtectedConsole()
+    ? await signedOperatorHeaders(pathName, method, body || "")
+    : { "X-SGW-Console-Token": consoleToken() };
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
 
   const response = await fetch(pathName, {
-    method: options.method || "GET",
+    method,
     headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    body
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -170,7 +172,9 @@ export function isProtectedConsole(): boolean {
 
 export async function downloadAuditCsv(): Promise<void> {
   const response = await fetch(auditCsvUrl(), {
-    headers: { "X-SGW-Console-Token": consoleToken() }
+    headers: isProtectedConsole()
+      ? await signedOperatorHeaders(auditCsvUrl(), "GET", "")
+      : { "X-SGW-Console-Token": consoleToken() }
   });
   if (!response.ok) throw new Error("Audit CSV download failed.");
 
@@ -182,4 +186,9 @@ export async function downloadAuditCsv(): Promise<void> {
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+function signedOperatorHeaders(pathName: string, method: string, body: string): Promise<Record<string, string>> {
+  if (!window.SGW_OPERATOR_SIGN) throw new Error("Operator request signing is unavailable.");
+  return window.SGW_OPERATOR_SIGN(pathName, method, body);
 }

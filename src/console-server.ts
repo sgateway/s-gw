@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -51,11 +51,13 @@ const maxBodyBytes = 1024 * 1024;
 const operatorCodeLifetimeMs = 5 * 60 * 1000;
 const operatorSessionLifetimeMs = 15 * 60 * 1000;
 const operatorCookieName = "sgw_operator";
+const verifiedOperatorBodies = new WeakMap<IncomingMessage, Buffer>();
 
 interface OperatorSession {
   id: string;
   proof: string;
   expiresAt: number;
+  usedNonces: Set<string>;
 }
 
 interface OperatorAuthState {
@@ -484,7 +486,7 @@ async function handleProtectedRequest(
   }
 
   if (url.pathname.startsWith("/api/")) {
-    if (!validConsoleToken(req, session.proof)) {
+    if (!validConsoleToken(req, session.proof) && !await validSignedOperatorRequest(req, url, session)) {
       throw new HttpError(403, "Invalid operator request token.");
     }
     await handleApi(req, res, url, store, updateChecker, agentOptions, instanceKey);
@@ -522,7 +524,8 @@ async function enrollOperator(req: IncomingMessage, res: ServerResponse, auth: O
     auth.session = {
       id: randomBytes(32).toString("base64url"),
       proof: randomBytes(24).toString("base64url"),
-      expiresAt: now + operatorSessionLifetimeMs
+      expiresAt: now + operatorSessionLifetimeMs,
+      usedNonces: new Set()
     };
     res.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
@@ -630,7 +633,7 @@ function serveOperatorLogin(req: IncomingMessage, res: ServerResponse): void {
       if (!signature || !/^[A-Za-z0-9_-]{43}$/.test(signature)) throw new Error("Console proof missing.");
       const bytes = Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
       const key = await crypto.subtle.importKey(
-        "raw", new TextEncoder().encode(body.proof), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]
+        "raw", new TextEncoder().encode(body.proof), { name: "HMAC", hash: "SHA-256" }, false, ["verify", "sign"]
       );
       if (!await crypto.subtle.verify("HMAC", key, bytes, new TextEncoder().encode(markup))) {
         throw new Error("Console proof invalid.");
@@ -638,6 +641,19 @@ function serveOperatorLogin(req: IncomingMessage, res: ServerResponse): void {
 
       const parsed = new DOMParser().parseFromString(markup, "text/html");
       const scripts = [...parsed.querySelectorAll("script")];
+      window.SGW_OPERATOR_SIGN = async function (path, method, requestBody) {
+        const target = new URL(path, location.href);
+        if (target.origin !== location.origin || !target.pathname.startsWith("/api/")) {
+          throw new Error("Invalid console request.");
+        }
+        const random = crypto.getRandomValues(new Uint8Array(16));
+        const nonce = btoa(String.fromCharCode(...random)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+        const prefix = "sgw-operator-v1\\n" + method + "\\n" + target.pathname + target.search + "\\n" + nonce + "\\n";
+        const signed = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(prefix + requestBody));
+        const signature = btoa(String.fromCharCode(...new Uint8Array(signed)))
+          .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+        return { "X-SGW-Console-Nonce": nonce, "X-SGW-Console-Signature": signature };
+      };
       window.SGW_CONSOLE_TOKEN = body.proof;
       window.SGW_CONSOLE_LIVE = true;
       window.SGW_CONSOLE_OPERATOR_AUTH = true;
@@ -656,6 +672,7 @@ function serveOperatorLogin(req: IncomingMessage, res: ServerResponse): void {
         if (old.src) script.src = old.src;
         if (old.type) script.type = old.type;
         if (old.crossOrigin) script.crossOrigin = old.crossOrigin;
+        if (old.integrity) script.integrity = old.integrity;
         if (!old.src) script.textContent = old.textContent;
         script.async = false;
         (old.parentElement === parsed.head ? document.head : document.body).appendChild(script);
@@ -1452,6 +1469,7 @@ async function serveUi(
   }
 
   if (operatorProof) {
+    body = Buffer.from(await addUiIntegrity(body.toString("utf8"), uiDir));
     res.setHeader("X-SGW-App-Proof", createHmac("sha256", operatorProof).update(body).digest("base64url"));
   }
 
@@ -1469,6 +1487,30 @@ async function serveUi(
   }
 
   res.end(body);
+}
+
+async function addUiIntegrity(html: string, uiDir: string): Promise<string> {
+  const tags = [...html.matchAll(/<(script|link)\b[^>]*>/giu)];
+  const root = await realpath(uiDir);
+  let result = html;
+  for (let index = tags.length - 1; index >= 0; index--) {
+    const match = tags[index];
+    const tag = match[0];
+    if (match[1].toLowerCase() === "link" && !/\brel=["']stylesheet["']/iu.test(tag)) continue;
+    const asset = /\b(?:src|href)=["']([^"']+)["']/iu.exec(tag)?.[1];
+    if (!asset) continue;
+    const url = new URL(asset, "http://127.0.0.1/");
+    if (url.origin !== "http://127.0.0.1") continue;
+    const target = await realpath(path.resolve(uiDir, uiRelativePath(url.pathname, uiDir)));
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+      throw new HttpError(403, "Protected console asset is outside its directory.");
+    }
+    const digest = createHash("sha256").update(await readFile(target)).digest("base64");
+    const updated = tag.replace(/\s+integrity=["'][^"']*["']/iu, "")
+      .replace(/>$/u, ` integrity="sha256-${digest}">`);
+    result = result.slice(0, match.index) + updated + result.slice(match.index + tag.length);
+  }
+  return result;
 }
 
 function uiRelativePath(pathname: string, uiDir: string): string {
@@ -1524,6 +1566,19 @@ function consoleContentSecurityPolicy(nonce: string): string {
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const body = verifiedOperatorBodies.get(req) || await readBody(req);
+  verifiedOperatorBodies.delete(req);
+  if (body.length === 0) return {};
+
+  const parsed = JSON.parse(body.toString("utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new HttpError(400, "JSON body must be an object.");
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
 
@@ -1537,16 +1592,23 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
     chunks.push(buffer);
   }
 
-  if (chunks.length === 0) {
-    return {};
-  }
+  return Buffer.concat(chunks);
+}
 
-  const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new HttpError(400, "JSON body must be an object.");
-  }
+async function validSignedOperatorRequest(req: IncomingMessage, url: URL, session: OperatorSession): Promise<boolean> {
+  const nonce = req.headers["x-sgw-console-nonce"];
+  const signature = req.headers["x-sgw-console-signature"];
+  if (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{22}$/u.test(nonce) ||
+      typeof signature !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(signature) ||
+      session.usedNonces.has(nonce) || session.usedNonces.size >= 20_000) return false;
 
-  return parsed as Record<string, unknown>;
+  const body = await readBody(req);
+  const prefix = `sgw-operator-v1\n${req.method}\n${url.pathname}${url.search}\n${nonce}\n`;
+  const expected = createHmac("sha256", session.proof).update(prefix).update(body).digest("base64url");
+  if (!sameSecret(signature, expected)) return false;
+  session.usedNonces.add(nonce);
+  verifiedOperatorBodies.set(req, body);
+  return true;
 }
 
 function validConsoleToken(req: IncomingMessage, expected: string): boolean {

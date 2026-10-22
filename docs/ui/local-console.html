@@ -2445,12 +2445,10 @@
         }
 
         var init = options || {};
-        init.headers = Object.assign({
-          "X-SGW-Console-Token": apiToken,
-          "Content-Type": "application/json"
-        }, init.headers || {});
-
-        return fetch(path, init).then(function (response) {
+        return requestHeaders(path, init.method || "GET", init.body || "").then(function (authHeaders) {
+          init.headers = Object.assign({ "Content-Type": "application/json" }, authHeaders, init.headers || {});
+          return fetch(path, init);
+        }).then(function (response) {
           return response.json().catch(function () {
             return {};
           }).then(function (payload) {
@@ -2468,10 +2466,8 @@
           return Promise.reject(new Error("Console API is not available from the static file."));
         }
 
-        return fetch(path, {
-          headers: {
-            "X-SGW-Console-Token": apiToken
-          }
+        return requestHeaders(path, "GET", "").then(function (authHeaders) {
+          return fetch(path, { headers: authHeaders });
         }).then(function (response) {
           if (!response.ok) {
             throw new Error("Download failed.");
@@ -2479,6 +2475,16 @@
 
           return response.text();
         });
+      }
+
+      function requestHeaders(path, method, body) {
+        if (!window.SGW_CONSOLE_OPERATOR_AUTH) {
+          return Promise.resolve({ "X-SGW-Console-Token": apiToken });
+        }
+        if (!window.SGW_OPERATOR_SIGN) {
+          return Promise.reject(new Error("Operator request signing is unavailable."));
+        }
+        return window.SGW_OPERATOR_SIGN(path, method, body);
       }
 
       function loadState(message, quiet) {

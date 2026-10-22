@@ -170,6 +170,11 @@ describe("local console server", () => {
     const html = await signedInPage.text();
     expect(signedInPage.headers.get("x-sgw-app-proof"))
       .toBe(createHmac("sha256", proof).update(html).digest("base64url"));
+    const script = /<script[^>]*\bsrc="([^"]+)"[^>]*\bintegrity="sha256-([^"]+)"/u.exec(html);
+    expect(script).not.toBeNull();
+    const asset = await fetch(new URL(script![1], running.url), { headers: { Cookie: sessionCookie } });
+    expect(asset.status).toBe(200);
+    expect(script![2]).toBe(createHash("sha256").update(Buffer.from(await asset.arrayBuffer())).digest("base64"));
     expect(html).toContain('window.SGW_CONSOLE_TOKEN||""');
     expect(html).not.toContain(code);
     expect(html).not.toContain(proof);
@@ -178,6 +183,18 @@ describe("local console server", () => {
     expect((await fetch(`${running.url}api/health`, { headers: { Cookie: sessionCookie } })).status).toBe(403);
     expect((await fetch(`${running.url}api/health`, { headers: { Cookie: sessionCookie, "X-SGW-Console-Token": "é".repeat(32) } })).status).toBe(403);
     expect((await fetch(`${running.url}api/health`, { headers: { Cookie: sessionCookie, "X-SGW-Console-Token": proof } })).status).toBe(200);
+
+    const signedHeaders = (method: string, route: string, body: string, nonce: string) => ({
+      Cookie: sessionCookie,
+      "X-SGW-Console-Nonce": nonce,
+      "X-SGW-Console-Signature": createHmac("sha256", proof)
+        .update(`sgw-operator-v1\n${method}\n${route}\n${nonce}\n`).update(body).digest("base64url")
+    });
+    const readNonce = "A".repeat(22);
+    const signedRead = signedHeaders("GET", "/api/health", "", readNonce);
+    expect((await fetch(`${running.url}api/health`, { headers: signedRead })).status).toBe(200);
+    expect((await fetch(`${running.url}api/health`, { headers: signedRead })).status).toBe(403);
+    expect((await fetch(`${running.url}api/state`, { headers: signedHeaders("GET", "/api/health", "", "B".repeat(22)) })).status).toBe(403);
 
     const action = (headers: Record<string, string>) => fetch(`${running!.url}api/scan`, {
       method: "POST",
@@ -189,6 +206,16 @@ describe("local console server", () => {
     expect((await action({ Cookie: sessionCookie, Origin: "http://malicious.example", "X-SGW-Console-Token": proof })).status).toBe(403);
     expect((await action({ Origin: new URL(running.url).origin, "X-SGW-Console-Token": proof })).status).toBe(401);
     expect((await action({ Cookie: sessionCookie, Origin: new URL(running.url).origin, "X-SGW-Console-Token": proof })).status).toBe(200);
+    const signedBody = JSON.stringify({ text: "no secret", persist: false });
+    const signedWrite = signedHeaders("POST", "/api/scan", signedBody, "C".repeat(22));
+    expect((await fetch(`${running.url}api/scan`, {
+      method: "POST", headers: { ...signedWrite, Origin: new URL(running.url).origin, "Content-Type": "application/json" }, body: signedBody
+    })).status).toBe(200);
+    expect((await fetch(`${running.url}api/scan`, {
+      method: "POST", headers: { ...signedHeaders("POST", "/api/scan", signedBody, "D".repeat(22)),
+        Origin: new URL(running.url).origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "changed", persist: false })
+    })).status).toBe(403);
   });
 
   it.skipIf(process.platform !== "darwin")("enrolls a background operator from a private local control socket", async () => {

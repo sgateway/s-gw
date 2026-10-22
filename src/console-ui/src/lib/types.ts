@@ -340,5 +340,6 @@ declare global {
     SGW_CONSOLE_TOKEN?: string;
     SGW_CONSOLE_LIVE?: boolean;
     SGW_CONSOLE_OPERATOR_AUTH?: boolean;
+    SGW_OPERATOR_SIGN?: (path: string, method: string, body: string) => Promise<Record<string, string>>;
   }
 }

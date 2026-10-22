@@ -2,6 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -33,6 +34,7 @@ let profileDir = "";
 let running: RunningConsoleServer | undefined;
 let chrome: ChildProcess | undefined;
 let cdp: Cdp | undefined;
+let replacementListener: HttpServer | undefined;
 let oldEnv: NodeJS.ProcessEnv;
 
 beforeEach(async () => {
@@ -49,6 +51,10 @@ afterEach(async () => {
   cdp?.dispose();
   cdp = undefined;
   await stopChrome();
+  if (replacementListener) {
+    await new Promise<void>((resolve) => replacementListener!.close(() => resolve()));
+    replacementListener = undefined;
+  }
   if (running) {
     await running.close();
     running = undefined;
@@ -134,6 +140,14 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(await cdp.eval<string>("document.body.innerText")).toContain("one-time code");
     expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe("");
     await cdp.eval(`(() => {
+      window.SGW_API_HEADERS = [];
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (path, init) => {
+        if (String(path).startsWith('/api/')) {
+          window.SGW_API_HEADERS.push(Object.fromEntries(new Headers(init?.headers).entries()));
+        }
+        return originalFetch(path, init);
+      };
       document.querySelector('#code').value = ${JSON.stringify(code)};
       document.querySelector('#login').requestSubmit();
       return true;
@@ -141,6 +155,10 @@ describeBrowser("React local console (real headless Chrome)", () => {
 
     await waitFor(() => cdp!.eval<boolean>("Boolean(window.SGW_CONSOLE_TOKEN)"), "signed-in console");
     await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#root')?.children.length)"), "protected React console");
+    const appHeaders = await cdp.eval<Array<Record<string, string>>>("window.SGW_API_HEADERS || []");
+    expect(appHeaders.length).toBeGreaterThan(0);
+    expect(appHeaders.every((headers) => !headers["x-sgw-console-token"])).toBe(true);
+    expect(appHeaders.every((headers) => Boolean(headers["x-sgw-console-nonce"] && headers["x-sgw-console-signature"]))).toBe(true);
     expect(await cdp.eval<string>("sessionStorage.getItem('sgw_operator_proof') || ''")).toBe("");
     expect(await cdp.eval<string>("localStorage.getItem('sgw_operator_proof') || ''")).toBe("");
     const result = await cdp.eval<{ read: number; write: number; csvWithoutProof: number; csvWithProof: number }>(`(async () => {
@@ -188,6 +206,78 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe("");
     expect(await cdp.eval<string>("window.SGW_INJECTED_APP || ''")).toBe("");
   }, 30_000);
+
+  it("rejects a script changed after the protected app response was signed", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "protected-asset-swap-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    const uiDir = path.join(tmpHome, "ui");
+    mkdirSync(uiDir);
+    writeFileSync(path.join(uiDir, "index.html"), '<!doctype html><html><head><script src="/payload.js"></script></head><body>Protected fixture</body></html>');
+    writeFileSync(path.join(uiDir, "payload.js"), "window.SGW_ORIGINAL_ASSET = true;");
+    let code = "";
+    running = await startConsoleServer({ port: 0, uiDir, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const launched = await launchChrome(running.url);
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "operator sign-in page");
+    await cdp.eval(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const response = await originalFetch(...args);
+        if (args[0] !== '/auth/app') return response;
+        window.SGW_APP_FETCHED = true;
+        await new Promise((resolve) => { window.SGW_RELEASE_APP = resolve; });
+        return response;
+      };
+      document.querySelector('#code').value = ${JSON.stringify(code)};
+      document.querySelector('#login').requestSubmit();
+      return true;
+    })()`);
+    await waitFor(() => cdp!.eval<boolean>("Boolean(window.SGW_APP_FETCHED)"), "signed app response");
+    writeFileSync(path.join(uiDir, "payload.js"), "window.SGW_CHANGED_ASSET = true;");
+    await cdp.eval("window.SGW_RELEASE_APP()");
+    await waitFor(() => cdp!.eval<boolean>("Boolean(window.SGW_CONSOLE_TOKEN)"), "verified app response");
+    expect(await cdp.eval<string>("document.querySelector('script[src$=\"/payload.js\"]')?.integrity || ''"))
+      .toMatch(/^sha256-/u);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(await cdp.eval<boolean>("Boolean(window.SGW_ORIGINAL_ASSET || window.SGW_CHANGED_ASSET)")).toBe(false);
+  }, 30_000);
+
+  it("keeps the operator proof out of requests after the listener is replaced", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "protected-rebind-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    let code = "";
+    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const url = running.url;
+    const launched = await launchChrome(url);
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "operator sign-in page");
+    await cdp.eval(`(() => {
+      document.querySelector('#code').value = ${JSON.stringify(code)};
+      document.querySelector('#login').requestSubmit();
+      return true;
+    })()`);
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#root')?.children.length)"), "protected console");
+    const proof = await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''");
+    expect(proof).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+
+    await running.close();
+    running = undefined;
+    let received: Record<string, string | string[] | undefined> | undefined;
+    replacementListener = createHttpServer((req, res) => {
+      if (req.url === "/api/state") received = req.headers;
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end('{"error":"replacement"}');
+    });
+    await new Promise<void>((resolve, reject) => {
+      replacementListener!.once("error", reject);
+      replacementListener!.listen(Number(new URL(url).port), "127.0.0.1", resolve);
+    });
+    await waitFor(() => Boolean(received), "signed refresh reaching replacement listener", 12_000);
+    expect(received!["x-sgw-console-token"]).toBeUndefined();
+    expect(received!["x-sgw-console-nonce"]).toMatch(/^[A-Za-z0-9_-]{22}$/u);
+    expect(received!["x-sgw-console-signature"]).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(JSON.stringify(received)).not.toContain(proof);
+  }, 35_000);
 
   it("shows the canonical managed SSH route and pinned host key before approval", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "managed-route-browser-fixture";
