@@ -178,7 +178,7 @@ s-gw requests
 s-gw approve <request-id>
 ```
 
-Only after approval may the agent call `sgw_execute_request`. The executor injects the secret inside the local child process, sanitizes the output, records an audit event, and returns a tokenized result — the agent never receives the raw value:
+After approval, run `s-gw execute <request-id>` from the operator CLI. Ordinary MCP clients can submit environment-command and target-based SSH requests, but their name-only connection cannot claim them, even if they know the approved request ID. The current verified MCP endpoint supports agent execution of owned HTTPS and operator-managed SSH requests bound to its OS principal and live session; it does not offer environment commands or target-based SSH. The executor injects the secret inside the local child process, sanitizes the output, and records an audit event:
 
 ```json
 {

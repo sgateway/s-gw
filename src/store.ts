@@ -1321,10 +1321,10 @@ export class SecretStore {
       if (request.action.kind === "model_relay") {
         throw new Error("Model relay requests must be claimed by the verified relay launcher.");
       }
-      assertExecutionCaller(request, caller);
       if (request.state !== "approved") {
         throw new Error(`Request ${id} is ${request.state}; local approval is required before execution.`);
       }
+      assertExecutionCaller(request, caller, true);
 
       let upgradedLegacyAbsolute = false;
       try {
@@ -4234,8 +4234,9 @@ function durablePolicyAgentName(request: RequestRecord): string {
 }
 
 function assertExecutionCaller(
-  request: Pick<RequestRecord, "action" | "agentSource" | "principalId" | "agentSessionId">,
-  caller?: AgentIdentityContext
+  request: Pick<RequestRecord, "agentSource" | "principalId" | "agentSessionId">,
+  caller?: AgentIdentityContext,
+  requireSession = false
 ): void {
   // Operator CLI and UI calls omit caller; every MCP call supplies one.
   if (caller === undefined) return;
@@ -4243,19 +4244,13 @@ function assertExecutionCaller(
     if (request.agentSource === "managed-peer") {
       throw new Error("This execution is bound to a different verified agent or session.");
     }
-    if (request.action.kind === "http_request" ||
-        (request.action.kind === "ssh_session" && request.action.ssh?.managedRouteId)) {
-      throw new Error("Owned HTTPS and managed SSH execution requires a verified agent principal and session.");
-    }
+    if (requireSession) throw new Error("Agent execution requires a verified agent principal and session.");
     return;
   }
   const agent = requestAgentIdentity("", caller);
   if (request.agentSource !== "managed-peer" || agent.source !== "managed-peer" ||
       !request.principalId || request.principalId !== agent.principalId ||
-      request.agentSessionId !== agent.agentSessionId ||
-      ((request.action.kind === "http_request" ||
-        (request.action.kind === "ssh_session" && request.action.ssh?.managedRouteId)) &&
-        !request.agentSessionId)) {
+      request.agentSessionId !== agent.agentSessionId || (requireSession && !request.agentSessionId)) {
     throw new Error("This execution is bound to a different verified agent or session.");
   }
 }

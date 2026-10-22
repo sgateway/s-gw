@@ -3585,7 +3585,10 @@ describe("SecretStore", () => {
     await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/verified agent/i);
 
     await store.approveRequest(pending.id);
-    expect((await executeApprovedRequest(store, pending.id, { caller: claimed, engine: "typescript" })).stdout).toBe("policy");
+    await expect(executeApprovedRequest(store, pending.id, { caller: claimed, engine: "typescript" }))
+      .rejects.toThrow(/verified agent principal and session/);
+    expect((await store.getRequest(pending.id)).state).toBe("approved");
+    expect((await executeApprovedRequest(store, pending.id, { engine: "typescript" })).stdout).toBe("policy");
     for (const context of [
       { agentName: "Codex", env: {} },
       { env: { CODEX_SHELL: "1" } },
@@ -3698,14 +3701,17 @@ describe("SecretStore", () => {
     await store.approveRequest(legacy.id);
     await expect(executeApprovedRequest(store, legacy.id, { caller: peer, engine: "typescript" }))
       .rejects.toThrow(/different verified agent or session/);
-    expect((await executeApprovedRequest(store, legacy.id, { caller: ordinary, engine: "typescript" })).stdout).toBe("claimed");
+    await expect(executeApprovedRequest(store, legacy.id, { caller: ordinary, engine: "typescript" }))
+      .rejects.toThrow(/verified agent principal and session/);
+    expect((await store.getRequest(legacy.id)).state).toBe("approved");
+    expect((await executeApprovedRequest(store, legacy.id, { engine: "typescript" })).stdout).toBe("claimed");
 
     const operatorRequest = await store.createRequest(secret.handle, action, "operator claim", peer);
     await store.approveRequest(operatorRequest.id);
     expect((await executeApprovedRequest(store, operatorRequest.id, { engine: "typescript" })).stdout).toBe("claimed");
   });
 
-  it("keeps ordinary owned HTTPS and managed SSH approvals for the operator until a verified session requests them", async () => {
+  it("keeps ordinary HTTPS and SSH approvals for operator execution", async () => {
     const store = new SecretStore();
     const httpSecret = await store.addSecret({ name: "claim HTTPS token", type: "api-token", value: "synthetic-http-token",
       policy: { allowedCommands: [SGW_HTTP_COMMAND], allowedDestinations: ["example.test:443"] } });
@@ -3740,6 +3746,17 @@ describe("SecretStore", () => {
     }
     expect((await store.claimApprovedRequest(ssh.id)).state).toBe("executing");
     await store.markFailed(ssh.id, "synthetic operator fixture complete");
+
+    const targetSsh = await store.createRequest(sshSecret.handle, buildSshSessionAction({
+      target: "tester@example.test", args: ["id"], injectEnv: "SGW_SSH_CREDENTIAL"
+    }), "ordinary target SSH", ordinary);
+    await store.approveRequest(targetSsh.id);
+    for (const caller of [ordinary, otherClient, verified]) {
+      await expect(store.claimApprovedRequest(targetSsh.id, caller)).rejects.toThrow(/verified agent/);
+      expect((await store.getRequest(targetSsh.id)).state).toBe("approved");
+    }
+    expect((await store.claimApprovedRequest(targetSsh.id)).state).toBe("executing");
+    await store.markFailed(targetSsh.id, "synthetic operator fixture complete");
 
     const noSession = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex"), env: {} };
     const managedHttp = await store.createRequest(httpSecret.handle, buildHttpRequestAction({

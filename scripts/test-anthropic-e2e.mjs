@@ -139,8 +139,10 @@ try {
     const execute = () => ordinaryMcp.callTool({ name: 'sgw_execute_request', arguments: { requestId: request.id } });
     assert.equal((await execute()).isError, true);
     legacyCli(['approve', request.id]);
-    const executed = await execute(); assert(!executed.isError, JSON.stringify(executed));
-    const summary = JSON.parse(executed.content[0].text);
+    const denied = await execute();
+    assert.equal(denied.isError, true);
+    assert.match(denied.content[0].text, /verified agent principal and session/);
+    const summary = legacyCli(['execute', request.id]);
     assert.equal(summary.exitCode, 0); assert.match(summary.stdout, /ordinary MCP success/);
     assert(!summary.stdout.includes(legacyValue)); assert.match(summary.stdout, /SGW_SECRET/);
     assert.equal((await execute()).isError, true);

@@ -12,7 +12,7 @@ The existing builtin guard is still the default. macOS and Linux use Anthropic s
 
 ## Credential-backed actions
 
-The sandbox MCP connection exposes handle metadata, HTTPS requests, SSH requests, SSH uploads, and approved execution. It does not expose scanning, raw secret reads, or generic credential-bearing commands. Ordinary MCP retains its existing tools. The current same-user launcher gives this MCP connection only a declared client name. It can submit owned HTTPS and managed SSH requests, but it cannot execute them after approval; the operator CLI/UI must execute those requests and return only sanitized results. Agent execution of those actions requires the separate verified MCP endpoint with a matching OS principal and session. This changes the earlier request-and-execute flow for ordinary MCP clients; target-based SSH keeps its current behavior.
+The sandbox MCP connection exposes handle metadata, HTTPS requests, SSH requests, SSH uploads, and approved execution. It does not expose scanning, raw secret reads, or generic credential-bearing commands. Ordinary MCP retains its existing tools. The current same-user launcher gives this MCP connection only a declared client name. It can submit owned HTTPS, managed SSH, and target-based SSH requests, but it cannot execute them after approval; the operator CLI/UI must execute those requests and return only sanitized results. Agent execution of owned HTTPS and managed SSH requires the separate verified MCP endpoint with a matching OS principal and session. That endpoint does not offer target-based SSH or environment commands.
 
 For HTTPS, allow the exact destination and the owned executor on an existing handle through the trusted operator CLI:
 

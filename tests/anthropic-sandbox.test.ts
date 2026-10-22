@@ -707,6 +707,18 @@ writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0
       await store.approveRequest(requestId!);
       expect(httpRequestId).toBeTruthy(); await store.approveRequest(httpRequestId!);
       await writeFile(path.join(root, "workspace", "approval-ready"), "approved fixture");
+      let sshClaimDenied = false;
+      while (!sshClaimDenied && Date.now() < deadline) {
+        try { await readFile(path.join(root, "workspace", "ssh-claim-denied")); sshClaimDenied = true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (!sshClaimDenied) await new Promise(resolve => setTimeout(resolve, 30));
+      }
+      expect(sshClaimDenied).toBe(true);
+      expect((await store.getRequest(requestId!)).state).toBe("approved");
+      const sshSummary = await executeApprovedRequest(store, requestId!);
+      expect(sshSummary.exitCode).toBe(0);
+      await writeFile(path.join(root, "workspace", "ssh-operator-result.json"), JSON.stringify(sshSummary));
+      await writeFile(path.join(root, "workspace", "ssh-operator-executed"), "trusted operator executed");
       let claimDenied = false;
       while (!claimDenied && Date.now() < deadline) {
         try { await readFile(path.join(root, "workspace", "http-claim-denied")); claimDenied = true; }

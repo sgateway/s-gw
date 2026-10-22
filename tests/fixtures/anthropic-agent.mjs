@@ -81,11 +81,17 @@ try {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
   const executed = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: pending.id } });
-  assert(!executed.isError, JSON.stringify(executed));
-  const result = JSON.parse(executed.content[0].text);
+  assert.equal(executed.isError, true);
+  assert.match(executed.content[0].text, /verified agent principal and session/);
+  writeFileSync(`${root}/workspace/ssh-claim-denied`, 'ordinary MCP claim denied');
+  while (!existsSync(`${root}/workspace/ssh-operator-executed`)) {
+    if (Date.now() > deadline) throw new Error('Fixture operator SSH execution timed out');
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  const result = JSON.parse(readFileSync(`${root}/workspace/ssh-operator-result.json`, 'utf8'));
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /owned SSH fixture complete/);
-  checks.push('external broker executes approved SSH action; pending action was denied');
+  checks.push('operator executes approved SSH action after ordinary claim denial');
   const httpClaim = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } });
   assert.equal(httpClaim.isError, true);
   assert.match(httpClaim.content[0].text, /verified agent principal and session/);

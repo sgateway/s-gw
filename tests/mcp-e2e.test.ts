@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createWriteStream, realpathSync } from "node:fs";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -210,9 +210,10 @@ describe("MCP end-to-end flow", () => {
         name: "sgw_execute_request",
         arguments: { requestId: requestPayload.request.id }
       });
-      expect(executed.isError).not.toBe(true);
+      expect(executed.isError).toBe(true);
+      expect(executed.content[0].text).toContain("verified agent principal and session");
 
-      const summary = JSON.parse(executed.content[0].text);
+      const summary = JSON.parse(runCli(["execute", requestPayload.request.id]));
       expect(summary.exitCode).toBe(0);
       expect(summary.stdout).not.toContain("mcp-e2e-secret-value");
       expect(summary.stdout).toContain(`<<SGW_SECRET:${addPayload.handle}>>`);
@@ -266,8 +267,9 @@ describe("MCP end-to-end flow", () => {
       expect(manual.approvalGrantId).toBeUndefined();
       expect(JSON.parse(runCli(["approval", "grants", "list"]))).toEqual([]);
       const executed = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
-      expect(executed.isError).not.toBe(true);
-      expect(JSON.parse(executed.content[0].text)).toMatchObject({ exitCode: 0, stdout: "approved" });
+      expect(executed.isError).toBe(true);
+      expect(executed.content[0].text).toContain("verified agent principal and session");
+      expect(JSON.parse(runCli(["execute", request.id]))).toMatchObject({ exitCode: 0, stdout: "approved" });
 
       const repeat = await client.callTool({ name: "sgw_request_execution", arguments: args });
       const repeatRequest = JSON.parse(repeat.content[0].text).request;
@@ -284,8 +286,9 @@ describe("MCP end-to-end flow", () => {
         const claimed = await otherClient.callTool({
           name: "sgw_execute_request", arguments: { requestId: repeatRequest.id }
         });
-        expect(claimed.isError).not.toBe(true);
-        expect(JSON.parse(claimed.content[0].text)).toMatchObject({ exitCode: 0, stdout: "approved" });
+        expect(claimed.isError).toBe(true);
+        expect(claimed.content[0].text).toContain("verified agent principal and session");
+        expect(JSON.parse(runCli(["execute", repeatRequest.id]))).toMatchObject({ exitCode: 0, stdout: "approved" });
       } finally {
         await otherClient.close();
       }
@@ -323,6 +326,55 @@ describe("MCP end-to-end flow", () => {
         expect(denied.isError).toBe(true);
         expect(denied.content[0].text).toMatch(/verified agent principal and session/);
       }
+    } finally {
+      await Promise.all(clients.map(client => client.close()));
+    }
+  }, 30_000);
+
+  it.skipIf(process.platform === "win32")("keeps a manually approved legacy SSH request out of another MCP client", async () => {
+    const fakeSsh = path.join(tmpHome, "fake-ssh");
+    await writeFile(fakeSsh, `#!${process.execPath}\nif (!process.argv.includes("-M")) process.stdout.write("legacy SSH result");\n`);
+    await chmod(fakeSsh, 0o755);
+    testEnv = {
+      ...testEnv,
+      SGW_HOME: path.join(tmpHome, "store"),
+      SGW_RECOVERY_HOME: path.join(tmpHome, "recovery"),
+      SGW_TEST_MODE: "1",
+      SGW_TEST_HOME_ROOT: tmpHome,
+      SGW_SSH_CLI: realpathSync(fakeSsh)
+    };
+    runCli(["init"]);
+    const secret = JSON.parse(runCli([
+      "secret", "add", "--name", "legacy SSH claim fixture", "--type", "ssh-key", "--value-stdin",
+      "--allow-command", "s-gw:ssh-session"
+    ], "synthetic-legacy-ssh-key"));
+
+    const clients: Client[] = [];
+    try {
+      for (const name of ["Codex", "Claude"]) {
+        const transport = new StdioClientTransport({
+          command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+          env: testEnv as Record<string, string>, stderr: "pipe"
+        });
+        const client = new Client({ name, version: "0.0.1" });
+        await client.connect(transport);
+        clients.push(client);
+      }
+      const pending = await clients[0].callTool({ name: "sgw_request_ssh_session", arguments: {
+        handle: secret.handle, target: "fixture@example.test", args: ["id"],
+        reason: "ordinary MCP legacy SSH claim fixture"
+      } });
+      const request = JSON.parse(pending.content[0].text).request;
+      expect(request).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "mcp-client" });
+      expect(request.action.ssh.managedRouteId).toBeUndefined();
+      runCli(["approve", request.id, "--mode", "per-transaction"]);
+
+      for (const client of clients) {
+        const denied = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+        expect(denied.isError).toBe(true);
+        expect(denied.content[0].text).toContain("verified agent principal and session");
+      }
+      expect(JSON.parse(runCli(["execute", request.id]))).toMatchObject({ exitCode: 0, stdout: "legacy SSH result" });
     } finally {
       await Promise.all(clients.map(client => client.close()));
     }
