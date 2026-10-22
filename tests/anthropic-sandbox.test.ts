@@ -125,6 +125,10 @@ describe("Anthropic sandbox", () => {
     expect(anthropicSandboxReadiness("win32")).toMatchObject({ supported: false, ready: false, tlsInterception: false });
   });
 
+  it("rejects Windows session storage without a native user boundary", () => {
+    expect(() => sandboxSessionRoot("win32", 1000)).toThrow("A native user identity is required");
+  });
+
   it("starts isolated authentication with a fresh agent home and a small environment", () => {
     const workspace = path.resolve("fixture-workspace");
     const store = path.resolve("fixture-store");
@@ -145,7 +149,7 @@ describe("Anthropic sandbox", () => {
     for (const name of ["API_KEY", "SGW_MASTER_PASSPHRASE", "NODE_OPTIONS", "SSH_AUTH_SOCK"]) expect(env[name]).toBeUndefined();
   });
 
-  it("checks native account paths and workspace overlap in strict isolated mode", async () => {
+  it.skipIf(process.platform === "win32")("checks native account paths and workspace overlap in strict isolated mode", async () => {
     const store = await fixtureStore();
     const workspace = path.join(root, "workspace");
     const outside = path.join(root, "outside");
@@ -184,7 +188,7 @@ describe("Anthropic sandbox", () => {
     expect(() => anthropicSandboxConfig(workspace, store.home, { strictIsolatedAuth: true })).toThrow("requires isolated authentication");
   });
 
-  it("does not re-allow an arbitrary native-home file as a CA dependency", async () => {
+  it.skipIf(process.platform === "win32")("does not re-allow an arbitrary native-home file as a CA dependency", async () => {
     const store = await fixtureStore();
     const workspace = path.join(root, "workspace");
     const nativeHome = path.join(root, "native-home");
@@ -206,7 +210,7 @@ describe("Anthropic sandbox", () => {
     expect(config.filesystem.allowRead).toContain(outsideCa);
   });
 
-  it("rejects package and command read allowances under protected homes", async () => {
+  it.skipIf(process.platform === "win32")("rejects package and command read allowances under protected homes", async () => {
     const store = await fixtureStore();
     const workspace = path.join(root, "workspace");
     const outside = path.join(root, "outside");

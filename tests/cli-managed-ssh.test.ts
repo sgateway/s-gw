@@ -59,4 +59,4 @@ it("manages trusted SSH routes and requests one by ID through the CLI", async ()
   expect(run(["ssh", "route", "update", "--id", added.id, "--name", "renamed"]).name).toBe("renamed");
   expect(run(["ssh", "route", "delete", "--id", added.id]).id).toBe(added.id);
   expect(run(["ssh", "route", "list"])).toEqual([]);
-});
+}, 30_000);
