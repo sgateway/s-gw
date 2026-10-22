@@ -118,16 +118,21 @@ export interface LinuxManagedMcpSession {
   close(): Promise<void>;
 }
 
-export async function closeLinuxManagedMcpResources(stopAgent: () => Promise<void>,
-  mcp: Pick<VerifiedMcpServer, "close">, control: Pick<LinuxAgentControlClient, "close">,
+export async function closeLinuxManagedMcpResources(stopAgent: (() => Promise<void>) | undefined,
+  mcp: Pick<VerifiedMcpServer, "close"> | undefined,
+  control: Pick<LinuxAgentControlClient, "close"> | undefined,
   relay?: Pick<VerifiedModelRelayServer, "close">): Promise<void> {
-  traceLinuxManagedStop("agent stop call entering");
-  const agentStop = Promise.resolve().then(stopAgent);
-  void agentStop.then(() => traceLinuxManagedStop("agent stop resolved"),
-    () => traceLinuxManagedStop("agent stop rejected"));
-  const controlClose = agentStop.then(() => control.close(), () => control.close());
-  const cleanup = [agentStop, Promise.resolve().then(() => mcp.close()), controlClose];
+  const agentStop = stopAgent ? Promise.resolve().then(stopAgent) : Promise.resolve();
+  if (stopAgent) {
+    traceLinuxManagedStop("agent stop call entering");
+    void agentStop.then(() => traceLinuxManagedStop("agent stop resolved"),
+      () => traceLinuxManagedStop("agent stop rejected"));
+  }
+  const cleanup: Promise<void>[] = [];
+  if (stopAgent) cleanup.push(agentStop);
+  if (mcp) cleanup.push(Promise.resolve().then(() => mcp.close()));
   if (relay) cleanup.push(Promise.resolve().then(() => relay.close()));
+  if (control) cleanup.push(agentStop.then(() => control.close(), () => control.close()));
   const failures: unknown[] = [];
   for (const result of await Promise.allSettled(cleanup)) {
     if (result.status === "rejected") failures.push(result.reason);
@@ -179,16 +184,11 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
       });
     if (control.signal.aborted) throw new Error("Linux root control service ended during launch.");
   } catch (error) {
-    const failures = [error];
-    const cleanup: Promise<void>[] = [];
-    if (stopAgent) cleanup.push(stopAgent());
-    if (relay) cleanup.push(relay.close());
-    if (mcp) cleanup.push(mcp.close());
-    for (const result of await Promise.allSettled(cleanup)) {
-      if (result.status === "rejected") failures.push(result.reason);
+    try { await closeLinuxManagedMcpResources(stopAgent, mcp, control, relay); }
+    catch (cleanupError) {
+      const failures = cleanupError instanceof AggregateError ? cleanupError.errors : [cleanupError];
+      throw new AggregateError([error, ...failures], "Linux managed MCP launch cleanup failed.");
     }
-    if (control) { try { await control.close(); } catch (cleanup) { failures.push(cleanup); } }
-    if (failures.length > 1) throw new AggregateError(failures, "Linux managed MCP launch cleanup failed.");
     throw error;
   }
   let closing: Promise<void> | undefined;

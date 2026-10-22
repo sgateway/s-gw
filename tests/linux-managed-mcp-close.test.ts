@@ -25,6 +25,25 @@ describe("Linux managed MCP teardown", () => {
     expect(control.close).toHaveBeenCalledOnce();
   });
 
+  it("closes root control after a partial launch without a stop callback", async () => {
+    const events: string[] = [];
+    let finishMcp: (() => void) | undefined;
+    const mcpClosed = new Promise<void>(resolve => { finishMcp = resolve; });
+    const mcp = { close: vi.fn(async () => {
+      events.push("mcp close");
+      await mcpClosed;
+      events.push("mcp closed");
+    }) };
+    const control = { close: vi.fn(async () => {
+      events.push("control close");
+      finishMcp!();
+    }) };
+
+    await closeLinuxManagedMcpResources(undefined, mcp, control);
+    expect(events).toEqual(["mcp close", "control close", "mcp closed"]);
+    expect(control.close).toHaveBeenCalledOnce();
+  });
+
   it("waits for a successful agent stop before closing root control", async () => {
     const events: string[] = [];
     let finishStop: (() => void) | undefined;
