@@ -1,5 +1,5 @@
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -168,6 +168,8 @@ describe("local console server", () => {
     const sessionCookie = cookie.split(";")[0];
     const signedInPage = await fetch(`${running.url}auth/app`, { headers: { Cookie: sessionCookie } });
     const html = await signedInPage.text();
+    expect(signedInPage.headers.get("x-sgw-app-proof"))
+      .toBe(createHmac("sha256", proof).update(html).digest("base64url"));
     expect(html).toContain('window.SGW_CONSOLE_TOKEN||""');
     expect(html).not.toContain(code);
     expect(html).not.toContain(proof);

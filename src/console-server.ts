@@ -479,7 +479,7 @@ async function handleProtectedRequest(
   }
 
   if (url.pathname === "/auth/app") {
-    await serveUi(req, res, "/", uiDir, "", true);
+    await serveUi(req, res, "/", uiDir, "", true, session.proof);
     return;
   }
 
@@ -625,8 +625,18 @@ function serveOperatorLogin(req: IncomingMessage, res: ServerResponse): void {
       if (!body.proof) throw new Error("Missing operator proof.");
       const app = await fetch("/auth/app");
       if (!app.ok) throw new Error("Console unavailable.");
+      const markup = await app.text();
+      const signature = app.headers.get("X-SGW-App-Proof");
+      if (!signature || !/^[A-Za-z0-9_-]{43}$/.test(signature)) throw new Error("Console proof missing.");
+      const bytes = Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+      const key = await crypto.subtle.importKey(
+        "raw", new TextEncoder().encode(body.proof), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]
+      );
+      if (!await crypto.subtle.verify("HMAC", key, bytes, new TextEncoder().encode(markup))) {
+        throw new Error("Console proof invalid.");
+      }
 
-      const parsed = new DOMParser().parseFromString(await app.text(), "text/html");
+      const parsed = new DOMParser().parseFromString(markup, "text/html");
       const scripts = [...parsed.querySelectorAll("script")];
       window.SGW_CONSOLE_TOKEN = body.proof;
       window.SGW_CONSOLE_LIVE = true;
@@ -1408,7 +1418,8 @@ async function serveUi(
   pathname: string,
   uiDir: string,
   token: string,
-  operatorAuth = false
+  operatorAuth = false,
+  operatorProof?: string
 ): Promise<void> {
   if (req.method !== "GET" && req.method !== "HEAD") {
     throw new HttpError(405, "Only GET is supported for local console assets.");
@@ -1438,6 +1449,10 @@ async function serveUi(
   const scriptNonce = randomBytes(18).toString("base64");
   if (path.basename(target) === "local-console.html" || path.basename(target) === "index.html") {
     body = Buffer.from(injectConsoleToken(body.toString("utf8"), token, scriptNonce, operatorAuth));
+  }
+
+  if (operatorProof) {
+    res.setHeader("X-SGW-App-Proof", createHmac("sha256", operatorProof).update(body).digest("base64url"));
   }
 
   res.writeHead(200, {

@@ -163,6 +163,32 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe("");
   }, 30_000);
 
+  it("rejects a changed app response after operator enrollment", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "protected-app-swap-fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    let code = "";
+    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    const launched = await launchChrome(running.url);
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('#login'))"), "operator sign-in page");
+    await cdp.eval(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const response = await originalFetch(...args);
+        if (args[0] !== '/auth/app') return response;
+        const altered = (await response.text()).replace('</body>',
+          '<script>window.SGW_INJECTED_APP = window.SGW_CONSOLE_TOKEN || "executed";</script></body>');
+        return new Response(altered, { status: response.status, headers: response.headers });
+      };
+      document.querySelector('#code').value = ${JSON.stringify(code)};
+      document.querySelector('#login').requestSubmit();
+      return true;
+    })()`);
+    await waitFor(() => cdp!.eval<boolean>("document.querySelector('#error')?.textContent.includes('Sign-in failed')"), "altered app rejected");
+    expect(await cdp.eval<string>("window.SGW_CONSOLE_TOKEN || ''")).toBe("");
+    expect(await cdp.eval<string>("window.SGW_INJECTED_APP || ''")).toBe("");
+  }, 30_000);
+
   it("shows the canonical managed SSH route and pinned host key before approval", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "managed-route-browser-fixture";
     process.env.SGW_SECRET_BACKEND = "local";
