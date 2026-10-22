@@ -1,7 +1,7 @@
 import { runOwnedHttpRequest, type OwnedHttpOptions } from "./http-executor.js";
 import { createHash } from "node:crypto";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { verifyPinnedCommand } from "./command-path.js";
 import {
@@ -12,6 +12,7 @@ import {
 } from "./store.js";
 import { sanitizeKnownSecrets } from "./scanner.js";
 import { assertSshCredentialSupported, runOwnedSshSession } from "./ssh.js";
+import { killProcessTree, spawnIsolated } from "./process-tree.js";
 import type { AgentIdentityContext } from "./agent-context.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
 
@@ -20,6 +21,7 @@ export interface ExecutionOptions {
   coreBinary?: string;
   http?: OwnedHttpOptions;
   operationsOnly?: boolean;
+  strictLegacyRevocation?: boolean;
   caller?: AgentIdentityContext;
   agentSession?: { signal: AbortSignal; assertActive(): void };
 }
@@ -36,15 +38,22 @@ export async function executeApprovedRequest(
     if (!["http_request", "ssh_session"].includes(pending.action.kind)) throw new Error("Sandbox execution supports owned SSH and HTTPS operations only.");
   }
   const request = await store.claimApprovedRequest(requestId, options.caller, options.agentSession?.assertActive);
+  const strictLegacy = options.strictLegacyRevocation === true &&
+    (request.action.kind === "env_command" || request.action.kind === "ssh_session") && !request.action.owned;
   try {
     options.agentSession?.assertActive();
     const summary = await executeRequest(store, request, options);
     options.agentSession?.assertActive();
+    if (strictLegacy) await store.assertLegacyRequestAuthorized(requestId);
     await store.markExecuted(requestId, summary);
     return summary;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await store.markFailed(requestId, message);
+    try {
+      await store.markFailed(requestId, message);
+    } catch (markError) {
+      if (!strictLegacy || (await store.getRequest(requestId)).state !== "failed") throw markError;
+    }
     throw error;
   }
 }
@@ -60,34 +69,45 @@ export async function executeReusablePermit(
   }
 
   const prepared = await prepareEnvExecution(store, initialRequest);
+  const assertReusable = options.strictLegacyRevocation ? async () => {
+    options.agentSession?.assertActive();
+    await store.validateReusableExecutionPermit(permit, options.caller);
+    options.agentSession?.assertActive();
+  } : undefined;
   let nativeLaunch = false;
   try {
-    return await store.launchReusableExecution(permit, (request) => {
+    const summary = await store.launchReusableExecution(permit, (request) => {
       const launch = launchReusableEnvCommand(
         request,
         prepared.command,
         prepared.secretRecord,
         prepared.secretValue,
         prepared.extraSecrets,
-        options
+        options,
+        assertReusable
       );
       nativeLaunch = launch.nativeLaunch;
       return launch;
     }, options.caller);
+    await assertReusable?.();
+    return summary;
   } catch (error) {
     if (!nativeLaunch || executionEngine(options.engine) !== "auto" || !isNativeLaunchError(error)) {
       throw error;
     }
 
-    return store.launchReusableExecution(permit, (request) => {
+    const summary = await store.launchReusableExecution(permit, (request) => {
       return startTypeScriptEnvCommand(
         request,
         prepared.command,
         prepared.secretRecord,
         prepared.secretValue,
-        prepared.extraSecrets
+        prepared.extraSecrets,
+        assertReusable
       );
     }, options.caller);
+    await assertReusable?.();
+    return summary;
   }
 }
 
@@ -105,6 +125,14 @@ async function executeRequest(
   executionOptions: { cacheOnePassword?: boolean } = {}
 ): Promise<ExecutionSummary> {
   options.agentSession?.assertActive();
+  const strictLegacy = options.strictLegacyRevocation === true &&
+    (request.action.kind === "env_command" || request.action.kind === "ssh_session") && !request.action.owned;
+  const assertLegacy = strictLegacy ? async () => {
+    options.agentSession?.assertActive();
+    await store.assertLegacyRequestAuthorized(request.id);
+    options.agentSession?.assertActive();
+  } : undefined;
+  await assertLegacy?.();
   const command = request.action.kind === "env_command"
     ? commandForExecution(request)
     : undefined;
@@ -124,16 +152,17 @@ async function executeRequest(
     });
   }
   if (request.action.kind === "ssh_session") {
-    const assertOwned = options.operationsOnly || request.action.owned ? async () => {
+    const assertSshAuthorization = options.operationsOnly || request.action.owned ? async () => {
       options.agentSession?.assertActive();
       await store.assertOwnedRequestAuthorized(request.id);
       options.agentSession?.assertActive();
-    } : undefined;
-    if (options.operationsOnly) await assertOwned?.();
-    return runOwnedSshSession(request, secretRecord, secretValue, store.home, assertOwned, options.agentSession?.signal);
+    } : assertLegacy;
+    if (options.operationsOnly) await assertSshAuthorization?.();
+    return runOwnedSshSession(request, secretRecord, secretValue, store.home, assertSshAuthorization, options.agentSession?.signal, strictLegacy);
   }
   const extraSecrets = await resolveExtraSecrets(store, request, executionOptions);
-  return runEnvCommand(request, command!, secretRecord, secretValue, extraSecrets, options);
+  await assertLegacy?.();
+  return runEnvCommand(request, command!, secretRecord, secretValue, extraSecrets, options, assertLegacy);
 }
 
 interface PreparedEnvExecution {
@@ -158,8 +187,10 @@ async function runEnvCommand(
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[],
-  options: ExecutionOptions
+  options: ExecutionOptions,
+  assertAuthorized?: () => Promise<void>
 ): Promise<ExecutionSummary> {
+  await assertAuthorized?.();
   const engine = executionEngine(options.engine);
   const coreBinary = options.coreBinary || rustCoreBinary();
   if (engine !== "typescript" && existsSync(coreBinary)) {
@@ -167,14 +198,15 @@ async function runEnvCommand(
       if (engine === "rust") {
         throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
       }
-      return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets).completion;
+      return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets, assertAuthorized).completion;
     }
 
     try {
-      return await startRustEnvCommand(coreBinary, request, command, secretRecord, secretValue, extraSecrets).completion;
+      return await startRustEnvCommand(coreBinary, request, command, secretRecord, secretValue, extraSecrets, assertAuthorized).completion;
     } catch (error) {
       if (engine === "auto" && isNativeLaunchError(error)) {
-        return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets).completion;
+        await assertAuthorized?.();
+        return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets, assertAuthorized).completion;
       }
       if (engine === "rust" && isNativeLaunchError(error)) {
         throw new Error(`Rust execution core could not be launched: ${coreBinary}. ${errorMessage(error)}`);
@@ -186,7 +218,7 @@ async function runEnvCommand(
     throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
   }
 
-  return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets).completion;
+  return startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets, assertAuthorized).completion;
 }
 
 interface ReusableEnvLaunch extends ExecutionLaunch<ExecutionSummary> {
@@ -199,7 +231,8 @@ function launchReusableEnvCommand(
   secretRecord: SecretRecord,
   secretValue: string,
   extraSecrets: ResolvedEnvSecret[],
-  options: ExecutionOptions
+  options: ExecutionOptions,
+  assertAuthorized?: () => Promise<void>
 ): ReusableEnvLaunch {
   const engine = executionEngine(options.engine);
   const coreBinary = options.coreBinary || rustCoreBinary();
@@ -208,10 +241,10 @@ function launchReusableEnvCommand(
       if (engine === "rust") {
         throw new Error(`Rust execution core is not compatible with ${process.platform}-${process.arch}: ${coreBinary}`);
       }
-      return { ...startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
+      return { ...startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets, assertAuthorized), nativeLaunch: false };
     }
 
-    const launch = startRustEnvCommand(coreBinary, request, command, secretRecord, secretValue, extraSecrets);
+    const launch = startRustEnvCommand(coreBinary, request, command, secretRecord, secretValue, extraSecrets, assertAuthorized);
     if (engine !== "rust") {
       return { ...launch, nativeLaunch: true };
     }
@@ -229,7 +262,7 @@ function launchReusableEnvCommand(
     throw new Error(`Rust execution core is unavailable: ${coreBinary}`);
   }
 
-  return { ...startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets), nativeLaunch: false };
+  return { ...startTypeScriptEnvCommand(request, command, secretRecord, secretValue, extraSecrets, assertAuthorized), nativeLaunch: false };
 }
 
 function startRustEnvCommand(
@@ -238,14 +271,22 @@ function startRustEnvCommand(
   command: string,
   secretRecord: SecretRecord,
   secretValue: string,
-  extraSecrets: ResolvedEnvSecret[]
+  extraSecrets: ResolvedEnvSecret[],
+  assertAuthorized?: () => Promise<void>
 ): ExecutionLaunch<ExecutionSummary> {
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
-  const child = spawn(coreBinary, ["execute"], {
+  const launch = assertAuthorized ? spawnIsolated : spawn;
+  const child = launch(coreBinary, ["execute"], {
     env: buildCoreEnv(),
     shell: false,
     stdio: ["pipe", "pipe", "pipe"]
   });
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    killProcessTree(child, "SIGKILL");
+    throw new Error("Rust execution core capture pipes unavailable.");
+  }
+  const stdin = child.stdin;
+  const monitor = monitorLegacyAuthorization(child, assertAuthorized);
   let stdout = "";
   let stderr = "";
   const responseLimit = Math.max(1_048_576, maxOutput * 4);
@@ -262,14 +303,14 @@ function startRustEnvCommand(
     child.once("close", (code, signal) => resolve({ code, signal }));
   });
   const input = new Promise<void>((resolve, reject) => {
-    child.stdin.once("error", (error: NodeJS.ErrnoException) => {
+    stdin.once("error", (error: NodeJS.ErrnoException) => {
       if (error.code === "EPIPE") {
         resolve();
         return;
       }
       reject(error);
     });
-    child.stdin.end(JSON.stringify({
+    stdin.end(JSON.stringify({
       version: 1,
       requestId: request.id,
       handle: request.handle,
@@ -288,7 +329,9 @@ function startRustEnvCommand(
     }), resolve);
   });
 
-  const completion = Promise.all([childCompletion, input]).then(([status]) => {
+  const completion = Promise.all([childCompletion, input]).then(async ([status]) => {
+    const revoked = await monitor?.stop();
+    if (revoked) throw revoked;
     if (status.code !== 0) {
       throw new Error(stderr.trim() || `Rust execution core exited ${status.code ?? status.signal ?? "unexpectedly"}.`);
     }
@@ -310,6 +353,9 @@ function startRustEnvCommand(
       throw new Error("Rust execution core returned an invalid execution proof.");
     }
     return summary;
+  }).catch(async (error: unknown) => {
+    const revoked = await monitor?.stop();
+    throw revoked || error;
   });
   void completion.catch(() => undefined);
   return { completion };
@@ -478,7 +524,8 @@ function startTypeScriptEnvCommand(
   command: string,
   secretRecord: SecretRecord,
   secretValue: string,
-  extraSecrets: ResolvedEnvSecret[]
+  extraSecrets: ResolvedEnvSecret[],
+  assertAuthorized?: () => Promise<void>
 ): ExecutionLaunch<ExecutionSummary> {
   const started = Date.now();
   const maxOutput = secretRecord.policy.maxOutputBytes || 16_384;
@@ -492,12 +539,18 @@ function startTypeScriptEnvCommand(
   // truncating raw output first could cut a secret in half and leak the prefix.
   const captureCap = maxOutput + longestSecretBytes;
   const env = buildExecutionEnv(request.action.injectEnv, secretValue, extraSecrets);
-  const child = spawn(command, request.action.args, {
+  const launch = assertAuthorized ? spawnIsolated : spawn;
+  const child = launch(command, request.action.args, {
     cwd: request.action.workingDir,
     env,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"]
   });
+  if (!child.stdout || !child.stderr) {
+    killProcessTree(child, "SIGKILL");
+    throw new Error("Command capture pipes unavailable.");
+  }
+  const monitor = monitorLegacyAuthorization(child, assertAuthorized);
 
   let stdout = "";
   let stderr = "";
@@ -506,9 +559,9 @@ function startTypeScriptEnvCommand(
   const timeout = request.action.timeoutMs > 0
     ? setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      if (assertAuthorized) killProcessTree(child, "SIGTERM"); else child.kill("SIGTERM");
       killTimer = setTimeout(() => {
-        child.kill("SIGKILL");
+        if (assertAuthorized) killProcessTree(child, "SIGKILL"); else child.kill("SIGKILL");
       }, 1_500);
     }, request.action.timeoutMs)
     : undefined;
@@ -523,13 +576,15 @@ function startTypeScriptEnvCommand(
   const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (code, signal) => resolve({ code, signal }));
-  }).then((status) => {
+  }).then(async (status) => {
     if (timeout) {
       clearTimeout(timeout);
     }
     if (killTimer) {
       clearTimeout(killTimer);
     }
+    const revoked = await monitor?.stop();
+    if (revoked) throw revoked;
 
     const sanitizedStdout = sanitizeKnownSecrets(stdout, secretPairs);
     const sanitizedStderr = sanitizeKnownSecrets(stderr, secretPairs);
@@ -546,9 +601,40 @@ function startTypeScriptEnvCommand(
       timedOut,
       sanitized: sanitizedStdout !== stdout || sanitizedStderr !== stderr
     } satisfies ExecutionSummary;
+  }).catch(async (error: unknown) => {
+    if (timeout) clearTimeout(timeout);
+    if (killTimer) clearTimeout(killTimer);
+    const revoked = await monitor?.stop();
+    throw revoked || error;
   });
   void completion.catch(() => undefined);
   return { completion };
+}
+
+function monitorLegacyAuthorization(child: ChildProcess, assertAuthorized?: () => Promise<void>):
+  { stop(): Promise<Error | undefined> } | undefined {
+  if (!assertAuthorized) return;
+  let pending: Promise<void> | undefined;
+  let revoked: Error | undefined;
+  let closed = false;
+  const timer = setInterval(() => {
+    if (closed || pending || revoked) return;
+    pending = assertAuthorized().catch((error: unknown) => {
+      if (closed) return;
+      revoked = error instanceof Error ? error : new Error("Legacy execution authorization was revoked.");
+      try { killProcessTree(child, "SIGKILL"); }
+      catch { child.kill("SIGKILL"); }
+    }).finally(() => { pending = undefined; });
+  }, 100);
+  child.once("close", () => { closed = true; clearInterval(timer); });
+  return {
+    async stop() {
+      closed = true;
+      clearInterval(timer);
+      await pending;
+      return revoked;
+    }
+  };
 }
 
 interface ResolvedEnvSecret {

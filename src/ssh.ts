@@ -117,7 +117,8 @@ export async function runOwnedSshSession(
   secretValue: string,
   home = getSgwHome(),
   assertAuthorized?: () => Promise<void>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  strictLegacyRevocation = false
 ): Promise<ExecutionSummary> {
   if (request.action.kind !== "ssh_session") {
     throw new Error("runOwnedSshSession requires an ssh_session action.");
@@ -135,6 +136,9 @@ export async function runOwnedSshSession(
   try {
     assertSshCredentialSupported(secretRecord);
     auth = await prepareSshAuth(secretRecord, secretValue, home);
+    if (strictLegacyRevocation && process.platform !== "win32") {
+      await closeLegacyControlMasterIfActive(sshPath, home, request.handle, target, port, captureCap);
+    }
     if (assertAuthorized) {
       await assertAuthorized();
       const transfer = normalizeSshTransfer(request.action.ssh?.transfer);
@@ -218,9 +222,15 @@ export async function runOwnedSshSession(
   } catch (error) {
     throw sanitizedSshError(error, request.handle, secretValue, maxOutput);
   } finally {
-    upload?.stream.destroy();
-    await upload?.cleanup();
-    await auth?.cleanup();
+    try {
+      if (strictLegacyRevocation && process.platform !== "win32") {
+        await closeLegacyControlMasterIfActive(sshPath, home, request.handle, target, port, captureCap);
+      }
+    } finally {
+      upload?.stream.destroy();
+      await upload?.cleanup();
+      await auth?.cleanup();
+    }
   }
 }
 
@@ -378,6 +388,23 @@ async function controlMasterIsActive(
     rejectOnNonZero: false
   });
   return result.exitCode === 0;
+}
+
+async function closeLegacyControlMasterIfActive(
+  sshPath: string, home: string, handle: string, target: string, port: number, captureCap: number
+): Promise<void> {
+  const socketPath = await controlSocketPath(home, handle, target, port);
+  if (!(await controlMasterIsActive(sshPath, socketPath, target, port, 10_000, captureCap))) return;
+
+  const result = await runProcess(sshPath, ["-S", socketPath, "-O", "exit", "-p", String(port), target], {
+    timeoutMs: 10_000,
+    env: await baseSshEnv(),
+    maxOutputBytes: captureCap,
+    rejectOnNonZero: false
+  });
+  if (result.exitCode !== 0 || await controlMasterIsActive(sshPath, socketPath, target, port, 10_000, captureCap)) {
+    throw new Error("Could not close the legacy SSH ControlMaster before strict execution.");
+  }
 }
 
 async function openControlMaster(

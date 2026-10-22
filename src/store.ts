@@ -1304,6 +1304,31 @@ export class SecretStore {
     if (error) throw new Error(error);
   }
 
+  async assertLegacyRequestAuthorized(id: string): Promise<void> {
+    const store = await this.read();
+    const request = store.requests.find(item => item.id === id);
+    if (!request || !["env_command", "ssh_session"].includes(request.action.kind) ||
+        request.action.owned || request.state !== "executing") {
+      throw new Error("Legacy execution authorization is no longer active.");
+    }
+    const secret = store.secrets.find(item => item.handle === request.handle);
+    if (!secret) throw new Error("Legacy credential handle was removed.");
+    assertManagedSshRouteCurrent(store, request.action);
+    assertActionAllowed(secret, request.action);
+    assertBoundHandlesAllowed(store, request.handle, request.action);
+
+    const now = new Date().toISOString();
+    const agent = identityFromRequest(request);
+    const rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
+    if (rule?.decision === "deny") throw new Error("Legacy execution was denied by the current policy.");
+    if (request.approvalGrantId) {
+      const grant = activeApprovalGrant(store, request.handle, request.action, agent, now);
+      if (!grant || grant.id !== request.approvalGrantId) throw new Error("Legacy approval grant expired or was revoked.");
+    }
+    const error = automaticRequestAuthorizationError(store, request, now);
+    if (error) throw new Error(error);
+  }
+
   async claimApprovedRequest(
     id: string, caller?: AgentIdentityContext, assertCallerActive?: () => void
   ): Promise<RequestRecord> {
