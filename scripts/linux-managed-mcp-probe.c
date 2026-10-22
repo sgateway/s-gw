@@ -444,8 +444,10 @@ static int model_handoff_probe(const char *socket_path, const char *handoff_path
             const char *stage = "cross-model-handoff-error\n";
             if (failed_step == 2 && (handoff_error == EACCES || handoff_error == EPERM))
                 stage = "cross-model-connect-denied\n";
-            else if (failed_step == 2 && (handoff_error == ENOENT || handoff_error == ECONNREFUSED))
-                stage = "cross-model-connect-unavailable\n";
+            else if (failed_step == 2 && handoff_error == ENOENT)
+                stage = "cross-model-connect-missing\n";
+            else if (failed_step == 2 && handoff_error == ECONNREFUSED)
+                stage = "cross-model-connect-refused\n";
             else if (failed_step == 3 && (handoff_error == EACCES || handoff_error == EPERM))
                 stage = "cross-model-send-denied\n";
             write_probe_stage(stage);

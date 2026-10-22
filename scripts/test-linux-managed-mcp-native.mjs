@@ -595,6 +595,20 @@ async function startHandoffHelper(agent, model = false, receiver = agent) {
       receiverNet === hostNet || await readlink(`/proc/${pid}/ns/net`) !== receiverNet) {
     throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup/PID namespace, zero effective capabilities, or receiver network namespace.`);
   }
+  if (crossSession) {
+    let agentView;
+    try { agentView = await lstat(`/proc/${agentPid}/root/run/s-gw/handoff-cross/model.sock`); }
+    catch (error) {
+      if (error.code === "ENOENT") {
+        throw new Error("The cross-model helper socket is missing from the managed agent root.");
+      }
+      throw error;
+    }
+    const hostView = await lstat(socketPath);
+    if (!agentView.isSocket() || agentView.dev !== hostView.dev || agentView.ino !== hostView.ino) {
+      throw new Error("The cross-model helper socket differs inside the managed agent root.");
+    }
+  }
 }
 
 async function stopHandoffHelper(helper) {
