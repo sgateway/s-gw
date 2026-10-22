@@ -7,8 +7,8 @@ import {
 } from "../src/offline-ledger-reconciliation.js";
 
 const syntheticRoot = path.join(path.parse(process.cwd()).root, "synthetic");
-const home = path.join(syntheticRoot, "operator", ".s-gw");
-const recoveryHome = path.join(syntheticRoot, "operator", ".s-gw-recovery");
+const home = path.resolve(syntheticRoot, "operator", ".s-gw");
+const recoveryHome = path.resolve(syntheticRoot, "operator", ".s-gw-recovery");
 const timestamp = "2026-10-21T00:00:00.000Z";
 
 function canonical(value: unknown): unknown {
@@ -85,12 +85,14 @@ function seal(app: {
   approvalGrants: Record<string, unknown>[];
   approvalPolicyRules: Record<string, unknown>[];
   managedSshRoutes: Record<string, unknown>[];
+  credentialOps?: Record<string, unknown>[];
 }, donor: object): OfflineReconciliationInput {
   const secrets = app.secrets.map(({ updatedAt: _updatedAt, ...secret }) => secret);
   const controls = {
     version: 1, secrets, approvalSettings: app.approvalSettings,
     approvalGrants: app.approvalGrants, approvalPolicyRules: app.approvalPolicyRules,
-    managedSshRoutes: app.managedSshRoutes
+    managedSshRoutes: app.managedSshRoutes,
+    ...(app.credentialOps?.length ? { credentialOps: app.credentialOps } : {})
   };
   const fingerprint = sha(JSON.stringify(canonical(controls)));
   const checkpointName = `checkpoint-1700000000000-cp_synthetic-${fingerprint}.json`;
@@ -99,8 +101,8 @@ function seal(app: {
     controlManifestRaw: JSON.stringify({
       version: 1, fingerprint, updatedAt: timestamp, secrets: app.secrets.length,
       approvalPolicyRules: app.approvalPolicyRules.length, recoverySealed: true,
-      recoveryCheckpoint: checkpointName, recoveryNamespace: sha(home).slice(0, 24),
-      recoveryVaultId: sha(recoveryHome), writerVersion: "0.1.22"
+      recoveryCheckpoint: checkpointName, recoveryNamespace: sha(path.resolve(home)).slice(0, 24),
+      recoveryVaultId: sha(path.resolve(recoveryHome)), writerVersion: "0.1.22"
     }),
     checkpointName,
     checkpointRaw: JSON.stringify({ ...app, requests: [], audit: [] }),
@@ -127,12 +129,13 @@ describe("offline ledger reconciliation assessment", () => {
     expect(assessment.blockingReasons).toEqual([
       expect.stringContaining("decrypt the generation-2 envelope"),
       expect.stringContaining("generation-2 writer omits current HTTP fields and SSH transfer paths"),
-      expect.stringContaining("plaintext app ledger, journal, and retained backups")
+      expect.stringContaining("Locked Usage Flow detail visibility also needs an operator decision")
     ]);
     expect(Object.keys(assessment)).toEqual(["migrationBlocked", "blockingReasons", "summary"]);
     expect(assessment.summary).toMatchObject({
       secrets: 1, grants: 1, rules: 1, routes: 1, requests: 1, audit: 1,
       donorIdentityRecords: 1, ruleFieldsOnlyInSeal: 2,
+      appOnlyRequests: 0, appOnlyAudit: 0, donorOpenRequests: 0,
       plaintextRequestRows: 1, plaintextAuditRows: 1,
       donorPlaintextRequestRows: 0, donorPlaintextAuditRows: 0
     });
@@ -162,6 +165,9 @@ describe("offline ledger reconciliation assessment", () => {
     checkpoint.approvalPolicyRules[0].decision = "deny";
     expect(() => assessOfflineLedgerReconciliation({ ...input, checkpointRaw: JSON.stringify(checkpoint) }))
       .toThrow("sealed app control plane");
+    expect(() => assessOfflineLedgerReconciliation({ ...input,
+      originalHome: path.join(home, "..", ".s-gw"),
+      originalRecoveryHome: path.join(recoveryHome, "..", ".s-gw-recovery") })).not.toThrow();
   });
 
   it("rejects generation-2 secret, grant, setting, rule, and shared-condition drift", () => {
@@ -188,6 +194,70 @@ describe("offline ledger reconciliation assessment", () => {
     expect(() => assessOfflineLedgerReconciliation(editDonor(input, (d) => {
       d.audit.push({ ...d.audit[0] });
     }))).toThrow("duplicate ledger record ID");
+  });
+
+  it("rejects a shared history ID when its immutable origin differs", () => {
+    const { input } = fixture();
+    for (const change of [
+      (d: any) => { d.requests[0].handle = "s-gw:synthetic:other"; },
+      (d: any) => { d.requests[0].createdAt = "2026-10-20T00:00:00.000Z"; },
+      (d: any) => { d.requests[0].action.kind = "ssh"; },
+      (d: any) => { d.requests[0].action.command = "/usr/bin/false"; },
+      (d: any) => { d.audit[0].ts = "2026-10-20T00:00:00.000Z"; },
+      (d: any) => { d.audit[0].type = "request.executed"; },
+      (d: any) => { d.audit[0].requestId = "req_other"; }
+    ]) {
+      expect(() => assessOfflineLedgerReconciliation(editDonor(input, change)))
+        .toThrow("history provenance conflicts");
+    }
+  });
+
+  it("refuses unknown ledger fields, malformed origins, and invalid donor states", () => {
+    const { input } = fixture();
+    expect(() => assessOfflineLedgerReconciliation(editDonor(input, (d) => {
+      d.futureAuthority = { synthetic: true };
+    }))).toThrow("unrecognized ledger field");
+    expect(() => assessOfflineLedgerReconciliation(editDonor(input, (d) => {
+      delete d.requests[0].createdAt;
+    }))).toThrow("Invalid shared history provenance");
+    expect(() => assessOfflineLedgerReconciliation(editDonor(input, (d) => {
+      d.requests[0].state = "unknown";
+    }))).toThrow("Invalid generation-2 request state");
+    const checkpoint = JSON.parse(input.checkpointRaw);
+    checkpoint.futureAuthority = { synthetic: true };
+    expect(() => assessOfflineLedgerReconciliation({ ...input, checkpointRaw: JSON.stringify(checkpoint) }))
+      .toThrow("unrecognized ledger field");
+    const manifest = JSON.parse(input.controlManifestRaw);
+    manifest.futureAuthority = { synthetic: true };
+    expect(() => assessOfflineLedgerReconciliation({ ...input, controlManifestRaw: JSON.stringify(manifest) }))
+      .toThrow("unrecognized control manifest field");
+    const head = JSON.parse(input.recoveryHeadRaw);
+    head.futureAuthority = { synthetic: true };
+    expect(() => assessOfflineLedgerReconciliation({ ...input, recoveryHeadRaw: JSON.stringify(head) }))
+      .toThrow("unrecognized recovery head field");
+  });
+
+  it("counts newer app history and open donor states without granting them authority", () => {
+    const { input, app } = fixture();
+    app.requests.push({ ...app.requests[0], id: "req_new" });
+    app.audit.push({ ...app.audit[0], id: "audit_new" });
+    const donor = JSON.parse(input.generationTwoLedgerRaw);
+    donor.requests[0].state = "executing";
+    const assessment = assessOfflineLedgerReconciliation(seal(app, donor));
+    expect(assessment.summary).toMatchObject({
+      requests: 2, audit: 2, appOnlyRequests: 1, appOnlyAudit: 1, donorOpenRequests: 1
+    });
+  });
+
+  it("blocks a sealed pending credential operation and unexpected donor authority", () => {
+    const { input, app } = fixture();
+    const donor = JSON.parse(input.generationTwoLedgerRaw);
+    const staged = { id: "op_synthetic", kind: "keychain-add", phase: "prepared" };
+    const withStaged = seal({ ...app, credentialOps: [staged] }, donor);
+    expect(() => assessOfflineLedgerReconciliation(withStaged)).toThrow("staged credential transaction");
+    expect(() => assessOfflineLedgerReconciliation(editDonor(input, (d) => {
+      d.credentialOps = [staged];
+    }))).toThrow("unrecognized ledger field");
   });
 
   it("refuses open requests rather than treating them as migration-ready history", () => {

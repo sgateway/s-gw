@@ -33,6 +33,9 @@ export interface OfflineReconciliationSummary {
   audit: number;
   donorIdentityRecords: number;
   ruleFieldsOnlyInSeal: number;
+  appOnlyRequests: number;
+  appOnlyAudit: number;
+  donorOpenRequests: number;
   plaintextRequestRows: number;
   plaintextAuditRows: number;
   donorPlaintextRequestRows: number;
@@ -48,22 +51,47 @@ export interface OfflineReconciliationAssessment {
 
 const appOnlyRuleFields = new Set(["envBindings", "resolvedCommands", "principalIds", "actionKeys"]);
 const terminalStates = new Set(["denied", "executed", "failed"]);
+const requestStates = new Set([...terminalStates, "pending", "approved", "executing"]);
+const appLedgerFields = new Set([
+  "version", "secrets", "requests", "audit", "approvalSettings", "approvalGrants",
+  "approvalPolicyRules", "managedSshRoutes", "credentialOps"
+]);
+const donorLedgerFields = new Set([
+  "version", "writerGeneration", "secrets", "requests", "agentIdentities", "audit",
+  "approvalSettings", "approvalGrants", "approvalPolicyRules", "sensitiveMetadata"
+]);
+const controlManifestFields = new Set([
+  "version", "fingerprint", "updatedAt", "secrets", "approvalPolicyRules",
+  "recoverySealed", "recoveryCheckpoint", "recoveryVaultId", "recoveryNamespace", "writerVersion"
+]);
+const recoveryHeadFields = new Set(["version", "checkpoint", "fingerprint"]);
 
 /** Pure assessment for a quiesced, paired home/recovery snapshot. It never reads or writes files. */
 export function assessOfflineLedgerReconciliation(input: OfflineReconciliationInput): OfflineReconciliationAssessment {
   const app = parseLedger(input.sealedLedgerRaw);
   const donor = parseLedger(input.generationTwoLedgerRaw);
   const checkpoint = parseLedger(input.checkpointRaw);
+  assertKnownFields(app, appLedgerFields, "ledger");
+  assertKnownFields(donor, donorLedgerFields, "ledger");
+  assertKnownFields(checkpoint, appLedgerFields, "ledger");
   const appFormat = inspectLedgerFormat(input.sealedLedgerRaw);
   const donorFormat = inspectLedgerFormat(input.generationTwoLedgerRaw);
   assertExpectedFormats(input, appFormat);
 
   assertSealedControl(input, app, checkpoint);
+  assertNoStagedCredentialOps(app);
   const restoredFields = assertDonorAuthority(app, donor);
   const appRequests = recordsByKey(app.requests, "id");
   const appAudit = recordsByKey(app.audit, "id");
-  assertDonorHistoryIsPresent(appRequests, recordsByKey(donor.requests, "id"));
-  assertDonorHistoryIsPresent(appAudit, recordsByKey(donor.audit, "id"));
+  const donorRequests = recordsByKey(donor.requests, "id");
+  const donorAudit = recordsByKey(donor.audit, "id");
+  assertSharedHistoryProvenance(appRequests, donorRequests, "request");
+  assertSharedHistoryProvenance(appAudit, donorAudit, "audit");
+  for (const request of donor.requests) {
+    if (!requestStates.has(request.state as string)) {
+      throw new Error("Invalid generation-2 request state.");
+    }
+  }
 
   assertClosedHistory(app);
 
@@ -74,7 +102,7 @@ export function assessOfflineLedgerReconciliation(input: OfflineReconciliationIn
     blockingReasons: [
       "A trusted offline process must decrypt the generation-2 envelope, reconcile each history ID against the sealed app ledger, and re-encrypt the chosen details. Opaque envelope grafting can overwrite newer history.",
       "One compatible writer must round-trip agent identities, managed SSH routes, every policy condition, and format-aware encrypted history. The generation-2 writer omits current HTTP fields and SSH transfer paths.",
-      "The plaintext app ledger, journal, and retained backups need an approved encryption or retention migration before installation."
+      "The plaintext app ledger, journal, and retained backups need an approved encryption or retention migration before installation. Locked Usage Flow detail visibility also needs an operator decision."
     ],
     summary: {
       secrets: app.secrets.length,
@@ -85,6 +113,9 @@ export function assessOfflineLedgerReconciliation(input: OfflineReconciliationIn
       audit: app.audit.length,
       donorIdentityRecords: identities.length,
       ruleFieldsOnlyInSeal: restoredFields,
+      appOnlyRequests: appRequests.size - donorRequests.size,
+      appOnlyAudit: appAudit.size - donorAudit.size,
+      donorOpenRequests: donor.requests.filter((request) => !terminalStates.has(request.state as string)).length,
       plaintextRequestRows: appFormat.plaintextRequestRows,
       plaintextAuditRows: appFormat.plaintextAuditRows,
       donorPlaintextRequestRows: donorFormat.plaintextRequestRows,
@@ -92,6 +123,14 @@ export function assessOfflineLedgerReconciliation(input: OfflineReconciliationIn
       controlFingerprint: controlFingerprint(app)
     }
   };
+}
+
+function assertKnownFields(record: Record<string, unknown>, fields: Set<string>, name: string): void {
+  for (const field of Object.keys(record)) {
+    if (!fields.has(field)) {
+      throw new Error(`An unrecognized ${name} field requires a separate migration review.`);
+    }
+  }
 }
 
 function assertExpectedFormats(input: OfflineReconciliationInput,
@@ -120,12 +159,15 @@ function assertClosedHistory(app: Ledger): void {
 function assertSealedControl(input: OfflineReconciliationInput, app: Ledger, checkpoint: Ledger): void {
   const manifest = parseObject(input.controlManifestRaw, "control manifest");
   const head = parseObject(input.recoveryHeadRaw, "recovery head");
+  assertKnownFields(manifest, controlManifestFields, "control manifest");
+  assertKnownFields(head, recoveryHeadFields, "recovery head");
   const fingerprint = controlFingerprint(app);
   const checkpointHash = controlFingerprint(checkpoint);
   const checkpointName = /^checkpoint-\d{13}-[A-Za-z0-9_-]+-([a-f0-9]{64})\.json$/
     .exec(input.checkpointName);
   // A later writer may change the fingerprint or checkpoint format.
   if (!checkpointName || manifest.version !== 1 || manifest.recoverySealed !== true
+      || typeof manifest.updatedAt !== "string"
       || manifest.writerVersion !== "0.1.22"
       || manifest.fingerprint !== fingerprint || checkpointHash !== fingerprint
       || checkpointName[1] !== fingerprint || manifest.recoveryCheckpoint !== input.checkpointName
@@ -148,6 +190,15 @@ function assertSealedControl(input: OfflineReconciliationInput, app: Ledger, che
   }
   if (Object.hasOwn(checkpoint, "writerGeneration") || Object.hasOwn(checkpoint, "sensitiveMetadata")) {
     throw new Error("The sealed control checkpoint has unsupported generation-2 fields.");
+  }
+  if (Object.hasOwn(checkpoint, "agentIdentities")) {
+    throw new Error("The sealed control checkpoint has unsupported generation-2 fields.");
+  }
+}
+
+function assertNoStagedCredentialOps(app: Ledger): void {
+  if (optionalArray(app.credentialOps, "staged credential operations").length) {
+    throw new Error("A staged credential transaction requires a separate recovery decision.");
   }
 }
 
@@ -191,10 +242,28 @@ function assertDonorAuthority(app: Ledger, donor: Ledger): number {
   return restoredFields;
 }
 
-function assertDonorHistoryIsPresent(app: Map<string, Record<string, unknown>>, donor: Map<string, Record<string, unknown>>): void {
-  for (const id of donor.keys()) {
-    if (!app.has(id)) {
+function assertSharedHistoryProvenance(app: Map<string, Record<string, unknown>>,
+    donor: Map<string, Record<string, unknown>>, kind: "request" | "audit"): void {
+  for (const [id, donorRow] of donor) {
+    const appRow = app.get(id);
+    if (!appRow) {
       throw new Error("Generation-2 history contains an ID missing from the sealed ledger.");
+    }
+    const appOrigin = kind === "request"
+      ? [appRow.handle, appRow.createdAt, asObject(appRow.action)?.kind, asObject(appRow.action)?.command]
+      : [appRow.ts, appRow.type, appRow.handle, appRow.requestId];
+    const donorOrigin = kind === "request"
+      ? [donorRow.handle, donorRow.createdAt, asObject(donorRow.action)?.kind, asObject(donorRow.action)?.command]
+      : [donorRow.ts, donorRow.type, donorRow.handle, donorRow.requestId];
+    const requiredFields = kind === "request" ? 4 : 2;
+    for (let index = 0; index < requiredFields; index += 1) {
+      if (typeof appOrigin[index] !== "string" || !appOrigin[index]
+          || typeof donorOrigin[index] !== "string" || !donorOrigin[index]) {
+        throw new Error("Invalid shared history provenance.");
+      }
+    }
+    if (appOrigin.some((field, index) => field !== donorOrigin[index])) {
+      throw new Error("Generation-2 history provenance conflicts with the sealed ledger.");
     }
   }
 }
@@ -222,13 +291,17 @@ function controlFingerprint(ledger: Ledger): string {
   const routes = optionalArray(ledger.managedSshRoutes, "managed routes")
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
   recordsByKey(routes, "id");
+  const credentialOps = optionalArray(ledger.credentialOps, "staged credential operations")
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  recordsByKey(credentialOps, "id");
   const control = {
     version: ledger.version,
     secrets,
     approvalSettings: ledger.approvalSettings,
     approvalGrants: grants,
     approvalPolicyRules: rules,
-    ...(routes.length ? { managedSshRoutes: routes } : {})
+    ...(routes.length ? { managedSshRoutes: routes } : {}),
+    ...(credentialOps.length ? { credentialOps } : {})
   };
   return digest(canonical(control));
 }
