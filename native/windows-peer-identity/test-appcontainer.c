@@ -13,6 +13,8 @@
 #include <string.h>
 #include <wchar.h>
 #include <errno.h>
+#include <fwpmu.h>
+#include "wfp-boundary.h"
 
 #define PIPE_CLIENT_RIGHTS (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE)
 
@@ -349,6 +351,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         return 1;
     }
     PSID sid = NULL;
+    SGW_WFP_BOUNDARY wfp = { 0 };
     HRESULT status = DeriveAppContainerSidFromAppContainerName(name, &sid);
     if (FAILED(status)) return 1;
 
@@ -426,6 +429,17 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
             goto done;
         }
     }
+    DWORD wfp_error = sgw_wfp_start(sid, &wfp);
+    if (wfp_error != ERROR_SUCCESS) {
+        fprintf(stderr, "AppContainer WFP deny setup failed: 0x%08lx\n", (unsigned long)wfp_error);
+        CloseHandle(job);
+        goto done;
+    }
+    if (!sgw_wfp_healthy(&wfp)) {
+        fputs("AppContainer WFP deny disappeared before launch.\n", stderr);
+        CloseHandle(job);
+        goto done;
+    }
     if (!CreateProcessW(executable, command, NULL, NULL, FALSE,
         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
         environment, agent_dir,
@@ -450,6 +464,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         fflush(stdout);
     }
     if (pause_start) {
+        puts("WFP-READY");
         puts("JOB-READY");
         fflush(stdout);
     }
@@ -491,7 +506,15 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         }
         if (result) TerminateProcess(process.hProcess, 1);
     } else {
-        DWORD waited = WaitForSingleObject(process.hProcess, 30000);
+        DWORD waited = WAIT_TIMEOUT;
+        for (int i = 0; i < 120 && waited == WAIT_TIMEOUT; i++) {
+            waited = WaitForSingleObject(process.hProcess, 250);
+            if (waited == WAIT_TIMEOUT && !sgw_wfp_healthy(&wfp)) {
+                fputs("AppContainer WFP deny disappeared during execution.\n", stderr);
+                TerminateJobObject(job, 1);
+                break;
+            }
+        }
         if (waited != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
         else if (GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0) result = 0;
     }
@@ -503,6 +526,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     if (job) CloseHandle(job);
 
 done:
+    sgw_wfp_stop(&wfp);
     if (initialized) DeleteProcThreadAttributeList(attrs);
     free(attrs);
     FreeSid(sid);
@@ -532,6 +556,54 @@ static int hold_empty_job(const wchar_t *name, DWORD flags) {
     return 0;
 }
 
+static int test_wfp_revocation(const wchar_t *first_profile, const wchar_t *second_profile) {
+    PSID first_sid = NULL, second_sid = NULL;
+    if (FAILED(DeriveAppContainerSidFromAppContainerName(first_profile, &first_sid)) ||
+        FAILED(DeriveAppContainerSidFromAppContainerName(second_profile, &second_sid))) {
+        if (first_sid) FreeSid(first_sid);
+        if (second_sid) FreeSid(second_sid);
+        return 1;
+    }
+    if (EqualSid(first_sid, second_sid)) {
+        FreeSid(first_sid);
+        FreeSid(second_sid);
+        return 1;
+    }
+    SGW_WFP_BOUNDARY first = { 0 }, second = { 0 };
+    DWORD result = sgw_wfp_start(first_sid, &first);
+    if (result == ERROR_SUCCESS) result = sgw_wfp_start(second_sid, &second);
+    FreeSid(first_sid);
+    FreeSid(second_sid);
+    if (result != ERROR_SUCCESS) {
+        fprintf(stderr, "WFP policy self-test setup failed: 0x%08lx\n", (unsigned long)result);
+        sgw_wfp_stop(&first);
+        return 1;
+    }
+    int healthy = sgw_wfp_healthy(&first) && sgw_wfp_healthy(&second);
+    result = FwpmFilterDeleteById0(first.engine, first.filters[0]);
+    int revoked = healthy && result == ERROR_SUCCESS &&
+        !sgw_wfp_healthy(&first) && sgw_wfp_healthy(&second);
+    UINT64 second_filter = second.filters[0];
+    sgw_wfp_stop(&first);
+    if (revoked) revoked = sgw_wfp_healthy(&second);
+    sgw_wfp_stop(&second);
+    HANDLE audit_engine = NULL;
+    result = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &audit_engine);
+    if (result == ERROR_SUCCESS) {
+        FWPM_FILTER0 *leftover = NULL;
+        result = FwpmFilterGetById0(audit_engine, second_filter, &leftover);
+        if (leftover) FwpmFreeMemory0((void **)&leftover);
+        if (result != (DWORD)FWP_E_FILTER_NOT_FOUND) revoked = 0;
+        FwpmEngineClose0(audit_engine);
+    } else revoked = 0;
+    if (!revoked) {
+        fputs("WFP deletion did not revoke only the selected package boundary.\n", stderr);
+        return 1;
+    }
+    puts("WFP-REVOCATION-DETECTED");
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
     if (argc == 3 && wcscmp(argv[1], L"create") == 0) return create_profile(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"delete") == 0) {
@@ -541,6 +613,8 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (argc == 3 && wcscmp(argv[1], L"job-host") == 0)
         return hold_empty_job(argv[2], JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if (argc == 4 && wcscmp(argv[1], L"wfp-selftest") == 0)
+        return test_wfp_revocation(argv[2], argv[3]);
     if (argc == 3 && wcscmp(argv[1], L"job-host-breakaway") == 0)
         return hold_empty_job(argv[2], JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK);
     if (argc == 3 && wcscmp(argv[1], L"job-host-no-kill") == 0)

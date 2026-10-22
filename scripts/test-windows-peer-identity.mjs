@@ -16,6 +16,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = resolve(root, "dist/native", `win32-${process.arch}`, "s-gw-windows-peer-identity.exe");
 const tokenSource = resolve(root, "native/windows-peer-identity/test-token.c");
 const appContainerSource = resolve(root, "native/windows-peer-identity/test-appcontainer.c");
+const wfpSource = resolve(root, "native/windows-peer-identity/wfp-boundary.c");
 const parentEnvCanary = randomBytes(16).toString("hex");
 assert.ok(existsSync(helper), "The native peer helper must be built before its acceptance test.");
 
@@ -38,6 +39,8 @@ function launch(args, executable = helper) {
   const ready = new Promise(resolve => { readyDone = resolve; });
   let jobReadyDone;
   const jobReady = new Promise(resolve => { jobReadyDone = resolve; });
+  let wfpReadyDone;
+  const wfpReady = new Promise(resolve => { wfpReadyDone = resolve; });
   let finish;
   const done = new Promise(resolve => { finish = resolve; });
   let reportPid;
@@ -50,6 +53,7 @@ function launch(args, executable = helper) {
     const match = /(?:^|\n)CHILD-PID=(\d+)\r?\n/.exec(report);
     if (match) reportPid(Number(match[1]));
     if (/JOB-READY\r?\n/.test(report)) jobReadyDone(true);
+    if (/WFP-READY\r?\n/.test(report)) wfpReadyDone(true);
     if (output.length) readyDone(output[0] === 0x52);
   });
   child.stderr.on("data", chunk => { stderr += chunk.toString(); });
@@ -57,10 +61,11 @@ function launch(args, executable = helper) {
   child.once("close", (code, signal) => {
     readyDone(false);
     jobReadyDone(false);
+    wfpReadyDone(false);
     reportPid(null);
     finish({ code, signal, output, stderr, spawnError });
   });
-  return { child, ready, jobReady, done, processPid };
+  return { child, ready, jobReady, wfpReady, done, processPid };
 }
 
 function pipeName() {
@@ -169,6 +174,8 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
         profile.canaryPath, jobName()], profile.executable);
       assert.equal(await deadline(transferTarget.jobReady, 30_000, "transfer target Job"), true,
         "The same-profile target was not held in its own Job.");
+      assert.equal(await deadline(transferTarget.wfpReady, 30_000, "transfer target WFP policy"), true,
+        "The transfer target did not install its package-SID network deny.");
       transferTargetPid = await deadline(transferTarget.processPid, 10_000, "transfer target PID");
       assert.ok(Number.isInteger(transferTargetPid) && transferTargetPid > 0,
         "The same-profile target process ID was not reported.");
@@ -182,6 +189,8 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
     client = launch(clientArgs, profile.executable);
     assert.equal(await deadline(client.jobReady, 30_000, "AppContainer Job"), true,
       "The launcher did not create and retain the Job before the pipe opened.");
+    assert.equal(await deadline(client.wfpReady, 30_000, "AppContainer WFP policy"), true,
+      "The package-SID WFP deny was not installed before the agent resumed.");
     run = launch([name, brokerSid, brokerSid, profile.sid, logonLuid, sessionId, job]);
     assert.equal(await deadline(run.ready, 30_000, "AppContainer pipe"), true,
       "The AppContainer pipe was not ready.");
@@ -300,14 +309,24 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
   }
 }
 
-function compileFixture(source, output, libraries) {
-  const compiled = spawnSync("cl", [
-    "/nologo", "/std:c11", "/W4", "/WX", "/O2", "/GS", "/sdl", "/DUNICODE", "/D_UNICODE",
-    `/Fo${join(tmp, `${output}.obj`)}`, `/Fe${join(tmp, `${output}.exe`)}`, source,
+function compileFixture(source, output, libraries, extraSources = []) {
+  const objects = [];
+  for (const [index, file] of [source, ...extraSources].entries()) {
+    const object = join(tmp, `${output}-${index}.obj`);
+    const compiled = spawnSync("cl", [
+      "/nologo", "/std:c11", "/W4", "/WX", "/O2", "/GS", "/sdl", "/DUNICODE", "/D_UNICODE",
+      "/c", `/Fo${object}`, file
+    ], { encoding: "utf8", windowsHide: true });
+    assert.equal(compiled.error, undefined, compiled.error?.message);
+    assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout);
+    objects.push(object);
+  }
+  const linked = spawnSync("cl", [
+    "/nologo", ...objects, `/Fe${join(tmp, `${output}.exe`)}`,
     "/link", "/INCREMENTAL:NO", "/DYNAMICBASE", "/NXCOMPAT", ...libraries
   ], { encoding: "utf8", windowsHide: true });
-  assert.equal(compiled.error, undefined, compiled.error?.message);
-  assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout);
+  assert.equal(linked.error, undefined, linked.error?.message);
+  assert.equal(linked.status, 0, linked.stderr || linked.stdout);
   return join(tmp, `${output}.exe`);
 }
 
@@ -315,7 +334,7 @@ const tmp = mkdtempSync(join(tmpdir(), "s-gw-windows-peer-test-"));
 try {
   const tokenProbe = compileFixture(tokenSource, "test-token", ["advapi32.lib"]);
   const appContainerFixture = compileFixture(appContainerSource, "test-appcontainer",
-    ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib"]);
+    ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib", "fwpuclnt.lib"], [wfpSource]);
 
   const probed = spawnSync(tokenProbe, [], { encoding: "utf8", windowsHide: true });
   assert.equal(probed.status, 0, probed.stderr || "Could not inspect the CI process token.");
@@ -396,6 +415,10 @@ try {
         "The broker canary must remain readable to the host account.");
     }
     assert.notEqual(profiles[0].sid, profiles[1].sid, "The two agents need distinct package identities.");
+    const wfpCheck = spawnSync(appContainerFixture, ["wfp-selftest", profiles[0].name, profiles[1].name],
+      { encoding: "utf8", windowsHide: true, timeout: 30_000 });
+    assert.equal(wfpCheck.status, 0, wfpCheck.stderr || "The WFP policy self-test failed.");
+    assert.match(wfpCheck.stdout, /WFP-REVOCATION-DETECTED/);
     await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
       { intruderProfile: profiles[1], sameProfileOutOfJob: true });
     await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
