@@ -1985,7 +1985,8 @@ async function handleAwsCommand(
 
   if (action === "request") {
     const request = await createAwsRequest(store, handles, wrapper, awsArgs, flags);
-    printJson(awsRequestResponse(request, wrapper, awsArgs, handles));
+    printJson(awsRequestResponse(request, wrapper, awsArgs, handles,
+      hasFlag(flags, "strict-legacy-revocation")));
     return;
   }
 
@@ -1996,7 +1997,8 @@ async function handleAwsCommand(
     getFlag(flags, "reason") || "s-gw AWS command request"
   );
   if (admission.kind === "request") {
-    printJson(awsRequestResponse(admission.request, wrapper, awsArgs, handles));
+    printJson(awsRequestResponse(admission.request, wrapper, awsArgs, handles,
+      hasFlag(flags, "strict-legacy-revocation")));
     return;
   }
 
@@ -2010,7 +2012,8 @@ async function handleAwsCommand(
 
   printJson({
     approvalRequired: false,
-    repeatCommand: awsCommandLine("run", awsArgs, { wrapper, handles }),
+    repeatCommand: awsCommandLine("run", awsArgs, { wrapper, handles,
+      strictLegacyRevocation: hasFlag(flags, "strict-legacy-revocation") }),
     wrapper,
     secretHandle: handles.secret.handle,
     accessKeyHandle: handles.access.handle,
@@ -2148,15 +2151,17 @@ function awsRequestResponse(
   request: RequestRecord,
   wrapper: string,
   awsArgs: string[],
-  handles: AwsHandles
+  handles: AwsHandles,
+  strictLegacyRevocation = false
 ) {
   return {
     approvalRequired: request.state !== "approved",
     localApprovalCommand: request.state === "approved"
       ? undefined
       : `s-gw approve ${request.id} --mode timed-session --duration 8h --agent-scope any-agent`,
-    localRunCommand: `s-gw execute ${request.id}`,
-    repeatCommand: awsCommandLine("run", awsArgs, { wrapper, handles }),
+    localRunCommand: `s-gw execute ${request.id}` +
+      (strictLegacyRevocation ? " --strict-legacy-revocation" : ""),
+    repeatCommand: awsCommandLine("run", awsArgs, { wrapper, handles, strictLegacyRevocation }),
     wrapper,
     secretHandle: handles.secret.handle,
     accessKeyHandle: handles.access.handle,
@@ -2167,7 +2172,7 @@ function awsRequestResponse(
 function awsCommandLine(
   action: "request" | "run",
   args: string[],
-  options: { wrapper?: string; handles?: AwsHandles } = {}
+  options: { wrapper?: string; handles?: AwsHandles; strictLegacyRevocation?: boolean } = {}
 ): string {
   const parts = ["s-gw", "aws", action];
   if (options.handles) {
@@ -2177,6 +2182,7 @@ function awsCommandLine(
   if (options.wrapper) {
     parts.push("--wrapper", options.wrapper);
   }
+  if (options.strictLegacyRevocation) parts.push("--strict-legacy-revocation");
   return [...parts.map(shellArg), "--", ...args.map(shellArg)].join(" ");
 }
 
