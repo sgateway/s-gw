@@ -59,7 +59,9 @@ static int loopback_blocked(const wchar_t *port_text, int family) {
     if (probe == INVALID_SOCKET) {
         int error = WSAGetLastError();
         WSACleanup();
-        return error == WSAEACCES;
+        if (error == WSAEACCES) return 1;
+        fprintf(stderr, "AppContainer loopback socket failed without access denial: %d\n", error);
+        return 0;
     }
     int blocked;
     if (family == AF_INET6) {
@@ -79,8 +81,9 @@ static int loopback_blocked(const wchar_t *port_text, int family) {
     int error = blocked ? WSAGetLastError() : 0;
     closesocket(probe);
     WSACleanup();
-    if (error == WSAEINVAL || error == WSAEAFNOSUPPORT || error == WSAENOTSOCK) return 0;
-    return blocked;
+    if (error == WSAEACCES) return 1;
+    if (blocked) fprintf(stderr, "AppContainer loopback connect failed without access denial: %d\n", error);
+    return 0;
 }
 
 static int can_read_fixture(const wchar_t *path) {
