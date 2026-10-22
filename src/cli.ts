@@ -656,7 +656,9 @@ async function main(): Promise<void> {
       throw new Error("execute requires a request id.");
     }
 
-    printJson(await executeApprovedRequest(store, second));
+    printJson(await executeApprovedRequest(store, second, {
+      strictLegacyRevocation: hasFlag(parsed.flags, "strict-legacy-revocation")
+    }));
     return;
   }
 
@@ -664,7 +666,9 @@ async function main(): Promise<void> {
     const request = await findNextApprovedRequest(store, parsed.flags);
     printJson({
       requestId: request.id,
-      summary: await executeApprovedRequest(store, request.id)
+      summary: await executeApprovedRequest(store, request.id, {
+        strictLegacyRevocation: hasFlag(parsed.flags, "strict-legacy-revocation")
+      })
     });
     return;
   }
@@ -1806,13 +1810,16 @@ async function handleOneShotEnvCommand(
     printJson({
       approvalRequired: admission.request.state !== "approved",
       localApprovalCommand: admission.request.state === "approved" ? undefined : `s-gw approve ${admission.request.id}`,
-      localRunCommand: `s-gw execute ${admission.request.id}`,
+      localRunCommand: `s-gw execute ${admission.request.id}` +
+        (hasFlag(flags, "strict-legacy-revocation") ? " --strict-legacy-revocation" : ""),
       request: admission.request
     });
     return;
   }
 
-  const summary = await executeReusablePermit(store, admission.permit);
+  const summary = await executeReusablePermit(store, admission.permit, {
+    strictLegacyRevocation: hasFlag(flags, "strict-legacy-revocation")
+  });
   if (hasFlag(flags, "raw")) {
     printRawSummary(summary);
     return;
@@ -1847,7 +1854,9 @@ async function handleSshCommand(
   }
 
   if (action === "run" && getFlag(flags, "request-id")) {
-    printJson(await executeApprovedRequest(store, requireFlag(flags, "request-id")));
+    printJson(await executeApprovedRequest(store, requireFlag(flags, "request-id"), {
+      strictLegacyRevocation: hasFlag(flags, "strict-legacy-revocation")
+    }));
     return;
   }
 
@@ -1875,13 +1884,16 @@ async function handleSshCommand(
       printJson({
         approvalRequired: request.state !== "approved",
         localApprovalCommand: request.state === "approved" ? undefined : `s-gw approve ${request.id}`,
-        localRunCommand: `s-gw ssh run --request-id ${request.id}`,
+        localRunCommand: `s-gw ssh run --request-id ${request.id}` +
+          (hasFlag(flags, "strict-legacy-revocation") ? " --strict-legacy-revocation" : ""),
         request
       });
       return;
     }
 
-    printJson(await executeApprovedRequest(store, request.id));
+    printJson(await executeApprovedRequest(store, request.id, {
+      strictLegacyRevocation: hasFlag(flags, "strict-legacy-revocation")
+    }));
     return;
   }
 
@@ -1988,7 +2000,9 @@ async function handleAwsCommand(
     return;
   }
 
-  const summary = await executeReusablePermit(store, admission.permit);
+  const summary = await executeReusablePermit(store, admission.permit, {
+    strictLegacyRevocation: hasFlag(flags, "strict-legacy-revocation")
+  });
   if (hasFlag(flags, "raw")) {
     printRawSummary(summary);
     return;
@@ -2762,7 +2776,7 @@ Commands:
   s-gw guard status
   s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
-  s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--raw]
+  s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--strict-legacy-revocation] [--raw]
   s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary] [--launchd-socket|--direct-bind]
   s-gw service start|stop|status|uninstall
   s-gw menubar app-path
@@ -2785,14 +2799,14 @@ Commands:
   s-gw onepassword status
   s-gw onepassword import [--vault Dev] [--dry-run] [--include-companions] [--allow-command CMD]
   s-gw onepassword capture --text-stdin [--vault Dev] [--name NAME] [--inject-env ENV] [--allow-command CMD]
-  s-gw aws plan|request|run [--wrapper CMD] [--timeout-ms 0] [--raw] -- AWS_ARGS...
+  s-gw aws plan|request|run [--wrapper CMD] [--timeout-ms 0] [--strict-legacy-revocation] [--raw] -- AWS_ARGS...
   s-gw ssh request HANDLE --target user@host [--port 22] [--arg VALUE]
   s-gw ssh route add --name NAME --host HOST --user USER --port 22 --host-public-key 'ssh-ed25519 AAAA...'
   s-gw ssh route list|show|update|delete [--id ROUTE_ID]
   s-gw ssh request HANDLE --route ROUTE_ID [--arg VALUE]
   s-gw ssh run HANDLE --target user@host [--port 22] [--] [remote command...]
   s-gw ssh run HANDLE --route ROUTE_ID [--] [remote command...]
-  s-gw ssh run --request-id REQUEST_ID
+  s-gw ssh run --request-id REQUEST_ID [--strict-legacy-revocation]
   s-gw ssh close HANDLE --target user@host [--port 22]
   s-gw approval settings
   s-gw approval set --mode per-transaction|timed-session|login-session|always [--duration 15m] [--require-verified-agent]
@@ -2818,12 +2832,12 @@ Commands:
   s-gw requests [--state pending] [--active] [--limit 100] [--all]
   s-gw requests --recover [REQUEST_ID]
   s-gw requests cleanup [--pending-ttl-ms 86400000] [--approved-ttl-ms 3600000] [--no-dedupe]
-  s-gw execute-next [--handle HANDLE] [--kind env_command|ssh_session] [--command CMD]
+  s-gw execute-next [--handle HANDLE] [--kind env_command|ssh_session] [--command CMD] [--strict-legacy-revocation]
   s-gw store backups
   s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent] [--confirm-route 'user@host:port SHA256:...']
   s-gw approve-policy REQUEST_ID [--confirm-route 'user@host:port SHA256:...']
   s-gw deny REQUEST_ID
-  s-gw execute REQUEST_ID
+  s-gw execute REQUEST_ID [--strict-legacy-revocation]
 `);
 }
 
