@@ -784,7 +784,7 @@ try {
     }
   }
   const controlFiles = ["linux-agent-control.js", "linux-agent-unit.js",
-    "linux-peer-identity.js", "linux-agent-identity.js"];
+    "linux-peer-identity.js", "linux-agent-identity.js", "model-relay-action.js"];
   for (const name of controlFiles) {
     await copyFile(path.join(project, "dist", name), path.join(controlDir, name));
     await chmod(path.join(controlDir, name), 0o755);
@@ -813,7 +813,11 @@ try {
   run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/linux-peer-identity/verify.c"),
     "-o", path.join(verifierDir, "s-gw-linux-peer-identity")]);
+  run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+    path.join(project, "native/peer-credentials/peer-credentials.c"),
+    "-o", path.join(verifierDir, "s-gw-peer-credentials")]);
   await checkedInstalledFile(path.join(verifierDir, "s-gw-linux-peer-identity"));
+  await checkedInstalledFile(path.join(verifierDir, "s-gw-peer-credentials"));
   for (const agent of agents) {
     const gate = `${agent.root}/usr/libexec/s-gw/agent-launch-gate`;
     const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
@@ -997,6 +1001,12 @@ try {
     } catch { return false; }
   }, "root Linux agent control service");
   await remember("/run/s-gw/agent-control.sock");
+  const prepSocket = await lstat("/run/s-gw/agent-prepare.sock");
+  if (!prepSocket.isSocket() || prepSocket.uid !== 0 || prepSocket.gid !== 0 ||
+      (prepSocket.mode & 0o777) !== 0o600) {
+    throw new Error("Linux root preparation socket is not private.");
+  }
+  await remember("/run/s-gw/agent-prepare.sock");
   await rejectWritableImport(agents[0].brokerUnit, entry,
     path.join(installed, "broker-preexec-marker"));
   for (const agent of agents) {
@@ -1026,22 +1036,24 @@ try {
     }
   }
   if (testRelay) {
-    // An unhandled activation connection would restart the preapproval broker until systemd hits its limit.
     for (const agent of agents) {
-      run("systemctl", ["--system", "start", agent.brokerUnit]);
+      const prepared = JSON.parse(run(rootNode, [controlEntry, "--prepare", agent.sessionId],
+        false, { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" }).stdout);
+      if (prepared.sessionId !== agent.sessionId ||
+          !/^[A-Za-z0-9_-]{1,256}$/.test(prepared.requestId)) {
+        throw new Error("Root preparation returned an invalid model request.");
+      }
       const requestId = await until(() => {
         const found = asBroker("relay-pending", [agent.sessionId, agent.name,
           agent.model.handle, agent.plan.identityGeneration]);
         return found === "none" ? false : found;
       }, `${agent.sessionId} pending model relay grant`);
-      if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId)) {
-        throw new Error("Invalid native model relay request ID.");
+      if (requestId !== prepared.requestId) {
+        throw new Error("Root preparation returned a different model request ID.");
       }
       if (run("systemctl", ["--system", "is-active", agent.agentUnit], true).status === 0) {
         throw new Error("Managed agent launched before model relay approval.");
       }
-      await until(() => run("systemctl", ["--system", "is-active", agent.brokerUnit], true).status !== 0,
-        `${agent.sessionId} preapproval broker exit`);
       const preparedUnit = unitProperties(agent.brokerUnit, ["Id", "FragmentPath", "ActiveState",
         "Result", "ExecMainStatus", "InvocationID", "MainPID"]);
       if (preparedUnit.get("Id") !== agent.brokerUnit ||
@@ -1051,9 +1063,22 @@ try {
           preparedUnit.get("ExecMainStatus") !== "0" ||
           preparedUnit.get("MainPID") !== "0" || !invocationId(preparedUnit) ||
           !await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile) ||
-          run("systemctl", ["--system", "is-active", agent.socketUnit], true).status !== 0 ||
-          run("systemctl", ["--system", "is-active", agent.modelSocketUnit], true).status !== 0) {
-        throw new Error("Preapproval request was not prepared by the verified broker unit with both sockets active.");
+          run("systemctl", ["--system", "is-active", agent.socketUnit], true).status === 0 ||
+          run("systemctl", ["--system", "is-active", agent.modelSocketUnit], true).status === 0) {
+        throw new Error("Preapproval request was not prepared by the verified broker with both sockets stopped.");
+      }
+      for (const socketPath of [agent.socketPath, agent.modelSocketPath]) {
+        await new Promise((resolve, reject) => {
+          const socket = createConnection(socketPath);
+          socket.once("connect", () => { socket.destroy(); reject(new Error("A stopped agent socket accepted a queued client.")); });
+          socket.once("error", () => { socket.destroy(); resolve(); });
+        });
+      }
+      const repeated = JSON.parse(run(rootNode, [controlEntry, "--prepare", agent.sessionId],
+        false, { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" }).stdout);
+      if (repeated.requestId !== requestId ||
+          run("systemctl", ["--system", "is-active", agent.agentUnit], true).status === 0) {
+        throw new Error("Repeated trusted preparation changed its request or launched the agent.");
       }
       if (asBroker("approve-relay", [requestId]) !== requestId) {
         throw new Error("Native model relay approval changed its request ID.");
@@ -1075,6 +1100,8 @@ try {
       await remember(agent.configPath);
       await checkedInstalledFile(agent.configPath);
       run("systemctl", ["--system", "reset-failed", agent.brokerUnit]);
+      run("systemctl", ["--system", "start", agent.socketUnit]);
+      run("systemctl", ["--system", "start", agent.modelSocketUnit]);
       for (const [unit, file] of [[agent.socketUnit, agent.socketUnitFile],
         [agent.modelSocketUnit, agent.modelSocketUnitFile]]) {
         const socket = unitProperties(unit, ["ActiveState", "Triggers"]);
@@ -1713,6 +1740,7 @@ try {
         await removeOwned(`/run/s-gw/launch-gates/${agent.sessionId}`, true);
       }
       await removeOwned("/run/s-gw/agent-control.sock");
+      await removeOwned("/run/s-gw/agent-prepare.sock");
       for (const agent of agents) {
         await removeOwned(path.dirname(agent.socketPath), true);
         await removeOwned(agent.root, true);

@@ -4,8 +4,9 @@ import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, controlHandshakeFailure, sendControlReply, startTrackedManagedUnit,
-  stopTrackedManagedUnit, validateLinuxManagedPlan,
+  stopTrackedManagedUnit, validateLinuxManagedPlan, linuxRelayPreparationHash,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
+import { assertLinuxPreparationSocketEnvironment } from "../src/linux-agent-control.js";
 import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
 import type { LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
 
@@ -190,6 +191,39 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
     expect(() => validateLinuxManagedPlanRecord({ ...first,
       modelRelaySocketUnitFile: undefined }, first.plan.sessionId,
     first.plan.brokerUid, gid)).toThrow();
+    expect(() => assertModelSocketUnit(first,
+      state.replace("ActiveState=active", "ActiveState=inactive"), "inactive")).not.toThrow();
+    expect(() => assertManagedMcpSocketUnit(first,
+      `Id=s-gw-managed-mcp-managed-session.socket\nActiveState=inactive\n` +
+      `FragmentPath=${first.mcpSocketUnitFile}\nTriggers=${first.brokerUnit}\n` +
+      "BindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n", "inactive")).not.toThrow();
+  });
+
+  it("binds a trusted preparation to the exact root plan, strict grant, and bytes", () => {
+    const first = record();
+    first.plan = { ...first.plan, logicalAgentId: "managed-session",
+      identityGeneration: "a".repeat(32),
+      modelRelaySocket: "/run/s-gw/agents/managed-session/model.sock" };
+    first.modelRelaySocketUnitFile = "/run/systemd/system/s-gw-managed-model-managed-session.socket";
+    const grant = { handle: "s-gw:api-token:fixture", provider: "anthropic",
+      ttlMs: 30_000, payloadProfile: "strict", routes: ["POST /v1/messages"] };
+    const config = { name: "Managed agent", leaseDir: "/run/s-gw/managed-leases",
+      plan: first.plan, relay: { grant } };
+    const serialized = JSON.stringify(config) + "\n";
+    expect(linuxRelayPreparationHash(first, serialized)).toMatch(/^[a-f0-9]{64}$/);
+    expect(linuxRelayPreparationHash(first, serialized)).not.toBe(
+      linuxRelayPreparationHash(first, JSON.stringify(config)));
+    expect(() => linuxRelayPreparationHash(first, JSON.stringify({ ...config,
+      plan: { ...first.plan, identityGeneration: "b".repeat(32) } }))).toThrow();
+    expect(() => linuxRelayPreparationHash(first, JSON.stringify({ ...config,
+      relay: { ...config.relay, requestId: "req_old" } }))).toThrow();
+    expect(() => linuxRelayPreparationHash(first, JSON.stringify({ ...config,
+      relay: { grant: { ...grant, payloadProfile: undefined } } }))).toThrow();
+    expect(() => linuxRelayPreparationHash({ ...first, modelRelaySocketUnitFile: undefined }, serialized)).toThrow();
+    expect(() => assertLinuxPreparationSocketEnvironment({})).not.toThrow();
+    for (const name of ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"]) {
+      expect(() => assertLinuxPreparationSocketEnvironment({ [name]: "1" })).toThrow();
+    }
   });
 
   it("rejects broker unit replacement, a foreign PID, and a new invocation", () => {

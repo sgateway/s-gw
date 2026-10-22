@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { principalForVerifiedPeer } from "./agent-context.js";
 import { systemdAgentSocketFd, systemdManagedSocketFds } from "./linux-activated-socket.js";
-import { connectLinuxAgentControl, validateLinuxManagedPlan,
+import { assertLinuxPreparationSocketEnvironment, connectLinuxAgentControl, validateLinuxManagedPlan,
   type LinuxAgentControlClient } from "./linux-agent-control.js";
 import { LinuxAgentSessionLeases } from "./linux-agent-session.js";
 import { traceLinuxManagedStop, type LinuxAgentUnitPlan } from "./linux-agent-unit.js";
@@ -54,38 +55,50 @@ export function validateLinuxManagedMcpConfig(value: LinuxManagedMcpConfig): voi
   }
 }
 
-export async function prepareLinuxManagedRelayRequest(config: LinuxManagedMcpConfig,
+async function createManagedRelayRequest(config: LinuxManagedMcpConfig,
   store: SecretStore): Promise<string> {
+  const relay = config.relay!;
+  const principal = principalForVerifiedPeer(`linux:managed:${config.plan.identityGeneration}`,
+    config.name, config.plan.sessionId);
+  const existing = (await store.listRequests({ active: true })).filter(request =>
+    request.agentSource === "managed-peer" && request.principalId === principal.id &&
+    request.agentSessionId === principal.sessionId);
+  if (existing.length) {
+    const request = existing[0];
+    if (existing.length !== 1 || !["pending", "approved"].includes(request.state) ||
+        request.agentName !== config.name || request.action.kind !== "model_relay" ||
+        JSON.stringify(normalizeModelRelayGrant(relay.grant)) !==
+          JSON.stringify(grantFromModelRelayAction(request.handle, request.action))) {
+      throw new Error("This Linux model relay session already has a different active request.");
+    }
+    return request.id;
+  }
+  const request = await store.createModelRelayRequest(relay.grant, principal,
+    "Root-managed Linux agent requested model API access.");
+  return request.id;
+}
+
+export async function prepareLinuxManagedRelayRequest(config: LinuxManagedMcpConfig,
+  store: SecretStore, configHash?: string): Promise<string> {
   validateLinuxManagedMcpConfig(config);
   if (!config.relay || config.relay.requestId || !config.plan.identityGeneration) {
     throw new Error("Only an unprepared root-managed relay can create its approval request.");
   }
+  if (configHash !== undefined) assertLinuxPreparationSocketEnvironment();
   const control = await connectLinuxAgentControl(config.plan);
   try {
-    const principal = principalForVerifiedPeer(`linux:managed:${config.plan.identityGeneration}`,
-      config.name, config.plan.sessionId);
-    const existing = (await store.listRequests({ active: true })).filter(request =>
-      request.agentSource === "managed-peer" && request.principalId === principal.id &&
-      request.agentSessionId === principal.sessionId);
-    if (existing.length) {
-      const request = existing[0];
-      if (existing.length !== 1 || !["pending", "approved"].includes(request.state) ||
-          request.action.kind !== "model_relay" ||
-          JSON.stringify(normalizeModelRelayGrant(config.relay.grant)) !==
-            JSON.stringify(grantFromModelRelayAction(request.handle, request.action))) {
-        throw new Error("This Linux model relay session already has a different active request.");
-      }
-      return request.id;
-    }
-    const request = await store.createModelRelayRequest(config.relay.grant, principal,
-      "Root-managed Linux agent requested model API access.");
-    return request.id;
+    if (configHash !== undefined) await control.prepare(configHash);
+    const requestId = await createManagedRelayRequest(config, store);
+    if (configHash !== undefined) await control.prepared(requestId);
+    return requestId;
   } finally {
     await control.close();
   }
 }
 
-export async function readLinuxManagedMcpConfig(filename: string): Promise<LinuxManagedMcpConfig> {
+async function readLinuxManagedMcpConfigWithHash(filename: string): Promise<{
+  config: LinuxManagedMcpConfig; hash: string;
+}> {
   const gid = process.getgid?.();
   if (process.platform !== "linux" || !Number.isSafeInteger(gid) || gid! < 1 ||
       !path.isAbsolute(filename) || path.resolve(filename) !== filename) {
@@ -108,9 +121,14 @@ export async function readLinuxManagedMcpConfig(filename: string): Promise<Linux
     if (next === parent) break;
     parent = next;
   }
-  const data = JSON.parse(await readFile(filename, "utf8")) as LinuxManagedMcpConfig;
-  validateLinuxManagedMcpConfig(data);
-  return data;
+  const content = await readFile(filename, "utf8");
+  const config = JSON.parse(content) as LinuxManagedMcpConfig;
+  validateLinuxManagedMcpConfig(config);
+  return { config, hash: createHash("sha256").update(content).digest("hex") };
+}
+
+export async function readLinuxManagedMcpConfig(filename: string): Promise<LinuxManagedMcpConfig> {
+  return (await readLinuxManagedMcpConfigWithHash(filename)).config;
 }
 
 export interface LinuxManagedMcpSession {
@@ -210,11 +228,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   if (process.argv.length !== 3 || !path.isAbsolute(process.argv[2])) {
     throw new Error("Usage: linux-managed-mcp <absolute root-provisioned config.json>");
   }
-  const config = await readLinuxManagedMcpConfig(process.argv[2]);
+  const { config, hash } = await readLinuxManagedMcpConfigWithHash(process.argv[2]);
   const store = new SecretStore();
   await store.init();
   if (config.relay && !config.relay.requestId) {
-    const requestId = await prepareLinuxManagedRelayRequest(config, store);
+    const trusted = ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"]
+      .every(name => process.env[name] === undefined);
+    const requestId = await prepareLinuxManagedRelayRequest(config, store,
+      trusted ? hash : undefined);
     process.stdout.write(`${JSON.stringify({ sessionId: config.plan.sessionId, requestId })}\n`);
   } else {
   const session = await startLinuxManagedMcpSession(config, store);

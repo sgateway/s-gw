@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, chown, lstat, open, readFile, readlink, realpath, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
@@ -10,11 +11,14 @@ import { lifecyclePlanKey, SystemdRunAgentUnitManager, validateLinuxAgentPlan,
   type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
 import { attestDurableLinuxAgentIdentity } from "./linux-agent-identity.js";
 import { verifyLinuxPeerProcess } from "./linux-peer-identity.js";
+import { normalizeModelRelayGrant, type ModelRelayGrant } from "./model-relay-action.js";
 
 const controlSocket = "/run/s-gw/agent-control.sock";
+const prepareSocket = "/run/s-gw/agent-prepare.sock";
 const planDir = "/run/s-gw/agent-plans";
 const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
 const rootPidfdHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-linux-peer-identity`, import.meta.url));
+const rootPeerHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-peer-credentials`, import.meta.url));
 const maxFrame = 32 * 1024;
 const unsafeStartupEnv = ["NODE_OPTIONS", "NODE_PATH", "NODE_TLS_REJECT_UNAUTHORIZED",
   "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "OPENSSL_CONF", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -61,12 +65,14 @@ export interface LinuxManagedPlanRecord {
   brokerCa: string | null;
 }
 
-type Method = "start" | "inspect" | "release" | "stop";
+type Method = "start" | "inspect" | "release" | "stop" | "prepare" | "prepared";
 interface ControlCall {
   id: number;
   method: Method;
   plan: LinuxAgentUnitPlan;
   state?: LinuxAgentUnitState;
+  configHash?: string;
+  requestId?: string;
 }
 
 export function validateLinuxManagedPlan(plan: LinuxAgentUnitPlan, brokerUid: number, brokerGid: number): void {
@@ -128,7 +134,7 @@ async function checkedBrokerFile(filename: string): Promise<void> {
 }
 
 async function registeredPlan(sessionId: string, brokerUid: number,
-  brokerGid: number): Promise<LinuxManagedPlanRecord> {
+  brokerGid: number, socketState: "active" | "inactive" = "active"): Promise<LinuxManagedPlanRecord> {
   linuxAgentUnitName(sessionId);
   const directory = await lstat(planDir);
   if (!directory.isDirectory() || directory.uid !== 0 ||
@@ -149,12 +155,12 @@ async function registeredPlan(sessionId: string, brokerUid: number,
   await checkedRootFile(value.mcpSocketUnitFile);
   assertManagedMcpSocketUnit(value, await systemctlProperties(
     path.basename(value.mcpSocketUnitFile),
-    ["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]));
+    ["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]), socketState);
   if (value.modelRelaySocketUnitFile) {
     await checkedRootFile(value.modelRelaySocketUnitFile);
     assertModelSocketUnit(value, await systemctlProperties(
       path.basename(value.modelRelaySocketUnitFile),
-      ["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]));
+      ["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]), socketState);
   }
   await checkedBrokerFile(value.brokerNode);
   await checkedBrokerFile(value.brokerPreflight);
@@ -254,8 +260,9 @@ async function checkedRootRuntime(): Promise<void> {
   }
   for (const filename of [fileURLToPath(import.meta.url), path.join(runtimeDir, "linux-agent-unit.js"),
     path.join(runtimeDir, "linux-peer-identity.js"), path.join(runtimeDir, "linux-agent-identity.js"),
+    path.join(runtimeDir, "model-relay-action.js"),
     path.join(runtimeDir, "package.json"),
-    rootPidfdHelper, await realpath(process.execPath)]) {
+    rootPidfdHelper, rootPeerHelper, await realpath(process.execPath)]) {
     await checkedRootFile(filename);
   }
   const runtimeRoot = path.dirname(runtimeDir);
@@ -300,7 +307,7 @@ async function readPeer(socket: Socket, helper: string): Promise<{ uid: number; 
   });
 }
 
-function firstFrame(socket: Socket): Promise<unknown> {
+function firstFrame(socket: Socket, timeoutMs = 1500): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let pending = Buffer.alloc(0);
     const done = (error?: Error, value?: unknown) => {
@@ -329,7 +336,7 @@ function firstFrame(socket: Socket): Promise<unknown> {
       try { done(undefined, JSON.parse(pending.subarray(0, end).toString("utf8"))); }
       catch { done(new Error("Invalid Linux control handshake JSON.")); }
     };
-    socket.setTimeout(1500, () => done(new Error("Linux control handshake timed out.")));
+    socket.setTimeout(timeoutMs, () => done(new Error("Linux control handshake timed out.")));
     socket.on("data", onData);
     socket.once("close", onClose);
     socket.once("error", onError);
@@ -362,12 +369,55 @@ async function systemctlProperties(unit: string, names = ["Id", "ActiveState", "
   });
 }
 
-export function assertModelSocketUnit(record: LinuxManagedPlanRecord, output: string): void {
+async function systemctlAction(action: "start" | "stop", unit: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("/usr/bin/systemctl", ["--system", action, unit],
+      { stdio: ["ignore", "ignore", "pipe"], env: {}, timeout: 10_000 });
+    let errorOutput = "";
+    child.stderr!.on("data", chunk => {
+      errorOutput += String(chunk);
+      if (errorOutput.length > 4096) child.kill();
+    });
+    child.once("error", reject);
+    child.once("close", code => code === 0 ? resolve() :
+      reject(new Error(`Could not ${action} registered Linux unit ${unit}.`)));
+  });
+}
+
+export function linuxRelayPreparationHash(record: LinuxManagedPlanRecord, content: string): string {
+  const config = JSON.parse(content) as { name?: unknown; leaseDir?: unknown;
+    plan?: LinuxAgentUnitPlan; relay?: {
+    grant?: ModelRelayGrant; requestId?: unknown;
+  } };
+  if (!record.modelRelaySocketUnitFile || !config?.plan || !config.relay ||
+      typeof config.name !== "string" || !config.name.trim() || config.name.length > 120 ||
+      typeof config.leaseDir !== "string" || !path.isAbsolute(config.leaseDir) ||
+      path.resolve(config.leaseDir) !== config.leaseDir ||
+      config.relay.requestId !== undefined ||
+      lifecyclePlanKey(config.plan) !== lifecyclePlanKey(record.plan) ||
+      !record.plan.identityGeneration) {
+    throw new Error("Linux relay preparation needs the unapproved root-registered plan.");
+  }
+  const grant = normalizeModelRelayGrant(config.relay.grant!);
+  if (grant.payloadProfile !== "strict") {
+    throw new Error("Linux relay preparation needs a strict model grant.");
+  }
+  return createHash("sha256").update(content).digest("hex");
+}
+
+export function assertLinuxPreparationSocketEnvironment(env: NodeJS.ProcessEnv = process.env): void {
+  if (["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"].some(name => env[name] !== undefined)) {
+    throw new Error("Linux relay preparation cannot inherit an activated agent socket.");
+  }
+}
+
+export function assertModelSocketUnit(record: LinuxManagedPlanRecord, output: string,
+  state: "active" | "inactive" = "active"): void {
   const file = record.modelRelaySocketUnitFile;
   if (!file) throw new Error("No managed Linux model socket unit is registered.");
   const values = parseUnitProperties(output);
   // systemd exposes the socket's resolved service target as Triggers, not Service.
-  if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== "active" ||
+  if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== state ||
       values.get("FragmentPath") !== file || values.get("Triggers") !== record.brokerUnit ||
       !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
       !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
@@ -375,10 +425,11 @@ export function assertModelSocketUnit(record: LinuxManagedPlanRecord, output: st
   }
 }
 
-export function assertManagedMcpSocketUnit(record: LinuxManagedPlanRecord, output: string): void {
+export function assertManagedMcpSocketUnit(record: LinuxManagedPlanRecord, output: string,
+  state: "active" | "inactive" = "active"): void {
   const file = record.mcpSocketUnitFile;
   const values = parseUnitProperties(output);
-  if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== "active" ||
+  if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== state ||
       values.get("FragmentPath") !== file || values.get("Triggers") !== record.brokerUnit ||
       !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
       !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
@@ -534,7 +585,7 @@ function controlCall(value: unknown): ControlCall {
   if (!value || typeof value !== "object") throw new Error("Invalid Linux control call.");
   const call = value as ControlCall;
   if (!Number.isSafeInteger(call.id) || call.id < 1 ||
-      !["start", "inspect", "release", "stop"].includes(call.method) || !call.plan) {
+      !["start", "inspect", "release", "stop", "prepare", "prepared"].includes(call.method) || !call.plan) {
     throw new Error("Invalid Linux control call.");
   }
   return call;
@@ -562,6 +613,35 @@ export async function stopTrackedManagedUnit(manager: Pick<SystemdRunAgentUnitMa
   state.started = false;
 }
 
+async function assertInactiveUnit(unit: string): Promise<void> {
+  const values = parseUnitProperties(await systemctlProperties(unit, ["Id", "ActiveState", "MainPID"]));
+  if (values.get("Id") !== unit || values.get("ActiveState") !== "inactive" ||
+      values.get("MainPID") !== "0") {
+    throw new Error(`Linux unit must be stopped before relay preparation: ${unit}`);
+  }
+}
+
+async function waitForPreparedBroker(unit: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const values = parseUnitProperties(await systemctlProperties(unit,
+      ["Id", "ActiveState", "MainPID", "Result", "ExecMainStatus"]));
+    if (values.get("Id") === unit && values.get("ActiveState") === "inactive" &&
+        values.get("MainPID") === "0" && values.get("Result") === "success" &&
+        values.get("ExecMainStatus") === "0") return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error("Verified Linux broker did not finish relay preparation cleanly.");
+}
+
+interface RelayPreparation {
+  configHash: string;
+  consumed: boolean;
+  completed: boolean;
+  resolve(requestId: string): void;
+  reject(error: Error): void;
+}
+
 export async function startLinuxAgentControlService(brokerUid: number, brokerGid: number): Promise<LinuxAgentControlService> {
   await checkedRootRuntime();
   if (!Number.isSafeInteger(brokerUid) || brokerUid < 1 ||
@@ -572,6 +652,7 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
   const owners = new Map<string, Socket>();
   const draining = new Set<string>();
   const usedSessions = new Set<string>();
+  const preparations = new Map<string, RelayPreparation>();
   const connections = new Set<Socket>();
   const cleanups = new Set<Promise<void>>();
   let closing = false;
@@ -591,7 +672,8 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
       }
       const sessionId = hello.sessionId;
       stage = "registration";
-      const record = await registeredPlan(sessionId, brokerUid, brokerGid);
+      const record = await registeredPlan(sessionId, brokerUid, brokerGid,
+        preparations.has(sessionId) ? "inactive" : "active");
       stage = "broker";
       const invocation = await attestBroker(socket, record, brokerUid, brokerGid);
       stage = "admission";
@@ -623,7 +705,37 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
           if (closing || socket.destroyed) throw new Error("Linux root control service is stopping.");
           // Passing the socket to the peer helper pauses its parent stream in Node.
           socket.resume();
+          if (call.method === "prepare" || call.method === "prepared") {
+            const preparation = preparations.get(sessionId);
+            if (!preparation || state.started || used || usedSessions.has(sessionId)) {
+              throw new Error("No trusted Linux relay preparation is active for this session.");
+            }
+            await registeredPlan(sessionId, brokerUid, brokerGid, "inactive");
+            const currentHash = linuxRelayPreparationHash(record,
+              await readFile(record.brokerConfig, "utf8"));
+            if (currentHash !== preparation.configHash) {
+              throw new Error("Linux relay preparation config changed after root authorization.");
+            }
+            if (call.method === "prepare") {
+              if (preparation.consumed || call.configHash !== currentHash ||
+                  call.requestId !== undefined) {
+                throw new Error("Linux relay preparation was not authorized for this exact config.");
+              }
+              preparation.consumed = true;
+              return undefined;
+            }
+            if (!preparation.consumed || preparation.completed || call.configHash !== undefined ||
+                !/^[A-Za-z0-9_-]{1,256}$/.test(call.requestId || "")) {
+              throw new Error("Linux relay preparation did not produce a bounded request ID.");
+            }
+            preparation.completed = true;
+            preparation.resolve(call.requestId!);
+            return undefined;
+          }
           if (call.method === "start") {
+            if (preparations.has(sessionId)) {
+              throw new Error("Linux relay preparation cannot launch an agent.");
+            }
             if (used) throw new Error("This Linux agent session was already launched.");
             used = true;
             usedSessions.add(sessionId);
@@ -686,16 +798,113 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
       socket.destroy();
     });
   });
+  const prepareConnections = new Set<Socket>();
+  const prepareRelay = async (sessionId: string): Promise<string> => {
+    linuxAgentUnitName(sessionId);
+    if (closing || owners.has(sessionId) || draining.has(sessionId) ||
+        usedSessions.has(sessionId) || preparations.has(sessionId)) {
+      throw new Error("Linux relay session is active or already preparing.");
+    }
+    const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
+    await assertInactiveUnit(linuxAgentUnitName(sessionId));
+    await assertInactiveUnit(brokerUnit);
+    const mcpUnit = `s-gw-managed-mcp-${sessionId}.socket`;
+    const mcpState = parseUnitProperties(await systemctlProperties(mcpUnit,
+      ["ActiveState"])).get("ActiveState");
+    if (mcpState !== "active" && mcpState !== "inactive") {
+      throw new Error("Linux MCP socket is not in a preparable state.");
+    }
+    const record = await registeredPlan(sessionId, brokerUid, brokerGid, mcpState);
+    if (!record.modelRelaySocketUnitFile) {
+      throw new Error("Linux relay preparation requires its registered model socket.");
+    }
+    const initialHash = linuxRelayPreparationHash(record,
+      await readFile(record.brokerConfig, "utf8"));
+    const modelUnit = path.basename(record.modelRelaySocketUnitFile);
+    if (mcpState === "active") {
+      await systemctlAction("stop", mcpUnit);
+      await systemctlAction("stop", modelUnit);
+    }
+    await assertInactiveUnit(brokerUnit);
+    await registeredPlan(sessionId, brokerUid, brokerGid, "inactive");
+    const configHash = linuxRelayPreparationHash(record,
+      await readFile(record.brokerConfig, "utf8"));
+    if (configHash !== initialHash) {
+      throw new Error("Linux relay preparation config changed while sockets stopped.");
+    }
+    let timeout: NodeJS.Timeout | undefined;
+    const completed = new Promise<string>((resolve, reject) => {
+      const lease: RelayPreparation = { configHash, consumed: false, completed: false,
+        resolve, reject };
+      preparations.set(sessionId, lease);
+      timeout = setTimeout(() => reject(new Error("Linux relay preparation timed out.")), 45_000);
+    });
+    void completed.catch(() => {});
+    try {
+      await systemctlAction("start", record.brokerUnit);
+      const requestId = await completed;
+      await waitForPreparedBroker(record.brokerUnit);
+      const deadline = Date.now() + 5000;
+      while (owners.has(sessionId) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (owners.has(sessionId)) throw new Error("Linux broker retained control after preparation.");
+      return requestId;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      preparations.delete(sessionId);
+    }
+  };
+  const prepareServer = createServer(socket => {
+    if (closing || prepareConnections.size >= 4) { socket.destroy(); return; }
+    prepareConnections.add(socket);
+    socket.pause();
+    socket.on("error", () => socket.destroy());
+    socket.once("close", () => prepareConnections.delete(socket));
+    void (async () => {
+      const peer = await readPeer(socket, rootPeerHelper);
+      if (peer.uid !== 0 || peer.gid !== 0) {
+        throw new Error("Linux relay preparation needs a root operator.");
+      }
+      const raw = await firstFrame(socket) as { sessionId?: unknown };
+      if (!raw || typeof raw !== "object" || Object.keys(raw).length !== 1 ||
+          typeof raw.sessionId !== "string") {
+        throw new Error("Linux relay preparation needs one registered session ID.");
+      }
+      const requestId = await prepareRelay(raw.sessionId);
+      sendFrame(socket, { ok: true, sessionId: raw.sessionId, requestId }, () => socket.end());
+    })().catch(error => {
+      if (!socket.destroyed) {
+        sendFrame(socket, { ok: false, error: String(error) }, () => socket.end());
+      }
+    });
+  });
   const oldMask = process.umask(0o117);
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(controlSocket, () => { server.off("error", reject); resolve(); });
     });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        prepareServer.once("error", reject);
+        prepareServer.listen(prepareSocket, () => {
+          prepareServer.off("error", reject);
+          resolve();
+        });
+      });
+    } catch (error) {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await unlink(controlSocket);
+      throw error;
+    }
   } finally { process.umask(oldMask); }
   await chown(controlSocket, 0, brokerGid);
   await chmod(controlSocket, 0o660);
+  await chown(prepareSocket, 0, 0);
+  await chmod(prepareSocket, 0o600);
   const node = await lstat(controlSocket);
+  const prepareNode = await lstat(prepareSocket);
   let closed: Promise<void> | undefined;
   return {
     close() {
@@ -703,16 +912,23 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
       closing = true;
       closed = (async () => {
         for (const socket of connections) socket.destroy();
+        for (const socket of prepareConnections) socket.destroy();
+        for (const lease of preparations.values()) {
+          lease.reject(new Error("Linux root control service ended during relay preparation."));
+        }
         await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+        await new Promise<void>((resolve, reject) => prepareServer.close(error => error ? reject(error) : resolve()));
         await Promise.all([...cleanups]);
-        try {
-          const current = await lstat(controlSocket);
-          if (current.dev !== node.dev || current.ino !== node.ino) {
-            throw new Error("Linux control socket changed before cleanup.");
+        for (const [filename, original] of [[controlSocket, node], [prepareSocket, prepareNode]] as const) {
+          try {
+            const current = await lstat(filename);
+            if (current.dev !== original.dev || current.ino !== original.ino) {
+              throw new Error(`Linux control socket changed before cleanup: ${filename}`);
+            }
+            await unlink(filename);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           }
-          await unlink(controlSocket);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
       })();
       return closed;
@@ -722,7 +938,44 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
 
 export interface LinuxAgentControlClient extends LinuxAgentUnitManager {
   signal: AbortSignal;
+  prepare(configHash: string): Promise<void>;
+  prepared(requestId: string): Promise<void>;
   close(): Promise<void>;
+}
+
+export async function requestLinuxRelayPreparation(sessionId: string): Promise<string> {
+  if (process.platform !== "linux" || process.getuid?.() !== 0 || process.geteuid?.() !== 0) {
+    throw new Error("Linux relay preparation needs a root operator.");
+  }
+  linuxAgentUnitName(sessionId);
+  await checkedRootFile(rootPeerHelper);
+  const node = await lstat(prepareSocket);
+  if (!node.isSocket() || node.uid !== 0 || node.gid !== 0 ||
+      (node.mode & 0o777) !== 0o600) {
+    throw new Error("Linux relay preparation socket is not root-private.");
+  }
+  const socket = createConnection(prepareSocket);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    socket.pause();
+    const peer = await readPeer(socket, rootPeerHelper);
+    if (peer.uid !== 0 || peer.gid !== 0) {
+      throw new Error("Linux relay preparation server is not root.");
+    }
+    sendFrame(socket, { sessionId });
+    const reply = await firstFrame(socket, 60_000) as {
+      ok?: unknown; sessionId?: unknown; requestId?: unknown; error?: unknown;
+    };
+    if (reply?.ok === false) throw new Error(String(reply.error || "Linux relay preparation failed."));
+    if (reply?.ok !== true || reply.sessionId !== sessionId ||
+        !/^[A-Za-z0-9_-]{1,256}$/.test(String(reply.requestId || ""))) {
+      throw new Error("Linux relay preparation returned an invalid request ID.");
+    }
+    return reply.requestId as string;
+  } finally { socket.destroy(); }
 }
 
 export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promise<LinuxAgentControlClient> {
@@ -798,7 +1051,8 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
     pending = undefined;
   });
   socket.resume();
-  const call = async (method: Method, plan: LinuxAgentUnitPlan, state?: LinuxAgentUnitState): Promise<unknown> => {
+  const call = async (method: Method, plan: LinuxAgentUnitPlan, state?: LinuxAgentUnitState,
+    configHash?: string, requestId?: string): Promise<unknown> => {
     if (socket.destroyed || pending) throw new Error("Linux root control service is unavailable or busy.");
     if (plan.sessionId !== admittedPlan.sessionId ||
         lifecyclePlanKey(plan) !== lifecyclePlanKey(admittedPlan)) {
@@ -809,13 +1063,21 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
       pending = { id, method, resolve, reject };
       if (method === "stop") traceLinuxManagedStop("broker control stop call send");
       traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call send`);
-      try { sendFrame(socket, { id, method, plan, state },
+      try { sendFrame(socket, { id, method, plan, state, configHash, requestId },
         () => traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call flushed`)); }
       catch (error) { pending = undefined; reject(error as Error); }
     });
   };
   return {
     signal: lost.signal,
+    prepare: async configHash => {
+      if (!/^[a-f0-9]{64}$/.test(configHash)) throw new Error("Invalid Linux relay config hash.");
+      await call("prepare", admittedPlan, undefined, configHash);
+    },
+    prepared: async requestId => {
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId)) throw new Error("Invalid model relay request ID.");
+      await call("prepared", admittedPlan, undefined, undefined, requestId);
+    },
     start: async plan => { await call("start", plan); },
     inspect: async plan => await call("inspect", plan) as LinuxAgentUnitState,
     release: async (plan, state) => { await call("release", plan, state); },
@@ -829,18 +1091,22 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv.length !== 5 || process.argv[2] !== "--serve") {
-    throw new Error("Usage: linux-agent-control --serve <broker-uid> <broker-gid>");
-  }
-  const brokerUid = Number(process.argv[3]);
-  const brokerGid = Number(process.argv[4]);
-  const service = await startLinuxAgentControlService(brokerUid, brokerGid);
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.once(signal, () => {
-      void service.close().then(() => { process.exitCode = 0; }, error => {
-        process.stderr.write(`${String(error)}\n`);
-        process.exitCode = 1;
+  if (process.argv.length === 4 && process.argv[2] === "--prepare") {
+    const requestId = await requestLinuxRelayPreparation(process.argv[3]);
+    process.stdout.write(`${JSON.stringify({ sessionId: process.argv[3], requestId })}\n`);
+  } else if (process.argv.length === 5 && process.argv[2] === "--serve") {
+    const brokerUid = Number(process.argv[3]);
+    const brokerGid = Number(process.argv[4]);
+    const service = await startLinuxAgentControlService(brokerUid, brokerGid);
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      process.once(signal, () => {
+        void service.close().then(() => { process.exitCode = 0; }, error => {
+          process.stderr.write(`${String(error)}\n`);
+          process.exitCode = 1;
+        });
       });
-    });
+    }
+  } else {
+    throw new Error("Usage: linux-agent-control --serve <broker-uid> <broker-gid> | --prepare <session-id>");
   }
 }
