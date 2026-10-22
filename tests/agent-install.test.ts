@@ -1072,6 +1072,11 @@ describe("agent integration installation", () => {
   it("serializes concurrent stale recovery installs and uninstalls without losing ownership", async () => {
     const agentIds = ["codex", "claudecode", "cursor", "geminicli"];
     const commands = ["codex", "claude", "cursor", "gemini"];
+    const deadPid = Number.MAX_SAFE_INTEGER;
+    let deadPidError: unknown;
+    try { process.kill(deadPid, 0); } catch (error) { deadPidError = error; }
+    expect(deadPidError).toBeDefined();
+    expect((deadPidError as NodeJS.ErrnoException).code).not.toBe("EPERM");
 
     for (let round = 0; round < 3; round += 1) {
       const homeDir = testHome();
@@ -1086,18 +1091,16 @@ describe("agent integration installation", () => {
         SGW_RECOVERY_HOME: path.join(homeDir, ".s-gw-recovery"),
         SGW_DISABLE_UPDATE_CHECK: "1"
       };
-      const deadProcess = spawnSync(process.execPath, ["-e", ""]);
-      expect(deadProcess.status).toBe(0);
       const lockPath = path.join(homeDir, ".s-gw-agent-integrations.lock");
       const owner = {
-        pid: deadProcess.pid,
+        pid: deadPid,
         startedAt: Date.now(),
         token: `concurrent-dead-owner-${round}`
       };
       mkdirSync(lockPath, { mode: 0o700 });
       writeFileSync(path.join(lockPath, `owner-${owner.token}.json`), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
 
-      const staleCandidate = `${lockPath}.tmp-${deadProcess.pid}-stale-recovery-${round}`;
+      const staleCandidate = `${lockPath}.tmp-${deadPid}-stale-recovery-${round}`;
       mkdirSync(staleCandidate, { mode: 0o700 });
       const staleMarker = path.join(staleCandidate, "owner-stale-recovery.json");
       writeFileSync(staleMarker, "unfinished owner metadata", { mode: 0o600 });
