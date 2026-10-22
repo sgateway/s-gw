@@ -36,6 +36,8 @@ describe("customer package layout", () => {
       await writeFile(plistPath, buildConsoleLaunchAgentPlist(9876, dir, {}, true));
       expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(true);
       expect(installedConsolePort(plistPath)).toBe(9876);
+      await writeFile(plistPath, `<key>ProgramArguments</key><array><string>--ui-manifest</string><string>/tmp/ui.json</string></array>`);
+      expect(() => installedConsoleRequiresOperatorProof(plistPath)).toThrow("invalid protected UI manifest path");
       await writeFile(plistPath, "<key>ProgramArguments</key><array><string>--operator-auth</string></array>");
       expect(() => installedConsoleRequiresOperatorProof(plistPath)).toThrow("incomplete operator-auth configuration");
     } finally {
@@ -290,6 +292,17 @@ describe("launch-agent packaging", () => {
     expect(plist).toContain("<string>--background</string>");
     expect(plist).toContain("<string>--no-open</string>");
     expect(plist).not.toContain("s-gw one-time operator code");
+  });
+
+  it("passes a pinned UI manifest only to a protected console", () => {
+    const manifestPath = "/Library/Application Support/s-gw/operator & UI.json";
+    const plist = buildConsoleLaunchAgentPlist(8718, "/tmp/s-gw logs", {}, true, false, manifestPath);
+    expect(plist).toContain("<string>--ui-manifest</string>");
+    expect(plist).toContain("<string>/Library/Application Support/s-gw/operator &amp; UI.json</string>");
+    expect(() => buildConsoleLaunchAgentPlist(8718, "/tmp/s-gw logs", {}, false, false, manifestPath))
+      .toThrow("requires a protected console");
+    expect(() => buildConsoleLaunchAgentPlist(8718, "/tmp/s-gw logs", {}, true, false, "relative.json"))
+      .toThrow("absolute path");
   });
 
   it("offers launchd ownership of the exact protected loopback listener only when selected", () => {

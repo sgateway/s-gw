@@ -113,6 +113,7 @@ export interface ServiceInstallOptions {
   start?: boolean;
   operatorAuth?: boolean;
   socketActivated?: boolean;
+  uiManifestPath?: string;
 }
 
 export interface MenuBarOptions {
@@ -393,6 +394,8 @@ export async function installConsoleLaunchAgent(options: ServiceInstallOptions =
   }
   const oldMode = oldArgs.includes("--operator-auth") && oldArgs.includes("--background");
   const operatorAuth = options.operatorAuth ?? oldMode;
+  const oldUiManifestPath = consoleUiManifestPath(oldArgs);
+  const uiManifestPath = options.uiManifestPath ?? (operatorAuth ? oldUiManifestPath : undefined);
   const oldSocketMode = oldArgs.includes("--launchd-socket");
   const socketActivated = options.socketActivated ?? (operatorAuth && oldSocketMode);
   if (socketActivated && !operatorAuth) {
@@ -401,11 +404,12 @@ export async function installConsoleLaunchAgent(options: ServiceInstallOptions =
   if (socketActivated) accessSync(getPackageLayout().consoleActivatorPath, constants.X_OK);
   const oldPort = numberAfter(oldArgs, "--port");
   const socketPortChanged = (oldSocketMode || socketActivated) && oldPort !== undefined && oldPort !== port;
-  if (oldArgs.length && (oldMode !== operatorAuth || oldSocketMode !== socketActivated || socketPortChanged) &&
+  if (oldArgs.length && (oldMode !== operatorAuth || oldSocketMode !== socketActivated ||
+      oldUiManifestPath !== uiManifestPath || socketPortChanged) &&
       launchAgentStatus("console").loaded && !options.start) {
-    throw new Error("Changing console authentication, socket mode, or activated port requires --start to restart the existing service.");
+    throw new Error("Changing console authentication, UI manifest, socket mode, or activated port requires --start to restart the existing service.");
   }
-  await writeFile(plistPath, buildConsoleLaunchAgentPlist(port, logs, {}, operatorAuth, socketActivated), { mode: 0o644 });
+  await writeFile(plistPath, buildConsoleLaunchAgentPlist(port, logs, {}, operatorAuth, socketActivated, uiManifestPath), { mode: 0o644 });
 
   if (options.start) {
     startLaunchAgent(consoleLabel, plistPath);
@@ -670,12 +674,13 @@ async function refreshConsoleLaunchAgent(status: LaunchAgentStatus): Promise<Lau
   const env = launchAgentEnvironment(status.plistPath);
   const port = numberAfter(args, "--port") || 8718;
   const logs = await ensureLogDir(env.SGW_HOME);
-  if (status.loaded) stopLaunchAgent(consoleLabel);
   const operatorAuth = args.includes("--operator-auth") && args.includes("--background");
   const socketActivated = args.includes("--launchd-socket");
+  const uiManifestPath = consoleUiManifestPath(args);
   if (socketActivated) accessSync(getPackageLayout().consoleActivatorPath, constants.X_OK);
-  await writeFile(status.plistPath,
-    buildConsoleLaunchAgentPlist(port, logs, env, operatorAuth, socketActivated), { mode: 0o644 });
+  const plist = buildConsoleLaunchAgentPlist(port, logs, env, operatorAuth, socketActivated, uiManifestPath);
+  if (status.loaded) stopLaunchAgent(consoleLabel);
+  await writeFile(status.plistPath, plist, { mode: 0o644 });
   if (status.loaded) startLaunchAgent(consoleLabel, status.plistPath);
   return launchAgentStatus("console");
 }
@@ -701,6 +706,19 @@ function launchAgentProgramArguments(plistPath: string): string[] {
   const match = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist);
   if (!match) return [];
   return [...match[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((item) => xmlUnescape(item[1]));
+}
+
+function consoleUiManifestPath(args: string[]): string | undefined {
+  const index = args.indexOf("--ui-manifest");
+  if (index === -1) return undefined;
+  if (args.indexOf("--ui-manifest", index + 1) !== -1) {
+    throw new Error("Existing console service has duplicate UI manifest arguments.");
+  }
+  const manifestPath = args[index + 1];
+  if (!manifestPath || !path.isAbsolute(manifestPath) || !args.includes("--operator-auth")) {
+    throw new Error("Existing console service has an invalid protected UI manifest path.");
+  }
+  return manifestPath;
 }
 
 function launchAgentEnvironment(plistPath: string): Record<string, string> {
@@ -1363,6 +1381,7 @@ export function installedConsoleRequiresOperatorProof(plistPath = launchAgentPat
   if (args.includes("--operator-auth") !== args.includes("--background")) {
     throw new Error("Existing console service has an incomplete operator-auth configuration.");
   }
+  consoleUiManifestPath(args);
   return args.includes("--operator-auth");
 }
 
@@ -2374,10 +2393,14 @@ export function buildConsoleLaunchAgentPlist(
   logsDir: string,
   inheritedEnvironment: Record<string, string> = {},
   operatorAuth = false,
-  socketActivated = false
+  socketActivated = false,
+  uiManifestPath?: string
 ): string {
   if (socketActivated && (!operatorAuth || !Number.isInteger(port) || port < 1 || port > 65_535)) {
     throw new Error("launchd socket activation requires a protected console and an exact port.");
+  }
+  if (uiManifestPath !== undefined && (!operatorAuth || !path.isAbsolute(uiManifestPath) || uiManifestPath.includes("\0"))) {
+    throw new Error("A UI manifest requires a protected console and an absolute path.");
   }
   const layout = getPackageLayout();
   const consoleArgs = [
@@ -2390,6 +2413,7 @@ export function buildConsoleLaunchAgentPlist(
     String(port),
     "--no-open",
     ...(operatorAuth ? ["--operator-auth", "--background"] : []),
+    ...(uiManifestPath ? ["--ui-manifest", uiManifestPath] : []),
     ...(socketActivated ? ["--launchd-socket"] : [])
   ];
   return buildLaunchAgentPlist({
