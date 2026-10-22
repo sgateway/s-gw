@@ -179,14 +179,19 @@ static int enter_agent_netns_and_drop(const char *pid_text, const char *uid_text
     return 0;
 }
 
-static int handoff_socket(int broker_fd, const char *name) {
+static int handoff_socket(int broker_fd, const char *name, int *failed_step) {
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, name);
     int channel = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (channel < 0) return -1;
+    if (channel < 0) {
+        if (failed_step) *failed_step = 1;
+        return -1;
+    }
     if (connect(channel, (struct sockaddr *)&address, sizeof(address)) != 0) {
         int error = errno;
         close(channel);
+        if (failed_step) *failed_step = 2;
+        errno = error;
         return error == EACCES || error == EPERM || error == ENOENT || error == ECONNREFUSED ? 0 : -1;
     }
     char payload = 'x';
@@ -203,6 +208,8 @@ static int handoff_socket(int broker_fd, const char *name) {
     int error = errno;
     close(channel);
     if (sent == 1) return 1;
+    if (failed_step) *failed_step = 3;
+    errno = error;
     return sent < 0 && (error == EACCES || error == EPERM) ? 0 : -1;
 }
 
@@ -413,23 +420,43 @@ static int model_stream_request(const char *socket_path, int cancel) {
 
 static int model_handoff_probe(const char *socket_path, const char *handoff_path,
                                const char *ready_path, const char *result_path) {
+    int cross_session = strcmp(handoff_path, "/run/s-gw/handoff-cross/model.sock") == 0;
     const char *prefix = "{\"model\":\"fixture-model\",";
     const char *remaining = "\"max_tokens\":16,\"mcp_servers\":[]}";
     int fd = connect_model(socket_path);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        if (cross_session) write_probe_stage("cross-model-upstream-connect-failed\n");
+        return -1;
+    }
     if (model_headers(fd, strlen(prefix) + strlen(remaining)) != 0 ||
         send_line(fd, prefix) != 0 ||
         write_handoff_result(ready_path, "ready\n") != 0) {
+        if (cross_session) write_probe_stage("cross-model-ready-failed\n");
         close(fd);
         return -1;
     }
-    int handoff = handoff_socket(fd, handoff_path);
+    int failed_step = 0;
+    int handoff = handoff_socket(fd, handoff_path, &failed_step);
+    int handoff_error = errno;
     close(fd);
-    if (handoff != 1) return -1;
+    if (handoff != 1) {
+        if (cross_session) {
+            const char *stage = "cross-model-handoff-error\n";
+            if (failed_step == 2 && (handoff_error == EACCES || handoff_error == EPERM))
+                stage = "cross-model-connect-denied\n";
+            else if (failed_step == 2 && (handoff_error == ENOENT || handoff_error == ECONNREFUSED))
+                stage = "cross-model-connect-unavailable\n";
+            else if (failed_step == 3 && (handoff_error == EACCES || handoff_error == EPERM))
+                stage = "cross-model-send-denied\n";
+            write_probe_stage(stage);
+        }
+        return -1;
+    }
     for (int attempt = 0; attempt < 100; attempt++) {
         if (access(result_path, F_OK) == 0) return 0;
         usleep(100000);
     }
+    if (cross_session) write_probe_stage("cross-model-result-timeout\n");
     return -1;
 }
 
@@ -553,7 +580,7 @@ int main(int argc, char **argv) {
         usleep(100000);
     }
     if (!release) return 27;
-    int handoff = handoff_socket(handoff_fd, "/workspace/handoff.sock");
+    int handoff = handoff_socket(handoff_fd, "/workspace/handoff.sock", NULL);
     close(handoff_fd);
     if (handoff != 1) return 23;
     int finished = 0;

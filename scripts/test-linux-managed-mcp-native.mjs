@@ -1439,6 +1439,20 @@ try {
     states.boundary = await maybeText(`${agent.root}/workspace/boundary`);
     states.handoffReady = await maybeText(`${agent.root}/workspace/handoff-ready`);
     states.probeStage = await maybeText(`${agent.root}/workspace/probe-stage`);
+    if (testRelay) {
+      states.modelHandoffs = {};
+      for (const [name, result] of [
+        ["model-handoff", `${agent.root}/workspace/model-handoff-result`],
+        ["cross-model-handoff", `${agent.root}/run/s-gw/handoff-cross/result`]
+      ]) {
+        const helper = handoffHelpers.get(`${agent.sessionId}:${name}`);
+        states.modelHandoffs[name] = {
+          result: await maybeText(result),
+          helperExit: helper?.child.exitCode ?? null,
+          helperSignal: helper?.child.signalCode ?? null
+        };
+      }
+    }
     states.gateRelease = await maybeText(`/run/s-gw/launch-gates/${agent.sessionId}/release`);
     states.forwarderAttestation = (await maybeText(
       `/run/s-gw/launch-gates/${agent.sessionId}/forwarder-attestation.json`)) !== undefined;
