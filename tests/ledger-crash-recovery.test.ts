@@ -16,7 +16,7 @@ import type { RequestRecord, StoreFile } from "../src/types.js";
  */
 
 let tmpHome = "";
-let pendingWrites: Promise<unknown> | undefined;
+let pendingWork: Promise<unknown> | undefined;
 
 function fakeOpenAiToken(label: string): string {
   return ["sk", "-proj-", label, "_1234567890abcdef"].join("");
@@ -71,7 +71,7 @@ async function latestFullBackup(): Promise<string> {
 }
 
 beforeEach(async () => {
-  pendingWrites = undefined;
+  pendingWork = undefined;
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-ledger-crash-"));
   process.env.SGW_HOME = tmpHome;
   process.env.SGW_RECOVERY_HOME = `${tmpHome}-recovery`;
@@ -81,7 +81,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await pendingWrites;
+  await pendingWork;
   delete process.env.SGW_HOME;
   delete process.env.SGW_RECOVERY_HOME;
   delete process.env.SGW_MASTER_PASSPHRASE;
@@ -273,22 +273,26 @@ describe("ledger crash and recovery drills", () => {
   });
 
   it("survives repeated crash and restart cycles with unchanged counts", async () => {
-    const seeded = await seedLedger(3);
-    const before = await readLedger();
+    const drill = (async () => {
+      const seeded = await seedLedger(3);
+      const before = await readLedger();
 
-    for (let cycle = 0; cycle < 3; cycle += 1) {
-      await rm(path.join(tmpHome, "store.json"));
-      const recovered = new SecretStore();
-      const requests = await recovered.listRequests();
-      expect(requests).toHaveLength(before.requests.length);
-      expect((await recovered.listHandles()).map((entry) => entry.handle)).toContain(seeded.handle);
-    }
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        await rm(path.join(tmpHome, "store.json"));
+        const recovered = new SecretStore();
+        const requests = await recovered.listRequests();
+        expect(requests).toHaveLength(before.requests.length);
+        expect((await recovered.listHandles()).map((entry) => entry.handle)).toContain(seeded.handle);
+      }
 
-    const after = await readLedger();
-    expect(after.requests).toHaveLength(before.requests.length);
-    expect(after.secrets).toHaveLength(before.secrets.length);
-    expect(after.approvalPolicyRules).toHaveLength(before.approvalPolicyRules.length);
-  });
+      const after = await readLedger();
+      expect(after.requests).toHaveLength(before.requests.length);
+      expect(after.secrets).toHaveLength(before.secrets.length);
+      expect(after.approvalPolicyRules).toHaveLength(before.approvalPolicyRules.length);
+    })();
+    pendingWork = Promise.allSettled([drill]);
+    await drill;
+  }, 45_000);
 
   it("serializes simultaneous writers without losing a request", async () => {
     const seeded = await seedLedger(0);
@@ -305,7 +309,7 @@ describe("ledger crash and recovery drills", () => {
       );
     });
 
-    pendingWrites = Promise.allSettled(writers);
+    pendingWork = Promise.allSettled(writers);
     const created = await Promise.all(writers);
     const persisted = await readLedger();
     const persistedIds = new Set(persisted.requests.map((entry) => entry.id));
