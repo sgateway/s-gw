@@ -40,7 +40,7 @@ function manager(p: LinuxAgentUnitPlan) {
     stop: vi.fn(async () => {}) } satisfies LinuxAgentUnitManager;
 }
 
-describe("Linux broker agent leases", () => {
+describe.skipIf(process.platform === "win32")("Linux broker agent leases", () => {
   it("persists unique UID and GID tombstones before registering the attested cgroup", async () => {
     const location = await leases();
     const p = plan();

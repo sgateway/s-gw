@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 if (process.platform !== "win32") {
@@ -78,10 +78,13 @@ function jobName() {
 
 function aclTrail(path) {
   const lines = [];
-  for (let at = path; ; at = dirname(at)) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR;
+  const targets = [parse(path).root];
+  if (systemRoot) targets.push(systemRoot, join(systemRoot, "System32"));
+  targets.push(dirname(path), path);
+  for (const at of new Set(targets)) {
     const acl = spawnSync("icacls", [at], { encoding: "utf8", windowsHide: true });
     lines.push(`${at}: ${acl.stdout.trim() || acl.stderr.trim() || `icacls exit ${acl.status}`}`);
-    if (dirname(at) === at) break;
   }
   return lines.join("\n");
 }

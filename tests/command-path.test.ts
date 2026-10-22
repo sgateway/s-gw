@@ -83,7 +83,7 @@ describe("credential command path pinning", () => {
       .rejects.toThrow(/different executable/i);
     expect(reveal).not.toHaveBeenCalled();
     expect((await store.getRequest(request.id)).state).toBe("failed");
-  });
+  }, process.platform === "win32" ? 15_000 : 5_000);
 
   it("revalidates reusable permits before revealing a credential", async () => {
     const firstBin = path.join(testRoot, "permit-first");

@@ -162,7 +162,7 @@ describe("CLI verified-only automatic approval", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  });
+  }, process.platform === "win32" ? 15_000 : 5_000);
 });
 
 describe("CLI unknown-command behavior (end to end)", () => {

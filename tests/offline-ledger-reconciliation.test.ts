@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   assessOfflineLedgerReconciliation,
   type OfflineReconciliationInput
 } from "../src/offline-ledger-reconciliation.js";
 
-const home = "/synthetic/operator/.s-gw";
-const recoveryHome = "/synthetic/operator/.s-gw-recovery";
+const syntheticRoot = path.join(path.parse(process.cwd()).root, "synthetic");
+const home = path.join(syntheticRoot, "operator", ".s-gw");
+const recoveryHome = path.join(syntheticRoot, "operator", ".s-gw-recovery");
 const timestamp = "2026-10-21T00:00:00.000Z";
 
 function canonical(value: unknown): unknown {
@@ -145,7 +147,8 @@ describe("offline ledger reconciliation assessment", () => {
     wrongManifest.fingerprint = "0".repeat(64);
     expect(() => assessOfflineLedgerReconciliation({ ...input, controlManifestRaw: JSON.stringify(wrongManifest) }))
       .toThrow("sealed app control plane");
-    expect(() => assessOfflineLedgerReconciliation({ ...input, originalRecoveryHome: "/synthetic/other" }))
+    expect(() => assessOfflineLedgerReconciliation({ ...input,
+      originalRecoveryHome: path.join(syntheticRoot, "other") }))
       .toThrow("different home or recovery vault");
     expect(() => assessOfflineLedgerReconciliation({ ...input, recoveryHeadRaw: JSON.stringify({ version: 1 }) }))
       .toThrow("sealed app control plane");

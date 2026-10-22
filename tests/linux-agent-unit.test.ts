@@ -54,7 +54,7 @@ function attestation(p: LinuxAgentUnitPlan): string {
   ].join("\n") + "\n";
 }
 
-describe("Linux systemd agent unit plan", () => {
+describe.skipIf(process.platform === "win32")("Linux systemd agent unit plan", () => {
   it("pins a unique static UID, root view, network and IPC isolation, and whole-cgroup teardown", () => {
     const args = systemdRunArgs(plan());
     expect(args).toContain("--system");

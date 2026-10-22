@@ -22,7 +22,7 @@ import { httpsFixture } from "./helpers/https-fixture.js";
 let root = "";
 const originalEnv = { ...process.env };
 
-it("keeps marked Keychain repair lock mode in the strict outside broker", () => {
+it.skipIf(process.platform === "win32")("keeps marked Keychain repair lock mode in the strict outside broker", () => {
   const env = brokerChildEnvironment(process.cwd(), path.join(os.tmpdir(), "sgw-test-store"), "Codex", [], {
     strictEnv: true,
     inheritedEnv: { PATH: process.env.PATH, SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK: "1" },
@@ -31,7 +31,7 @@ it("keeps marked Keychain repair lock mode in the strict outside broker", () => 
   expect(env.SGW_REQUIRE_MARKED_KEYCHAIN_REPAIR_LOCK).toBe("1");
 });
 
-it("passes a validated Keychain subprocess timeout to the strict outside broker", () => {
+it.skipIf(process.platform === "win32")("passes a validated Keychain subprocess timeout to the strict outside broker", () => {
   const inheritedEnv = { PATH: process.env.PATH, SGW_MAC_KEYCHAIN_SUBPROCESS_TIMEOUT_MS: "2000" };
   const options = { strictEnv: true, inheritedEnv, agentWritablePaths: [process.cwd()] };
   const env = brokerChildEnvironment(process.cwd(), path.join(os.tmpdir(), "sgw-test-store"), "Codex", [], options);

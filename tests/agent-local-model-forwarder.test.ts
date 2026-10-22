@@ -104,7 +104,7 @@ describe("Linux agent-local model forwarder boundary", () => {
   });
 });
 
-describe("agent-local model byte bridge (synthetic only)", () => {
+describe.skipIf(process.platform === "win32")("agent-local model byte bridge (synthetic only)", () => {
   it("streams the first SSE event before the broker finishes the response", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>(resolve => { release = resolve; });

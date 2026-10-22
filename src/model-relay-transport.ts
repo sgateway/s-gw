@@ -38,6 +38,10 @@ const marker = Buffer.from("[s-gw withheld credential]");
 let bufferedBodyBytes = 0;
 const bufferedByOwner = new Map<string, number>();
 
+export function modelRelayBufferUsage(owner?: string): number {
+  return owner === undefined ? bufferedBodyBytes : bufferedByOwner.get(owner) || 0;
+}
+
 export function modelAddressAllowed(address: string): boolean {
   if (!httpAddressAllowed(address, false)) return false;
   const ip = address.toLowerCase();

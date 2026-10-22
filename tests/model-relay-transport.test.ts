@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { httpsFixture } from "./helpers/https-fixture.js";
-import { modelAddressAllowed, relayModelRequest, type ModelProvider, type ModelUpstreamRequest } from "../src/model-relay-transport.js";
+import { modelAddressAllowed, modelRelayBufferUsage, relayModelRequest, type ModelProvider, type ModelUpstreamRequest } from "../src/model-relay-transport.js";
 
 let home = "";
 let provider: HttpsServer | undefined;
@@ -69,6 +69,15 @@ async function startFixture(
   const gatewayAddress = gateway.address();
   if (!gatewayAddress || typeof gatewayAddress === "string") throw new Error("Gateway fixture port missing.");
   return { url: `http://127.0.0.1:${gatewayAddress.port}`, outbound };
+}
+
+async function waitForBufferedBytes(expected: number, owner?: string) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (modelRelayBufferUsage(owner) === expected) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`Relay buffered ${modelRelayBufferUsage(owner)} bytes; expected ${expected}.`);
 }
 
 describe("model relay transport", () => {
@@ -562,33 +571,27 @@ describe("model relay transport", () => {
         socket.write(`POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${fullBody.length + 1}\r\n\r\n`);
         await new Promise<void>((resolve, reject) => socket.write(partial, error => error ? reject(error) : resolve()));
       }
-      let denied = false;
-      for (let attempt = 0; attempt < 20; attempt++) {
-        const outboundBefore = fixture.outbound.length;
-        const crowded = await fetch(endpoint, {
-          method: "POST", headers: { "content-type": "application/json" }, body: Buffer.alloc(3 * 1024 * 1024, 0x20)
-        });
-        if (crowded.status === 503) {
-          expect(await crowded.text()).toContain("Model relay request buffer is full");
-          expect(fixture.outbound).toHaveLength(outboundBefore);
-          denied = true;
-          break;
-        }
-        expect(crowded.status).toBe(200);
-        await crowded.arrayBuffer();
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-      expect(denied).toBe(true);
+      await waitForBufferedBytes(2 * partial.length);
+      const outboundBefore = fixture.outbound.length;
+      const crowded = await fetch(endpoint, {
+        method: "POST", headers: { "content-type": "application/json", connection: "close" },
+        body: " "
+      });
+      expect(crowded.status).toBe(503);
+      expect(await crowded.text()).toContain("Model relay request buffer is full");
+      expect(fixture.outbound).toHaveLength(outboundBefore);
     } finally {
       for (const socket of stalled) socket.destroy();
     }
 
+    await waitForBufferedBytes(0);
+
     const recovered = await fetch(endpoint, {
-      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+      method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: "{}"
     });
     expect(recovered.status).toBe(200);
     expect(await recovered.text()).toBe("2");
-  });
+  }, 30_000);
 
   it("limits one verified session's request buffers independently of the global budget", async () => {
     const fixture = await startFixture("anthropic", async (req, res) => {
@@ -602,17 +605,20 @@ describe("model relay transport", () => {
       socket.write("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 33554432\r\n\r\n");
       await new Promise<void>((resolve, reject) => socket.write(Buffer.alloc(31 * 1024 * 1024, 0x20),
         error => error ? reject(error) : resolve()));
+      await waitForBufferedBytes(31 * 1024 * 1024, "agent-one");
       const crowded = await fetch(fixture.url + "/v1/messages", {
-        method: "POST", headers: { "content-type": "application/json" }, body: Buffer.alloc(2 * 1024 * 1024, 0x20)
+        method: "POST", headers: { "content-type": "application/json", connection: "close" },
+        body: Buffer.alloc(1024 * 1024 + 1, 0x20)
       });
       expect(crowded.status).toBe(503);
       expect(fixture.outbound).toEqual([]);
     } finally {
       socket.destroy();
     }
+    await waitForBufferedBytes(0, "agent-one");
     const recovered = await fetch(fixture.url + "/v1/messages", {
-      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+      method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: "{}"
     });
     expect(recovered.status).toBe(200);
-  });
+  }, 30_000);
 });

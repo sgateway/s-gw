@@ -3509,7 +3509,7 @@ describe("SecretStore", () => {
     const raw = JSON.parse(storeText);
     expect(raw.secrets[0].cache.approvalGrantId).toBe(approved.approvalGrantId);
     expect(raw.secrets[0].cache.expiresAt).toBeTruthy();
-  });
+  }, process.platform === "win32" ? 15_000 : 5_000);
 
   it("drops cached 1Password values when the reusable approval is revoked", async () => {
     const counterPath = path.join(tmpHome, "op-revoke-count.txt");

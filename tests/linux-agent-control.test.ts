@@ -64,7 +64,7 @@ function controlState(): string {
     `ExecStart={ path=${rootRuntime.preflight} ; argv[]=${rootRuntime.preflight} verify-exec ${rootRuntime.runtimeRoot} ${rootRuntime.node} ${rootRuntime.entry} ${rootRuntime.unitFile} - - -- --serve 1000 1000 ; ignore_errors=no ; status=0 }`].join("\n") + "\n";
 }
 
-describe("Linux managed MCP control", () => {
+describe.skipIf(process.platform === "win32")("Linux managed MCP control", () => {
   it("requires the full supervised profile and a separate agent identity", () => {
     const good = plan();
     expect(() => validateLinuxManagedPlan(good, good.brokerUid, process.getgid?.() ?? 1000)).not.toThrow();

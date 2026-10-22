@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync,
-  rmSync, symlinkSync, writeFileSync
+  lstatSync, realpathSync, rmSync, symlinkSync, writeFileSync
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,13 +37,25 @@ function run(args = ["verify", runtime, nodePath, entry, config, ca, envFile], e
 function passes(name) {
   const result = run();
   assert.equal(result.error, undefined, `${name}: ${result.error?.message}`);
-  assert.equal(result.status, 0, `${name}: exit ${result.status}, ${result.stderr}`);
+  assert.equal(result.status, 0, `${name}: exit ${result.status}, ${result.stderr}\n` +
+    ["/", "/run", work, runtime, nodePath].map(pathState).join("\n"));
 }
 
 function rejects(name, args, env) {
   const result = run(args, env);
   assert.equal(result.error, undefined, `${name}: ${result.error?.message}`);
   assert.notEqual(result.status, 0, `${name}: unsafe runtime accepted`);
+}
+
+function pathState(filename) {
+  try {
+    const info = lstatSync(filename);
+    return `${filename}: uid=${info.uid} mode=${(info.mode & 0o777).toString(8)} ` +
+      `links=${info.nlink} file=${info.isFile()} dir=${info.isDirectory()} ` +
+      `canonical=${realpathSync(filename) === filename}`;
+  } catch (error) {
+    return `${filename}: ${error.message}`;
+  }
 }
 
 try {
@@ -166,12 +178,15 @@ try {
   });
   assert.equal(existsSync(marker), false);
 
+  rmSync(nodePath);
   copyFileSync(process.execPath, nodePath);
   chmodSync(nodePath, 0o755);
   writeFileSync(entry, 'import { writeFileSync } from "node:fs"; writeFileSync(process.argv[2], "executed")\n');
+  passes("copied Node baseline");
   const execArgs = ["verify-exec", runtime, nodePath, entry, config, ca, envFile, "--", marker];
   const cleanExec = run(execArgs);
-  assert.equal(cleanExec.status, 0, cleanExec.stderr);
+  assert.equal(cleanExec.status, 0, `${cleanExec.stderr}\n` +
+    ["/", "/run", work, runtime, nodePath].map(pathState).join("\n"));
   assert.equal(existsSync(marker), true, "verified Node did not execute");
   rmSync(marker);
   rejects("verify-exec preload marker must not run", execArgs, { NODE_OPTIONS: `--require=${evil}` });
