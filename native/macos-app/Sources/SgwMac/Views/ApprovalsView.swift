@@ -22,7 +22,13 @@ struct ApprovalsView: View {
       } else {
         Table(appState.pendingRequests) {
           TableColumn("Agent") { request in
-            Text(request.agentName)
+            VStack(alignment: .leading, spacing: 2) {
+              Text(request.agentName)
+              Label(request.agentIdentitySummary, systemImage: request.hasVerifiedAgentIdentity ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(request.hasVerifiedAgentIdentity ? SGWTheme.green : SGWTheme.orange)
+                .help(request.agentIdentityDetails)
+            }
           }
           TableColumn("Command") { request in
             let executable = request.action.resolvedCommand ?? request.action.command
@@ -74,6 +80,10 @@ struct RequestRow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text("\(request.agentName) requested \(SGWText.shortPath(request.action.command))")
           .font(.callout.weight(.semibold))
+        Label(request.agentIdentitySummary, systemImage: request.hasVerifiedAgentIdentity ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+          .font(.caption2)
+          .foregroundStyle(request.hasVerifiedAgentIdentity ? SGWTheme.green : SGWTheme.orange)
+          .help(request.agentIdentityDetails)
         Text(request.action.resolvedCommand ?? "Not pinned (legacy request)")
           .font(.caption2.monospaced())
           .foregroundStyle(.secondary)
@@ -112,6 +122,10 @@ struct ApprovalMenu: View {
             VStack(alignment: .leading, spacing: 12) {
               Text("Approved operation").font(.headline)
               Text(request.handle).font(.caption.monospaced())
+              Text("\(request.agentName) · \(request.agentIdentitySummary)")
+              Text(request.agentIdentityDetails)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
               ScrollView {
                 Text(request.action.http?.approvalDetails ?? request.action.ssh?.transfer?.approvalDetails ?? "SSH target: \(request.action.ssh?.target ?? ""):\(request.action.ssh?.port ?? 22)\nRemote arguments: \(String(data: (try? JSONSerialization.data(withJSONObject: request.action.args, options: .prettyPrinted)) ?? Data(), encoding: .utf8) ?? "")")
                   .font(.body.monospaced()).textSelection(.enabled)
@@ -132,7 +146,7 @@ struct ApprovalMenu: View {
         appState.approve(request, choice: .oneTime)
       }
       Divider()
-      Section(request.agentName) {
+      Section("\(request.agentName) · \(request.agentIdentitySummary)") {
         timedButtons(scope: .sameAgent)
         Button("Until logout") {
           appState.approve(request, choice: .login(scope: .sameAgent))

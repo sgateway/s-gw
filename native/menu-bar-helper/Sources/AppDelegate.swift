@@ -327,7 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       if notificationsEnabled {
         sendNotification(
           title: "Approval required for s-gw",
-          body: "\(request.agentName) requested \(helperShortHandle(request.handle)) for \(request.shortCommand)."
+          body: "\(request.agentName) (\(request.agentIdentitySummary)) requested \(helperShortHandle(request.handle)) for \(request.shortCommand)."
         )
       }
     }
@@ -447,8 +447,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   private func showTestNotificationAction() {
     if let first = model.state.pending.first {
       sendNotification(
-        title: "Approval required for \(first.agentName)",
-        body: "\(first.shortCommand) requested \(helperShortHandle(first.handle))."
+        title: "Approval required for s-gw",
+        body: "\(first.agentName) (\(first.agentIdentitySummary)) requested \(helperShortHandle(first.handle)) for \(first.shortCommand)."
       )
       return
     }

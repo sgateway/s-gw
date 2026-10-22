@@ -525,6 +525,14 @@ struct ApprovalPromptCard: View {
 
       ApprovalTrustPath(request: request)
 
+      Label(request.agentIdentitySummary, systemImage: request.hasVerifiedAgentIdentity ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+        .font(.system(size: 11, weight: .semibold))
+        .foregroundStyle(request.hasVerifiedAgentIdentity ? HelperTheme.teal : HelperTheme.orange)
+      Text(request.agentIdentityDetails)
+        .font(.system(size: 10, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .textSelection(.enabled)
+
       VStack(alignment: .leading, spacing: 6) {
         requestLine("Command", commandPreview, monospaced: true)
         requestLine("Handle", helperShortHandle(request.handle), monospaced: true)
@@ -619,7 +627,7 @@ struct ApprovalPromptCard: View {
         Button("1 day") { approveTimed(24 * 60) }
       }
 
-      Section(agentScope == "same-agent" ? request.agentName : "All agents") {
+      Section(agentScope == "same-agent" ? "\(request.agentName) · \(request.agentIdentitySummary)" : "All agents") {
         Button("Until logout") {
           actions.approve(request.id, .login(scope: agentScope))
         }
@@ -694,8 +702,8 @@ private struct ApprovalTrustPath: View {
         image: AgentIconResolver.image(for: request.agentName),
         openSourceIcon: "bot",
         title: request.agentName,
-        detail: "Requesting agent",
-        tint: HelperTheme.teal
+        detail: request.hasVerifiedAgentIdentity ? "Verified OS identity" : "Unverified name",
+        tint: request.hasVerifiedAgentIdentity ? HelperTheme.teal : HelperTheme.orange
       )
 
       ApprovalPathConnector()
@@ -723,7 +731,7 @@ private struct ApprovalTrustPath: View {
     .background(HelperTheme.surface, in: RoundedRectangle(cornerRadius: 7))
     .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(HelperTheme.hairline))
     .accessibilityElement(children: .combine)
-    .accessibilityLabel("\(request.agentName) requests \(flow.transportTitle) access to \(flow.destinationTitle)")
+    .accessibilityLabel("\(request.agentName), \(request.agentIdentitySummary), requests \(flow.transportTitle) access to \(flow.destinationTitle)")
   }
 
   private var destinationImage: NSImage? {

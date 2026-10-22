@@ -52,6 +52,9 @@ struct RequestRecord: Decodable, Identifiable, Hashable, Sendable {
   let handle: String
   let reason: String
   let recordedAgentName: String?
+  var agentSource: String? = nil
+  var principalId: String? = nil
+  var agentSessionId: String? = nil
   let state: String
   let action: CommandAction
   let createdAt: String
@@ -62,6 +65,9 @@ struct RequestRecord: Decodable, Identifiable, Hashable, Sendable {
     case handle
     case reason
     case recordedAgentName = "agentName"
+    case agentSource
+    case principalId
+    case agentSessionId
     case state
     case action
     case createdAt
@@ -80,6 +86,23 @@ struct RequestRecord: Decodable, Identifiable, Hashable, Sendable {
     if lower.contains("console") { return "Console" }
     if lower.contains("mcp") { return "MCP" }
     return "Agent"
+  }
+
+  var hasVerifiedAgentIdentity: Bool {
+    agentSource == "managed-peer" &&
+      !(principalId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) &&
+      !(agentSessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+  }
+
+  var agentIdentitySummary: String {
+    hasVerifiedAgentIdentity ? "Verified OS identity" : "Unverified agent name"
+  }
+
+  var agentIdentityDetails: String {
+    guard hasVerifiedAgentIdentity, let principalId, let agentSessionId else {
+      return "The displayed agent name does not prove which OS process made this request."
+    }
+    return "OS principal: \(principalId)\nSession: \(agentSessionId)"
   }
 
   var shortCommand: String {

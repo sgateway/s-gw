@@ -282,6 +282,7 @@ struct AppStateGuardTests {
     runSemVerComparisonTest()
     runAtomFallbackParsingTest()
     runChecksumManifestTest()
+    runAgentIdentityCueTest()
 
     print("ALL_NATIVE_TESTS_OK")
   }
@@ -920,5 +921,27 @@ struct AppStateGuardTests {
     }
     """
     return try! JSONDecoder().decode(StatusPayload.self, from: Data(json.utf8))
+  }
+
+  static func runAgentIdentityCueTest() {
+    let json = """
+    {
+      "id":"req-identity", "handle":"s-gw:token:test", "reason":"Run command", "agentName":"Claude",
+      "action":{"kind":"env_command", "command":"/usr/bin/env", "args":[], "injectEnv":"TOKEN", "timeoutMs":30000},
+      "state":"pending", "createdAt":"2026-07-02T00:00:00Z", "updatedAt":"2026-07-02T00:00:00Z"
+    }
+    """
+    var request = try! JSONDecoder().decode(RequestRecord.self, from: Data(json.utf8))
+    check(!request.hasVerifiedAgentIdentity && request.agentIdentitySummary == "Unverified agent name",
+          "an old request with a familiar name must be labeled unverified")
+    request.agentSource = "managed-peer"
+    request.principalId = "darwin:uid:501"
+    check(!request.hasVerifiedAgentIdentity,
+          "a managed peer without a session must still be labeled unverified")
+    request.agentSessionId = "session-1"
+    check(request.hasVerifiedAgentIdentity &&
+          request.agentIdentityDetails.contains("darwin:uid:501") &&
+          request.agentIdentityDetails.contains("session-1"),
+          "a verified request must display the OS principal and session")
   }
 }

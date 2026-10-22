@@ -504,6 +504,29 @@ struct DecisionGuardTests {
     check(sshFlow.transportTitle == "SSH", "SSH requests should identify the transport")
     check(sshFlow.destinationTitle == "prod-api-01", "SSH user names should be removed from the destination")
     check(sshFlow.destinationKind == .amazonEC2, "AWS SSH requests should use the EC2 destination")
+    check(!sshRequest.hasVerifiedAgentIdentity && sshRequest.agentIdentitySummary == "Unverified agent name",
+          "a familiar agent name without OS identity must be labeled unverified")
+    let oldJson = """
+    {
+      "id":"req-old", "handle":"s-gw:token:test", "reason":"Run command", "agentName":"Claude",
+      "state":"pending", "action":{"kind":"env_command", "command":"/usr/bin/env", "args":[], "injectEnv":"TOKEN"},
+      "createdAt":"2026-07-02T00:00:00Z"
+    }
+    """
+    let oldRequest = try! JSONDecoder().decode(RequestRecord.self, from: Data(oldJson.utf8))
+    check(!oldRequest.hasVerifiedAgentIdentity,
+          "older requests without identity fields must decode as unverified")
+
+    var verifiedRequest = sshRequest
+    verifiedRequest.agentSource = "managed-peer"
+    verifiedRequest.principalId = "darwin:uid:501"
+    check(!verifiedRequest.hasVerifiedAgentIdentity,
+          "a managed peer without a session must still be labeled unverified")
+    verifiedRequest.agentSessionId = "session-1"
+    check(verifiedRequest.hasVerifiedAgentIdentity &&
+          verifiedRequest.agentIdentityDetails.contains("darwin:uid:501") &&
+          verifiedRequest.agentIdentityDetails.contains("session-1"),
+          "the verified cue must show the broker's OS principal and session")
 
     let localRequest = RequestRecord(
       id: "req-local",

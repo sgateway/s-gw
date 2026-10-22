@@ -6,7 +6,7 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ### Added
 
-- Approval cards in the React console and its compact browser menu view now label declared agent names as unverified, and show the verified principal and session for managed peers.
+- Approval cards in the React console, macOS app, and menu-bar helper now label declared agent names as unverified and show the verified principal and session for managed peers. Notifications also identify unverified names.
 - Added an opt-in verified Unix MCP listener and stdio bridge for broker-owned HTTPS and managed SSH actions. It binds requests to a kernel-verified agent session and cancels in-flight work when that session ends. Production launchers and network isolation are still required before this is a confinement boundary.
 - Added an opt-in Linux managed-agent identity with root-owned generation records, a static pre-exec runtime verifier, and a two-agent systemd acceptance fixture. Existing UID-based principals keep their behavior; the new profile needs a privileged installer and native acceptance before deployment.
 - Added per-message sender checks to the systemd-activated Linux verified MCP listener, with a native descriptor-handoff probe. Default model relay and ordinary listeners still need descriptor-transfer controls; native Linux acceptance is pending.
