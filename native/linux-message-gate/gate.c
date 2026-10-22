@@ -189,7 +189,7 @@ static int prepare_listener(void) {
     return 0;
 }
 
-static int run_gate(uid_t uid, gid_t gid, const char *cgroup) {
+static int run_gate(uid_t uid, gid_t gid, const char *cgroup, int http_half_close) {
     struct sockaddr_storage address = { 0 };
     socklen_t address_size = sizeof(address);
     struct ucred peer = { 0 };
@@ -210,12 +210,15 @@ static int run_gate(uid_t uid, gid_t gid, const char *cgroup) {
     struct pending inbound = { 0 };
     struct pending outbound = { 0 };
     int input_open = 1;
+    int socket_input_open = 1;
     while (1) {
         struct pollfd items[3] = {
-            { .fd = SOCKET_FD, .events = (inbound.used ? 0 : POLLIN) |
-                (outbound.used ? POLLOUT : 0) },
+            { .fd = SOCKET_FD,
+                .events = (socket_input_open && !inbound.used ? POLLIN : 0) |
+                    (outbound.used ? POLLOUT : 0) },
             { .fd = STDOUT_FILENO, .events = inbound.used ? POLLOUT : 0 },
-            { .fd = STDIN_FILENO, .events = input_open && !outbound.used ? POLLIN : 0 }
+            { .fd = input_open ? STDIN_FILENO : -1,
+                .events = input_open && !outbound.used ? POLLIN : 0 }
         };
         int ready = poll(items, 3, 35 * 60 * 1000);
         if (ready <= 0) break;
@@ -234,9 +237,10 @@ static int run_gate(uid_t uid, gid_t gid, const char *cgroup) {
             else if (amount < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
             if (outbound.sent == outbound.used) outbound = (struct pending){ 0 };
         }
-        if (!inbound.used && (items[0].revents & POLLIN)) {
+        if (socket_input_open && !inbound.used && (items[0].revents & (POLLIN | POLLHUP))) {
             int result = verified_read(&inbound, uid, gid, cgroup);
-            if (result == 0 || result < 0) break;
+            if (result < 0 || (result == 0 && !http_half_close)) break;
+            if (result == 0) socket_input_open = 0;
         }
         if (input_open && !outbound.used && (items[2].revents & POLLIN)) {
             ssize_t amount = read(STDIN_FILENO, outbound.bytes, sizeof(outbound.bytes));
@@ -258,9 +262,10 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "prepare") == 0) return prepare_listener();
     unsigned int uid = 0;
     unsigned int gid = 0;
-    if (argc == 5 && strcmp(argv[1], "run") == 0 && read_id(argv[2], &uid) &&
+    if ((argc == 5 || (argc == 6 && strcmp(argv[5], "http") == 0)) &&
+        strcmp(argv[1], "run") == 0 && read_id(argv[2], &uid) &&
         read_id(argv[3], &gid) && uid > 0 && gid > 0) {
-        return run_gate((uid_t)uid, (gid_t)gid, argv[4]);
+        return run_gate((uid_t)uid, (gid_t)gid, argv[4], argc == 6);
     }
     return 1;
 }

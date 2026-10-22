@@ -194,8 +194,9 @@ static int write_handoff_result(const char *filename, const char *result) {
 }
 
 static int receive_handoff(const char *socket_name, const char *result_name,
-                           const char *pid_name, const char *expected_handle) {
-    if (strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 30;
+                           const char *pid_name, const char *expected_handle, int agent_pid) {
+    if (agent_pid < 1 || agent_pid == getpid() ||
+        strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 30;
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, socket_name);
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -230,6 +231,18 @@ static int receive_handoff(const char *socket_name, const char *result_name,
         socket_type != SOCK_STREAM) return 35;
     if (setsockopt(broker_fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0 ||
         setsockopt(broker_fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0) return 36;
+    char forged_byte = 'x';
+    struct iovec forged_data = { .iov_base = &forged_byte, .iov_len = 1 };
+    char forged_control[CMSG_SPACE(sizeof(struct ucred))] = { 0 };
+    struct msghdr forged = { .msg_iov = &forged_data, .msg_iovlen = 1,
+        .msg_control = forged_control, .msg_controllen = sizeof(forged_control) };
+    struct cmsghdr *claimed = CMSG_FIRSTHDR(&forged);
+    struct ucred identity = { .pid = agent_pid, .uid = getuid(), .gid = getgid() };
+    claimed->cmsg_level = SOL_SOCKET;
+    claimed->cmsg_type = SCM_CREDENTIALS;
+    claimed->cmsg_len = CMSG_LEN(sizeof(identity));
+    memcpy(CMSG_DATA(claimed), &identity, sizeof(identity));
+    if (sendmsg(broker_fd, &forged, MSG_NOSIGNAL) != -1 || errno != EPERM) return 40;
     const char *result = "inconclusive\n";
     if (send_line(broker_fd, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0) {
         result = "denied\n";
@@ -250,7 +263,7 @@ int main(int argc, char **argv) {
     if (argc == 9 && strcmp(argv[1], "--receive-handoff") == 0) {
         signal(SIGPIPE, SIG_IGN);
         if (enter_agent_netns_and_drop(argv[6], argv[7], argv[8]) != 0) return 39;
-        return receive_handoff(argv[2], argv[3], argv[4], argv[5]);
+        return receive_handoff(argv[2], argv[3], argv[4], argv[5], positive_number(argv[6]));
     }
     if (argc != 11 && !claimant) return 1;
     signal(SIGPIPE, SIG_IGN);

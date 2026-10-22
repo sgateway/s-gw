@@ -8,7 +8,8 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 - Added an opt-in verified Unix MCP listener and stdio bridge for broker-owned HTTPS and managed SSH actions. It binds requests to a kernel-verified agent session and cancels in-flight work when that session ends. Production launchers and network isolation are still required before this is a confinement boundary.
 - Added an opt-in Linux managed-agent identity with root-owned generation records, a static pre-exec runtime verifier, and a two-agent systemd acceptance fixture. Existing UID-based principals keep their behavior; the new profile needs a privileged installer and native acceptance before deployment.
-- Added per-message sender checks to the systemd-activated Linux verified MCP listener, with a native descriptor-handoff probe. The model relay and ordinary listener still need separate descriptor-transfer controls; native Linux acceptance is pending.
+- Added per-message sender checks to the systemd-activated Linux verified MCP listener, with a native descriptor-handoff probe. Default model relay and ordinary listeners still need descriptor-transfer controls; native Linux acceptance is pending.
+- Added a source-level opt-in per-message Linux gate for the systemd-activated model relay. It checks each request byte range before HTTP parsing and preserves responses after a client half-closes its write side. No production entrypoint uses the relay constructor yet; native two-agent relay acceptance and descriptor-read isolation remain pending.
 
 ### Changed
 

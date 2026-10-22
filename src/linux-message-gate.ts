@@ -26,7 +26,7 @@ export async function prepareLinuxMessageListener(fd: number): Promise<void> {
 }
 
 export async function startLinuxMessageGate(socket: Socket, uid: number, gid: number,
-  cgroup: string): Promise<LinuxMessageGate> {
+  cgroup: string, mode?: "http"): Promise<LinuxMessageGate> {
   if (process.platform !== "linux" || socket.destroyed || !Number.isSafeInteger(uid) || uid < 1 ||
       !Number.isSafeInteger(gid) || gid < 1 ||
       typeof cgroup !== "string" || !cgroup.startsWith("/")) {
@@ -34,7 +34,9 @@ export async function startLinuxMessageGate(socket: Socket, uid: number, gid: nu
   }
   const helper = await checkedHelper();
   if (socket.destroyed) throw new Error("Agent socket closed before message gate started.");
-  const child = spawn(helper, ["run", String(uid), String(gid), cgroup], {
+  const args = ["run", String(uid), String(gid), cgroup];
+  if (mode === "http") args.push("http");
+  const child = spawn(helper, args, {
     stdio: ["pipe", "pipe", "ignore", socket], env: {}
   });
   socket.setTimeout(0);
@@ -43,6 +45,7 @@ export async function startLinuxMessageGate(socket: Socket, uid: number, gid: nu
   socket.once("close", () => child.kill());
   child.stdin!.on("error", () => socket.destroy());
   child.stdout!.on("error", () => socket.destroy());
+  if (socket.destroyed) child.kill();
   return { input: child.stdout!, output: child.stdin! };
 }
 

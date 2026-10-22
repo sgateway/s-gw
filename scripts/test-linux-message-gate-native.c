@@ -3,6 +3,8 @@
 #undef main
 
 #include <stddef.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 static int check(int good, const char *name) {
     if (good) return 1;
@@ -127,7 +129,106 @@ static int test_rights(const char *cgroup) {
     return check(rejected, "SCM_RIGHTS rejected");
 }
 
+static int read_exact(int fd, char *buffer, size_t size) {
+    size_t used = 0;
+    while (used < size) {
+        struct pollfd item = { .fd = fd, .events = POLLIN };
+        if (poll(&item, 1, 1500) <= 0) return 0;
+        ssize_t amount = read(fd, buffer + used, size - used);
+        if (amount <= 0) return 0;
+        used += (size_t)amount;
+    }
+    return 1;
+}
+
+static int read_eof(int fd) {
+    struct pollfd item = { .fd = fd, .events = POLLIN };
+    if (poll(&item, 1, 1500) <= 0) return 0;
+    char byte;
+    return read(fd, &byte, 1) == 0;
+}
+
+static int drain_to_eof(int fd) {
+    char bytes[16];
+    for (int i = 0; i < 4; i++) {
+        struct pollfd item = { .fd = fd, .events = POLLIN };
+        if (poll(&item, 1, 1500) <= 0) return 0;
+        ssize_t amount = read(fd, bytes, sizeof(bytes));
+        if (amount == 0) return 1;
+        if (amount < 0) return 0;
+    }
+    return 0;
+}
+
+static int wait_gate(pid_t child, int *status) {
+    for (int i = 0; i < 150; i++) {
+        pid_t done = waitpid(child, status, WNOHANG);
+        if (done == child) return 1;
+        if (done < 0 && errno != EINTR) return 0;
+        poll(NULL, 0, 10);
+    }
+    kill(child, SIGKILL);
+    for (int i = 0; i < 150; i++) {
+        pid_t done = waitpid(child, status, WNOHANG);
+        if (done == child || (done < 0 && errno == ECHILD)) break;
+        poll(NULL, 0, 10);
+    }
+    return 0;
+}
+
+static int test_shutdown(const char *cgroup, int mode) {
+    int client = -1;
+    int to_gate[2];
+    int from_gate[2];
+    if (!check(stream_pair(&client) && enable_creds() &&
+            pipe(to_gate) == 0 && pipe(from_gate) == 0, "shutdown setup")) return 0;
+    pid_t child = fork();
+    if (!check(child >= 0, "fork gate")) return 0;
+    if (child == 0) {
+        dup2(to_gate[0], STDIN_FILENO);
+        dup2(from_gate[1], STDOUT_FILENO);
+        close(to_gate[0]);
+        close(to_gate[1]);
+        close(from_gate[0]);
+        close(from_gate[1]);
+        close(client);
+        _exit(run_gate(getuid(), getgid(), cgroup, mode != 3));
+    }
+    close(SOCKET_FD);
+    close(to_gate[0]);
+    close(from_gate[1]);
+    int good = send(client, "req", 3, MSG_NOSIGNAL) == 3;
+    if (mode == 1) { close(client); client = -1; }
+    else good = good && shutdown(client, SHUT_WR) == 0;
+    char bytes[8] = { 0 };
+    if (mode != 1) good = good && read_exact(from_gate[0], bytes, 3) && memcmp(bytes, "req", 3) == 0;
+    if (mode == 2) { close(client); client = -1; }
+    if (mode == 1) {
+        good = good && drain_to_eof(from_gate[0]);
+    } else if (mode != 0) {
+        good = good && read_eof(from_gate[0]);
+    } else {
+        good = good && write(to_gate[1], "response", 8) == 8;
+        close(to_gate[1]);
+        to_gate[1] = -1;
+        good = good && read_exact(client, bytes, 8) && memcmp(bytes, "response", 8) == 0;
+        good = good && read_eof(client);
+    }
+    if (!good) kill(child, SIGKILL);
+    int status = 0;
+    int exited = wait_gate(child, &status);
+    if (client >= 0) close(client);
+    if (to_gate[1] >= 0) close(to_gate[1]);
+    close(from_gate[0]);
+    const char *name = mode == 0 ? "HTTP half-close preserves response" :
+        mode == 1 ? "full close releases gate promptly" :
+        mode == 2 ? "close after half-close releases gate promptly" :
+        "default MCP half-close still closes promptly";
+    return check(good && exited && WIFEXITED(status), name);
+}
+
 int main(void) {
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) return 1;
     char cgroup[4096];
     if (!check(own_cgroup(cgroup, sizeof(cgroup)), "read own cgroup")) return 1;
     if (!test_listener()) return 1;
@@ -137,6 +238,10 @@ int main(void) {
             "wrong cgroup rejected")) return 1;
     if (!test_read(cgroup, getuid(), getgid(), 0, -1, "prequeued bytes rejected")) return 1;
     if (!test_rights(cgroup)) return 1;
+    if (!test_shutdown(cgroup, 0)) return 1;
+    if (!test_shutdown(cgroup, 1)) return 1;
+    if (!test_shutdown(cgroup, 2)) return 1;
+    if (!test_shutdown(cgroup, 3)) return 1;
     puts("Linux message gate native checks passed.");
     return 0;
 }

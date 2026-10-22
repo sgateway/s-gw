@@ -388,14 +388,22 @@ async function startHandoffHelper(agent) {
   const agentCgroup = await readFile(`/proc/${agentPid}/cgroup`, "utf8");
   const hostNet = await readlink("/proc/self/ns/net");
   const agentNet = await readlink(`/proc/${agentPid}/ns/net`);
+  const hostPidNs = await readlink("/proc/self/ns/pid");
+  const agentPidNs = await readlink(`/proc/${agentPid}/ns/pid`);
   const uidValues = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
   const gidValues = /^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
   const extraGroups = status.split("\n").find(line => line.startsWith("Groups:"));
+  const unprivileged = ["CapInh", "CapPrm", "CapEff", "CapAmb"].every(name => {
+    const value = new RegExp(`^${name}:\\s+([0-9a-fA-F]+)$`, "m").exec(status)?.[1];
+    return Boolean(value && /^0+$/.test(value));
+  });
   if (!uidValues || uidValues.slice(1).some(value => Number(value) !== agent.uid) ||
       !gidValues || gidValues.slice(1).some(value => Number(value) !== agent.uid) ||
       extraGroups?.trim() !== "Groups:" || cgroup !== hostCgroup || cgroup === agentCgroup ||
+      !unprivileged || agentPidNs !== hostPidNs ||
+      await readlink(`/proc/${pid}/ns/pid`) !== hostPidNs ||
       agentNet === hostNet || await readlink(`/proc/${pid}/ns/net`) !== agentNet) {
-    throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup, or agent network namespace.`);
+    throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup/PID namespace, zero effective capabilities, or agent network namespace.`);
   }
 }
 

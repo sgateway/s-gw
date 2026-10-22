@@ -133,6 +133,12 @@ async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
 }
 
 describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay listener", () => {
+  it("requires an activated Linux listener for the opt-in message gate", async () => {
+    await expect(startVerifiedModelRelayServer({ socketPath, store,
+      requireLinuxMessageGate: true, approval: { async assertAuthorized() {} } }))
+      .rejects.toThrow(/activated pidfd-verified listener/);
+  });
+
   it.skipIf(process.platform !== "linux")("claims a generated principal without a UID policy alias", async () => {
     const handle = (await store.addSecret({ name: "Generated relay identity fixture",
       type: "api-token", value: credential,

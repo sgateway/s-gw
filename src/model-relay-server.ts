@@ -1,7 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import type { VerifiedAgentPrincipal } from "./agent-context.js";
+import { startLinuxMessageGate } from "./linux-message-gate.js";
 import { normalizeModelRelayGrant, SGW_MODEL_RELAY_COMMAND, type ModelRelayGrant } from "./model-relay-action.js";
+import { modelRelayHttpSocket, watchModelBodyIdle } from "./model-relay-socket.js";
 import { modelRoute, relayModelRequest, type ModelProvider, type ModelUpstreamRequest } from "./model-relay-transport.js";
 import { startVerifiedPeerServer, type PeerSession, type VerifiedPeerServerOptions } from "./peer-identity.js";
 import type { SecretStore } from "./store.js";
@@ -15,7 +18,8 @@ export interface ModelRelayApproval {
   retryPendingSessionEnds?(): Promise<void>;
 }
 
-export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions, "socketPath" | "socketMode" | "socketGid" | "activatedFd"> {
+export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions,
+  "socketPath" | "socketMode" | "socketGid" | "activatedFd" | "requireLinuxMessageGate"> {
   store: SecretStore;
   approval: ModelRelayApproval;
   maxActiveRequestsPerSession?: number;
@@ -123,8 +127,8 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
   let closed = false;
   const pendingSessionEnds = new Set<Promise<void>>();
   const sessionEndErrors: Error[] = [];
-  const principals = new WeakMap<Socket, VerifiedAgentPrincipal>();
-  const headers = new WeakMap<Socket, ReturnType<typeof setTimeout>>();
+  const principals = new WeakMap<Socket | Duplex, VerifiedAgentPrincipal>();
+  const headers = new WeakMap<Socket | Duplex, ReturnType<typeof setTimeout>>();
   const http = createServer((req, res) => { void handleRequest(req, res); });
   http.headersTimeout = headerDeadlineMs;
   http.requestTimeout = maxBodyDurationMs;
@@ -202,14 +206,21 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
     activeRequests++;
     res.setHeader("connection", "close");
     let bodyTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopBodyIdle: (() => void) | undefined;
     if (req.method !== "GET") {
       bodyTimer = setTimeout(() => req.destroy(new Error("Model request body exceeded its deadline.")), maxBodyDurationMs);
       bodyTimer.unref();
-      req.socket.setTimeout(bodyIdleMs, () => req.destroy(new Error("Model request body stalled.")));
-      req.once("end", () => {
-        clearTimeout(bodyTimer);
-        req.socket.setTimeout(35 * 60_000);
-      });
+      if (options.requireLinuxMessageGate) {
+        stopBodyIdle = watchModelBodyIdle(req.socket, bodyIdleMs,
+          () => req.destroy(new Error("Model request body stalled.")));
+        req.once("end", () => { clearTimeout(bodyTimer); stopBodyIdle?.(); });
+      } else {
+        req.socket.setTimeout(bodyIdleMs, () => req.destroy(new Error("Model request body stalled.")));
+        req.once("end", () => {
+          clearTimeout(bodyTimer);
+          req.socket.setTimeout(35 * 60_000);
+        });
+      }
     }
     try {
       if (options.activatedFd !== undefined) await peer.assertSocketBinding();
@@ -239,6 +250,7 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
       deny(res, 403, "Model relay authorization unavailable.");
     } finally {
       clearTimeout(bodyTimer);
+      stopBodyIdle?.();
       active.active--;
       activeRequests--;
     }
@@ -250,20 +262,29 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
     socketGid: options.socketGid,
     activatedFd: options.activatedFd,
     requireLinuxPeerPidfd: true,
-    onConnection(socket, principal) {
+    requireLinuxMessageGate: options.requireLinuxMessageGate,
+    async onConnection(socket, principal, peer) {
       if (connectionLimit !== undefined && verifiedConnections >= connectionLimit) {
         socket.destroy();
         return;
       }
       verifiedConnections++;
       socket.once("close", () => { verifiedConnections--; });
-      principals.set(socket, principal);
-      const timer = setTimeout(() => socket.destroy(new Error("Model request headers timed out.")), headerDeadlineMs);
+      let httpSocket: Socket | Duplex = socket;
+      if (options.requireLinuxMessageGate) {
+        const active = principal.sessionId ? grants.get(principal.sessionId) : undefined;
+        if (!active?.session.linuxCgroup) { socket.destroy(); return; }
+        const gate = await startLinuxMessageGate(socket, peer.uid, peer.gid, active.session.linuxCgroup, "http");
+        httpSocket = modelRelayHttpSocket(socket, gate);
+      }
+      principals.set(httpSocket, principal);
+      const timer = setTimeout(() => httpSocket.destroy(new Error("Model request headers timed out.")), headerDeadlineMs);
       timer.unref();
-      headers.set(socket, timer);
-      socket.once("close", () => clearTimeout(timer));
-      http.emit("connection", socket);
-      socket.resume();
+      headers.set(httpSocket, timer);
+      httpSocket.once("close", () => clearTimeout(timer));
+      if (httpSocket.destroyed) return;
+      http.emit("connection", httpSocket);
+      httpSocket.resume();
     }
   });
 
