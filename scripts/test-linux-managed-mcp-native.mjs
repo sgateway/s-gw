@@ -1328,6 +1328,17 @@ try {
     }
     states.boundary = await maybeText(`${agent.root}/workspace/boundary`);
     states.handoffReady = await maybeText(`${agent.root}/workspace/handoff-ready`);
+    states.probeStage = await maybeText(`${agent.root}/workspace/probe-stage`);
+    states.gateRelease = await maybeText(`/run/s-gw/launch-gates/${agent.sessionId}/release`);
+    states.forwarderAttestation = (await maybeText(
+      `/run/s-gw/launch-gates/${agent.sessionId}/forwarder-attestation.json`)) !== undefined;
+    const pid = Number(states.agent.stdout.match(/^MainPID=(\d+)$/m)?.[1]);
+    if (Number.isSafeInteger(pid) && pid > 0) {
+      try { states.processExe = await readlink(`/proc/${pid}/exe`); }
+      catch (readError) { states.processExeError = readError.code || "unknown"; }
+      try { states.processWchan = (await readFile(`/proc/${pid}/wchan`, "utf8")).trim(); }
+      catch (readError) { states.processWchanError = readError.code || "unknown"; }
+    }
     liveUnits.push({ sessionId: agent.sessionId, ...states });
   }
   let rootEnvironmentFiles = "not staged";

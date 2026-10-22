@@ -28,6 +28,14 @@ static int send_line(int fd, const char *line) {
     return 0;
 }
 
+static int write_probe_stage(const char *stage) {
+    int fd = open("/workspace/probe-stage", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    int written = send_line(fd, stage);
+    int closed = close(fd);
+    return written == 0 && closed == 0 ? 0 : -1;
+}
+
 static int receive_line(int fd, char *out, size_t capacity) {
     size_t used = 0;
     while (used + 1 < capacity) {
@@ -468,6 +476,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *socket_path = getenv("SGW_BROKER_SOCKET");
     if (!socket_path || strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 2;
+    if (!claimant && write_probe_stage("started\n") != 0) return 48;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 3;
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) return 3;
@@ -477,6 +486,7 @@ int main(int argc, char **argv) {
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, socket_path);
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) return 5;
+    if (!claimant && write_probe_stage("connected\n") != 0) return 48;
     char reply[16384];
     if (claimant) {
         return receive_line(fd, reply, sizeof(reply)) == -2 ? 0 : 10;
@@ -497,6 +507,7 @@ int main(int argc, char **argv) {
     int udp_host = network_probe(AF_INET, SOCK_DGRAM, argv[6], ports[5]);
     int model_direct = !model_socket || network_probe(AF_INET, SOCK_STREAM, argv[11], 443);
     int netlink_denied = netlink_route_denied();
+    if (write_probe_stage("egress-checked\n") != 0) return 48;
     const char *model_result = "";
     if (model_socket) model_result = model_direct ? " model=1" : " model=0";
     char boundary[128];
