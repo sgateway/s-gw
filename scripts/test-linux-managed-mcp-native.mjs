@@ -1307,13 +1307,20 @@ try {
   const brokerLogs = run("journalctl", ["--no-pager", "-n", "30",
     ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
   let rootEnvironmentFiles = "not staged";
+  let managedSocketState = "not staged";
   if (unitsInstalled) {
     const check = run("systemctl", ["--system", "--no-pager", "--all", "show", controlUnit,
       "-p", "EnvironmentFiles"], true);
     rootEnvironmentFiles = JSON.stringify({ status: check.status, error: check.error?.message,
       stdout: check.stdout.slice(0, 1000), stderr: check.stderr.slice(0, 300) });
+    const socket = run("systemctl", ["--system", "--no-pager", "--all", "show", agents[0].socketUnit,
+      ...["Id", "ActiveState", "FragmentPath", "Service", "BindsTo", "After"]
+        .flatMap(name => ["-p", name])], true);
+    managedSocketState = JSON.stringify({ status: socket.status, error: socket.error?.message,
+      stdout: socket.stdout.slice(0, 3000), stderr: socket.stderr.slice(0, 300) });
   }
   primaryFailure = new Error(`${String(error)}\nRoot EnvironmentFiles=${rootEnvironmentFiles}` +
+    `\nManaged MCP socket=${managedSocketState}` +
     `\nRoot control journal:\n${rootLogs}\nBroker journal:\n${brokerLogs}`);
   throw primaryFailure;
 } finally {
