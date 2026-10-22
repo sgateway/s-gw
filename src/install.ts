@@ -14,6 +14,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { consoleProofPath, verifyConsoleStatusProof } from "./console-control.js";
 import {
   getSgwHome,
   getSgwInstanceKey,
@@ -1339,6 +1340,16 @@ export function launchAgentStatus(kind: "console" | "menubar"): LaunchAgentStatu
   };
 }
 
+export function installedConsoleRequiresOperatorProof(plistPath = launchAgentPath(consoleLabel)): boolean {
+  requireMac("protected console authority check");
+  if (!existsSync(plistPath)) return false;
+  const args = launchAgentProgramArguments(plistPath);
+  if (args.includes("--operator-auth") !== args.includes("--background")) {
+    throw new Error("Existing console service has an incomplete operator-auth configuration.");
+  }
+  return args.includes("--operator-auth");
+}
+
 export function openMenuBarHelper(options: MenuBarOptions = {}): { appPath: string; consoleUrl: string } {
   requireMac("menu-bar open");
   assertMacRuntimeForManagedSurfaces();
@@ -1532,6 +1543,61 @@ export async function waitForConsoleAuthority(
       && payload.name === "s-gw"
       && payload.instanceKey === expectedKey) {
       return;
+    }
+    throw new Error(`Refusing to open an unverified local service at ${consoleUrl}`);
+  }
+  throw new Error(`Timed out waiting for the verified s-gw console at ${consoleUrl}`);
+}
+
+export async function waitForProtectedConsoleAuthority(
+  consoleUrl: string,
+  expectedKey = getSgwInstanceKey(),
+  timeoutMs = 12_000
+): Promise<void> {
+  const endpoint = new URL(consoleUrl);
+  if (endpoint.protocol !== "http:"
+    || endpoint.hostname !== "127.0.0.1"
+    || !endpoint.port
+    || endpoint.username
+    || endpoint.password
+    || endpoint.pathname !== "/"
+    || endpoint.search
+    || endpoint.hash) {
+    throw new Error("The desktop console must use explicit IPv4 loopback HTTP.");
+  }
+  const port = Number(endpoint.port);
+  const proofSocket = consoleProofPath(getStorePath(), port);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const nonce = randomBytes(24).toString("base64url");
+    const statusUrl = new URL("auth/status", endpoint);
+    statusUrl.searchParams.set("challenge", nonce);
+    let response: Response;
+    try {
+      response = await fetch(statusUrl, { signal: AbortSignal.timeout(750) });
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      continue;
+    }
+    let payload: Record<string, unknown>;
+    try {
+      payload = await response.json() as Record<string, unknown>;
+    } catch {
+      throw new Error(`Refusing to open an unverified local service at ${consoleUrl}`);
+    }
+    if (!response.ok || payload.ok !== true || payload.name !== "s-gw" ||
+        payload.instanceKey !== expectedKey || payload.challenge !== nonce ||
+        typeof payload.proof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(payload.proof)) {
+      throw new Error(`Refusing to open an unverified local service at ${consoleUrl}`);
+    }
+    try {
+      if (await verifyConsoleStatusProof(proofSocket, port, nonce, payload.proof)) return;
+    } catch (error) {
+      if (["ENOENT", "ECONNREFUSED"].includes((error as NodeJS.ErrnoException).code || "")) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        continue;
+      }
+      throw error;
     }
     throw new Error(`Refusing to open an unverified local service at ${consoleUrl}`);
   }

@@ -35,6 +35,7 @@ import {
   installMenuBarLaunchAgent,
   installSystemdUserService,
   installWindowsLoginService,
+  installedConsoleRequiresOperatorProof,
   launchAgentStatus,
   normalizeMenuBarCountMode,
   openDesktopApp,
@@ -53,6 +54,7 @@ import {
   stopMacApp,
   stopWindowsSurfaces,
   waitForConsoleAuthority,
+  waitForProtectedConsoleAuthority,
   type WindowsStoppedSurfaces,
   uninstallConsoleLaunchAgent,
   uninstallMenuBarLaunchAgent,
@@ -2477,7 +2479,7 @@ async function handleAppCommand(
     const { port, url: consoleUrl } = appConsoleEndpoint(flags);
     if (hasFlag(flags, "browser")) {
       const service = await ensureBrowserConsole(port);
-      await waitForConsoleAuthority(consoleUrl);
+      await waitForInstalledConsoleAuthority(consoleUrl);
       await openBrowser(consoleUrl);
       printJson({ kind: "web-console", consoleUrl, service });
       return;
@@ -2604,15 +2606,26 @@ async function openPreferredUi(port: number, consoleUrl: string) {
     }
   }
 
+  if (installedConsoleRequiresOperatorProof()) {
+    await waitForProtectedConsoleAuthority(consoleUrl);
+  }
   try {
     const opened = openMacApp({ port, consoleUrl });
     return { kind: "mac-app", ...opened };
   } catch {
     const service = await ensureBrowserConsole(port);
-    await waitForConsoleAuthority(consoleUrl);
+    await waitForInstalledConsoleAuthority(consoleUrl);
     await openBrowser(consoleUrl);
     return { kind: "web-console", consoleUrl, service };
   }
+}
+
+async function waitForInstalledConsoleAuthority(consoleUrl: string): Promise<void> {
+  if (process.platform === "darwin" && installedConsoleRequiresOperatorProof()) {
+    await waitForProtectedConsoleAuthority(consoleUrl);
+    return;
+  }
+  await waitForConsoleAuthority(consoleUrl);
 }
 
 async function ensureBrowserConsole(port: number): Promise<unknown> {

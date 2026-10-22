@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -13,7 +13,7 @@ import {
   uninstallAgentIntegrations,
   type AgentIntegrationOptions
 } from "./agent-install.js";
-import { consoleControlPath, startConsoleControl } from "./console-control.js";
+import { consoleControlPath, consoleProofPath, startConsoleControl, startConsoleProofControl } from "./console-control.js";
 import { executeApprovedRequest } from "./executor.js";
 import { requestAgentName } from "./agent-context.js";
 import {
@@ -65,6 +65,10 @@ interface OperatorAuthState {
   attemptsResetAt: number;
   session?: OperatorSession;
   origin: string;
+  statusKey?: Buffer;
+  statusPort?: number;
+  statusWindowStartedAt?: number;
+  statusAttempts?: number;
 }
 
 export interface ConsoleServerOptions {
@@ -174,7 +178,8 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     codeExpiresAt: backgroundAuth ? 0 : Date.now() + operatorCodeLifetimeMs,
     attempts: 0,
     attemptsResetAt: 0,
-    origin: ""
+    origin: "",
+    statusKey: backgroundAuth ? randomBytes(32) : undefined
   } : undefined;
   const store = options.store || new SecretStore();
   const uiDir = options.uiDir || defaultUiDir();
@@ -205,19 +210,28 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
       if (operatorAuth) {
         const boundAddress = server.address() as AddressInfo;
         operatorAuth.origin = `http://127.0.0.1:${boundAddress.port}`;
+        if (backgroundAuth) operatorAuth.statusPort = boundAddress.port;
       }
       resolve();
     });
   });
 
   let control: Awaited<ReturnType<typeof startConsoleControl>> | undefined;
+  let proofControl: Awaited<ReturnType<typeof startConsoleProofControl>> | undefined;
   if (backgroundAuth && operatorAuth) {
     try {
       const address = server.address() as AddressInfo;
       control = await startConsoleControl(consoleControlPath(store.storePath, address.port), () => issueOperatorCode(operatorAuth));
+      proofControl = await startConsoleProofControl(
+        consoleProofPath(store.storePath, address.port),
+        (port, nonce, proof) => verifyStatusProof(operatorAuth, instanceKey, port, nonce, proof)
+      );
     } catch (error) {
       clearInterval(updateTimer);
-      await closeServer(server);
+      const cleanupErrors = await settleConsoleListeners(server, control, proofControl);
+      if (cleanupErrors.length) {
+        throw new AggregateError([error, ...cleanupErrors], "Could not start or close the protected console.");
+      }
       throw error;
     }
   }
@@ -242,8 +256,9 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
     server,
     close: async () => {
       clearInterval(updateTimer);
-      if (control) {
-        await Promise.all([control.close(), closeServer(server)]);
+      if (control && proofControl) {
+        const cleanupErrors = await settleConsoleListeners(server, control, proofControl);
+        if (cleanupErrors.length) throw new AggregateError(cleanupErrors, "Could not close the protected console.");
         return;
       }
       await closeServer(server);
@@ -251,11 +266,50 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
   };
 }
 
+async function settleConsoleListeners(
+  server: Server,
+  ...controls: Array<{ close: () => Promise<void> } | undefined>
+): Promise<unknown[]> {
+  const closing: Promise<void>[] = [closeServer(server)];
+  for (const control of controls) {
+    if (control) closing.push(control.close());
+  }
+  const results = await Promise.allSettled(closing);
+  const failures: unknown[] = [];
+  for (const result of results) {
+    if (result.status === "rejected") failures.push(result.reason);
+  }
+  return failures;
+}
+
 function issueOperatorCode(auth: OperatorAuthState): string {
   if (auth.code && Date.now() < auth.codeExpiresAt) return auth.code;
   auth.code = randomBytes(24).toString("base64url");
   auth.codeExpiresAt = Date.now() + operatorCodeLifetimeMs;
   return auth.code;
+}
+
+function statusProof(auth: OperatorAuthState, instanceKey: string, port: number, nonce: string): string {
+  if (!auth.statusKey || auth.statusPort !== port) throw new Error("Protected console listener is not ready.");
+  return createHmac("sha256", auth.statusKey)
+    .update("s-gw-console-status-v1\0")
+    .update(instanceKey).update("\0")
+    .update(String(port)).update("\0")
+    .update(nonce)
+    .digest("base64url");
+}
+
+function verifyStatusProof(
+  auth: OperatorAuthState,
+  instanceKey: string,
+  port: number,
+  nonce: string,
+  proof: string
+): boolean {
+  if (!/^[A-Za-z0-9_-]{32}$/u.test(nonce) || !/^[A-Za-z0-9_-]{43}$/u.test(proof)) return false;
+  if (auth.statusPort !== port) return false;
+  const expected = statusProof(auth, instanceKey, port, nonce);
+  return timingSafeEqual(Buffer.from(expected), Buffer.from(proof));
 }
 
 async function closeServer(server: Server): Promise<void> {
@@ -335,8 +389,28 @@ async function handleProtectedRequest(
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
 
-  if (req.method === "GET" && url.pathname === "/auth/status" && !url.search) {
-    sendJson(res, 200, { ok: true, name: "s-gw", instanceKey });
+  if (req.method === "GET" && url.pathname === "/auth/status") {
+    if (!url.search) {
+      sendJson(res, 200, { ok: true, name: "s-gw", instanceKey });
+      return;
+    }
+    const nonce = url.searchParams.get("challenge");
+    if (!auth.statusKey || !auth.statusPort || url.searchParams.size !== 1 ||
+        !nonce || !/^[A-Za-z0-9_-]{32}$/u.test(nonce)) {
+      throw new HttpError(400, "Invalid listener challenge.");
+    }
+    const now = Date.now();
+    if (!auth.statusWindowStartedAt || now - auth.statusWindowStartedAt >= 1_000) {
+      auth.statusWindowStartedAt = now;
+      auth.statusAttempts = 0;
+    }
+    auth.statusAttempts = (auth.statusAttempts || 0) + 1;
+    if (auth.statusAttempts > 128) throw new HttpError(429, "Too many listener challenges.");
+    sendJson(res, 200, {
+      ok: true, name: "s-gw", instanceKey,
+      challenge: nonce,
+      proof: statusProof(auth, instanceKey, auth.statusPort, nonce)
+    });
     return;
   }
 

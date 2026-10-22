@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -9,6 +10,7 @@ import {
   buildMenuBarLaunchAgentPlist,
   consoleLabel,
   getPackageLayout,
+  installedConsoleRequiresOperatorProof,
   macAppProcessRecordPath,
   menuBarLabel,
   packageHealth,
@@ -21,6 +23,22 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 
 describe("customer package layout", () => {
+  it.skipIf(process.platform !== "darwin")("selects protected opener verification from the installed plist", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sgw-console-plist-"));
+    const plistPath = path.join(dir, "console.plist");
+    try {
+      expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(false);
+      await writeFile(plistPath, buildConsoleLaunchAgentPlist(8718, dir));
+      expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(false);
+      await writeFile(plistPath, buildConsoleLaunchAgentPlist(8718, dir, {}, true));
+      expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(true);
+      await writeFile(plistPath, "<key>ProgramArguments</key><array><string>--operator-auth</string></array>");
+      expect(() => installedConsoleRequiresOperatorProof(plistPath)).toThrow("incomplete operator-auth configuration");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("allows a bounded Windows helper timeout only in isolated tests", () => {
     const oldTestMode = process.env.SGW_TEST_MODE;
     const oldTimeout = process.env.SGW_WINDOWS_HELPER_OPERATION_TIMEOUT_MS;

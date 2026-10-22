@@ -1,14 +1,16 @@
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { request as httpRequest } from "node:http";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
-import { consoleControlPath, requestConsoleCode } from "../src/console-control.js";
+import { consoleControlPath, consoleProofPath, requestConsoleCode, verifyConsoleStatusProof } from "../src/console-control.js";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
+import { waitForProtectedConsoleAuthority } from "../src/install.js";
 import { getSgwInstanceKey } from "../src/paths.js";
 import { buildSshSessionAction } from "../src/ssh.js";
 import { SecretStore } from "../src/store.js";
@@ -246,6 +248,81 @@ describe("local console server", () => {
       expect(signedIn.status).toBe(200);
     } finally {
       clock.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform !== "darwin")("proves the protected HTTP listener through its private control socket", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const port = Number(new URL(running.url).port);
+    const proofPath = consoleProofPath(path.join(tmpHome, "store.json"), port);
+    expect(lstatSync(proofPath).mode & 0o077).toBe(0);
+    await expect(waitForProtectedConsoleAuthority(running.url, getSgwInstanceKey(tmpHome), 1_000))
+      .resolves.toBeUndefined();
+
+    const nonce = "A".repeat(32);
+    const status = await fetch(`${running.url}auth/status?challenge=${nonce}`);
+    const data = await status.json() as { proof: string; challenge: string; code?: string };
+    expect(data.challenge).toBe(nonce);
+    expect(data.proof).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(data.code).toBeUndefined();
+    expect(await verifyConsoleStatusProof(proofPath, port, nonce, data.proof)).toBe(true);
+    expect(await verifyConsoleStatusProof(proofPath, port, "B".repeat(32), data.proof)).toBe(false);
+    expect(await verifyConsoleStatusProof(proofPath, port === 65_535 ? port - 1 : port + 1, nonce, data.proof)).toBe(false);
+
+    await running.close();
+    running = undefined;
+    running = await startConsoleServer({ port, operatorAuth: { background: true } });
+    expect(await verifyConsoleStatusProof(proofPath, port, nonce, data.proof)).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "darwin")("rejects a forged loopback status with the copied instance key", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const port = Number(new URL(running.url).port);
+    await running.close();
+    running = undefined;
+
+    const fake = createHttpServer((request, response) => {
+      const nonce = new URL(request.url || "/", `http://127.0.0.1:${port}`).searchParams.get("challenge");
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        ok: true, name: "s-gw", instanceKey: getSgwInstanceKey(tmpHome),
+        challenge: nonce, proof: "A".repeat(43)
+      }));
+    });
+    await new Promise<void>((resolve) => fake.listen(port, "127.0.0.1", resolve));
+    try {
+      expect((fake.address() as AddressInfo).port).toBe(port);
+      await expect(waitForProtectedConsoleAuthority(`http://127.0.0.1:${port}/`, getSgwInstanceKey(tmpHome), 500))
+        .rejects.toThrow(/Timed out waiting for the verified s-gw console|unverified local service/u);
+    } finally {
+      await new Promise<void>((resolve, reject) => fake.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.skipIf(process.platform !== "darwin")("rejects a forged status while the real proof socket is available", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const actualFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname !== "/auth/status" || !url.searchParams.has("challenge")) {
+        return actualFetch(input, init);
+      }
+      return new Response(JSON.stringify({
+        ok: true, name: "s-gw", instanceKey: getSgwInstanceKey(tmpHome),
+        challenge: url.searchParams.get("challenge"), proof: "A".repeat(43)
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    try {
+      await expect(waitForProtectedConsoleAuthority(running.url, getSgwInstanceKey(tmpHome), 500))
+        .rejects.toThrow("Refusing to open an unverified local service");
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 

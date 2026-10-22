@@ -204,7 +204,7 @@ describe("native desktop launch contract", () => {
 
     expect(openAction).toContain('hasFlag(flags, "browser")');
     expect(openAction).toContain("ensureBrowserConsole(port)");
-    expect(openAction).toContain("waitForConsoleAuthority(consoleUrl)");
+    expect(openAction).toContain("waitForInstalledConsoleAuthority(consoleUrl)");
     expect(openAction).toContain("openBrowser(consoleUrl)");
     expect(windowsAndLinuxLaunch).toContain("openDesktopApp({ port, consoleUrl })");
     expect(windowsAndLinuxLaunch).not.toMatch(/ensureBrowserConsole|openBrowser|openWindowsClient|web-console|windows-client/u);
