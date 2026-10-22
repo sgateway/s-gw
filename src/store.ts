@@ -3035,6 +3035,8 @@ function isValidStagedCredentialRecord(value: unknown, createdAt: string): value
 
   const policy = record.policy;
   if (Object.keys(policy).some((key) => !["injectEnv", "allowedCommands", "allowedDestinations", "maxOutputBytes"].includes(key)) ||
+      (policy.injectEnv !== undefined && (typeof policy.injectEnv !== "string" ||
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(policy.injectEnv))) ||
       !Array.isArray(policy.allowedCommands) || !policy.allowedCommands.every((value) => typeof value === "string") ||
       (policy.allowedDestinations !== undefined &&
         (!Array.isArray(policy.allowedDestinations) || !policy.allowedDestinations.every((value) => typeof value === "string"))) ||
