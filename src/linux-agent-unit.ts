@@ -51,6 +51,13 @@ const lifecycleRoot = "/run/s-gw/agent-unit-lifecycle";
 const gateExecutable = "/usr/libexec/s-gw/agent-launch-gate";
 const gateMount = "/run/s-gw/launch-gate";
 const privateSharedMemoryMount = "/dev/shm:rw,nosuid,nodev,noexec,mode=1777";
+let tracedStartStages = 0;
+
+export function traceLinuxManagedStart(uid: number, stage: string): void {
+  if (process.env.SGW_CI_LINUX_START_TRACE !== "1" || tracedStartStages++ >= 32) return;
+  process.stderr.write(`Linux managed start trace uid=${uid} stage=${stage}\n`);
+}
+
 const unitProperties = [
   "Type=exec", "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
   "DynamicUser=no", "PrivateUsers=no",
@@ -369,7 +376,9 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
           if (!lease) await rejectExistingUnitLifecycleLease(plan);
           fence = await beginLinuxUnitLaunchAttempt(plan, attemptId, lifecycleRoot, 0);
           launchAttempted = true;
-          await run("/usr/bin/systemd-run", args);
+          traceLinuxManagedStart(plan.uid, "systemd-run call");
+          await run("/usr/bin/systemd-run", args, undefined, plan.uid);
+          traceLinuxManagedStart(plan.uid, "systemd-run returned");
           launchSucceeded = true;
         },
         inspectOwnership: () => run("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
@@ -380,6 +389,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
           }
           if (plan.launchGate) await checkedGateFiles(plan);
           if (plan.launchGate && plan.activatedSocket) this.launchPaths.set(plan.sessionId, before);
+          traceLinuxManagedStart(plan.uid, "start verify complete");
         },
         stopOwned: async () => {
           if (lease) await verifyUnitLifecycleLease(lease);
@@ -390,6 +400,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
           safeTeardown = true;
         }
       });
+      traceLinuxManagedStart(plan.uid, "start operation complete");
       if (fence) this.launchFences.set(plan.sessionId, { fence, planKey: lifecyclePlanKey(plan) });
     } catch (error) {
       if (fence && launchSucceeded && safeTeardown) {
@@ -1197,12 +1208,17 @@ function canonicalPath(value: string): boolean {
     !value.endsWith("/") && !value.includes("\0") && !value.includes(":");
 }
 
-function run(command: string, args: string[], sharedFd?: number): Promise<string> {
+function run(command: string, args: string[], sharedFd?: number, tracedUid?: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const stdio: StdioOptions = sharedFd === undefined ? ["ignore", "pipe", "pipe"] :
       ["ignore", "pipe", "pipe", sharedFd];
     const child = spawn(command, args, { cwd: "/", env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
       stdio });
+    if (tracedUid !== undefined) {
+      child.once("spawn", () => traceLinuxManagedStart(tracedUid, "systemd-run spawned"));
+      child.once("exit", code => traceLinuxManagedStart(tracedUid,
+        code === 0 ? "systemd-run exit success" : "systemd-run exit failure"));
+    }
     let output = "";
     let errorOutput = "";
     let overflow = false;
@@ -1211,6 +1227,7 @@ function run(command: string, args: string[], sharedFd?: number): Promise<string
     child.stderr!.on("data", chunk => { errorOutput += String(chunk); if (errorOutput.length > 64_000) { overflow = true; child.kill("SIGKILL"); } });
     child.once("error", error => { clearTimeout(timeout); reject(error); });
     child.once("close", code => {
+      if (tracedUid !== undefined) traceLinuxManagedStart(tracedUid, "systemd-run close");
       clearTimeout(timeout);
       if (code !== 0 || overflow) { reject(new Error("Linux agent systemd operation failed.")); return; }
       resolve(output);

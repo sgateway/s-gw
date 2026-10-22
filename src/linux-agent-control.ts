@@ -6,7 +6,8 @@ import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { lifecyclePlanKey, SystemdRunAgentUnitManager, validateLinuxAgentPlan,
-  linuxAgentUnitName, type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
+  linuxAgentUnitName, traceLinuxManagedStart,
+  type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
 import { attestDurableLinuxAgentIdentity } from "./linux-agent-identity.js";
 import { verifyLinuxPeerProcess } from "./linux-peer-identity.js";
 
@@ -616,14 +617,23 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
             await attestDurableLinuxAgentIdentity(plan);
             await reserveManagedIdentity(plan);
             await attestDurableLinuxAgentIdentity(plan);
+            traceLinuxManagedStart(plan.uid, "control start call");
             await startTrackedManagedUnit(manager, plan, state);
+            traceLinuxManagedStart(plan.uid, "control start returned");
             return undefined;
           }
           if (!state.started) throw new Error("This Linux agent session has not started.");
-          if (call.method === "inspect") return manager.inspect(plan);
+          if (call.method === "inspect") {
+            traceLinuxManagedStart(plan.uid, "control inspect call");
+            const inspected = await manager.inspect(plan);
+            traceLinuxManagedStart(plan.uid, "control inspect returned");
+            return inspected;
+          }
           if (call.method === "release") {
             if (!call.state) throw new Error("Linux gate release needs its attested unit state.");
+            traceLinuxManagedStart(plan.uid, "control release call");
             await manager.release!(plan, call.state);
+            traceLinuxManagedStart(plan.uid, "control release returned");
           } else {
             await stopTrackedManagedUnit(manager, plan, state);
           }

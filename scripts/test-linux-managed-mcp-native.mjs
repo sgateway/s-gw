@@ -845,7 +845,7 @@ try {
   const environmentFile = safeUnitValue(envFile);
   await writeFile(envFile, `CI=true\nSGW_HOME=${storeHome}\nSGW_RECOVERY_HOME=${recoveryHome}\nSGW_MASTER_PASSPHRASE=${secret}\nSGW_DISABLE_KEYCHAIN=1\nSGW_DISABLE_ONEPASSWORD_BACKUP=1\nNODE_EXTRA_CA_CERTS=${certFile}\n`, { mode: 0o600 });
   await remember(envFile);
-  await writeFile(controlUnitFile, `[Unit]\nDescription=${controlDescription}\n[Service]\nType=exec\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - -\nUnsetEnvironment=${loaderUnset} NODE_EXTRA_CA_CERTS\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - - -- --serve ${brokerUid} ${brokerGid}\nRestart=no\n`, { mode: 0o644 });
+  await writeFile(controlUnitFile, `[Unit]\nDescription=${controlDescription}\n[Service]\nType=exec\nEnvironment=SGW_CI_LINUX_START_TRACE=1\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - -\nUnsetEnvironment=${loaderUnset} NODE_EXTRA_CA_CERTS\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - - -- --serve ${brokerUid} ${brokerGid}\nRestart=no\n`, { mode: 0o644 });
   await rememberUnitFile(controlUnitFile);
   for (const agent of agents) {
     const config = safeUnitValue(agent.configPath);
