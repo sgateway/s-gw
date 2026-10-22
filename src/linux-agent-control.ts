@@ -23,6 +23,7 @@ export interface LinuxManagedPlanRecord {
   plan: LinuxAgentUnitPlan;
   brokerUnit: string;
   brokerUnitFile: string;
+  mcpSocketUnitFile: string;
   modelRelaySocketUnitFile?: string;
   brokerEntry: string;
   brokerConfig: string;
@@ -55,6 +56,7 @@ export function validateLinuxManagedPlan(plan: LinuxAgentUnitPlan, brokerUid: nu
 
 export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
   sessionId: string, brokerUid: number, brokerGid: number): void {
+  const mcpUnit = `s-gw-managed-mcp-${sessionId}.socket`;
   const modelUnit = `s-gw-managed-model-${sessionId}.socket`;
   const modelFile = value?.modelRelaySocketUnitFile;
   const modelExpected = value?.plan?.modelRelaySocket !== undefined;
@@ -63,6 +65,8 @@ export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
       value.brokerUnit !== `s-gw-managed-mcp-${sessionId}.service` ||
       !["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"].includes(path.dirname(value.brokerUnitFile || "")) ||
       path.basename(value.brokerUnitFile) !== value.brokerUnit ||
+      !["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"].includes(path.dirname(value.mcpSocketUnitFile || "")) ||
+      path.basename(value.mcpSocketUnitFile) !== mcpUnit ||
       (modelExpected !== (modelFile !== undefined)) ||
       (modelFile !== undefined &&
         (!["/run/systemd/system", "/etc/systemd/system", "/usr/lib/systemd/system"]
@@ -77,8 +81,8 @@ export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
       !value.brokerPreflight.startsWith(`${value.brokerRuntimeRoot}/`) ||
       Object.keys(value).sort().join(",") !==
         (modelExpected
-          ? "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,modelRelaySocketUnitFile,plan"
-          : "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,plan")) {
+          ? "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,mcpSocketUnitFile,modelRelaySocketUnitFile,plan"
+          : "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,mcpSocketUnitFile,plan")) {
     throw new Error("Invalid root-provisioned Linux managed plan record.");
   }
   validateLinuxManagedPlan(value.plan, brokerUid, brokerGid);
@@ -115,6 +119,10 @@ async function registeredPlan(sessionId: string, brokerUid: number,
   validateLinuxManagedPlanRecord(value, sessionId, brokerUid, brokerGid);
   await attestDurableLinuxAgentIdentity(value.plan);
   await checkedRootFile(value.brokerUnitFile);
+  await checkedRootFile(value.mcpSocketUnitFile);
+  assertManagedMcpSocketUnit(value, await systemctlProperties(
+    path.basename(value.mcpSocketUnitFile),
+    ["Id", "ActiveState", "FragmentPath", "Service", "BindsTo", "After"]));
   if (value.modelRelaySocketUnitFile) {
     await checkedRootFile(value.modelRelaySocketUnitFile);
     assertModelSocketUnit(value, await systemctlProperties(
@@ -336,6 +344,17 @@ export function assertModelSocketUnit(record: LinuxManagedPlanRecord, output: st
       !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
       !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
     throw new Error("Linux model socket unit is not bound to the registered broker service.");
+  }
+}
+
+export function assertManagedMcpSocketUnit(record: LinuxManagedPlanRecord, output: string): void {
+  const file = record.mcpSocketUnitFile;
+  const values = parseUnitProperties(output);
+  if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== "active" ||
+      values.get("FragmentPath") !== file || values.get("Service") !== record.brokerUnit ||
+      !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
+      !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
+    throw new Error("Linux managed MCP socket unit is not bound to the registered broker service and root control.");
   }
 }
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, barry/anthropic-confinement-security-20261018]
   pull_request:
   workflow_dispatch:
 

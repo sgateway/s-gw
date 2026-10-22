@@ -792,7 +792,7 @@ try {
   await remember(controlUnitFile);
   for (const agent of agents) {
     const config = safeUnitValue(agent.configPath);
-    await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
+    await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
     await remember(agent.socketUnitFile);
     if (testRelay) {
       await writeFile(agent.modelSocketUnitFile, `[Unit]\nDescription=Native s-gw managed model fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.modelSocketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-model-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
@@ -801,7 +801,8 @@ try {
     await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=${loaderUnset}\n${testRelay ? `BindReadOnlyPaths=${modelHostsFile}:/etc/hosts\nExecCondition=/usr/bin/grep -qFx "${modelAddress} api.anthropic.com" /etc/hosts\n` : ""}ExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile}\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile} -- ${config}\nRestart=no\n`, { mode: 0o644 });
     await remember(agent.brokerUnitFile);
     await writeFile(agent.planPath, JSON.stringify({ plan: agent.plan, brokerUnit: agent.brokerUnit,
-      brokerUnitFile: agent.brokerUnitFile, brokerEntry: entry, brokerConfig: config,
+      brokerUnitFile: agent.brokerUnitFile, mcpSocketUnitFile: agent.socketUnitFile,
+      brokerEntry: entry, brokerConfig: config,
       ...(testRelay ? { modelRelaySocketUnitFile: agent.modelSocketUnitFile } : {}),
       brokerNode: node, brokerRuntimeRoot: runtimeRoot, brokerPreflight: verifier,
       brokerEnvironmentFile: environmentFile, brokerCa: certFile }) + "\n",
@@ -809,6 +810,7 @@ try {
     await remember(agent.planPath);
     await checkedInstalledFile(agent.configPath);
     await checkedInstalledFile(agent.planPath);
+    await checkedInstalledFile(agent.socketUnitFile);
     if (testRelay) await checkedInstalledFile(agent.modelSocketUnitFile);
     const configInfo = await lstat(agent.configPath);
     const planInfo = await lstat(agent.planPath);
@@ -1197,6 +1199,23 @@ try {
     controlUnit]);
   await until(() => run("systemctl", ["--system", "is-active", agents[1].agentUnit], true).status !== 0,
     "second agent teardown after root control death");
+  await until(() => ["inactive", "failed"].includes(unitProperties(agents[1].socketUnit,
+    ["ActiveState"]).get("ActiveState")), "second MCP socket teardown after root control death");
+  for (const agent of agents) {
+    const refused = await new Promise(resolve => {
+      const socket = createConnection(agent.socketPath);
+      socket.setTimeout(3000, () => { socket.destroy(); resolve(false); });
+      socket.once("connect", () => { socket.destroy(); resolve(false); });
+      socket.once("error", error => resolve(["ENOENT", "ECONNREFUSED"].includes(error.code)));
+    });
+    if (!refused || run("systemctl", ["--system", "is-active", agent.brokerUnit], true).status === 0 ||
+        run("systemctl", ["--system", "is-active", agent.agentUnit], true).status === 0) {
+      throw new Error(`The ${agent.sessionId} MCP socket reactivated a revoked session.`);
+    }
+  }
+  if (run("systemctl", ["--system", "is-active", controlUnit], true).status === 0) {
+    throw new Error("An MCP socket restarted the root control after revocation.");
+  }
   if (testRelay) {
     await until(() => {
       const broker = unitProperties(agents[1].brokerUnit, ["ActiveState", "MainPID"]);

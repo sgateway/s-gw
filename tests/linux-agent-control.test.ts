@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertControlUnitPreflight, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
+import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, sendControlReply, startTrackedManagedUnit,
   stopTrackedManagedUnit, validateLinuxManagedPlan,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
 import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
@@ -29,6 +29,7 @@ function record(sessionId = "managed-session"): LinuxManagedPlanRecord {
   const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
   return { plan: agentPlan, brokerUnit,
     brokerUnitFile: `/run/systemd/system/${brokerUnit}`,
+    mcpSocketUnitFile: `/run/systemd/system/s-gw-managed-mcp-${sessionId}.socket`,
     brokerEntry: "/opt/s-gw/dist/linux-managed-mcp.js",
     brokerConfig: `/run/s-gw/${sessionId}.json`,
     brokerNode: "/opt/s-gw/node", brokerRuntimeRoot: "/opt/s-gw",
@@ -119,12 +120,30 @@ describe("Linux managed MCP control", () => {
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, brokerUnitFile: "/tmp/agent.service" },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
+    expect(() => validateLinuxManagedPlanRecord({ ...first, mcpSocketUnitFile: "/tmp/agent.socket" },
+      first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, plan: { ...first.plan, uid: first.plan.brokerUid } },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, brokerPreflight: "/tmp/verify" },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first, brokerNode: "/tmp/node" },
       first.plan.sessionId, first.plan.brokerUid, gid)).toThrow();
+  });
+
+  it("requires the managed MCP socket to stop with root control", () => {
+    const first = record();
+    const state = `Id=s-gw-managed-mcp-managed-session.socket\nActiveState=active\n` +
+      `FragmentPath=${first.mcpSocketUnitFile}\nService=${first.brokerUnit}\n` +
+      "BindsTo=s-gw-agent-control.service\nAfter=network.target s-gw-agent-control.service\n";
+    expect(() => assertManagedMcpSocketUnit(first, state)).not.toThrow();
+    for (const changed of [
+      state.replace("ActiveState=active", "ActiveState=inactive"),
+      state.replace(`Service=${first.brokerUnit}`, "Service=other.service"),
+      state.replace(`FragmentPath=${first.mcpSocketUnitFile}`, "FragmentPath=/tmp/other.socket"),
+      state.replace("BindsTo=s-gw-agent-control.service", "BindsTo="),
+      state.replace("After=network.target s-gw-agent-control.service", "After=network.target"),
+      state + "Service=other.service\n"
+    ]) expect(() => assertManagedMcpSocketUnit(first, changed)).toThrow();
   });
 
   it("attests the model socket unit belongs to the same root-registered service", () => {
