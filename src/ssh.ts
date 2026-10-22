@@ -394,7 +394,17 @@ async function closeLegacyControlMasterIfActive(
   sshPath: string, home: string, handle: string, target: string, port: number, captureCap: number
 ): Promise<void> {
   const socketPath = await controlSocketPath(home, handle, target, port);
-  if (!(await controlMasterIsActive(sshPath, socketPath, target, port, 10_000, captureCap))) return;
+  if (!(await fileExists(socketPath))) return;
+
+  const checked = await runProcess(sshPath, ["-S", socketPath, "-O", "check", "-p", String(port), target], {
+    timeoutMs: 2_000,
+    env: await baseSshEnv(),
+    maxOutputBytes: captureCap,
+    rejectOnNonZero: false
+  });
+  if (checked.timedOut || checked.exitCode !== 0) {
+    throw new Error("Could not verify the existing legacy SSH ControlMaster before strict execution.");
+  }
 
   const result = await runProcess(sshPath, ["-S", socketPath, "-O", "exit", "-p", String(port), target], {
     timeoutMs: 10_000,
@@ -402,9 +412,14 @@ async function closeLegacyControlMasterIfActive(
     maxOutputBytes: captureCap,
     rejectOnNonZero: false
   });
-  if (result.exitCode !== 0 || await controlMasterIsActive(sshPath, socketPath, target, port, 10_000, captureCap)) {
+  if (result.timedOut || result.exitCode !== 0) {
     throw new Error("Could not close the legacy SSH ControlMaster before strict execution.");
   }
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (!(await fileExists(socketPath))) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error("The legacy SSH ControlMaster socket remained after strict closure.");
 }
 
 async function openControlMaster(

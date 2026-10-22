@@ -133,40 +133,15 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
 
   for (const cause of ["deny", "handle deletion"] as const) {
     unixIt(`closes a prior ControlMaster and cancels SSH after ${cause}`, async () => {
-      process.env.SGW_TEST_MODE = "1";
-      process.env.SGW_TEST_HOME_ROOT = await realpath(testRoot);
-      process.env.SGW_SSH_CONTROL_DIR = path.join(testHome, "ssh-control");
-      const fake = path.join(testHome, "fake-ssh");
-      const log = path.join(testHome, "ssh.log");
-      const ready = path.join(testHome, "ssh-ready");
-      await writeFile(fake, [
-        `#!${process.execPath}`,
-        "const fs = require('node:fs');",
-        "const args = process.argv.slice(2);",
-        `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');`,
-        "const socket = args.includes('-S') ? args[args.indexOf('-S') + 1] : args.find(arg => arg.startsWith('ControlPath='))?.slice(12);",
-        "if (args.includes('-O') && args.includes('check')) process.exit(socket && fs.existsSync(socket) ? 0 : 255);",
-        "if (args.includes('-O') && args.includes('exit')) { if (socket) fs.rmSync(socket, { force: true }); process.exit(0); }",
-        "if (args.includes('-M')) { fs.writeFileSync(socket, 'master'); process.exit(0); }",
-        `if (args.includes('slow')) { fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); setInterval(() => {}, 1000); }`,
-        "console.log('remote:fast');"
-      ].join("\n"), { mode: 0o700 });
-      await chmod(fake, 0o700);
-      process.env.SGW_SSH_CLI = await realpath(fake);
-
-      const store = new SecretStore();
-      const record = await store.addSecret({
-        name: "legacy SSH key", type: "private-key", value: fakePrivateKey(),
-        policy: { allowedCommands: [SGW_SSH_SESSION_COMMAND], injectEnv: "SGW_SSH_PRIVATE_KEY" }
-      });
-      const first = await sshRequest(store, record.handle, "fast");
+      const { store, handle, log, ready } = await legacySshFixture();
+      const first = await sshRequest(store, handle, "fast");
       expect((await executeApprovedRequest(store, first.id)).exitCode).toBe(0);
-      const second = await sshRequest(store, record.handle, "slow");
+      const second = await sshRequest(store, handle, "slow");
       const running = executeApprovedRequest(store, second.id, { strictLegacyRevocation: true });
       await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
       const revokedAt = Date.now();
-      if (cause === "deny") await denyHandle(store, record.handle, "ssh_session");
-      else await store.deleteSecret(record.handle);
+      if (cause === "deny") await denyHandle(store, handle, "ssh_session");
+      else await store.deleteSecret(handle);
 
       await expect(running).rejects.toThrow(cause === "deny" ? /denied by the current policy/i : /authorization is no longer active/i);
       expect(Date.now() - revokedAt).toBeLessThan(2_500);
@@ -177,7 +152,53 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
       expect((await store.getRequest(second.id)).state).toBe("failed");
     }, 15_000);
   }
+
+  unixIt("refuses strict SSH when an existing ControlMaster cannot be verified", async () => {
+    const { store, handle, log, ready, badCheck } = await legacySshFixture();
+    const first = await sshRequest(store, handle, "fast");
+    expect((await executeApprovedRequest(store, first.id)).exitCode).toBe(0);
+    await writeFile(badCheck, "ambiguous check");
+
+    const second = await sshRequest(store, handle, "slow");
+    await expect(executeApprovedRequest(store, second.id, { strictLegacyRevocation: true }))
+      .rejects.toThrow(/could not verify the existing legacy ssh controlmaster/i);
+    expect(existsSync(ready)).toBe(false);
+    const calls = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line) as string[]);
+    expect(calls.some(args => args.includes("slow"))).toBe(false);
+    expect((await store.getRequest(second.id)).state).toBe("failed");
+  }, 15_000);
 });
+
+async function legacySshFixture() {
+  process.env.SGW_TEST_MODE = "1";
+  process.env.SGW_TEST_HOME_ROOT = await realpath(testRoot);
+  process.env.SGW_SSH_CONTROL_DIR = path.join(testHome, "ssh-control");
+  const fake = path.join(testHome, "fake-ssh");
+  const log = path.join(testHome, "ssh.log");
+  const ready = path.join(testHome, "ssh-ready");
+  const badCheck = path.join(testHome, "bad-ssh-check");
+  await writeFile(fake, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    "const args = process.argv.slice(2);",
+    `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');`,
+    "const socket = args.includes('-S') ? args[args.indexOf('-S') + 1] : args.find(arg => arg.startsWith('ControlPath='))?.slice(12);",
+    `if (args.includes('-O') && args.includes('check')) process.exit(fs.existsSync(${JSON.stringify(badCheck)}) ? 255 : socket && fs.existsSync(socket) ? 0 : 255);`,
+    "if (args.includes('-O') && args.includes('exit')) { if (socket) fs.rmSync(socket, { force: true }); process.exit(0); }",
+    "if (args.includes('-M')) { fs.writeFileSync(socket, 'master'); process.exit(0); }",
+    `if (args.includes('slow')) { fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); setInterval(() => {}, 1000); }`,
+    "console.log('remote:fast');"
+  ].join("\n"), { mode: 0o700 });
+  await chmod(fake, 0o700);
+  process.env.SGW_SSH_CLI = await realpath(fake);
+
+  const store = new SecretStore();
+  const record = await store.addSecret({
+    name: "legacy SSH key", type: "private-key", value: fakePrivateKey(),
+    policy: { allowedCommands: [SGW_SSH_SESSION_COMMAND], injectEnv: "SGW_SSH_PRIVATE_KEY" }
+  });
+  return { store, handle: record.handle, log, ready, badCheck };
+}
 
 async function envRequest(finishAfterMs?: number) {
   const store = new SecretStore();
