@@ -66,6 +66,51 @@ afterEach(async () => {
 });
 
 describeBrowser("React local console (real headless Chrome)", () => {
+  it("distinguishes declared MCP names from verified peer identity before approval", async () => {
+    process.env.SGW_MASTER_PASSPHRASE = "browser identity fixture";
+    process.env.SGW_SECRET_BACKEND = "local";
+    const store = new SecretStore();
+    const secret = await store.addSecret({ name: "Identity fixture", type: "api-token", value: "synthetic-identity-secret-value",
+      policy: { allowedCommands: [process.execPath], injectEnv: "SGW_IDENTITY_TOKEN" } });
+    const action = buildEnvCommandAction({ command: process.execPath, args: ["-e", "console.log('fixture')"],
+      injectEnv: "SGW_IDENTITY_TOKEN", workingDir: repoRoot });
+    const declared = await store.createRequest(secret.handle, action, "identity fixture", { mcpClientName: "Claude", env: {} });
+    const principal = principalForVerifiedPeer("browser:codex", "Codex", "identity-browser");
+    const managed = await store.createRequest(secret.handle, action, "identity fixture", { managedPrincipal: principal });
+    expect(declared.agentSource).toBe("mcp-client");
+    expect(managed.agentSource).toBe("managed-peer");
+
+    running = await startConsoleServer({ port: 0, store });
+    const launched = await launchChrome(new URL("approvals", running.url).toString());
+    cdp = launched.cdp;
+    await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length === 2"), "identity approval rows");
+    const rowLabels = await cdp.eval<{ declared: string; managed: string }>(`(() => {
+      const rows = [...document.querySelectorAll('tbody tr')];
+      return {
+        declared: rows.find(row => row.textContent?.includes('Claude'))?.querySelector('[data-request-identity]')?.textContent || '',
+        managed: rows.find(row => row.textContent?.includes('Codex'))?.querySelector('[data-request-identity]')?.textContent || ''
+      };
+    })()`);
+    expect(rowLabels).toEqual({ declared: "Unverified MCP name", managed: "Verified peer" });
+
+    await cdp.eval("[...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes('Claude')).click()");
+    await waitFor(() => cdp!.eval<boolean>("document.body.innerText.includes('Source: MCP client declaration')"), "declared identity detail");
+    expect(await cdp.eval<string>("document.body.innerText")).not.toContain("Principal: browser:codex");
+
+    await cdp.send("Page.navigate", { url: new URL("approvals", running.url).toString() });
+    await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length === 2"), "verified identity row");
+    await cdp.eval("[...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes('Codex')).click()");
+    await waitFor(() => cdp!.eval<boolean>("document.body.innerText.includes('Principal: browser:codex · Session: identity-browser')"), "verified identity detail");
+
+    await cdp.send("Page.navigate", { url: new URL("menubar", running.url).toString() });
+    await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('[data-request-identity]').length === 2"), "menubar identity cues");
+    const menubar = await cdp.eval<string>("document.body.innerText");
+    expect(menubar).toContain("Unverified MCP name");
+    expect(menubar).toContain("Source: MCP client declaration");
+    expect(menubar).toContain("Verified peer");
+    expect(menubar).toContain("Principal: browser:codex · Session: identity-browser");
+  }, 45_000);
+
   it.skipIf(process.platform === "win32")("shows that named-pipe approval binds a path, not its streamed bytes", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "browser pipe fixture";
     process.env.SGW_SECRET_BACKEND = "local";

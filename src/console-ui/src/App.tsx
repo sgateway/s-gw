@@ -993,6 +993,7 @@ function PendingApprovalsPanel({ state, setApproval, setView }: { state: Console
             <AgentIcon name={first.agentName} className="h-7 w-7" />
             <span>{first.agentName || "Agent"}</span>
           </div>
+          <RequestIdentity request={first} details />
           <div className="text-muted-foreground">{commandName(first)} · {requestTarget(first)}</div>
           <Button className="mt-3 w-full" onClick={() => setApproval(first)} data-approve={first.id}>Review request</Button>
         </div>
@@ -1216,7 +1217,10 @@ function ApprovalsView({ state, setApproval, search }: { state: ConsoleState; se
                 <TableCell className="font-medium">
                   <span className="flex items-center gap-2">
                     <AgentIcon name={request.agentName} className="h-7 w-7" />
-                    <span>{request.agentName || "Agent"}</span>
+                    <span className="min-w-0">
+                      <span className="block">{request.agentName || "Agent"}</span>
+                      <RequestIdentity request={request} />
+                    </span>
                     {request.demo ? <DemoBadge /> : null}
                   </span>
                 </TableCell>
@@ -2942,6 +2946,7 @@ function MenubarSurface({ ctx, openApprovals }: { ctx: ConsoleContext; openAppro
               </span>
               <Badge variant="secondary">{relativeTime(request.updatedAt)}</Badge>
             </div>
+            <RequestIdentity request={request} details />
             <div className="mt-1 truncate text-muted-foreground">{commandName(request)} · {requestTarget(request)}</div>
             {request.action.ssh?.managed ? (
               <div className="mt-1 break-all text-xs text-muted-foreground">Host key SHA-256: {request.managedSsh?.hostKeyFingerprint || "Unavailable"}</div>
@@ -3094,6 +3099,7 @@ function ApprovalSheet({
                     <span>{request.agentName || "Agent"}</span>
                   </span>
                 )],
+                ["Agent identity", <RequestIdentity request={request} details />],
                 ["Action", commandName(request)],
                 ["Target", requestTarget(request)],
                 ["Executable", request.action.kind === "env_command"
@@ -3985,6 +3991,24 @@ function SeverityBadge({ severity }: { severity: SecretSeverity }) {
 function RequestStateBadge({ state }: { state: string }) {
   const variant = state === "pending" ? "secondary" : state === "denied" || state === "failed" ? "destructive" : "outline";
   return <Badge variant={variant}>{titleCase(state)}</Badge>;
+}
+
+function RequestIdentity({ request, details = false }: { request: RequestRecord; details?: boolean }) {
+  const verified = request.agentSource === "managed-peer" && Boolean(request.principalId && request.agentSessionId);
+  const label = verified ? "Verified peer" : request.agentSource === "mcp-client" ? "Unverified MCP name" : "Unverified agent name";
+  const source = request.agentSource === "managed-peer" ? "managed peer" :
+    request.agentSource === "mcp-client" ? "MCP client declaration" :
+    request.agentSource?.replaceAll("-", " ") || "unknown";
+
+  return (
+    <div data-request-identity={verified ? "verified" : "unverified"} className="min-w-0 text-xs font-normal">
+      <Badge variant={verified ? "outline" : "secondary"}>{label}</Badge>
+      {details ? <div className="mt-1 break-all text-muted-foreground">Source: {source}</div> : null}
+      {details && verified ? (
+        <div className="break-all text-muted-foreground">Principal: {request.principalId} · Session: {request.agentSessionId}</div>
+      ) : null}
+    </div>
+  );
 }
 
 function DecisionBadge({ decision }: { decision: ApprovalPolicyDecision }) {
