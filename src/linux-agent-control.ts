@@ -640,7 +640,10 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
           return undefined;
         }).then(value => {
           const id = (raw as ControlCall)?.id;
+          traceLinuxManagedStart(plan.uid,
+            socket.destroyed ? "control reply socket closed" : "control reply send");
           sendControlReply(socket, id, { ok: true, value });
+          traceLinuxManagedStart(plan.uid, "control reply queued");
         }).catch(error => {
           const id = (raw as ControlCall)?.id;
           sendControlReply(socket, id, { ok: false, error: String(error) });
@@ -759,19 +762,23 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
   } catch (error) { socket.destroy(); throw error; }
   let nextId = 0;
   const lost = new AbortController();
-  let pending: { id: number; resolve(value: unknown): void; reject(error: Error): void } | undefined;
+  let pending: { id: number; method: Method; resolve(value: unknown): void; reject(error: Error): void } | undefined;
   readFrames(socket, raw => {
     const reply = raw as { id?: number; ok?: boolean; value?: unknown; error?: string };
+    traceLinuxManagedStart(admittedPlan.uid, "broker reply frame received");
     if (!pending || reply.id !== pending.id || typeof reply.ok !== "boolean") {
+      traceLinuxManagedStart(admittedPlan.uid, "broker reply frame invalid");
       socket.destroy();
       return;
     }
     const current = pending;
     pending = undefined;
+    traceLinuxManagedStart(admittedPlan.uid, `broker ${current.method} reply ${reply.ok ? "ok" : "error"}`);
     if (reply.ok) current.resolve(reply.value);
     else current.reject(new Error(reply.error || "Linux control request failed."));
   });
   socket.once("close", () => {
+    traceLinuxManagedStart(admittedPlan.uid, "broker control socket closed");
     lost.abort();
     pending?.reject(new Error("Linux root control service disconnected."));
     pending = undefined;
@@ -785,7 +792,8 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
     }
     const id = ++nextId;
     return new Promise((resolve, reject) => {
-      pending = { id, resolve, reject };
+      pending = { id, method, resolve, reject };
+      traceLinuxManagedStart(admittedPlan.uid, `broker ${method} call send`);
       try { sendFrame(socket, { id, method, plan, state }); }
       catch (error) { pending = undefined; reject(error as Error); }
     });
