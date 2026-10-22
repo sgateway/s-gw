@@ -146,7 +146,9 @@ static int sender(const char *rendezvous, const char *broker_socket) {
         if (denied(errno)) result = status("denied");
         goto done;
     }
-    if (send_fd(peer, broker)) result = status("sent");
+    if (!deadline_for(peer)) goto done;
+    // Keep the donor's socket open until the recipient reads the broker's reply.
+    if (send_fd(peer, broker) && read_text(peer, "XFER-DONE-V1\n")) result = status("sent");
     else if (denied(errno)) result = status("denied");
 done:
     if (peer >= 0) close(peer);
@@ -183,10 +185,13 @@ static int receiver(const char *rendezvous) {
         goto done;
     }
     if (!deadline_for(broker)) { close(broker); goto done; }
-    if (write_text(broker, "XFER-USE-V1\n") && read_text(broker, "XFER-ACK-V1\n")) {
+    if (write_text(broker, "XFER-USE-V1\n") && read_text(broker, "XFER-ACK-V1\n") &&
+        write_text(peer, "XFER-DONE-V1\n")) {
         result = status("used");
     } else if (denied(errno)) {
         result = status("denied");
+    } else {
+        perror("receive: broker exchange");
     }
     close(broker);
 done:

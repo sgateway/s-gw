@@ -21,7 +21,7 @@ function runHelper(args) {
     child.stderr.on("data", chunk => { errors += String(chunk); });
     child.once("error", reject);
     child.once("close", code => {
-      if (code !== 0 || errors) reject(new Error(`Native helper failed: ${errors || code}`));
+      if (code !== 0 || errors) reject(new Error(`Native ${args[0]} helper failed: ${errors || code}`));
       else resolve(output.trim());
     });
   });
