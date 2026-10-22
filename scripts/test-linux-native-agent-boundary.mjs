@@ -98,6 +98,14 @@ function availableIdentity() {
   throw new Error("No unused CI UID/GID pair is available.");
 }
 
+function removeGroupIfPresent(name) {
+  const lookup = spawnSync("getent", ["group", name], { encoding: "utf8", timeout: 30_000 });
+  if (lookup.error || (lookup.status !== 0 && lookup.status !== 2)) {
+    throw new Error(`Could not check CI group ${name}: ${lookup.error?.message || lookup.stderr || lookup.status}`);
+  }
+  if (lookup.status === 0) command("groupdel", [name]);
+}
+
 async function stageRoot(plan, gateBinary, probeBinary) {
   const root = plan.rootDirectory;
   for (const relative of ["", "usr", "usr/bin", "usr/libexec", "usr/libexec/s-gw",
@@ -431,7 +439,7 @@ async function rootRun() {
       await rm(leaseDir, { recursive: true, force: true });
       await rm(temp, { recursive: true, force: true });
       for (const name of createdUsers.reverse()) command("userdel", [name]);
-      for (const name of createdGroups.reverse()) command("groupdel", [name]);
+      for (const name of createdGroups.reverse()) removeGroupIfPresent(name);
     }
     await Promise.all(Object.values(hosts).map(item => item.close()));
     if (teardownErrors.length > 0) {

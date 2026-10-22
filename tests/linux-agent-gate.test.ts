@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
@@ -153,19 +154,29 @@ int main(void) {
         { encoding: "utf8" });
       if (built.status !== 0) throw new Error(built.stderr || `Could not compile ${src}.`);
     }
-    const stdio = ["ignore", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore"] as const;
-    expect(spawnSync(wrapper, [probe], { stdio }).status).toBe(91);
-    const child = spawn(wrapper, [binary, "--", probe], {
-      env: { INVOCATION_ID: invocation }, stdio
-    });
-    const finished = new Promise<number>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", code => resolve(code ?? -1));
-    });
-    const ready = path.join(tmp, "ready.tmp");
-    await writeFile(ready, `GO ${invocation} ${child.pid}\n`, { mode: 0o444 });
-    await rename(ready, marker);
-    expect(await finished).toBe(0);
+    const heldFds: number[] = [];
+    try {
+      let inheritedFd = 0;
+      do {
+        inheritedFd = openSync("/dev/null", "r");
+        heldFds.push(inheritedFd);
+      } while (inheritedFd <= 7);
+      const stdio = ["ignore", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore", inheritedFd] as const;
+      expect(spawnSync(wrapper, [probe], { stdio }).status).toBe(91);
+      const child = spawn(wrapper, [binary, "--", probe], {
+        env: { INVOCATION_ID: invocation }, stdio
+      });
+      const finished = new Promise<number>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", code => resolve(code ?? -1));
+      });
+      const ready = path.join(tmp, "ready.tmp");
+      await writeFile(ready, `GO ${invocation} ${child.pid}\n`, { mode: 0o444 });
+      await rename(ready, marker);
+      expect(await finished).toBe(0);
+    } finally {
+      for (const fd of heldFds) closeSync(fd);
+    }
   });
 
   it("times out closed and rejects a symlinked marker", async () => {

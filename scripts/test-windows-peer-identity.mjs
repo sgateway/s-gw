@@ -187,8 +187,12 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
       profile.canaryPath, job];
     if (transferTargetPid) clientArgs.push(String(transferTargetPid));
     client = launch(clientArgs, profile.executable);
-    assert.equal(await deadline(client.jobReady, 30_000, "AppContainer Job"), true,
-      "The launcher did not create and retain the Job before the pipe opened.");
+    const jobReady = await deadline(client.jobReady, 30_000, "AppContainer Job");
+    if (!jobReady) {
+      const failed = await client.done;
+      assert.fail("The launcher did not create and retain the Job before the pipe opened: " +
+        (failed.spawnError?.message || failed.stderr.trim() || `exit ${failed.code}`));
+    }
     assert.equal(await deadline(client.wfpReady, 30_000, "AppContainer WFP policy"), true,
       "The package-SID WFP deny was not installed before the agent resumed.");
     run = launch([name, brokerSid, brokerSid, profile.sid, logonLuid, sessionId, job]);

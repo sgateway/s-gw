@@ -1,0 +1,2 @@
+# Synthetic, incomplete OpenSSH key fixture in the historical test commit.
+ba1e70bae17ac1673f62418c4b5a20685ba9ceee:tests/legacy-runtime-revocation.test.ts:private-key:215

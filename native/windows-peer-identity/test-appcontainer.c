@@ -419,12 +419,14 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     } else {
         job = create_private_job(job_name);
         if (!job || GetLastError() == ERROR_ALREADY_EXISTS) {
+            fprintf(stderr, "AppContainer Job creation failed: %lu\n", GetLastError());
             if (job) CloseHandle(job);
             goto done;
         }
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+            fprintf(stderr, "AppContainer Job limits failed: %lu\n", GetLastError());
             CloseHandle(job);
             goto done;
         }
