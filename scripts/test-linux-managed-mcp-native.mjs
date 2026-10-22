@@ -235,6 +235,7 @@ async function remember(filename) {
 }
 
 async function rememberUnitFile(filename) {
+  await checkedInstalledFile(filename);
   await remember(filename);
   unitFileTexts.set(filename, await readFile(filename, "utf8"));
 }
@@ -295,9 +296,11 @@ async function checkedBrokerTree() {
 
 async function checkedInstalledFile(filename) {
   const item = await lstat(filename);
+  const resolved = await realpath(filename);
   if (!item.isFile() || item.uid !== 0 || item.nlink !== 1 ||
-      (item.mode & 0o022) !== 0 || await realpath(filename) !== filename) {
-    throw new Error(`Native fixture file is not root controlled: ${filename}`);
+      (item.mode & 0o022) !== 0 || resolved !== filename) {
+    throw new Error(`Native fixture file is not root controlled: ${filename} ` +
+      `(uid=${item.uid}, mode=${(item.mode & 0o777).toString(8)}, links=${item.nlink}, resolved=${resolved})`);
   }
   let parent = path.dirname(filename);
   while (true) {
@@ -632,7 +635,6 @@ try {
   run("cp", ["-R", path.join(project, "tools/desktop-packager"),
     path.join(brokerPackage, "tools")]);
   await copyFile(path.join(project, "package.json"), path.join(brokerPackage, "package.json"));
-  run("chown", ["-R", "0:0", brokerPackage]);
   run("chmod", ["-R", "go-w", brokerPackage]);
   for (const agent of agents) {
     await mkdir(agent.root, { mode: 0o755 });
@@ -689,8 +691,9 @@ try {
       throw new Error(`Agent workspace canary has the wrong identity: ${agent.privateCanary}`);
     }
   }
-  for (const name of ["linux-agent-control.js", "linux-agent-unit.js",
-    "linux-peer-identity.js", "linux-agent-identity.js"]) {
+  const controlFiles = ["linux-agent-control.js", "linux-agent-unit.js",
+    "linux-peer-identity.js", "linux-agent-identity.js"];
+  for (const name of controlFiles) {
     await copyFile(path.join(project, "dist", name), path.join(controlDir, name));
     await chmod(path.join(controlDir, name), 0o755);
   }
@@ -705,16 +708,20 @@ try {
   run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/peer-credentials/peer-credentials.c"),
     "-o", path.join(brokerVerifierDir, "s-gw-peer-credentials")]);
+  run("chown", ["-R", "0:0", installed]);
   await checkedBrokerTree();
   for (const filename of [rootNode, runtimeVerifier, path.join(brokerPackage, "dist/linux-managed-mcp.js"),
     path.join(brokerVerifierDir, "s-gw-peer-credentials")]) {
     await checkedInstalledFile(filename);
   }
+  for (const name of controlFiles) await checkedInstalledFile(path.join(controlDir, name));
+  await checkedInstalledFile(path.join(controlDir, "package.json"));
   const verifierDir = path.join(installed, "dist", "native", `linux-${arch}`);
   await mkdir(verifierDir, { recursive: true, mode: 0o755 });
   run("cc", ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/linux-peer-identity/verify.c"),
     "-o", path.join(verifierDir, "s-gw-linux-peer-identity")]);
+  await checkedInstalledFile(path.join(verifierDir, "s-gw-linux-peer-identity"));
   for (const agent of agents) {
     const gate = `${agent.root}/usr/libexec/s-gw/agent-launch-gate`;
     const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
