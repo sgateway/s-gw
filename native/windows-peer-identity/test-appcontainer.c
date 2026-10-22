@@ -337,6 +337,20 @@ done:
     return job;
 }
 
+static DWORD probe_suspended_image(const wchar_t *image, const wchar_t *cwd, void *environment,
+    LPSTARTUPINFOW startup, DWORD flags) {
+    wchar_t command[MAX_PATH + 3];
+    int length = swprintf(command, MAX_PATH + 3, L"\"%ls\"", image);
+    if (length < 1 || length >= MAX_PATH + 3) return ERROR_BAD_PATHNAME;
+    PROCESS_INFORMATION probe = { 0 };
+    if (!CreateProcessW(image, command, NULL, NULL, FALSE, flags | CREATE_SUSPENDED | CREATE_NO_WINDOW,
+        environment, cwd, startup, &probe)) return GetLastError();
+    TerminateProcess(probe.hProcess, 1);
+    CloseHandle(probe.hThread);
+    CloseHandle(probe.hProcess);
+    return ERROR_SUCCESS;
+}
+
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
     const wchar_t *shared_path, const wchar_t *canary_path, const wchar_t *job_name,
@@ -447,26 +461,28 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         environment, agent_dir,
         &startup.StartupInfo, &process)) {
         DWORD launch_error = GetLastError();
-        DWORD probe_error = ERROR_BAD_PATHNAME;
+        DWORD agent_cwd_error = ERROR_BAD_PATHNAME;
+        DWORD system_cwd_error = ERROR_BAD_PATHNAME;
+        DWORD inherited_env_error = ERROR_BAD_PATHNAME;
+        DWORD plain_error = ERROR_BAD_PATHNAME;
         wchar_t system_image[MAX_PATH];
         int image_size = swprintf(system_image, MAX_PATH, L"%ls\\System32\\whoami.exe", system_dir);
         if (image_size > 0 && image_size < MAX_PATH) {
-            wchar_t probe_command[MAX_PATH + 3];
-            int command_size = swprintf(probe_command, MAX_PATH + 3, L"\"%ls\"", system_image);
-            PROCESS_INFORMATION probe = { 0 };
-            if (command_size > 0 && command_size < MAX_PATH + 3) {
-                if (CreateProcessW(system_image, probe_command, NULL, NULL, FALSE,
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                    environment, agent_dir, &startup.StartupInfo, &probe)) {
-                    probe_error = ERROR_SUCCESS;
-                    TerminateProcess(probe.hProcess, 1);
-                    CloseHandle(probe.hThread);
-                    CloseHandle(probe.hProcess);
-                } else probe_error = GetLastError();
-            }
+            DWORD app_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+            agent_cwd_error = probe_suspended_image(system_image, agent_dir, environment,
+                &startup.StartupInfo, app_flags);
+            system_cwd_error = probe_suspended_image(system_image, system_dir, environment,
+                &startup.StartupInfo, app_flags);
+            inherited_env_error = probe_suspended_image(system_image, system_dir, NULL,
+                &startup.StartupInfo, EXTENDED_STARTUPINFO_PRESENT);
+            STARTUPINFOW plain = { 0 };
+            plain.cb = sizeof(plain);
+            plain_error = probe_suspended_image(system_image, system_dir, NULL, &plain, 0);
         }
-        fprintf(stderr, "AppContainer process launch failed: %lu; system image probe: %lu\n",
-            (unsigned long)launch_error, (unsigned long)probe_error);
+        fprintf(stderr, "AppContainer process launch failed: %lu; system image probes (agent cwd, system cwd, inherited env, plain): %lu, %lu, %lu, %lu\n",
+            (unsigned long)launch_error, (unsigned long)agent_cwd_error,
+            (unsigned long)system_cwd_error, (unsigned long)inherited_env_error,
+            (unsigned long)plain_error);
         CloseHandle(job);
         goto done;
     }

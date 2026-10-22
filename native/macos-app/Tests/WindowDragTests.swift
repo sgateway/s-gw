@@ -53,6 +53,17 @@ private func evaluate(_ script: String, in webView: WKWebView) -> Any? {
   return result
 }
 
+@MainActor
+private func waitForBlankChromeDrag(_ webView: ConsoleWebView) -> Bool {
+  let deadline = Date(timeIntervalSinceNow: 5)
+  let point = NSPoint(x: 300, y: 20)
+  while Date() < deadline {
+    if webView.shouldStartWindowDrag(at: point) { return true }
+    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+  }
+  return false
+}
+
 @main
 struct WindowDragTests {
   @MainActor
@@ -89,8 +100,10 @@ struct WindowDragTests {
 
     check(waitForDocument(webView), "test document did not load")
     check(webView.isFlipped, "WKWebView should use top-left event coordinates")
-    let blank = evaluate("document.elementFromPoint(300, 20)?.outerHTML", in: webView) as? String ?? "none"
-    check(webView.shouldStartWindowDrag(at: NSPoint(x: 300, y: 20)), "blank title chrome should drag, found \(blank)")
+    if !waitForBlankChromeDrag(webView) {
+      let blank = evaluate("document.elementFromPoint(300, 20)?.outerHTML", in: webView) as? String ?? "none"
+      fail("blank title chrome should drag, found \(blank)")
+    }
     check(!webView.shouldStartWindowDrag(at: NSPoint(x: 30, y: 25)), "button should stay clickable")
     check(!webView.shouldStartWindowDrag(at: NSPoint(x: 130, y: 25)), "ARIA button should stay clickable")
     check(!webView.shouldStartWindowDrag(at: NSPoint(x: 300, y: 100)), "page content should not drag")

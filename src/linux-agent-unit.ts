@@ -1116,10 +1116,14 @@ async function assertHeldLaunchGate(plan: LinuxAgentUnitPlan, state: LinuxAgentU
     const fields = line.split(" ");
     return fields[4] === gateMount && fields[5]?.split(",").includes("ro");
   });
-  if (cmdline.toString("utf8") !== expected || !inside.isDirectory() ||
-      inside.dev !== outside.dev || inside.ino !== outside.ino || !readOnlyMount ||
-      executable.dev !== staged.dev || executable.ino !== staged.ino) {
-    throw new Error("Linux agent launch gate did not attest its command and read-only release mount.");
+  const failed = [];
+  if (cmdline.toString("utf8") !== expected) failed.push("command");
+  if (!inside.isDirectory()) failed.push("mounted directory");
+  if (inside.dev !== outside.dev || inside.ino !== outside.ino) failed.push("bind mount identity");
+  if (!readOnlyMount) failed.push("read-only mount");
+  if (executable.dev !== staged.dev || executable.ino !== staged.ino) failed.push("gate executable");
+  if (failed.length > 0) {
+    throw new Error(`Linux agent launch gate did not attest its command and read-only release mount: ${failed.join(", ")}.`);
   }
 }
 
