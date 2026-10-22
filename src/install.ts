@@ -14,7 +14,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { consoleProofPath, verifyConsoleStatusProof } from "./console-control.js";
+import { consoleProofPath, reserveConsoleStatusChallenge, verifyConsoleStatusProof } from "./console-control.js";
 import {
   getSgwHome,
   getSgwInstanceKey,
@@ -1576,6 +1576,20 @@ export async function waitForProtectedConsoleAuthority(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const nonce = randomBytes(24).toString("base64url");
+    try {
+      // Older protected daemons do not reserve challenges; their existing proof still works.
+      const reservation = await reserveConsoleStatusChallenge(proofSocket, port, nonce);
+      if (reservation === "busy") {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        continue;
+      }
+    } catch (error) {
+      if (["ENOENT", "ECONNREFUSED"].includes((error as NodeJS.ErrnoException).code || "")) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        continue;
+      }
+      throw error;
+    }
     const statusUrl = new URL("auth/status", endpoint);
     statusUrl.searchParams.set("challenge", nonce);
     let response: Response;

@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
-import { consoleControlPath, consoleProofPath, requestConsoleCode, verifyConsoleStatusProof } from "../src/console-control.js";
+import { consoleControlPath, consoleProofPath, requestConsoleCode, reserveConsoleStatusChallenge, verifyConsoleStatusProof } from "../src/console-control.js";
 import { consoleMcpSnippet, startConsoleServer, type RunningConsoleServer } from "../src/console-server.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { waitForProtectedConsoleAuthority } from "../src/install.js";
@@ -275,6 +275,84 @@ describe("local console server", () => {
     running = undefined;
     running = await startConsoleServer({ port, operatorAuth: { background: true } });
     expect(await verifyConsoleStatusProof(proofPath, port, nonce, data.proof)).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "darwin")("keeps the trusted opener available when public challenges exhaust their quota", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const port = Number(new URL(running.url).port);
+    const proofPath = consoleProofPath(path.join(tmpHome, "store.json"), port);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const publicUrl = `${running.url}auth/status?challenge=${"A".repeat(32)}`;
+      for (let i = 0; i < 128; i += 1) {
+        expect((await fetch(publicUrl)).status).toBe(200);
+      }
+      expect((await fetch(publicUrl)).status).toBe(429);
+      await expect(waitForProtectedConsoleAuthority(running.url, getSgwInstanceKey(tmpHome), 1_000))
+        .resolves.toBeUndefined();
+
+      const reservedNonce = "B".repeat(32);
+      expect(await reserveConsoleStatusChallenge(proofPath, port, reservedNonce)).toBe("ready");
+      const wrongPort = port === 65_535 ? port - 1 : port + 1;
+      expect(await reserveConsoleStatusChallenge(proofPath, wrongPort, "C".repeat(32))).toBe("denied");
+      const reservedUrl = `${running.url}auth/status?challenge=${reservedNonce}`;
+      const reserved = await fetch(reservedUrl);
+      expect(reserved.status).toBe(200);
+      const payload = await reserved.json() as { proof: string };
+      expect(await verifyConsoleStatusProof(proofPath, port, reservedNonce, payload.proof)).toBe(true);
+      expect((await fetch(reservedUrl)).status).toBe(429);
+
+      const expiringNonce = "D".repeat(32);
+      expect(await reserveConsoleStatusChallenge(proofPath, port, expiringNonce)).toBe("ready");
+      clock.mockReturnValue(now + 2_001);
+      for (let i = 0; i < 128; i += 1) {
+        expect((await fetch(publicUrl)).status).toBe(200);
+      }
+      expect((await fetch(`${running.url}auth/status?challenge=${expiringNonce}`)).status).toBe(429);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform !== "darwin")("retries a busy private proof socket before using HTTP", async () => {
+    tmpHome = realpathSync(tmpHome);
+    process.env.SGW_HOME = tmpHome;
+    running = await startConsoleServer({ port: 0, operatorAuth: { background: true } });
+    const port = Number(new URL(running.url).port);
+    const proofPath = consoleProofPath(path.join(tmpHome, "store.json"), port);
+    const start = Date.now();
+    let now = start;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const actualFetch = globalThis.fetch;
+    let earlyStatusCalls = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      for (let i = 0; i < 64; i += 1) {
+        const nonce = i.toString(36).padStart(32, "0");
+        expect(await reserveConsoleStatusChallenge(proofPath, port, nonce)).toBe("ready");
+      }
+      expect(await reserveConsoleStatusChallenge(proofPath, port, "Z".repeat(32))).toBe("busy");
+      now = start + 1_001;
+      expect(await reserveConsoleStatusChallenge(proofPath, port, "Z".repeat(32))).toBe("busy");
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (now < start + 2_001 && url.pathname === "/auth/status" && url.searchParams.has("challenge")) {
+          earlyStatusCalls += 1;
+        }
+        return actualFetch(input, init);
+      });
+      timer = setTimeout(() => { now = start + 2_001; }, 250);
+      await expect(waitForProtectedConsoleAuthority(running.url, getSgwInstanceKey(tmpHome), 3_000))
+        .resolves.toBeUndefined();
+      expect(earlyStatusCalls).toBe(0);
+    } finally {
+      if (timer) clearTimeout(timer);
+      vi.unstubAllGlobals();
+      clock.mockRestore();
+    }
   });
 
   it.skipIf(process.platform !== "darwin")("rejects a forged loopback status with the copied instance key", async () => {

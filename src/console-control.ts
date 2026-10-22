@@ -6,6 +6,8 @@ import { checkedSocketPath, checkUnixPeerHelper, readUnixPeer } from "./peer-ide
 
 const codePattern = /^[A-Za-z0-9_-]{32}\n$/u;
 const proofFramePattern = /^VERIFY-V1 ([1-9][0-9]{0,4}) ([A-Za-z0-9_-]{32}) ([A-Za-z0-9_-]{43})\n$/u;
+const reserveFramePattern = /^RESERVE-V1 ([1-9][0-9]{0,4}) ([A-Za-z0-9_-]{32})\n$/u;
+type ChallengeReservation = "ready" | "busy" | "denied";
 
 export function consoleControlPath(storePath: string, port: number): string {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -29,7 +31,8 @@ export async function startConsoleControl(
 
 export async function startConsoleProofControl(
   socketPath: string,
-  verify: (port: number, nonce: string, proof: string) => boolean
+  verify: (port: number, nonce: string, proof: string) => boolean,
+  reserve: (port: number, nonce: string) => ChallengeReservation
 ): Promise<{ close: () => Promise<void> }> {
   let startedAt = 0;
   let attempts = 0;
@@ -41,10 +44,19 @@ export async function startConsoleProofControl(
     }
     attempts += 1;
     if (attempts > 64) {
-      socket.end("DENY-V1\n");
+      socket.end("BUSY-V1\n");
       return;
     }
     const frame = await readFrame(socket, 100);
+    const reservation = reserveFramePattern.exec(frame);
+    if (reservation) {
+      const port = Number(reservation[1]);
+      const result = port <= 65_535 ? reserve(port, reservation[2]) : "denied";
+      if (result === "ready") socket.end("READY-V1\n");
+      else if (result === "busy") socket.end("BUSY-V1\n");
+      else socket.end("DENY-V1\n");
+      return;
+    }
     const parts = proofFramePattern.exec(frame);
     if (!parts) {
       socket.end("DENY-V1\n");
@@ -139,6 +151,27 @@ export async function verifyConsoleStatusProof(
     socket.end(`VERIFY-V1 ${port} ${nonce} ${proof}\n`);
     const response = await readFrame(socket, 16);
     return response === "OK-V1\n";
+  } finally {
+    socket.destroy();
+  }
+}
+
+export async function reserveConsoleStatusChallenge(
+  socketPath: string,
+  port: number,
+  nonce: string
+): Promise<ChallengeReservation> {
+  if (!Number.isInteger(port) || port < 1 || port > 65_535 || !/^[A-Za-z0-9_-]{32}$/u.test(nonce)) {
+    throw new Error("Invalid operator listener challenge reservation.");
+  }
+  const socket = await connectPrivateControl(socketPath);
+  try {
+    socket.end(`RESERVE-V1 ${port} ${nonce}\n`);
+    const response = await readFrame(socket, 16);
+    if (response === "READY-V1\n") return "ready";
+    if (response === "BUSY-V1\n") return "busy";
+    if (response === "DENY-V1\n") return "denied";
+    throw new Error("Invalid operator listener reservation response.");
   } finally {
     socket.destroy();
   }

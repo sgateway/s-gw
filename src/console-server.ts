@@ -69,6 +69,7 @@ interface OperatorAuthState {
   statusPort?: number;
   statusWindowStartedAt?: number;
   statusAttempts?: number;
+  statusReservations?: Map<string, number>;
 }
 
 export interface ConsoleServerOptions {
@@ -224,7 +225,8 @@ export async function startConsoleServer(options: ConsoleServerOptions = {}): Pr
       control = await startConsoleControl(consoleControlPath(store.storePath, address.port), () => issueOperatorCode(operatorAuth));
       proofControl = await startConsoleProofControl(
         consoleProofPath(store.storePath, address.port),
-        (port, nonce, proof) => verifyStatusProof(operatorAuth, instanceKey, port, nonce, proof)
+        (port, nonce, proof) => verifyStatusProof(operatorAuth, instanceKey, port, nonce, proof),
+        (port, nonce) => reserveStatusChallenge(operatorAuth, port, nonce)
       );
     } catch (error) {
       clearInterval(updateTimer);
@@ -310,6 +312,28 @@ function verifyStatusProof(
   if (auth.statusPort !== port) return false;
   const expected = statusProof(auth, instanceKey, port, nonce);
   return timingSafeEqual(Buffer.from(expected), Buffer.from(proof));
+}
+
+function reserveStatusChallenge(auth: OperatorAuthState, port: number, nonce: string): "ready" | "busy" | "denied" {
+  if (auth.statusPort !== port || !/^[A-Za-z0-9_-]{32}$/u.test(nonce)) return "denied";
+  const now = Date.now();
+  const reservations = auth.statusReservations || new Map<string, number>();
+  for (const [key, expiresAt] of reservations) {
+    if (expiresAt <= now) reservations.delete(key);
+  }
+  if (reservations.size >= 64 && !reservations.has(nonce)) return "busy";
+  reservations.set(nonce, now + 2_000);
+  auth.statusReservations = reservations;
+  return "ready";
+}
+
+function consumeStatusChallenge(auth: OperatorAuthState, nonce: string, now: number): boolean {
+  const reservations = auth.statusReservations;
+  if (!reservations) return false;
+  const expiresAt = reservations.get(nonce);
+  if (expiresAt === undefined) return false;
+  reservations.delete(nonce);
+  return expiresAt > now;
 }
 
 async function closeServer(server: Server): Promise<void> {
@@ -400,12 +424,14 @@ async function handleProtectedRequest(
       throw new HttpError(400, "Invalid listener challenge.");
     }
     const now = Date.now();
-    if (!auth.statusWindowStartedAt || now - auth.statusWindowStartedAt >= 1_000) {
-      auth.statusWindowStartedAt = now;
-      auth.statusAttempts = 0;
+    if (!consumeStatusChallenge(auth, nonce, now)) {
+      if (!auth.statusWindowStartedAt || now - auth.statusWindowStartedAt >= 1_000) {
+        auth.statusWindowStartedAt = now;
+        auth.statusAttempts = 0;
+      }
+      auth.statusAttempts = (auth.statusAttempts || 0) + 1;
+      if (auth.statusAttempts > 128) throw new HttpError(429, "Too many listener challenges.");
     }
-    auth.statusAttempts = (auth.statusAttempts || 0) + 1;
-    if (auth.statusAttempts > 128) throw new HttpError(429, "Too many listener challenges.");
     sendJson(res, 200, {
       ok: true, name: "s-gw", instanceKey,
       challenge: nonce,
