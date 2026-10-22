@@ -1303,7 +1303,8 @@ try {
   }
   passed = true;
 } catch (error) {
-  const logs = run("journalctl", ["--no-pager", "-n", "80", "-u", "s-gw-agent-control.service",
+  const rootLogs = run("journalctl", ["--no-pager", "-n", "20", "-u", controlUnit], true).stdout;
+  const brokerLogs = run("journalctl", ["--no-pager", "-n", "30",
     ...agents.flatMap(agent => ["-u", agent.brokerUnit])], true).stdout;
   let rootEnvironmentFiles = "not staged";
   if (unitsInstalled) {
@@ -1312,7 +1313,8 @@ try {
     rootEnvironmentFiles = JSON.stringify({ status: check.status, error: check.error?.message,
       stdout: check.stdout.slice(0, 1000), stderr: check.stderr.slice(0, 300) });
   }
-  primaryFailure = new Error(`${String(error)}\nRoot EnvironmentFiles=${rootEnvironmentFiles}\n${logs}`);
+  primaryFailure = new Error(`${String(error)}\nRoot EnvironmentFiles=${rootEnvironmentFiles}` +
+    `\nRoot control journal:\n${rootLogs}\nBroker journal:\n${brokerLogs}`);
   throw primaryFailure;
 } finally {
   let cleanupError;
