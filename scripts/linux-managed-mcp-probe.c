@@ -325,6 +325,70 @@ static int strict_model_denied(const char *socket_path) {
            strstr(reply, "Remote model MCP servers are outside this grant.") ? 0 : -1;
 }
 
+static int model_stream_request(const char *socket_path, int cancel) {
+    const char *phase = cancel ? "fixture-cancel" : "fixture-stream-complete";
+    const char *first = cancel ? "fixture-cancel-first" : "fixture-first";
+    char body[256], headers[512], reply[32768] = { 0 };
+    int body_size = snprintf(body, sizeof(body),
+        "{\"model\":\"fixture-model\",\"max_tokens\":16,\"stream\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}", phase);
+    if (body_size < 0 || (size_t)body_size >= sizeof(body)) return -1;
+    int fd = connect_model(socket_path);
+    if (fd < 0) return -1;
+    struct timeval deadline = { .tv_sec = 30, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0) {
+        close(fd);
+        return -1;
+    }
+    int header_size = snprintf(headers, sizeof(headers),
+        "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+        "Content-Type: application/json\r\nContent-Length: %d\r\n"
+        "Authorization: Bearer agent-supplied-fixture\r\n"
+        "x-api-key: agent-supplied-fixture\r\nConnection: close\r\n\r\n", body_size);
+    if (header_size < 0 || (size_t)header_size >= sizeof(headers) ||
+        send_line(fd, headers) != 0 || send_line(fd, body) != 0) {
+        close(fd);
+        return -1;
+    }
+    size_t used = 0;
+    while (!strstr(reply, first) && used + 1 < sizeof(reply)) {
+        ssize_t count = read(fd, reply + used, sizeof(reply) - used - 1);
+        if (count <= 0) { close(fd); return -1; }
+        used += (size_t)count;
+        reply[used] = 0;
+    }
+    if (!strstr(reply, "HTTP/1.1 200") || strstr(reply, "fixture-second") ||
+        strstr(reply, "synthetic-managed-model-")) {
+        close(fd);
+        return -1;
+    }
+    const char *first_result = cancel ? "/workspace/model-cancel-ready" : "/workspace/model-stream-first";
+    if (write_handoff_result(first_result, "first\n") != 0) { close(fd); return -1; }
+    if (cancel) {
+        for (;;) pause();
+    }
+    char gate[32];
+    int released = 0;
+    for (int attempt = 0; attempt < 300; attempt++) {
+        if (read_field("/workspace/model-stream-go", gate, sizeof(gate)) == 0 &&
+            strcmp(gate, "go") == 0) { released = 1; break; }
+        usleep(100000);
+    }
+    if (!released) { close(fd); return -1; }
+    while (used + 1 < sizeof(reply)) {
+        ssize_t count = read(fd, reply + used, sizeof(reply) - used - 1);
+        if (count == 0) break;
+        if (count < 0) { close(fd); return -1; }
+        used += (size_t)count;
+        reply[used] = 0;
+    }
+    close(fd);
+    if (!strstr(reply, "fixture-second") ||
+        !strstr(reply, "[s-gw withheld credential]") ||
+        strstr(reply, "synthetic-managed-model-")) return -1;
+    return write_handoff_result("/workspace/model-stream-result", "streamed\n");
+}
+
 static int model_handoff_probe(const char *socket_path, const char *handoff_path,
                                const char *ready_path, const char *result_path) {
     const char *prefix = "{\"model\":\"fixture-model\",";
@@ -374,7 +438,8 @@ int main(int argc, char **argv) {
         close(model_fd);
         return received == 0 || (received < 0 && error == ECONNRESET) ? 0 : 46;
     }
-    if (argc != 11 && !claimant) return 1;
+    const char *model_socket = getenv("SGW_MODEL_RELAY_SOCKET");
+    if ((model_socket ? argc != 12 : argc != 11) && !claimant) return 1;
     signal(SIGPIPE, SIG_IGN);
     const char *socket_path = getenv("SGW_BROKER_SOCKET");
     if (!socket_path || strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 2;
@@ -405,16 +470,19 @@ int main(int argc, char **argv) {
     int udp4 = network_probe(AF_INET, SOCK_DGRAM, "127.0.0.1", ports[3]);
     int udp6 = network_probe(AF_INET6, SOCK_DGRAM, "::1", ports[4]);
     int udp_host = network_probe(AF_INET, SOCK_DGRAM, argv[6], ports[5]);
+    int model_direct = !model_socket || network_probe(AF_INET, SOCK_STREAM, argv[11], 443);
+    const char *model_result = "";
+    if (model_socket) model_result = model_direct ? " model=1" : " model=0";
     char boundary[128];
     int boundary_size = snprintf(boundary, sizeof(boundary),
-        "files=%d tcp4=%d tcp6=%d tcphost=%d udp4=%d udp6=%d udphost=%d\n",
-        files, tcp4, tcp6, tcp_host, udp4, udp6, udp_host);
+        "files=%d tcp4=%d tcp6=%d tcphost=%d udp4=%d udp6=%d udphost=%d%s\n",
+        files, tcp4, tcp6, tcp_host, udp4, udp6, udp_host, model_result);
     if (boundary_size < 0 || (size_t)boundary_size >= sizeof(boundary)) return 21;
     int boundary_fd = open("/workspace/boundary", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     ssize_t boundary_written = boundary_fd < 0 ? -1 : write(boundary_fd, boundary, (size_t)boundary_size);
     int boundary_closed = boundary_fd < 0 ? -1 : close(boundary_fd);
     if (boundary_written != boundary_size || boundary_closed != 0) return 21;
-    if (!files || !tcp4 || !tcp6 || !tcp_host || !udp4 || !udp6 || !udp_host) return 22;
+    if (!files || !tcp4 || !tcp6 || !tcp_host || !udp4 || !udp6 || !udp_host || !model_direct) return 22;
     char handle[256], url[256], request_id[256], foreign_id[256], call[1024];
     if (read_field("/workspace/handle", handle, sizeof(handle)) != 0 ||
         read_field("/workspace/url", url, sizeof(url)) != 0) return 11;
@@ -447,14 +515,14 @@ int main(int argc, char **argv) {
         usleep(100000);
     }
     if (!finished) return 25;
-    const char *model_socket = getenv("SGW_MODEL_RELAY_SOCKET");
     if (model_socket) {
         if (strict_model_denied(model_socket) != 0) return 41;
         if (model_handoff_probe(model_socket, "/workspace/model-handoff.sock",
             "/workspace/model-handoff-ready", "/workspace/model-handoff-result") != 0) return 42;
         if (model_handoff_probe(model_socket, "/run/s-gw/handoff-cross/model.sock",
             "/workspace/cross-model-handoff-ready", "/run/s-gw/handoff-cross/result") != 0) return 47;
-        if (write_handoff_result("/workspace/model-result", "strict-rejected\n") != 0) return 43;
+        if (model_stream_request(model_socket, 0) != 0) return 48;
+        if (write_handoff_result("/workspace/model-result", "strict-rejected-and-streamed\n") != 0) return 43;
     }
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":3") ||
@@ -499,5 +567,6 @@ int main(int argc, char **argv) {
         !strstr(reply, "\\\"exitCode\\\": 0")) return 15;
     int result = open("/workspace/result", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (result < 0 || write(result, "owned-https=1\n", 14) != 14 || close(result) != 0) return 9;
+    if (model_socket && model_stream_request(model_socket, 1) != 0) return 49;
     for (;;) pause();
 }
