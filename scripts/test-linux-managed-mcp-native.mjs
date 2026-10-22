@@ -911,10 +911,18 @@ try {
     socketStartAttempted.add(agent.sessionId);
     run("systemctl", ["--system", "start", agent.socketUnit]);
     socketStarted.add(agent.sessionId);
+    const mcpTarget = unitProperties(agent.socketUnit, ["Triggers"]).get("Triggers");
+    if (mcpTarget !== agent.brokerUnit) {
+      throw new Error(`The managed MCP socket triggers ${mcpTarget ?? "no service"}.`);
+    }
     if (testRelay) {
       modelSocketStartAttempted.add(agent.sessionId);
       run("systemctl", ["--system", "start", agent.modelSocketUnit]);
       modelSocketStarted.add(agent.sessionId);
+      const modelTarget = unitProperties(agent.modelSocketUnit, ["Triggers"]).get("Triggers");
+      if (modelTarget !== agent.brokerUnit) {
+        throw new Error(`The managed model socket triggers ${modelTarget ?? "no service"}.`);
+      }
     }
     await remember(path.dirname(agent.socketPath));
     await new Promise((resolve, reject) => {
@@ -1314,7 +1322,7 @@ try {
     rootEnvironmentFiles = JSON.stringify({ status: check.status, error: check.error?.message,
       stdout: check.stdout.slice(0, 1000), stderr: check.stderr.slice(0, 300) });
     const socket = run("systemctl", ["--system", "--no-pager", "--all", "show", agents[0].socketUnit,
-      ...["Id", "ActiveState", "FragmentPath", "Service", "BindsTo", "After"]
+      ...["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]
         .flatMap(name => ["-p", name])], true);
     managedSocketState = JSON.stringify({ status: socket.status, error: socket.error?.message,
       stdout: socket.stdout.slice(0, 3000), stderr: socket.stderr.slice(0, 300) });

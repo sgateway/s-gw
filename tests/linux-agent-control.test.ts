@@ -146,16 +146,18 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
   it("requires the managed MCP socket to stop with root control", () => {
     const first = record();
     const state = `Id=s-gw-managed-mcp-managed-session.socket\nActiveState=active\n` +
-      `FragmentPath=${first.mcpSocketUnitFile}\nService=${first.brokerUnit}\n` +
+      `FragmentPath=${first.mcpSocketUnitFile}\nTriggers=${first.brokerUnit}\n` +
       "BindsTo=s-gw-agent-control.service\nAfter=network.target s-gw-agent-control.service\n";
     expect(() => assertManagedMcpSocketUnit(first, state)).not.toThrow();
     for (const changed of [
       state.replace("ActiveState=active", "ActiveState=inactive"),
-      state.replace(`Service=${first.brokerUnit}`, "Service=other.service"),
+      state.replace(`Triggers=${first.brokerUnit}`, "Triggers=other.service"),
+      state.replace(`Triggers=${first.brokerUnit}`, `Triggers=${first.brokerUnit} other.service`),
+      state.replace(`Triggers=${first.brokerUnit}\n`, ""),
       state.replace(`FragmentPath=${first.mcpSocketUnitFile}`, "FragmentPath=/tmp/other.socket"),
       state.replace("BindsTo=s-gw-agent-control.service", "BindsTo="),
       state.replace("After=network.target s-gw-agent-control.service", "After=network.target"),
-      state + "Service=other.service\n"
+      state + "Triggers=other.service\n"
     ]) expect(() => assertManagedMcpSocketUnit(first, changed)).toThrow();
   });
 
@@ -169,16 +171,18 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
     expect(() => validateLinuxManagedPlanRecord(first, first.plan.sessionId,
       first.plan.brokerUid, gid)).not.toThrow();
     const state = `Id=s-gw-managed-model-managed-session.socket\nActiveState=active\n` +
-      `FragmentPath=${first.modelRelaySocketUnitFile}\nService=${first.brokerUnit}\n` +
+      `FragmentPath=${first.modelRelaySocketUnitFile}\nTriggers=${first.brokerUnit}\n` +
       "BindsTo=s-gw-agent-control.service\nAfter=network.target s-gw-agent-control.service\n";
     expect(() => assertModelSocketUnit(first, state)).not.toThrow();
     for (const changed of [
       state.replace("ActiveState=active", "ActiveState=inactive"),
-      state.replace(`Service=${first.brokerUnit}`, "Service=other.service"),
+      state.replace(`Triggers=${first.brokerUnit}`, "Triggers=other.service"),
+      state.replace(`Triggers=${first.brokerUnit}`, `Triggers=${first.brokerUnit} other.service`),
+      state.replace(`Triggers=${first.brokerUnit}\n`, ""),
       state.replace(`FragmentPath=${first.modelRelaySocketUnitFile}`, "FragmentPath=/tmp/other.socket"),
       state.replace("BindsTo=s-gw-agent-control.service", "BindsTo="),
       state.replace("After=network.target s-gw-agent-control.service", "After=network.target"),
-      state + "Service=other.service\n"
+      state + "Triggers=other.service\n"
     ]) expect(() => assertModelSocketUnit(first, changed)).toThrow();
     expect(() => validateLinuxManagedPlanRecord({ ...first,
       modelRelaySocketUnitFile: "/tmp/model.socket" }, first.plan.sessionId,

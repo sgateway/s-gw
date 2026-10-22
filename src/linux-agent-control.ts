@@ -148,12 +148,12 @@ async function registeredPlan(sessionId: string, brokerUid: number,
   await checkedRootFile(value.mcpSocketUnitFile);
   assertManagedMcpSocketUnit(value, await systemctlProperties(
     path.basename(value.mcpSocketUnitFile),
-    ["Id", "ActiveState", "FragmentPath", "Service", "BindsTo", "After"]));
+    ["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]));
   if (value.modelRelaySocketUnitFile) {
     await checkedRootFile(value.modelRelaySocketUnitFile);
     assertModelSocketUnit(value, await systemctlProperties(
       path.basename(value.modelRelaySocketUnitFile),
-      ["Id", "ActiveState", "FragmentPath", "Service", "BindsTo", "After"]));
+      ["Id", "ActiveState", "FragmentPath", "Triggers", "BindsTo", "After"]));
   }
   await checkedBrokerFile(value.brokerNode);
   await checkedBrokerFile(value.brokerPreflight);
@@ -365,8 +365,9 @@ export function assertModelSocketUnit(record: LinuxManagedPlanRecord, output: st
   const file = record.modelRelaySocketUnitFile;
   if (!file) throw new Error("No managed Linux model socket unit is registered.");
   const values = parseUnitProperties(output);
+  // systemd exposes the socket's resolved service target as Triggers, not Service.
   if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== "active" ||
-      values.get("FragmentPath") !== file || values.get("Service") !== record.brokerUnit ||
+      values.get("FragmentPath") !== file || values.get("Triggers") !== record.brokerUnit ||
       !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
       !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
     throw new Error("Linux model socket unit is not bound to the registered broker service.");
@@ -377,7 +378,7 @@ export function assertManagedMcpSocketUnit(record: LinuxManagedPlanRecord, outpu
   const file = record.mcpSocketUnitFile;
   const values = parseUnitProperties(output);
   if (values.get("Id") !== path.basename(file) || values.get("ActiveState") !== "active" ||
-      values.get("FragmentPath") !== file || values.get("Service") !== record.brokerUnit ||
+      values.get("FragmentPath") !== file || values.get("Triggers") !== record.brokerUnit ||
       !values.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
       !values.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")) {
     throw new Error("Linux managed MCP socket unit is not bound to the registered broker service and root control.");
