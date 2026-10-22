@@ -595,6 +595,22 @@ describe.skipIf(process.platform === "win32")("Linux systemd agent unit plan", (
     expect(() => parseSystemdAgentState(p, good + "User=231001\n")).toThrow("Duplicate");
   });
 
+  it("names only failed properties in the native CI attestation trace", () => {
+    const previous = process.env.SGW_CI_LINUX_START_TRACE;
+    process.env.SGW_CI_LINUX_START_TRACE = "1";
+    try {
+      const value = attestation(plan()).replace("SupplementaryGroups=\n", "SupplementaryGroups=docker\n")
+        .replace("PrivateNetwork=yes", "PrivateNetwork=no");
+      expect(() => parseSystemdAgentState(plan(), value)).toThrow(
+        "Failed properties: SupplementaryGroups, PrivateNetwork.");
+      try { parseSystemdAgentState(plan(), value); }
+      catch (error) { expect(String(error)).not.toContain("docker"); }
+    } finally {
+      if (previous === undefined) delete process.env.SGW_CI_LINUX_START_TRACE;
+      else process.env.SGW_CI_LINUX_START_TRACE = previous;
+    }
+  });
+
   it("rejects an agent process with an unintended supplementary group", () => {
     expect(linuxProcessGroupsAreDedicated("Groups:\t231001\n", 231001)).toBe(true);
     expect(linuxProcessGroupsAreDedicated("Groups:\t\n", 231001)).toBe(true);

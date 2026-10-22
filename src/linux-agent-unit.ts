@@ -295,37 +295,53 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
   const cgroup = fields.get("ControlGroup") || "";
   const mainPid = Number(fields.get("MainPID"));
   const invocationId = fields.get("InvocationID") || "";
-  if (!matches("Id", unit) || !matches("ActiveState", "active") || !matches("Type", "exec") ||
-      !matches("User", String(plan.uid)) || !matches("Group", String(plan.gid)) ||
-      !matches("SupplementaryGroups", "") ||
-      !matches("RootDirectory", plan.rootDirectory) || !matches("WorkingDirectory", "/workspace") ||
-      !matches("ReadWritePaths", `${plan.rootDirectory}/workspace`) ||
-      !attestedReadOnlyPaths(plan, fields.get("BindReadOnlyPaths")) ||
-      (plan.isolatedSharedMemory && !matches("TemporaryFileSystem", privateSharedMemoryMount)) ||
-      (plan.sealedStdio && (!matches("StandardInput", "null") ||
-        !matches("StandardOutput", "null") || !matches("StandardError", "null"))) ||
-      (plan.restrictedSocketFamilies && (!matches("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6") ||
-        !matches("SystemCallArchitectures", "native"))) ||
-      !matches("BindPaths", "") ||
-      !matches("Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
-        " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`) ||
-      !matches("Restart", "no") || !matches("KillMode", "control-group") ||
-      !enabled("SendSIGKILL") || !disabled("Delegate") || !disabled("DynamicUser") ||
-      !disabled("PrivateUsers") || !enabled("PrivateNetwork") ||
-      !enabled("PrivateIPC") || !enabled("PrivateTmp") ||
-      !matches("ProtectSystem", "strict") || !enabled("ProtectHome") ||
-      !enabled("PrivateDevices") || !enabled("NoNewPrivileges") ||
-      !["", "0"].includes(fields.get("CapabilityBoundingSet") ?? "missing") ||
-      !["", "0"].includes(fields.get("AmbientCapabilities") ?? "missing") ||
-      !enabled("ProtectKernelTunables") || !enabled("ProtectKernelModules") ||
-      !enabled("ProtectControlGroups") || !enabled("RestrictNamespaces") ||
-      !enabled("RestrictSUIDSGID") || !matches("NetworkNamespacePath", "") ||
-      (plan.supervisedControlUnit && (!fields.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service") ||
-        !fields.get("After")?.split(/\s+/).includes("s-gw-agent-control.service"))) ||
-      !matches("IPCNamespacePath", "") || !matches("JoinsNamespaceOf", "") ||
-      !validLinuxCgroupPath(cgroup) || cgroup !== `/system.slice/${unit}` ||
-      !Number.isSafeInteger(mainPid) || mainPid < 1 || !/^[a-f0-9]{32}$/.test(invocationId)) {
-    throw new Error("Linux agent unit did not attest its required identity and isolation.");
+  const checks: Array<[string, boolean]> = [
+    ["Id", matches("Id", unit)], ["ActiveState", matches("ActiveState", "active")],
+    ["Type", matches("Type", "exec")], ["User", matches("User", String(plan.uid))],
+    ["Group", matches("Group", String(plan.gid))], ["SupplementaryGroups", matches("SupplementaryGroups", "")],
+    ["RootDirectory", matches("RootDirectory", plan.rootDirectory)],
+    ["WorkingDirectory", matches("WorkingDirectory", "/workspace")],
+    ["ReadWritePaths", matches("ReadWritePaths", `${plan.rootDirectory}/workspace`)],
+    ["BindReadOnlyPaths", attestedReadOnlyPaths(plan, fields.get("BindReadOnlyPaths"))],
+    ["TemporaryFileSystem", !plan.isolatedSharedMemory || matches("TemporaryFileSystem", privateSharedMemoryMount)],
+    ["StandardInput", !plan.sealedStdio || matches("StandardInput", "null")],
+    ["StandardOutput", !plan.sealedStdio || matches("StandardOutput", "null")],
+    ["StandardError", !plan.sealedStdio || matches("StandardError", "null")],
+    ["RestrictAddressFamilies", !plan.restrictedSocketFamilies ||
+      matches("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6")],
+    ["SystemCallArchitectures", !plan.restrictedSocketFamilies || matches("SystemCallArchitectures", "native")],
+    ["BindPaths", matches("BindPaths", "")],
+    ["Environment", matches("Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
+      " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`)],
+    ["Restart", matches("Restart", "no")], ["KillMode", matches("KillMode", "control-group")],
+    ["SendSIGKILL", enabled("SendSIGKILL")], ["Delegate", disabled("Delegate")],
+    ["DynamicUser", disabled("DynamicUser")], ["PrivateUsers", disabled("PrivateUsers")],
+    ["PrivateNetwork", enabled("PrivateNetwork")], ["PrivateIPC", enabled("PrivateIPC")],
+    ["PrivateTmp", enabled("PrivateTmp")], ["ProtectSystem", matches("ProtectSystem", "strict")],
+    ["ProtectHome", enabled("ProtectHome")], ["PrivateDevices", enabled("PrivateDevices")],
+    ["NoNewPrivileges", enabled("NoNewPrivileges")],
+    ["CapabilityBoundingSet", ["", "0"].includes(fields.get("CapabilityBoundingSet") ?? "missing")],
+    ["AmbientCapabilities", ["", "0"].includes(fields.get("AmbientCapabilities") ?? "missing")],
+    ["ProtectKernelTunables", enabled("ProtectKernelTunables")],
+    ["ProtectKernelModules", enabled("ProtectKernelModules")],
+    ["ProtectControlGroups", enabled("ProtectControlGroups")],
+    ["RestrictNamespaces", enabled("RestrictNamespaces")],
+    ["RestrictSUIDSGID", enabled("RestrictSUIDSGID")],
+    ["NetworkNamespacePath", matches("NetworkNamespacePath", "")],
+    ["BindsTo", !plan.supervisedControlUnit ||
+      !!fields.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service")],
+    ["After", !plan.supervisedControlUnit ||
+      !!fields.get("After")?.split(/\s+/).includes("s-gw-agent-control.service")],
+    ["IPCNamespacePath", matches("IPCNamespacePath", "")],
+    ["JoinsNamespaceOf", matches("JoinsNamespaceOf", "")],
+    ["ControlGroup", validLinuxCgroupPath(cgroup) && cgroup === `/system.slice/${unit}`],
+    ["MainPID", Number.isSafeInteger(mainPid) && mainPid >= 1],
+    ["InvocationID", /^[a-f0-9]{32}$/.test(invocationId)]
+  ];
+  const failed = checks.filter(([, valid]) => !valid).map(([name]) => name);
+  if (failed.length) {
+    const detail = process.env.SGW_CI_LINUX_START_TRACE === "1" ? ` Failed properties: ${failed.join(", ")}.` : "";
+    throw new Error(`Linux agent unit did not attest its required identity and isolation.${detail}`);
   }
   return { unit, uid: plan.uid, gid: plan.gid, cgroup, mainPid, invocationId };
 }
