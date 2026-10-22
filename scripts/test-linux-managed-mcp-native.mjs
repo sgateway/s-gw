@@ -537,7 +537,7 @@ async function startHandoffHelper(agent, model = false, receiver = agent) {
   const crossSession = receiver !== agent;
   const channel = crossSession ? "cross-model-handoff" : model ? "model-handoff" : "handoff";
   const shared = `${agent.root}/run/s-gw/handoff-cross`;
-  const socketPath = crossSession ? `${shared}/model.sock` : `${agent.root}/workspace/${channel}.sock`;
+  const socketPath = `${agent.root}/workspace/${channel}.sock`;
   const resultPath = crossSession ? `${shared}/result` : `${agent.root}/workspace/${channel}-result`;
   const pidPath = crossSession ? `${shared}/pid` : `${agent.root}/workspace/${channel}-pid`;
   const agentPid = agentMainPids.get(agent.sessionId);
@@ -596,8 +596,13 @@ async function startHandoffHelper(agent, model = false, receiver = agent) {
     throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup/PID namespace, zero effective capabilities, or receiver network namespace.`);
   }
   if (crossSession) {
+    const outsider = run(runuser, ["-u", receiver.userName, "--", "/usr/bin/test", "-x",
+      `${agent.root}/workspace`], true, { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
+    if (outsider.error || outsider.status === 0) {
+      throw new Error("The other agent UID can traverse the donor workspace by pathname.");
+    }
     let agentView;
-    try { agentView = await lstat(`/proc/${agentPid}/root/run/s-gw/handoff-cross/model.sock`); }
+    try { agentView = await lstat(`/proc/${agentPid}/root/workspace/cross-model-handoff.sock`); }
     catch (error) {
       if (error.code === "ENOENT") {
         throw new Error("The cross-model helper socket is missing from the managed agent root.");
@@ -1290,6 +1295,12 @@ try {
         `${agent.sessionId} cross-session model descriptor handoff result`);
       if (crossResult !== "denied\n") {
         throw new Error(`The ${agent.sessionId} model descriptor reached the other agent UID: ${crossResult}`);
+      }
+      const crossResultInfo = await lstat(`${agent.root}/run/s-gw/handoff-cross/result`);
+      if (!crossResultInfo.isFile() || crossResultInfo.nlink !== 1 ||
+          crossResultInfo.uid !== agents.find(item => item !== agent).uid ||
+          (crossResultInfo.mode & 0o777) !== 0o600) {
+        throw new Error("The cross-session model denial was not written by the receiving agent UID.");
       }
       const crossHelper = handoffHelpers.get(`${agent.sessionId}:cross-model-handoff`);
       const crossFinished = await crossHelper.finished;

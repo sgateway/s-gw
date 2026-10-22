@@ -221,16 +221,35 @@ static int write_handoff_result(const char *filename, const char *result) {
     return written == 0 && closed == 0 ? 0 : -1;
 }
 
-static int receive_handoff(const char *socket_name, const char *result_name,
-                           const char *pid_name, const char *expected_handle, int agent_pid,
-                           int model, int cross_session) {
-    if (agent_pid < 1 || agent_pid == getpid() ||
-        strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 30;
+static int cross_handoff_listener(const char *socket_name, int uid, int gid) {
+    if (uid < 1 || gid < 1 ||
+        strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, socket_name);
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        listen(listener, 1) != 0 || (cross_session && chmod(socket_name, 0666) != 0)) return 31;
+    if (listener < 0) return -1;
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(listener, 1) != 0 ||
+        chown(socket_name, (uid_t)uid, (gid_t)gid) != 0 ||
+        chmod(socket_name, 0666) != 0) {
+        close(listener);
+        return -1;
+    }
+    return listener;
+}
+
+static int receive_handoff(const char *socket_name, const char *result_name,
+                           const char *pid_name, const char *expected_handle, int agent_pid,
+                           int model, int listener) {
+    if (agent_pid < 1 || agent_pid == getpid() ||
+        strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 30;
+    if (listener < 0) {
+        struct sockaddr_un address = { .sun_family = AF_UNIX };
+        strcpy(address.sun_path, socket_name);
+        listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0) return 31;
+    }
     char pid_text[32];
     int pid_size = snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)getpid());
     if (pid_size < 0 || (size_t)pid_size >= sizeof(pid_text) ||
@@ -420,7 +439,7 @@ static int model_stream_request(const char *socket_path, int cancel) {
 
 static int model_handoff_probe(const char *socket_path, const char *handoff_path,
                                const char *ready_path, const char *result_path) {
-    int cross_session = strcmp(handoff_path, "/run/s-gw/handoff-cross/model.sock") == 0;
+    int cross_session = strcmp(handoff_path, "/workspace/cross-model-handoff.sock") == 0;
     const char *prefix = "{\"model\":\"fixture-model\",";
     const char *remaining = "\"max_tokens\":16,\"mcp_servers\":[]}";
     int fd = connect_model(socket_path);
@@ -454,11 +473,11 @@ static int model_handoff_probe(const char *socket_path, const char *handoff_path
         }
         return -1;
     }
+    if (cross_session) return 0;
     for (int attempt = 0; attempt < 100; attempt++) {
         if (access(result_path, F_OK) == 0) return 0;
         usleep(100000);
     }
-    if (cross_session) write_probe_stage("cross-model-result-timeout\n");
     return -1;
 }
 
@@ -481,9 +500,15 @@ int main(int argc, char **argv) {
     if ((argc == 9 && (strcmp(argv[1], "--receive-handoff") == 0 ||
                        strcmp(argv[1], "--receive-model-handoff") == 0)) || cross_handoff) {
         signal(SIGPIPE, SIG_IGN);
+        int listener = -1;
+        if (cross_handoff) {
+            listener = cross_handoff_listener(argv[2], positive_number(argv[7]),
+                                              positive_number(argv[8]));
+            if (listener < 0) return 31;
+        }
         if (enter_agent_netns_and_drop(cross_handoff ? argv[9] : argv[6], argv[7], argv[8]) != 0) return 39;
         return receive_handoff(argv[2], argv[3], argv[4], argv[5], positive_number(argv[6]),
-                               strcmp(argv[1], "--receive-handoff") != 0, cross_handoff);
+                               strcmp(argv[1], "--receive-handoff") != 0, listener);
     }
     if (model_claimant || model_cross_uid) {
         signal(SIGPIPE, SIG_IGN);
@@ -596,10 +621,8 @@ int main(int argc, char **argv) {
         if (strict_model_denied(model_socket) != 0) return 41;
         if (model_handoff_probe(model_socket, "/workspace/model-handoff.sock",
             "/workspace/model-handoff-ready", "/workspace/model-handoff-result") != 0) return 42;
-        if (model_handoff_probe(model_socket, "/run/s-gw/handoff-cross/model.sock",
+        if (model_handoff_probe(model_socket, "/workspace/cross-model-handoff.sock",
             "/workspace/cross-model-handoff-ready", "/run/s-gw/handoff-cross/result") != 0) return 47;
-        if (model_stream_request(model_socket, 0) != 0) return 48;
-        if (write_handoff_result("/workspace/model-result", "strict-rejected-and-streamed\n") != 0) return 43;
     }
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":3") ||
@@ -610,6 +633,10 @@ int main(int argc, char **argv) {
         !strstr(reply, "\"result\"") || !strstr(reply, "approvalRequired")) return 12;
     int marker = open("/workspace/requested", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (marker < 0 || write(marker, "pending\n", 8) != 8 || close(marker) != 0) return 13;
+    if (model_socket) {
+        if (model_stream_request(model_socket, 0) != 0) return 48;
+        if (write_handoff_result("/workspace/model-result", "strict-rejected-and-streamed\n") != 0) return 43;
+    }
     int approved = 0;
     for (int attempt = 0; attempt < 300; attempt++) {
         if (read_field("/workspace/approved-id", request_id, sizeof(request_id)) == 0) {
