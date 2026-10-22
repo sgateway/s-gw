@@ -35,6 +35,8 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `StandardInput=${p.sealedStdio ? "null" : "tty"}`,
     `StandardOutput=${p.sealedStdio ? "null" : "journal"}`,
     `StandardError=${p.sealedStdio ? "null" : "inherit"}`,
+    `RestrictAddressFamilies=${p.restrictedSocketFamilies ? "AF_UNIX AF_INET AF_INET6" : ""}`,
+    `SystemCallArchitectures=${p.restrictedSocketFamilies ? "native" : ""}`,
     `Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock${p.modelRelaySocket ?
       " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`,
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
@@ -165,6 +167,26 @@ describe("Linux systemd agent unit plan", () => {
     expect(() => validateLinuxAgentPlan({ ...ordinary, isolatedSharedMemory: "yes" as never }))
       .toThrow("arguments");
     expect(() => validateLinuxAgentPlan({ ...ordinary, isolatedSharedMemory: true }))
+      .toThrow("arguments");
+  });
+
+  it("can opt into socket-family restrictions without changing existing plans", () => {
+    const ordinary = plan();
+    const restricted = { ...ordinary, launchGate: true, restrictedSocketFamilies: true };
+    expect(systemdRunArgs(ordinary).some(arg => arg.startsWith("--property=RestrictAddressFamilies=")))
+      .toBe(false);
+    expect(systemdRunArgs(restricted)).toContain(
+      "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(systemdRunArgs(restricted)).toContain("--property=SystemCallArchitectures=native");
+    expect(parseSystemdAgentState(restricted, attestation(restricted)).mainPid).toBe(1234);
+    expect(lifecyclePlanKey(restricted)).not.toBe(lifecyclePlanKey(ordinary));
+    for (const value of [
+      attestation(restricted).replace("AF_UNIX AF_INET AF_INET6", "AF_UNIX AF_INET AF_INET6 AF_NETLINK"),
+      attestation(restricted).replace("SystemCallArchitectures=native", "SystemCallArchitectures=")
+    ]) expect(() => parseSystemdAgentState(restricted, value)).toThrow("did not attest");
+    expect(() => validateLinuxAgentPlan({ ...ordinary, restrictedSocketFamilies: true }))
+      .toThrow("arguments");
+    expect(() => validateLinuxAgentPlan({ ...restricted, restrictedSocketFamilies: "yes" as never }))
       .toThrow("arguments");
   });
 

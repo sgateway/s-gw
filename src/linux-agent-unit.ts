@@ -21,6 +21,7 @@ export interface LinuxAgentUnitPlan {
   serializedLifecycle?: boolean;
   launchAttemptFence?: boolean;
   sealedStdio?: boolean;
+  restrictedSocketFamilies?: boolean;
   supervisedControlUnit?: boolean;
   logicalAgentId?: string;
   identityGeneration?: string;
@@ -95,6 +96,8 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
       (plan.serializedLifecycle === true && plan.launchAttemptFence === false) ||
       (plan.sealedStdio !== undefined && typeof plan.sealedStdio !== "boolean") ||
       (plan.sealedStdio === true && plan.launchGate !== true) ||
+      (plan.restrictedSocketFamilies !== undefined && typeof plan.restrictedSocketFamilies !== "boolean") ||
+      (plan.restrictedSocketFamilies === true && plan.launchGate !== true) ||
       (plan.supervisedControlUnit !== undefined && typeof plan.supervisedControlUnit !== "boolean") ||
       (plan.supervisedControlUnit === true && (!plan.launchGate || !plan.activatedSocket ||
         !plan.serializedLifecycle || !plan.sealedStdio || !plan.isolatedSharedMemory)) ||
@@ -128,6 +131,8 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): st
     `BindReadOnlyPaths=${bindReadOnlyPaths(plan)}`,
     ...(plan.isolatedSharedMemory ? [`TemporaryFileSystem=${privateSharedMemoryMount}`] : []),
     ...(plan.sealedStdio ? ["StandardInput=null", "StandardOutput=null", "StandardError=null"] : []),
+    ...(plan.restrictedSocketFamilies ? ["RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+      "SystemCallArchitectures=native"] : []),
     ...(plan.supervisedControlUnit ? ["BindsTo=s-gw-agent-control.service", "After=s-gw-agent-control.service"] : []),
     `Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
       " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`
@@ -188,6 +193,7 @@ export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
     plan.supervisedControlUnit === true];
   if (plan.identityGeneration) fields.push(plan.logicalAgentId!, plan.identityGeneration);
   if (plan.modelRelaySocket) fields.push(plan.modelRelaySocket);
+  if (plan.restrictedSocketFamilies) fields.push("restricted-socket-families");
   return JSON.stringify(fields);
 }
 
@@ -276,6 +282,8 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       (plan.isolatedSharedMemory && !matches("TemporaryFileSystem", privateSharedMemoryMount)) ||
       (plan.sealedStdio && (!matches("StandardInput", "null") ||
         !matches("StandardOutput", "null") || !matches("StandardError", "null"))) ||
+      (plan.restrictedSocketFamilies && (!matches("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6") ||
+        !matches("SystemCallArchitectures", "native"))) ||
       !matches("BindPaths", "") ||
       !matches("Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
         " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`) ||
@@ -415,6 +423,7 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       "-p", "Id", "-p", "Description", "-p", "ActiveState", "-p", "Type", "-p", "User", "-p", "Group",
       "-p", "RootDirectory", "-p", "WorkingDirectory", "-p", "ReadWritePaths", "-p", "BindReadOnlyPaths", "-p", "BindPaths",
       "-p", "TemporaryFileSystem", "-p", "StandardInput", "-p", "StandardOutput", "-p", "StandardError",
+      "-p", "RestrictAddressFamilies", "-p", "SystemCallArchitectures",
       "-p", "Environment", "-p", "Restart", "-p", "KillMode", "-p", "SendSIGKILL",
       "-p", "Delegate", "-p", "DynamicUser", "-p", "PrivateUsers", "-p", "PrivateNetwork",
       "-p", "SupplementaryGroups",

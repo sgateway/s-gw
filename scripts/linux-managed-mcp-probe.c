@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <grp.h>
+#include <linux/netlink.h>
 #include <netinet/in.h>
 #include <sched.h>
 #include <signal.h>
@@ -103,6 +104,18 @@ static int network_probe(int family, int kind, const char *host, int port) {
     }
     close(fd);
     return kind == SOCK_STREAM ? result != 0 : 1;
+}
+
+static int netlink_route_socket(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd >= 0) { close(fd); return 1; }
+    return 0;
+}
+
+static int netlink_route_denied(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd >= 0) { close(fd); return 0; }
+    return errno == EAFNOSUPPORT || errno == EPERM;
 }
 
 static int initialized_broker_socket(const char *socket_path) {
@@ -412,6 +425,8 @@ static int model_handoff_probe(const char *socket_path, const char *handoff_path
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--netlink-positive") == 0)
+        return netlink_route_socket() ? 0 : 47;
     int claimant = argc == 2 && strcmp(argv[1], "--out-of-cgroup") == 0;
     int model_claimant = argc == 2 && strcmp(argv[1], "--model-out-of-cgroup") == 0;
     int model_cross_uid = argc == 2 && strcmp(argv[1], "--model-cross-uid") == 0;
@@ -471,18 +486,20 @@ int main(int argc, char **argv) {
     int udp6 = network_probe(AF_INET6, SOCK_DGRAM, "::1", ports[4]);
     int udp_host = network_probe(AF_INET, SOCK_DGRAM, argv[6], ports[5]);
     int model_direct = !model_socket || network_probe(AF_INET, SOCK_STREAM, argv[11], 443);
+    int netlink_denied = netlink_route_denied();
     const char *model_result = "";
     if (model_socket) model_result = model_direct ? " model=1" : " model=0";
     char boundary[128];
     int boundary_size = snprintf(boundary, sizeof(boundary),
-        "files=%d tcp4=%d tcp6=%d tcphost=%d udp4=%d udp6=%d udphost=%d%s\n",
-        files, tcp4, tcp6, tcp_host, udp4, udp6, udp_host, model_result);
+        "files=%d tcp4=%d tcp6=%d tcphost=%d udp4=%d udp6=%d udphost=%d netlink=%d%s\n",
+        files, tcp4, tcp6, tcp_host, udp4, udp6, udp_host, netlink_denied, model_result);
     if (boundary_size < 0 || (size_t)boundary_size >= sizeof(boundary)) return 21;
     int boundary_fd = open("/workspace/boundary", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     ssize_t boundary_written = boundary_fd < 0 ? -1 : write(boundary_fd, boundary, (size_t)boundary_size);
     int boundary_closed = boundary_fd < 0 ? -1 : close(boundary_fd);
     if (boundary_written != boundary_size || boundary_closed != 0) return 21;
-    if (!files || !tcp4 || !tcp6 || !tcp_host || !udp4 || !udp6 || !udp_host || !model_direct) return 22;
+    if (!files || !tcp4 || !tcp6 || !tcp_host || !udp4 || !udp6 || !udp_host ||
+        !netlink_denied || !model_direct) return 22;
     char handle[256], url[256], request_id[256], foreign_id[256], call[1024];
     if (read_field("/workspace/handle", handle, sizeof(handle)) != 0 ||
         read_field("/workspace/url", url, sizeof(url)) != 0) return 11;

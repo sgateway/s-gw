@@ -212,7 +212,8 @@ const agents = [0, 1].map(index => {
     ...(testRelay ? { modelRelaySocket: modelSocketPath } : {}),
     executable: "/usr/bin/managed-mcp-probe", args: [],
     launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
-    serializedLifecycle: true, sealedStdio: true, supervisedControlUnit: true,
+    serializedLifecycle: true, sealedStdio: true, restrictedSocketFamilies: true,
+    supervisedControlUnit: true,
     logicalAgentId, identityGeneration };
   const identityRecord = { logicalAgentId, identityGeneration, uid: agentUid, gid: agentUid };
   const identityPaths = [`${identityDir}/uid-${agentUid}.json`,
@@ -673,6 +674,7 @@ try {
       path.join(project, "native/linux-agent-gate/launch-gate.c"), "-o", gate]);
     run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
       path.join(project, "scripts/linux-managed-mcp-probe.c"), "-o", probe]);
+    run(probe, ["--netlink-positive"]);
     await chmod(gate, 0o755);
     await chmod(probe, 0o755);
   }
@@ -1002,7 +1004,7 @@ try {
   for (const agent of agents) {
     const result = await until(() => maybeText(`${agent.root}/workspace/boundary`),
       `${agent.sessionId} direct-egress and canary result`);
-    if (result !== `files=1 tcp4=1 tcp6=1 tcphost=1 udp4=1 udp6=1 udphost=1${testRelay ? " model=1" : ""}\n`) {
+    if (result !== `files=1 tcp4=1 tcp6=1 tcphost=1 udp4=1 udp6=1 udphost=1 netlink=1${testRelay ? " model=1" : ""}\n`) {
       throw new Error(`${agent.sessionId} reached a direct service or another private file: ${result}`);
     }
   }
@@ -1430,5 +1432,5 @@ try {
   }
 }
 if (passed) {
-  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.${testRelay ? " Opt-in model relay: durable approval and claim, strict-body rejection, cross-session/UID/cgroup/FD-transfer denial, broker-owned authenticated TLS streaming and redaction, and active-stream cancellation on both teardown paths." : ""}`);
+  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, restricted AF_NETLINK socket creation, connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.${testRelay ? " Opt-in model relay: durable approval and claim, strict-body rejection, cross-session/UID/cgroup/FD-transfer denial, broker-owned authenticated TLS streaming and redaction, and active-stream cancellation on both teardown paths." : ""}`);
 }
