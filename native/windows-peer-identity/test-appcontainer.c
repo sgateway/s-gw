@@ -182,6 +182,28 @@ static int process_handle_denied(const wchar_t *pid_text, const char *target) {
     return 0;
 }
 
+static int job_control_denied(const wchar_t *job_name) {
+    const DWORD rights[] = {
+        JOB_OBJECT_QUERY, JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_SET_ATTRIBUTES,
+        JOB_OBJECT_TERMINATE, WRITE_DAC, WRITE_OWNER
+    };
+    for (size_t i = 0; i < sizeof(rights) / sizeof(rights[0]); i++) {
+        HANDLE job = OpenJobObjectW(rights[i], FALSE, job_name);
+        if (job) {
+            CloseHandle(job);
+            fprintf(stderr, "AppContainer opened the launcher Job with rights 0x%08lx.\n",
+                (unsigned long)rights[i]);
+            return 0;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_ACCESS_DENIED) {
+            fprintf(stderr, "AppContainer Job access failed unexpectedly: %lu\n", error);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int connected_pipe_transfer_denied(HANDLE pipe, const wchar_t *pid_text) {
     wchar_t *end = NULL;
     errno = 0;
@@ -210,7 +232,7 @@ static int connected_pipe_transfer_denied(HANDLE pipe, const wchar_t *pid_text) 
 
 static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     const wchar_t *ipv6_port, const wchar_t *shared_path,
-    const wchar_t *canary_path, const wchar_t *profile,
+    const wchar_t *canary_path, const wchar_t *profile, const wchar_t *job_name,
     const wchar_t *other_agent_pid, const wchar_t *broker_pid,
     const wchar_t *transfer_target_pid) {
     PSID expected_sid = NULL;
@@ -232,6 +254,7 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     FreeSid(expected_sid);
     if (!isolated) return 1;
     if (!agent_environment_is_clean()) return 1;
+    if (!job_control_denied(job_name)) return 1;
     if (other_agent_pid) {
         int other_denied = process_handle_denied(other_agent_pid, "other agent");
         int broker_denied = process_handle_denied(broker_pid, "broker");
@@ -276,6 +299,40 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
     if (result) fprintf(stderr, "AppContainer exchange failed: %lu\n", GetLastError());
     CloseHandle(pipe);
     return result;
+}
+
+static HANDLE create_private_job(const wchar_t *name) {
+    HANDLE token = NULL;
+    DWORD size = 0;
+    TOKEN_USER *user = NULL;
+    LPWSTR sid = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    HANDLE job = NULL;
+    DWORD status = ERROR_SUCCESS;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return NULL;
+    GetTokenInformation(token, TokenUser, NULL, 0, &size);
+    if (!size || size > 4096) goto done;
+    user = malloc(size);
+    if (!user || !GetTokenInformation(token, TokenUser, user, size, &size) ||
+        !ConvertSidToStringSidW(user->User.Sid, &sid)) goto done;
+
+    wchar_t sddl[512];
+    int length = swprintf(sddl, sizeof(sddl) / sizeof(sddl[0]),
+        L"D:P(A;;GA;;;SY)(A;;GA;;;%ls)(A;;RC;;;OW)", sid);
+    if (length < 1 || (size_t)length >= sizeof(sddl) / sizeof(sddl[0]) ||
+        !ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1,
+            &descriptor, NULL)) goto done;
+    SECURITY_ATTRIBUTES security = { sizeof(security), descriptor, FALSE };
+    job = CreateJobObjectW(&security, name);
+
+done:
+    status = GetLastError();
+    if (descriptor) LocalFree(descriptor);
+    if (sid) LocalFree(sid);
+    free(user);
+    CloseHandle(token);
+    SetLastError(status);
+    return job;
 }
 
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
@@ -336,17 +393,17 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     wchar_t command[MAX_PATH * 4 + 256];
     if (other_agent_pid) {
         if (swprintf(command, sizeof(command) / sizeof(command[0]),
-            L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" %ls %ls",
+            L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" \"%ls\" %ls %ls",
             executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path,
-            name, other_agent_pid, broker_pid) < 0) goto done;
+            name, job_name, other_agent_pid, broker_pid) < 0) goto done;
     } else if (transfer_target_pid) {
         if (swprintf(command, sizeof(command) / sizeof(command[0]),
-            L"\"%ls\" client-transfer \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" %ls",
+            L"\"%ls\" client-transfer \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" \"%ls\" %ls",
             executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path,
-            name, transfer_target_pid) < 0) goto done;
+            name, job_name, transfer_target_pid) < 0) goto done;
     } else if (swprintf(command, sizeof(command) / sizeof(command[0]),
-        L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\"",
-        executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path, name) < 0) goto done;
+        L"\"%ls\" client \"%ls\" %ls %ls \"%ls\" \"%ls\" \"%ls\" \"%ls\"",
+        executable, pipe_name, ipv4_port, ipv6_port, shared_path, canary_path, name, job_name) < 0) goto done;
 
     STARTUPINFOEXW startup = { 0 };
     startup.StartupInfo.cb = sizeof(startup);
@@ -357,7 +414,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, job_name);
         if (!job) goto done;
     } else {
-        job = CreateJobObjectW(NULL, job_name);
+        job = create_private_job(job_name);
         if (!job || GetLastError() == ERROR_ALREADY_EXISTS) {
             if (job) CloseHandle(job);
             goto done;
@@ -453,7 +510,7 @@ done:
 }
 
 static int hold_empty_job(const wchar_t *name, DWORD flags) {
-    HANDLE job = CreateJobObjectW(NULL, name);
+    HANDLE job = create_private_job(name);
     if (!job) return 1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(job);
@@ -488,12 +545,12 @@ int wmain(int argc, wchar_t **argv) {
         return hold_empty_job(argv[2], JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK);
     if (argc == 3 && wcscmp(argv[1], L"job-host-no-kill") == 0)
         return hold_empty_job(argv[2], 0);
-    if ((argc == 8 || argc == 10) && wcscmp(argv[1], L"client") == 0)
-        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
-            argc == 10 ? argv[8] : NULL, argc == 10 ? argv[9] : NULL, NULL);
-    if (argc == 9 && wcscmp(argv[1], L"client-transfer") == 0)
-        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
-            NULL, NULL, argv[8]);
+    if ((argc == 9 || argc == 11) && wcscmp(argv[1], L"client") == 0)
+        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            argc == 11 ? argv[9] : NULL, argc == 11 ? argv[10] : NULL, NULL);
+    if (argc == 10 && wcscmp(argv[1], L"client-transfer") == 0)
+        return run_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            NULL, NULL, argv[9]);
     if (argc == 9 && wcscmp(argv[1], L"launch") == 0)
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
             0, 0, 0, NULL, NULL, NULL);
