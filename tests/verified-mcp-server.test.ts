@@ -166,7 +166,12 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified MCP transport",
     expect(summary.stdout).toContain("approved fixture");
     expect(summary.stdout).not.toContain(secretValue);
     expect(received).toBe(`Bearer ${secretValue}`);
+    const disconnected = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Verified MCP transport did not close after session revocation.")), 10_000);
+      mcp.onclose = () => { clearTimeout(timeout); resolve(); };
+    });
     stop();
+    await disconnected;
     await expect(mcp.listTools()).rejects.toThrow();
     await disconnectProbe();
   }, 30_000);
