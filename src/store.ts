@@ -1327,6 +1327,7 @@ export class SecretStore {
       assertExecutionCaller(request, caller, true);
 
       let upgradedLegacyAbsolute = false;
+      let denyingRuleName: string | undefined;
       try {
         upgradedLegacyAbsolute = request.action.kind === "env_command" &&
           !request.action.resolvedCommand && isAbsoluteCommand(request.action.command);
@@ -1337,6 +1338,10 @@ export class SecretStore {
         assertActionAllowed(secret, request.action);
         assertBoundHandlesAllowed(store, request.handle, request.action);
         if (upgradedLegacyAbsolute) migrateRequestGrantToPinnedAction(store, request);
+        const currentRule = matchingApprovalPolicyRuleForAction(
+          store, secret, request.action, identityFromRequest(request), now
+        );
+        if (currentRule?.decision === "deny") denyingRuleName = currentRule.name;
       } catch (error) {
         const executionError = errorMessage(error);
         request.state = "failed";
@@ -1346,7 +1351,9 @@ export class SecretStore {
         return { request, error: executionError };
       }
 
-      const authorizationError = automaticRequestAuthorizationError(store, request, now);
+      const authorizationError = denyingRuleName
+        ? `Denied by approval policy ${denyingRuleName}.`
+        : automaticRequestAuthorizationError(store, request, now);
       if (authorizationError) {
         request.state = "denied";
         request.deniedAt = now;
@@ -4046,6 +4053,7 @@ function approvalPolicyMatches(
 ): boolean {
   const conditions = normalizeApprovalPolicyConditions(rule.conditions);
   if (action.kind === "model_relay" && rule.decision === "allow") return false;
+  if (rule.decision === "allow" && action.kind === "http_request" && !conditions.actionKeys?.length) return false;
   if (rule.decision === "allow" && action.ssh?.managed && !conditions.actionKeys?.length) return false;
   if (conditions.actionKeys?.length && !conditions.actionKeys.includes(approvalActionKey(secret.handle, action))) return false;
   if (conditions.handles?.length && !conditions.handles.includes(secret.handle)) {

@@ -259,7 +259,7 @@ s-gw approval policy add \
 
 Policy rules can match credential handles, types, providers, minimum severity, agent names, action kinds, commands, injected environment names, working directories, SSH targets, and SSH ports. `allow` skips the approval popup for matching requests, `ask` keeps the normal approval/grant flow, and `deny` blocks matching requests before local execution.
 
-Run `s-gw approval policy audit` to list potential HTTPS `allow` rules without an exact action key. It is read-only and may include rules whose handle policy cannot currently reach an HTTPS destination. Review each rule's handle and verified principal before migrating it to an action-specific approval from a verified request with `s-gw approve-policy REQUEST_ID`. Existing broad rules retain their behavior until you change them.
+Run `s-gw approval policy audit` to list potential HTTPS `allow` rules without an exact action key. It is read-only and may include rules whose handle policy cannot currently reach an HTTPS destination. Broad rules remain stored but no longer autoapprove HTTPS; the request waits for manual approval. Review each rule's handle and verified principal before migrating it to an action-specific approval from a verified request with `s-gw approve-policy REQUEST_ID`. The exact key binds the method, full URL, headers, body, authentication mode, and timeout. Non-HTTPS rules are unchanged.
 
 Run the browser console in the foreground when needed:
 

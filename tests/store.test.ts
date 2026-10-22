@@ -2927,6 +2927,66 @@ describe("SecretStore", () => {
     expect((await store.getRequest(automatic.id)).state).toBe("denied");
   });
 
+  it("requires an exact HTTPS action key for unattended approval", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "exact HTTPS policy token",
+      type: "api-token",
+      value: "exact-https-policy-secret-value-123456789",
+      policy: { allowedCommands: [SGW_HTTP_COMMAND], allowedDestinations: ["api.example.test:443"] }
+    });
+    const http = {
+      url: "https://api.example.test/v1/items",
+      method: "POST" as const,
+      headers: { "x-operation": "read" },
+      body: '{"item":"first"}',
+      auth: { kind: "bearer" as const }
+    };
+    const action = buildHttpRequestAction(http);
+    await store.addApprovalPolicyRule({
+      name: "Old broad HTTPS allow",
+      decision: "allow",
+      conditions: { handles: [secret.handle], principalIds: ["test:codex"], actionKinds: ["http_request"] }
+    });
+
+    const pending = await store.createRequest(secret.handle, action, "Codex exact HTTPS request", verifiedCodex);
+    expect(pending.state).toBe("pending");
+    const scoped = await store.approveRequestWithScopedPolicy(pending.id);
+    expect(scoped.rule.conditions.actionKeys).toHaveLength(1);
+    expect((await store.createRequest(secret.handle, action, "Codex same HTTPS action", verifiedCodex)).state).toBe("approved");
+
+    const changed = [
+      { ...http, method: "GET" as const, body: undefined },
+      { ...http, url: "https://api.example.test/v1/other" },
+      { ...http, body: '{"item":"second"}' },
+      { ...http, headers: { "x-operation": "write" } }
+    ];
+    for (const spec of changed) {
+      const request = await store.createRequest(secret.handle, buildHttpRequestAction(spec), "Codex changed HTTPS action", verifiedCodex);
+      expect(request.state).toBe("pending");
+    }
+  });
+
+  it("keeps non-HTTPS unattended allow rules without action keys", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "non-HTTPS policy token",
+      type: "api-token",
+      value: "non-https-policy-secret-value-123456789",
+      policy: { injectEnv: "SGW_POLICY_TOKEN", allowedCommands: [process.execPath] }
+    });
+    await store.addApprovalPolicyRule({
+      name: "Allow pinned environment command",
+      decision: "allow",
+      conditions: {
+        handles: [secret.handle], principalIds: ["test:codex"], actionKinds: ["env_command"],
+        commands: [process.execPath], resolvedCommands: [resolvedNodeExecutable]
+      }
+    });
+    const action = buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "SGW_POLICY_TOKEN" });
+    expect((await store.createRequest(secret.handle, action, "Codex non-HTTPS policy", verifiedCodex)).state).toBe("approved");
+  });
+
   it("lets a higher-priority ask policy override a broader allow policy", async () => {
     const store = new SecretStore();
     const record = await store.addSecret({
@@ -2998,6 +3058,58 @@ describe("SecretStore", () => {
     const denied = await store.createRequest(record.handle, action, "Codex after deny policy");
     expect(denied.state).toBe("denied");
     expect(denied.error).toContain("Denied by approval policy");
+  });
+
+  it("rejects a manually approved environment command after a deny policy is added", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "manual env deny token",
+      type: "api-token",
+      value: "manual-env-deny-secret-value-123456789",
+      policy: { injectEnv: "SGW_MANUAL_DENY", allowedCommands: [process.execPath] }
+    });
+    const action = buildEnvCommandAction({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('should-not-run')"],
+      injectEnv: "SGW_MANUAL_DENY"
+    });
+    const approved = await store.createRequest(secret.handle, action, "Codex manual env approval", verifiedCodex);
+    await store.approveRequest(approved.id, { mode: "per-transaction" });
+    await store.addApprovalPolicyRule({
+      name: "Deny manual env commands",
+      decision: "deny",
+      conditions: { handles: [secret.handle], actionKinds: ["env_command"] }
+    });
+
+    const fresh = await store.createRequest(secret.handle, action, "Codex env after deny", verifiedCodex);
+    expect(fresh.state).toBe("denied");
+    await expect(executeApprovedRequest(store, approved.id, {
+      engine: "typescript", caller: verifiedCodex
+    })).rejects.toThrow(/Denied by approval policy Deny manual env commands/);
+    expect((await store.getRequest(approved.id)).state).toBe("denied");
+  });
+
+  it("rejects a manually approved target SSH request after a deny policy is added", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "manual target SSH deny key",
+      type: "private-key",
+      value: "manual-target-ssh-deny-secret-value-123456789",
+      policy: { injectEnv: "SGW_SSH_PRIVATE_KEY", allowedCommands: [SGW_SSH_SESSION_COMMAND] }
+    });
+    const action = buildSshSessionAction({ target: "deployer@example.test", injectEnv: "SGW_SSH_PRIVATE_KEY" });
+    const approved = await store.createRequest(secret.handle, action, "Codex manual SSH approval", verifiedCodex);
+    await store.approveRequest(approved.id, { mode: "per-transaction" });
+    await store.addApprovalPolicyRule({
+      name: "Deny manual target SSH",
+      decision: "deny",
+      conditions: { handles: [secret.handle], actionKinds: ["ssh_session"], sshTargets: ["deployer@example.test"] }
+    });
+
+    const fresh = await store.createRequest(secret.handle, action, "Codex SSH after deny", verifiedCodex);
+    expect(fresh.state).toBe("denied");
+    await expect(store.claimApprovedRequest(approved.id, verifiedCodex)).rejects.toThrow(/Denied by approval policy Deny manual target SSH/);
+    expect((await store.getRequest(approved.id)).state).toBe("denied");
   });
 
   it("requires a new approval when the same agent changes command arguments", async () => {

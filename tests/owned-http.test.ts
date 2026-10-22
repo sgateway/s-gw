@@ -248,9 +248,13 @@ describe("owned HTTPS operations", () => {
     expect(pending.state).toBe("pending"); await f.store.approveRequest(pending.id);
     expect((await executeApprovedRequest(f.store, pending.id, { http: { ca: f.ca } })).exitCode).toBe(0);
     await f.store.setApprovalPolicyRuleEnabled(ask.id, false);
-    const allow = await f.store.addApprovalPolicyRule({ name: "HTTPS allow fixture", decision: "allow", conditions: { handles: [f.handle.handle], actionKinds: ["http_request"] } });
+    await f.store.addApprovalPolicyRule({ name: "Old broad HTTPS allow", decision: "allow", conditions: { handles: [f.handle.handle], actionKinds: ["http_request"] } });
     const verified = { managedPrincipal: principalForVerifiedPeer("test:owned-http", "Codex", "session-1") };
     expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "claimed allow", { mcpClientName: "Codex" })).state).toBe("pending");
+    const exactPending = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "exact HTTPS allow", verified);
+    expect(exactPending.state).toBe("pending");
+    const { rule: allow } = await f.store.approveRequestWithScopedPolicy(exactPending.id);
+    expect(allow.conditions.actionKeys).toHaveLength(1);
     const next = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(f.spec), "policy fixture", verified);
     expect(next.state).toBe("approved"); await f.store.setApprovalPolicyRuleEnabled(allow.id, false);
     await expect(executeApprovedRequest(f.store, next.id, { http: { ca: f.ca }, caller: verified })).rejects.toThrow(/no longer|revoked/);
