@@ -617,6 +617,8 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
           traceLinuxManagedStart(plan.uid,
             socket.isPaused() ? "control socket paused after attestation" : "control socket flowing after attestation");
           if (closing || socket.destroyed) throw new Error("Linux root control service is stopping.");
+          // Passing the socket to the peer helper pauses its parent stream in Node.
+          socket.resume();
           if (call.method === "start") {
             if (used) throw new Error("This Linux agent session was already launched.");
             used = true;
