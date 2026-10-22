@@ -8,8 +8,10 @@ import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSock
   withLinuxPreparationReservation,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
 import { assertLinuxPreparationSocketEnvironment } from "../src/linux-agent-control.js";
-import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
+import { linuxManagedMcpStartMode, prepareLinuxManagedRelayRequest,
+  validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
 import type { LinuxAgentUnitPlan } from "../src/linux-agent-unit.js";
+import type { SecretStore } from "../src/store.js";
 
 function plan(): LinuxAgentUnitPlan {
   const brokerUid = process.getuid?.() ?? 1000;
@@ -115,6 +117,28 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
       plan: { ...managed, identityGeneration: undefined } })).toThrow();
     expect(() => validateLinuxManagedMcpConfig({ ...config,
       plan: { ...managed, modelRelaySocket: "/run/s-gw/agents/other/model.sock" } })).toThrow();
+  });
+
+  it("rejects an unsealed relay on either activated socket before opening the store", async () => {
+    const managed = { ...plan(), logicalAgentId: "managed-session",
+      identityGeneration: "a".repeat(32),
+      modelRelaySocket: "/run/s-gw/agents/managed-session/model.sock" };
+    const grant = { handle: "s-gw:api-token:fixture", provider: "anthropic" as const,
+      ttlMs: 30_000, payloadProfile: "strict" as const };
+    const config = { name: "Managed agent", leaseDir: "/run/s-gw/managed-leases",
+      plan: managed, relay: { grant } };
+    expect(linuxManagedMcpStartMode(config, {})).toBe("prepare");
+    for (const fdName of [`s-gw-agent-${managed.sessionId}`, `s-gw-model-${managed.sessionId}`]) {
+      expect(() => linuxManagedMcpStartMode(config, {
+        LISTEN_PID: "1234", LISTEN_FDS: "2", LISTEN_FDNAMES: fdName
+      })).toThrow(/cannot inherit an activated agent socket/);
+    }
+    expect(linuxManagedMcpStartMode({ ...config, relay: { grant, requestId: "req_approved" } },
+      { LISTEN_PID: "1234", LISTEN_FDS: "2" })).toBe("runtime");
+    expect(linuxManagedMcpStartMode({ name: config.name, leaseDir: config.leaseDir,
+      plan: plan() }, { LISTEN_PID: "1234", LISTEN_FDS: "1" })).toBe("runtime");
+    await expect(prepareLinuxManagedRelayRequest(config, {} as SecretStore,
+      "")).rejects.toThrow(/exact root-provisioned config hash/);
   });
 
   it("pins each broker unit and exact launch plan to a root registration", () => {

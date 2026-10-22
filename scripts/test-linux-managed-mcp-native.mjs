@@ -1036,6 +1036,40 @@ try {
     }
   }
   if (testRelay) {
+    const unsealed = agents[0];
+    for (const [unit, socketPath] of [[unsealed.socketUnit, unsealed.socketPath],
+      [unsealed.modelSocketUnit, unsealed.modelSocketPath]]) {
+      const queued = [];
+      try {
+        for (let index = 0; index < 3; index++) {
+          const socket = createConnection(socketPath);
+          socket.on("error", () => {});
+          queued.push(socket);
+          await new Promise((resolve, reject) => {
+            socket.once("connect", resolve);
+            socket.once("error", reject);
+          });
+        }
+        await until(() => {
+          const broker = unitProperties(unsealed.brokerUnit,
+            ["ActiveState", "MainPID", "Result", "InvocationID"]);
+          return broker.get("ActiveState") === "failed" && broker.get("MainPID") === "0" &&
+            invocationId(broker) ? broker : false;
+        }, `${unit} unsealed activation refusal`, 15_000);
+        if (asBroker("relay-created", [unsealed.sessionId]) !== "0" ||
+            run("systemctl", ["--system", "is-active", unsealed.agentUnit], true).status === 0) {
+          throw new Error(`${unit} created an untrusted relay request or launched an agent.`);
+        }
+      } finally {
+        for (const socket of queued) socket.destroy();
+        run("systemctl", ["--system", "stop", unsealed.socketUnit]);
+        run("systemctl", ["--system", "stop", unsealed.modelSocketUnit]);
+        run("systemctl", ["--system", "stop", unsealed.brokerUnit]);
+        run("systemctl", ["--system", "reset-failed", unsealed.brokerUnit]);
+      }
+      run("systemctl", ["--system", "start", unsealed.socketUnit]);
+      run("systemctl", ["--system", "start", unsealed.modelSocketUnit]);
+    }
     for (const agent of agents) {
       const prepared = JSON.parse(run(rootNode, [controlEntry, "--prepare", agent.sessionId],
         false, { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" }).stdout);

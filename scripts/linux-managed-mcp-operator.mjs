@@ -49,6 +49,11 @@ if (mode === "seed" && args.length === 1) {
     }
     process.stdout.write(`${request.id}\n`);
   }
+} else if (mode === "relay-created" && args.length === 1) {
+  const [sessionId] = args;
+  const count = (await store.listRequests()).filter(item =>
+    item.agentSessionId === sessionId && item.action.kind === "model_relay").length;
+  process.stdout.write(`${count}\n`);
 } else if (mode === "approve-relay" && args.length === 1) {
   const [requestId] = args;
   const request = await store.getRequest(requestId);

@@ -55,6 +55,14 @@ export function validateLinuxManagedMcpConfig(value: LinuxManagedMcpConfig): voi
   }
 }
 
+export function linuxManagedMcpStartMode(config: LinuxManagedMcpConfig,
+  env: NodeJS.ProcessEnv = process.env): "prepare" | "runtime" {
+  validateLinuxManagedMcpConfig(config);
+  if (!config.relay || config.relay.requestId) return "runtime";
+  assertLinuxPreparationSocketEnvironment(env);
+  return "prepare";
+}
+
 async function createManagedRelayRequest(config: LinuxManagedMcpConfig,
   store: SecretStore): Promise<string> {
   const relay = config.relay!;
@@ -79,17 +87,20 @@ async function createManagedRelayRequest(config: LinuxManagedMcpConfig,
 }
 
 export async function prepareLinuxManagedRelayRequest(config: LinuxManagedMcpConfig,
-  store: SecretStore, configHash?: string): Promise<string> {
+  store: SecretStore, configHash: string): Promise<string> {
   validateLinuxManagedMcpConfig(config);
   if (!config.relay || config.relay.requestId || !config.plan.identityGeneration) {
     throw new Error("Only an unprepared root-managed relay can create its approval request.");
   }
-  if (configHash !== undefined) assertLinuxPreparationSocketEnvironment();
+  if (!/^[a-f0-9]{64}$/.test(configHash)) {
+    throw new Error("Linux relay preparation needs the exact root-provisioned config hash.");
+  }
+  assertLinuxPreparationSocketEnvironment();
   const control = await connectLinuxAgentControl(config.plan);
   try {
-    if (configHash !== undefined) await control.prepare(configHash);
+    await control.prepare(configHash);
     const requestId = await createManagedRelayRequest(config, store);
-    if (configHash !== undefined) await control.prepared(requestId);
+    await control.prepared(requestId);
     return requestId;
   } finally {
     await control.close();
@@ -229,25 +240,23 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     throw new Error("Usage: linux-managed-mcp <absolute root-provisioned config.json>");
   }
   const { config, hash } = await readLinuxManagedMcpConfigWithHash(process.argv[2]);
+  const startMode = linuxManagedMcpStartMode(config);
   const store = new SecretStore();
   await store.init();
-  if (config.relay && !config.relay.requestId) {
-    const trusted = ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"]
-      .every(name => process.env[name] === undefined);
-    const requestId = await prepareLinuxManagedRelayRequest(config, store,
-      trusted ? hash : undefined);
+  if (startMode === "prepare") {
+    const requestId = await prepareLinuxManagedRelayRequest(config, store, hash);
     process.stdout.write(`${JSON.stringify({ sessionId: config.plan.sessionId, requestId })}\n`);
   } else {
-  const session = await startLinuxManagedMcpSession(config, store);
-  session.controlLost.addEventListener("abort", () => { process.exitCode = 1; }, { once: true });
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.once(signal, () => {
-      traceLinuxManagedStop("process signal received");
-      void session.close().then(() => { process.exitCode = 0; }, error => {
-        process.stderr.write(`${String(error)}\n`);
-        process.exitCode = 1;
+    const session = await startLinuxManagedMcpSession(config, store);
+    session.controlLost.addEventListener("abort", () => { process.exitCode = 1; }, { once: true });
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      process.once(signal, () => {
+        traceLinuxManagedStop("process signal received");
+        void session.close().then(() => { process.exitCode = 0; }, error => {
+          process.stderr.write(`${String(error)}\n`);
+          process.exitCode = 1;
+        });
       });
-    });
-  }
+    }
   }
 }
