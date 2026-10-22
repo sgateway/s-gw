@@ -1042,13 +1042,20 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
     const value = new RegExp(`^${name}:\\s+([0-9a-fA-F]+)$`, "m").exec(status)?.[1];
     return Boolean(value && /^0+$/.test(value));
   });
-  if (!uid || !gid || uid.slice(1).some(value => Number(value) !== state.uid) ||
-      gid.slice(1).some(value => Number(value) !== state.gid) ||
-      !linuxProcessGroupsAreDedicated(status, state.gid) ||
-      (current !== state.cgroup && !current?.startsWith(`${state.cgroup}/`)) ||
-      procRoot !== plan.rootDirectory || net === hostNet || ipc === hostIpc || mounts === hostMounts ||
-      !noCapabilities || !/^NoNewPrivs:\s+1$/m.test(status) || !/^Seccomp:\s+2$/m.test(status)) {
-    throw new Error("Linux agent main process did not attest its OS identity and namespaces.");
+  const failed = [];
+  if (!uid || uid.slice(1).some(value => Number(value) !== state.uid)) failed.push("uid");
+  if (!gid || gid.slice(1).some(value => Number(value) !== state.gid)) failed.push("gid");
+  if (!linuxProcessGroupsAreDedicated(status, state.gid)) failed.push("groups");
+  if (current !== state.cgroup && !current?.startsWith(`${state.cgroup}/`)) failed.push("cgroup");
+  if (procRoot !== plan.rootDirectory) failed.push("root directory");
+  if (net === hostNet) failed.push("network namespace");
+  if (ipc === hostIpc) failed.push("IPC namespace");
+  if (mounts === hostMounts) failed.push("mount namespace");
+  if (!noCapabilities) failed.push("capabilities");
+  if (!/^NoNewPrivs:\s+1$/m.test(status)) failed.push("no new privileges");
+  if (!/^Seccomp:\s+2$/m.test(status)) failed.push("seccomp");
+  if (failed.length > 0) {
+    throw new Error(`Linux agent main process did not attest its OS identity and namespaces: ${failed.join(", ")}.`);
   }
   if (plan.launchGate) await assertHeldLaunchGate(plan, state);
   if (plan.isolatedSharedMemory) await assertPrivateSharedMemory(state);

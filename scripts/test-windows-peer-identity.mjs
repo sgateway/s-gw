@@ -410,6 +410,9 @@ try {
       profile.sharedPath = join(profile.fixtureDir, "agent-readable.txt");
       profile.canaryPath = join(tmp, `broker-only-canary-${name}.txt`);
       copyFileSync(appContainerFixture, profile.executable);
+      const executableAcl = spawnSync("icacls", [profile.executable, "/grant", `*${sid}:RX`],
+        { encoding: "utf8", windowsHide: true });
+      assert.equal(executableAcl.status, 0, executableAcl.stderr || executableAcl.stdout);
       writeFileSync(profile.sharedPath, "agent-readable fixture\n");
       writeFileSync(profile.canaryPath, "broker-only fixture data\n");
       const denied = spawnSync("icacls", [profile.canaryPath, "/deny", `*${sid}:(GR,GW,DE,WDAC,WO)`],
