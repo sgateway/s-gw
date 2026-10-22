@@ -18,6 +18,18 @@ function fakeOpenAiToken(suffix: string): string {
   return ["sk", "-proj-", "abcdefghijklmnopqrstuvwxyz1234567890", suffix].join("");
 }
 
+function cliEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH || "/usr/bin:/bin",
+    HOME: tmpHome,
+    SGW_HOME: tmpHome,
+    SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
+    SGW_MASTER_PASSPHRASE: "guard cli passphrase",
+    SGW_DISABLE_KEYCHAIN: "1",
+    ...extra
+  };
+}
+
 beforeEach(async () => {
   tmpHome = await mkdtemp(path.join(os.tmpdir(), "sgw-guard-test-"));
   process.env.SGW_HOME = tmpHome;
@@ -248,14 +260,7 @@ describe("guard mode", () => {
       ],
       {
         cwd: repoRoot,
-        env: {
-          ...process.env,
-          SGW_HOME: tmpHome,
-          SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
-          SGW_MASTER_PASSPHRASE: "guard cli passphrase",
-          SGW_DISABLE_KEYCHAIN: "1",
-          OPENAI_API_KEY: raw
-        },
+        env: cliEnv({ OPENAI_API_KEY: raw }),
         encoding: "utf8"
       }
     );
@@ -274,14 +279,7 @@ describe("guard mode", () => {
       [tsxCli, "src/cli.ts", "guard", "run", "codex", "--dry-run", "--command", process.execPath],
       {
         cwd: repoRoot,
-        env: {
-          ...process.env,
-          SGW_HOME: tmpHome,
-          SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
-          SGW_MASTER_PASSPHRASE: "guard cli passphrase",
-          SGW_DISABLE_KEYCHAIN: "1",
-          npm_config_password: "short-private-registry-password"
-        },
+        env: cliEnv({ npm_config_password: "short-private-registry-password" }),
         encoding: "utf8"
       }
     );
@@ -301,14 +299,7 @@ describe("guard mode", () => {
       ],
       {
         cwd: repoRoot,
-        env: {
-          ...process.env,
-          SGW_HOME: tmpHome,
-          SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
-          SGW_MASTER_PASSPHRASE: "guard cli passphrase",
-          SGW_DISABLE_KEYCHAIN: "1",
-          npm_config_password: raw
-        },
+        env: cliEnv({ npm_config_password: raw }),
         encoding: "utf8"
       }
     );
@@ -322,11 +313,7 @@ describe("guard mode", () => {
     const out = execFileSync(process.execPath, [
       tsxCli, "src/cli.ts", "guard", "run", "codex", "--allow-raw-npm-env",
       "--command", process.execPath, "--", "-e", "process.stdout.write(process.env.npm_config_password || '')"
-    ], { cwd: repoRoot, env: {
-      ...process.env, SGW_HOME: tmpHome, SGW_RECOVERY_HOME: `${tmpHome}-recovery`,
-      SGW_MASTER_PASSPHRASE: "guard cli passphrase", SGW_DISABLE_KEYCHAIN: "1",
-      npm_config_password: raw
-    }, encoding: "utf8" });
+    ], { cwd: repoRoot, env: cliEnv({ npm_config_password: raw }), encoding: "utf8" });
     expect(out).toBe(raw);
   });
 
