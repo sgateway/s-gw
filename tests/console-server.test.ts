@@ -1,5 +1,6 @@
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -583,6 +584,19 @@ describe("local console server", () => {
     await expect(startConsoleServer({ port: 0, uiDir,
       protectedUiManifest: { "index.html": createHash("sha256").update(html).digest("hex") },
       operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/asset base URL/u);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a pinned UI FIFO before it can block the broker", async () => {
+    const uiDir = path.join(tmpHome, "fifo-pinned-ui");
+    mkdirSync(uiDir);
+    writeFileSync(path.join(uiDir, "index.html"), "<html>safe</html>");
+    execFileSync("mkfifo", [path.join(uiDir, "blocked.js")]);
+    const protectedUiManifest = {
+      "index.html": createHash("sha256").update("<html>safe</html>").digest("hex"),
+      "blocked.js": createHash("sha256").update("").digest("hex")
+    };
+    await expect(startConsoleServer({ port: 0, uiDir, protectedUiManifest,
+      operatorAuth: { displayCode: () => {} } })).rejects.toThrow(/regular files/u);
   });
 
   it("shows why every listener for one store needs the protected mode", async () => {
