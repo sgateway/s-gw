@@ -18,6 +18,7 @@ import { SecretStore } from "../src/store.js";
 import { httpsFixture } from "./helpers/https-fixture.js";
 
 const codex = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+const sandboxProfile = '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote tcp "localhost:*"))';
 const hasCompiler = spawnSync("cc", ["--version"], { stdio: "ignore" }).status === 0;
 const peerScript = fileURLToPath(new URL("../scripts/build-peer-credentials.mjs", import.meta.url));
 const linuxCgroup = process.platform === "linux"
@@ -64,7 +65,8 @@ function runCodex(root: string, port: number): Promise<{ code: number | null; st
     "-c", 'web_search="disabled"',
     "-c", "features.multi_agent=false",
     "Reply exactly HELLO."];
-  const child = spawn(codex, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: {
+  const child = spawn("/usr/bin/sandbox-exec", ["-p", sandboxProfile, codex, ...args], {
+    cwd: root, stdio: ["ignore", "pipe", "pipe"], env: {
     PATH: process.env.PATH || "/usr/bin:/bin", HOME: root, CODEX_HOME: path.join(root, "codex"),
     TMPDIR: root, LANG: "en_US.UTF-8", OPENAI_API_KEY: "synthetic-client-placeholder"
   } });
@@ -80,6 +82,11 @@ function runCodex(root: string, port: number): Promise<{ code: number | null; st
 
 it.skipIf(!existsSync(codex) || !hasCompiler || !canRegister)(
   "streams the native Codex protocol through a durable relay grant", async () => {
+    const check = spawnSync("/usr/bin/sandbox-exec", ["-p", sandboxProfile, process.execPath, "-e",
+      'const s=require("node:net").connect(443,"203.0.113.1");s.on("error",e=>{console.log(e.code);process.exit()});s.setTimeout(1000,()=>process.exit(2))'],
+    { encoding: "utf8", timeout: 3000 });
+    expect(check.status).toBe(0);
+    expect(check.stdout.trim()).toBe("EPERM");
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "sgw-native-codex-")));
     const socketPath = path.join(root, "model.sock");
     let relay: Awaited<ReturnType<typeof startVerifiedModelRelayServer>> | undefined;
