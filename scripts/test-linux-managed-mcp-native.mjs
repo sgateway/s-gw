@@ -1042,9 +1042,16 @@ try {
       for (const [unit, file] of [[agent.socketUnit, agent.socketUnitFile],
         [agent.modelSocketUnit, agent.modelSocketUnitFile]]) {
         const socket = unitProperties(unit, ["ActiveState", "Triggers"]);
-        if (socket.get("ActiveState") !== "active" || socket.get("Triggers") !== agent.brokerUnit ||
-            !await fixtureUnitFile(unit, file)) {
-          throw new Error("The managed model relay socket changed before activation.");
+        const wrong = [];
+        if (socket.get("ActiveState") !== "active") wrong.push("ActiveState");
+        if (socket.get("Triggers") !== agent.brokerUnit) wrong.push("Triggers");
+        if (!await fixtureUnitFile(unit, file)) wrong.push("unit file");
+        if (wrong.length) {
+          const state = socket.get("ActiveState");
+          const safeState = ["active", "inactive", "failed", "activating", "deactivating"]
+            .includes(state) ? state : "unknown";
+          throw new Error(`The managed model relay socket changed before activation ` +
+            `(${unit === agent.socketUnit ? "MCP" : "model"}: ${wrong.join(", ")}; state=${safeState}).`);
         }
       }
       await new Promise((resolve, reject) => {
@@ -1056,6 +1063,40 @@ try {
         try { return asBroker("assert-relay-state", [agent.relay.requestId, "executing"]) === "executing"; }
         catch { return false; }
       }, `${agent.sessionId} model relay claim`);
+      const broker = await until(() => {
+        const current = unitProperties(agent.brokerUnit,
+          ["Id", "FragmentPath", "ActiveState", "InvocationID", "MainPID"]);
+        if (current.get("Id") !== agent.brokerUnit ||
+            current.get("FragmentPath") !== agent.brokerUnitFile ||
+            current.get("ActiveState") === "failed") {
+          throw new Error("The managed MCP broker changed after model relay claim.");
+        }
+        return current.get("ActiveState") === "active" && Number(current.get("MainPID")) > 0
+          ? current : false;
+      }, `${agent.sessionId} active model relay broker`);
+      const brokerInvocation = invocationId(broker);
+      if (!brokerInvocation) throw new Error("The model relay broker has no verified invocation.");
+      await assertSafeNodeEnv(broker, certFile);
+      brokerInvocations.set(agent.sessionId, brokerInvocation);
+      const live = await until(() => {
+        const current = unitProperties(agent.agentUnit, ["Id", "Description", "ActiveState",
+          "User", "RootDirectory", "ControlGroup", "InvocationID", "MainPID"]);
+        if (current.get("ActiveState") === "failed") {
+          throw new Error("The managed model agent failed after relay claim.");
+        }
+        if (current.get("ActiveState") !== "active") return false;
+        const pid = Number(current.get("MainPID"));
+        if (current.get("Id") !== agent.agentUnit ||
+            !/^s-gw-agent-start:[a-f0-9]{32}$/.test(current.get("Description") ?? "") ||
+            current.get("User") !== String(agent.uid) ||
+            current.get("RootDirectory") !== agent.root ||
+            current.get("ControlGroup") !== `/system.slice/${agent.agentUnit}` ||
+            !invocationId(current) || !Number.isSafeInteger(pid) || pid < 1) {
+          throw new Error("The managed model agent changed after relay claim.");
+        }
+        return current;
+      }, `${agent.sessionId} active model relay agent`);
+      agentInvocations.set(agent.sessionId, invocationId(live));
     }
   }
   for (const agent of agents) {
@@ -1079,6 +1120,10 @@ try {
     if (broker.get("Id") !== agent.brokerUnit || broker.get("FragmentPath") !== agent.brokerUnitFile ||
         !brokerInvocation || !Number.isSafeInteger(brokerPid) || brokerPid < 1) {
       throw new Error("The managed MCP broker has no verified fixture invocation.");
+    }
+    if (brokerInvocations.has(agent.sessionId) &&
+        brokerInvocations.get(agent.sessionId) !== brokerInvocation) {
+      throw new Error("The model relay broker invocation changed after activation.");
     }
     await assertSafeNodeEnv(broker, certFile);
     brokerInvocations.set(agent.sessionId, brokerInvocation);
@@ -1158,6 +1203,10 @@ try {
         live.get("ControlGroup") !== `/system.slice/${agent.agentUnit}` || !agentInvocation ||
         !Number.isSafeInteger(mainPid) || mainPid < 1) {
       throw new Error("The protected agent has no verified fixture invocation or cgroup.");
+    }
+    if (agentInvocations.has(agent.sessionId) &&
+        agentInvocations.get(agent.sessionId) !== agentInvocation) {
+      throw new Error("The protected agent invocation changed after activation.");
     }
     agentInvocations.set(agent.sessionId, agentInvocation);
     agentMainPids.set(agent.sessionId, mainPid);
