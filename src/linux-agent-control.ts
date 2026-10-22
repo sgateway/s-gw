@@ -314,7 +314,7 @@ async function systemctlProperties(unit: string, names = ["Id", "ActiveState", "
     "FragmentPath", "BindsTo", "After", "ExecStart", "ExecStartPre",
     "EnvironmentFiles", "UnsetEnvironment"]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/systemctl", ["--system", "--no-pager", "show", unit,
+    const child = spawn("/usr/bin/systemctl", ["--system", "--no-pager", "--all", "show", unit,
       ...names.flatMap(name => ["-p", name])], { stdio: ["ignore", "pipe", "pipe"], env: {}, timeout: 3000 });
     let output = "";
     let errorOutput = "";

@@ -209,6 +209,8 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
     expect(() => assertControlUnitPreflight(attested, rootRuntime)).not.toThrow();
     expect(() => assertControlUnitPreflight(attested.replace("ActiveState=active", "ActiveState=activating"),
       rootRuntime)).toThrow(/ActiveState/);
+    expect(() => assertControlUnitPreflight(attested.replace("EnvironmentFiles=\n", ""),
+      rootRuntime)).toThrow(/EnvironmentFiles/);
     for (const changed of [
       attested.replace("ExecStartPre={ path=", "ExecStartPre={ path=/tmp/"),
       attested.replace("ignore_errors=no ; status=0 }", "ignore_errors=yes ; status=0 }"),

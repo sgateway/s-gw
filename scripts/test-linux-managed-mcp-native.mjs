@@ -117,7 +117,7 @@ function safeUnitValue(value) {
 }
 
 function unitProperties(unit, names) {
-  const args = ["--system", "show", unit];
+  const args = ["--system", "--all", "show", unit];
   for (const name of names) args.push("-p", name);
   const result = run("systemctl", args, true);
   if (result.error || result.status !== 0) {
