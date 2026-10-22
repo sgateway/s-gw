@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import dgram from "node:dgram";
+import { lookup } from "node:dns/promises";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -16,10 +18,18 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = resolve(root, "dist/native", `win32-${process.arch}`, "s-gw-windows-peer-identity.exe");
 const tokenSource = resolve(root, "native/windows-peer-identity/test-token.c");
 const appContainerSource = resolve(root, "native/windows-peer-identity/test-appcontainer.c");
-const rootGuardSource = resolve(root, "native/windows-peer-identity/test-root-guard.c");
+const hostPreflightSource = resolve(root, "native/windows-peer-identity/test-host-preflight.c");
 const wfpSource = resolve(root, "native/windows-peer-identity/wfp-boundary.c");
 const parentEnvCanary = randomBytes(16).toString("hex");
-let rootGuardFixture;
+const sharedHost = process.argv.length === 3 && process.argv[2] === "--shared-host";
+if (process.argv.length > 2 && !sharedHost) {
+  throw new Error("Usage: node scripts/test-windows-peer-identity.mjs [--shared-host]");
+}
+const acceptanceRoot = process.env.SGW_WINDOWS_NATIVE_ACCEPTANCE_ROOT;
+if (!sharedHost && !acceptanceRoot) {
+  throw new Error("Native Windows acceptance requires SGW_WINDOWS_NATIVE_ACCEPTANCE_ROOT on a prepared isolated host.");
+}
+let rootInspectionFixture;
 assert.ok(existsSync(helper), "The native peer helper must be built before its acceptance test.");
 
 function deadline(promise, ms, label) {
@@ -43,8 +53,6 @@ function launch(args, executable = helper) {
   const jobReady = new Promise(resolve => { jobReadyDone = resolve; });
   let wfpReadyDone;
   const wfpReady = new Promise(resolve => { wfpReadyDone = resolve; });
-  let rootReadyDone;
-  const rootReady = new Promise(resolve => { rootReadyDone = resolve; });
   let finish;
   const done = new Promise(resolve => { finish = resolve; });
   let reportPid;
@@ -58,7 +66,6 @@ function launch(args, executable = helper) {
     if (match) reportPid(Number(match[1]));
     if (/JOB-READY\r?\n/.test(report)) jobReadyDone(true);
     if (/WFP-READY\r?\n/.test(report)) wfpReadyDone(true);
-    if (/ROOT-READY\r?\n/.test(report)) rootReadyDone(true);
     if (output.length) readyDone(output[0] === 0x52);
   });
   child.stderr.on("data", chunk => { stderr += chunk.toString(); });
@@ -67,11 +74,10 @@ function launch(args, executable = helper) {
     readyDone(false);
     jobReadyDone(false);
     wfpReadyDone(false);
-    rootReadyDone(false);
     reportPid(null);
     finish({ code, signal, output, stderr, spawnError });
   });
-  return { child, ready, jobReady, wfpReady, rootReady, done, processPid };
+  return { child, ready, jobReady, wfpReady, done, processPid };
 }
 
 function pipeName() {
@@ -80,6 +86,73 @@ function pipeName() {
 
 function jobName() {
   return String.raw`Local\s-gw-agent-` + randomBytes(16).toString("hex");
+}
+
+function dnsQuestion(packet) {
+  if (packet.length < 17 || packet.readUInt16BE(4) !== 1) return null;
+  const labels = [];
+  let at = 12;
+  while (at < packet.length) {
+    const length = packet[at++];
+    if (length === 0) break;
+    if (length > 63 || at + length > packet.length) return null;
+    labels.push(packet.subarray(at, at + length).toString("ascii").toLowerCase());
+    at += length;
+  }
+  if (!labels.length || at + 4 > packet.length) return null;
+  return { name: labels.join("."), end: at + 4 };
+}
+
+async function closeDnsSockets(sockets) {
+  await Promise.all(sockets.map(socket => new Promise(resolveClose => {
+    try {
+      socket.close(resolveClose);
+    } catch {
+      resolveClose();
+    }
+  })));
+}
+
+async function startDnsCapture() {
+  const names = new Set();
+  const sockets = [];
+  try {
+    for (const [type, host] of [["udp4", "127.0.0.1"], ["udp6", "::1"]]) {
+      const socket = dgram.createSocket({ type, ipv6Only: type === "udp6" });
+      sockets.push(socket);
+      socket.on("message", (packet, peer) => {
+        const question = dnsQuestion(packet);
+        if (!question) return;
+        names.add(question.name);
+        const answer = Buffer.alloc(question.end);
+        packet.copy(answer, 0, 0, question.end);
+        answer.writeUInt16BE(0x8183, 2); // NXDOMAIN keeps the host control uncached.
+        answer.writeUInt16BE(0, 6);
+        answer.writeUInt16BE(0, 8);
+        answer.writeUInt16BE(0, 10);
+        socket.send(answer, peer.port, peer.address);
+      });
+      await deadline(new Promise((resolveBind, rejectBind) => {
+        socket.once("error", rejectBind);
+        socket.bind(53, host, () => {
+          socket.off("error", rejectBind);
+          resolveBind();
+        });
+      }), 10_000, `${host} DNS capture`);
+    }
+    const control = `host-${randomBytes(16).toString("hex")}.sgw-ci.example.net`;
+    try {
+      await deadline(lookup(control), 15_000, "host DNS positive control");
+    } catch (error) {
+      if (/timed out/.test(error?.message || "")) throw error;
+    }
+    assert.ok(names.has(control),
+      "The host DNS lookup did not reach the prepared loopback resolver.");
+    return { names, close: () => closeDnsSockets(sockets) };
+  } catch (error) {
+    await closeDnsSockets(sockets);
+    throw error;
+  }
 }
 
 function aclTrail(path) {
@@ -91,8 +164,8 @@ function aclTrail(path) {
   for (const at of new Set(targets)) {
     const acl = spawnSync("icacls", [at], { encoding: "utf8", windowsHide: true });
     lines.push(`${at}: ${acl.stdout.trim() || acl.stderr.trim() || `icacls exit ${acl.status}`}`);
-    if (at === targets[0] && rootGuardFixture) {
-      const nul = spawnSync(rootGuardFixture, ["null-acl"], { encoding: "utf8", windowsHide: true });
+    if (at === targets[0] && rootInspectionFixture) {
+      const nul = spawnSync(rootInspectionFixture, ["null-acl"], { encoding: "utf8", windowsHide: true });
       lines.push(`\\Device\\Null: ${nul.stdout.trim() || nul.stderr.trim() || `probe exit ${nul.status}`}`);
     }
   }
@@ -359,11 +432,24 @@ function compileFixture(source, output, libraries, extraSources = []) {
 }
 
 const tmp = mkdtempSync(join(tmpdir(), "s-gw-windows-peer-test-"));
+let acceptanceTmp;
+let rootBaseline;
+let rootArgs;
 try {
   const tokenProbe = compileFixture(tokenSource, "test-token", ["advapi32.lib"]);
   const appContainerFixture = compileFixture(appContainerSource, "test-appcontainer",
-    ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib", "fwpuclnt.lib"], [wfpSource]);
-  rootGuardFixture = compileFixture(rootGuardSource, "test-root-guard", ["advapi32.lib"]);
+    ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib", "fwpuclnt.lib", "dnsapi.lib"], [wfpSource]);
+  rootInspectionFixture = compileFixture(hostPreflightSource, "test-host-preflight", ["advapi32.lib"]);
+  rootArgs = sharedHost ? ["root-snapshot"] : ["prepared-host", acceptanceRoot];
+  const inspected = spawnSync(rootInspectionFixture, rootArgs,
+    { encoding: "utf8", windowsHide: true });
+  assert.equal(inspected.status, 0, inspected.stderr || "Read-only Windows root inspection failed.");
+  if (!sharedHost) {
+    assert.match(inspected.stdout, /(?:^|\n)ROOT-READY\r?\n/,
+      "The isolated host and separate test volume are not prepared for native acceptance.");
+    acceptanceTmp = mkdtempSync(join(acceptanceRoot, "s-gw-windows-peer-test-"));
+  }
+  rootBaseline = inspected.stdout;
 
   const probed = spawnSync(tokenProbe, [], { encoding: "utf8", windowsHide: true });
   assert.equal(probed.status, 0, probed.stderr || "Could not inspect the CI process token.");
@@ -414,7 +500,7 @@ try {
   }
 
   const profiles = [];
-  let rootGuard;
+  let dnsCapture;
   try {
     for (let i = 0; i < 2; i++) {
       const name = `sgw-pipe-test-${randomBytes(8).toString("hex")}`;
@@ -434,7 +520,7 @@ try {
       assert.equal(acl.status, 0, acl.stderr || acl.stdout);
       profile.executable = join(profile.fixtureDir, "test-appcontainer.exe");
       profile.sharedPath = join(profile.fixtureDir, "agent-readable.txt");
-      profile.canaryPath = join(tmp, `broker-only-canary-${name}.txt`);
+      profile.canaryPath = join(acceptanceTmp || tmp, `broker-only-canary-${name}.txt`);
       writeFileSync(profile.executable, readFileSync(appContainerFixture));
       const executableAcl = spawnSync("icacls", [profile.executable, "/grant", `*${sid}:RX`],
         { encoding: "utf8", windowsHide: true });
@@ -452,43 +538,33 @@ try {
       { encoding: "utf8", windowsHide: true, timeout: 30_000 });
     assert.equal(wfpCheck.status, 0, wfpCheck.stderr || "The WFP policy self-test failed.");
     assert.match(wfpCheck.stdout, /WFP-REVOCATION-DETECTED/);
-    if (process.env.GITHUB_ACTIONS === "true" && process.env.SGW_TEST_PREP_WINDOWS_ROOT === "1") {
-      rootGuard = launch(["root-guard"], rootGuardFixture);
-      const ready = await deadline(rootGuard.rootReady, 15_000, "CI system-drive ACL guard");
-      if (!ready) {
-        const failed = await rootGuard.done;
-        assert.fail("The CI system-drive ACL guard did not apply its metadata-only grant: " +
-          (failed.spawnError?.message || failed.stderr.trim() || `exit ${failed.code}`));
+    if (!sharedHost) {
+      dnsCapture = await startDnsCapture();
+      await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
+        { intruderProfile: profiles[1], sameProfileOutOfJob: true });
+      await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
+        { intruderProfile: profiles[0] });
+      await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
+        { transferTo: "same-profile" });
+      await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
+        { transferTo: "host" });
+      await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { stopJob: true });
+      await deadline(new Promise(resolveWait => setTimeout(resolveWait, 1000)), 2_000,
+        "late DNS query capture");
+      for (const profile of profiles) {
+        for (const api of ["addr", "query"]) {
+          const name = `${api}-${profile.name}.sgw-ci.example.net`;
+          assert.equal(dnsCapture.names.has(name), false,
+            `The ${profile.name} AppContainer leaked ${api} DNS through the host resolver.`);
+        }
       }
     }
-    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
-      { intruderProfile: profiles[1], sameProfileOutOfJob: true });
-    await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
-      { intruderProfile: profiles[0] });
-    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
-      { transferTo: "same-profile" });
-    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
-      { transferTo: "host" });
-    await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { stopJob: true });
     for (const profile of profiles) {
       assert.equal(readFileSync(profile.canaryPath, "utf8"), "broker-only fixture data\n",
         "The broker canary changed during AppContainer execution.");
     }
   } finally {
-    let guardError;
-    if (rootGuard) {
-      try {
-        if (rootGuard.child.exitCode === null && rootGuard.child.signalCode === null) {
-          rootGuard.child.stdin.end("R");
-        }
-        const restored = await deadline(rootGuard.done, 15_000, "CI system-drive ACL restoration");
-        assert.equal(restored.code, 0, restored.stderr || "The CI system-drive DACL was not restored.");
-        assert.match(restored.output.toString(), /(?:^|\n)ROOT-RESTORED\r?\n/,
-          "The CI system-drive original DACL was not verified after restoration.");
-      } catch (error) {
-        guardError = error;
-      }
-    }
+    if (dnsCapture) await dnsCapture.close();
     let profileError;
     for (const { name, fixtureDir } of profiles.reverse()) {
       try {
@@ -500,10 +576,20 @@ try {
         profileError ??= error;
       }
     }
-    if (guardError) throw guardError;
     if (profileError) throw profileError;
   }
-  console.log("Native Windows two-agent pipe, same-profile out-of-Job and connected-handle transfer denials to same-profile and host targets, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
+  if (sharedHost) {
+    console.log("Shared-host Windows checks passed: helper rejection, distinct AppContainer profiles, WFP revocation, and unchanged root DACL. Native agent launch and exchange were not run.");
+  } else {
+    console.log("Native Windows two-agent pipe, same-profile out-of-Job and connected-handle transfer denials to same-profile and host targets, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
+  }
 } finally {
+  const readback = rootBaseline && spawnSync(rootInspectionFixture, rootArgs,
+    { encoding: "utf8", windowsHide: true });
+  if (acceptanceTmp) rmSync(acceptanceTmp, { recursive: true, force: true });
   rmSync(tmp, { recursive: true, force: true });
+  if (readback) {
+    assert.equal(readback.status, 0, readback.stderr || "Could not recheck Windows root DACLs.");
+    assert.equal(readback.stdout, rootBaseline, "A Windows root DACL changed during native testing.");
+  }
 }

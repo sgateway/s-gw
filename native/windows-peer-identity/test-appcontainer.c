@@ -5,6 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <windns.h>
 #include <objbase.h>
 #include <sddl.h>
 #include <userenv.h>
@@ -15,6 +16,22 @@
 #include <errno.h>
 #include <fwpmu.h>
 #include "wfp-boundary.h"
+
+#ifdef __MINGW32__
+// Zig's bundled MinGW header omits DnsQueryEx; native acceptance uses the Windows SDK.
+typedef struct _DNS_QUERY_REQUEST {
+    ULONG Version;
+    PCWSTR QueryName;
+    WORD QueryType;
+    ULONG64 QueryOptions;
+    void *pDnsServerList;
+    ULONG InterfaceIndex;
+    PDNS_QUERY_COMPLETION_ROUTINE pQueryCompletionCallback;
+    PVOID pQueryContext;
+} DNS_QUERY_REQUEST, *PDNS_QUERY_REQUEST;
+DNS_STATUS WINAPI DnsQueryEx(PDNS_QUERY_REQUEST pQueryRequest,
+    PDNS_QUERY_RESULT pQueryResults, void *pCancelHandle);
+#endif
 
 #define PIPE_CLIENT_RIGHTS (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE)
 
@@ -88,6 +105,42 @@ static int loopback_blocked(const wchar_t *port_text, int family) {
     return 0;
 }
 
+static int dns_probes(const wchar_t *profile) {
+    wchar_t address_name[160], query_name[160];
+    int address_size = swprintf(address_name, sizeof(address_name) / sizeof(address_name[0]),
+        L"addr-%ls.sgw-ci.example.net", profile);
+    int query_size = swprintf(query_name, sizeof(query_name) / sizeof(query_name[0]),
+        L"query-%ls.sgw-ci.example.net", profile);
+    if (address_size < 1 || address_size >= (int)(sizeof(address_name) / sizeof(address_name[0])) ||
+        query_size < 1 || query_size >= (int)(sizeof(query_name) / sizeof(query_name[0]))) return 0;
+
+    WSADATA winsock;
+    if (WSAStartup(MAKEWORD(2, 2), &winsock)) return 0;
+    ADDRINFOW hints = { 0 };
+    hints.ai_family = AF_INET;
+    PADDRINFOW addresses = NULL;
+    int address_status = GetAddrInfoW(address_name, NULL, &hints, &addresses);
+    if (addresses) FreeAddrInfoW(addresses);
+    WSACleanup();
+
+    DNS_QUERY_REQUEST request = { 0 };
+    DNS_QUERY_RESULT response = { 0 };
+    request.Version = DNS_QUERY_REQUEST_VERSION1;
+    request.QueryName = query_name;
+    request.QueryType = DNS_TYPE_A;
+    request.QueryOptions = DNS_QUERY_BYPASS_CACHE;
+    response.Version = DNS_QUERY_RESULTS_VERSION1;
+    DNS_STATUS query_status = DnsQueryEx(&request, &response, NULL);
+    if (response.pQueryRecords) DnsRecordListFree(response.pQueryRecords, DnsFreeRecordList);
+    if (address_status == WSAEINVAL || query_status == ERROR_INVALID_PARAMETER ||
+        query_status == DNS_REQUEST_PENDING) {
+        fprintf(stderr, "AppContainer DNS probe failed before a normal lookup: %d, %lu\n",
+            address_status, (unsigned long)query_status);
+        return 0;
+    }
+    return 1;
+}
+
 static int can_read_fixture(const wchar_t *path) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -123,6 +176,29 @@ static int canary_delete_denied(const wchar_t *path) {
     DWORD error = GetLastError();
     if (error == ERROR_ACCESS_DENIED) return 1;
     fprintf(stderr, "AppContainer broker canary delete failed unexpectedly: %lu\n", error);
+    return 0;
+}
+
+static int canary_parent_write_denied(const wchar_t *path) {
+    wchar_t sibling[MAX_PATH];
+    size_t length = wcslen(path);
+    if (length + 24 >= MAX_PATH) return 0;
+    wmemcpy(sibling, path, length + 1);
+    wchar_t *slash = wcsrchr(sibling, L'\\');
+    if (!slash) return 0;
+    if (swprintf(slash + 1, MAX_PATH - (size_t)(slash + 1 - sibling),
+        L"agent-write-probe.tmp") < 1) return 0;
+    HANDLE file = CreateFileW(sibling, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+        DeleteFileW(sibling);
+        fputs("AppContainer created a file in the broker canary directory.\n", stderr);
+        return 0;
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED) return 1;
+    fprintf(stderr, "AppContainer canary parent probe failed unexpectedly: %lu\n", error);
     return 0;
 }
 
@@ -266,6 +342,7 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
         fputs("AppContainer reached forbidden IPv4 or IPv6 host loopback.\n", stderr);
         return 1;
     }
+    if (!dns_probes(profile)) return 1;
     if (!can_read_fixture(shared_path)) {
         fputs("AppContainer could not read its shared-file control.\n", stderr);
         return 1;
@@ -274,7 +351,8 @@ static int run_client(const wchar_t *pipe_name, const wchar_t *ipv4_port,
         !canary_access_denied(canary_path, GENERIC_WRITE, "write") ||
         !canary_access_denied(canary_path, DELETE, "delete") ||
         !canary_access_denied(canary_path, WRITE_DAC, "ACL change") ||
-        !canary_delete_denied(canary_path)) {
+        !canary_delete_denied(canary_path) ||
+        !canary_parent_write_denied(canary_path)) {
         return 1;
     }
 

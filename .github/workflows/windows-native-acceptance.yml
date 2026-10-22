@@ -1,0 +1,24 @@
+name: Windows native boundary acceptance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  native_boundary:
+    name: Two-agent AppContainer, WFP, and pipe acceptance
+    runs-on: [self-hosted, Windows, X64, sgw-isolated]
+    timeout-minutes: 45
+    env:
+      SGW_WINDOWS_NATIVE_ACCEPTANCE_ROOT: ${{ vars.SGW_WINDOWS_NATIVE_ACCEPTANCE_ROOT }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run build
+      - name: Run native boundary acceptance on the prepared host
+        shell: pwsh
+        run: ./scripts/run-windows-peer-native.ps1

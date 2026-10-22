@@ -453,39 +453,10 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run build
-      - name: Compile and test one-shot Windows peer helper
+      - name: Compile and test Windows peer helper on shared host
         if: matrix.group == 'acl'
         shell: pwsh
-        env:
-          SGW_TEST_PREP_WINDOWS_ROOT: '1'
-        run: |
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (-not (Test-Path $vswhere)) { throw 'Visual Studio installation discovery is unavailable.' }
-          $vsRoot = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
-          if (-not $vsRoot) { throw 'MSVC C tools are unavailable.' }
-          $devCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
-          if (-not (Test-Path $devCmd)) { throw 'MSVC environment setup is unavailable.' }
-          $consoleKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Console')
-          if (-not $consoleKey) { throw 'Could not open the Windows console settings.' }
-          $hadLowBoxValue = $consoleKey.GetValueNames() -contains 'LowBoxConsoleEnabled'
-          if ($hadLowBoxValue) {
-            $oldLowBoxValue = $consoleKey.GetValue('LowBoxConsoleEnabled', $null,
-              [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-            $oldLowBoxKind = $consoleKey.GetValueKind('LowBoxConsoleEnabled')
-          }
-          try {
-            $consoleKey.SetValue('LowBoxConsoleEnabled', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-            $compile = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && npm run build:windows-peer-identity && node scripts/test-windows-peer-identity.mjs'
-            & cmd.exe /d /s /c $compile
-            if ($LASTEXITCODE -ne 0) { throw 'The one-shot Windows peer helper failed native acceptance tests.' }
-          } finally {
-            if ($hadLowBoxValue) {
-              $consoleKey.SetValue('LowBoxConsoleEnabled', $oldLowBoxValue, $oldLowBoxKind)
-            } else {
-              $consoleKey.DeleteValue('LowBoxConsoleEnabled', $false)
-            }
-            $consoleKey.Dispose()
-          }
+        run: ./scripts/run-windows-peer-native.ps1 -SharedHost
       - run: npm run test:windows -- --group ${{ matrix.group }}
 
   windows-preview:
