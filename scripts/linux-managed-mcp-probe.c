@@ -157,8 +157,7 @@ static int enter_agent_netns_and_drop(const char *pid_text, const char *uid_text
     return 0;
 }
 
-static int handoff_socket(int broker_fd) {
-    const char *name = "/workspace/handoff.sock";
+static int handoff_socket(int broker_fd, const char *name) {
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, name);
     int channel = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -194,14 +193,15 @@ static int write_handoff_result(const char *filename, const char *result) {
 }
 
 static int receive_handoff(const char *socket_name, const char *result_name,
-                           const char *pid_name, const char *expected_handle, int agent_pid) {
+                           const char *pid_name, const char *expected_handle, int agent_pid,
+                           int model, int cross_session) {
     if (agent_pid < 1 || agent_pid == getpid() ||
         strlen(socket_name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 30;
     struct sockaddr_un address = { .sun_family = AF_UNIX };
     strcpy(address.sun_path, socket_name);
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        listen(listener, 1) != 0) return 31;
+        listen(listener, 1) != 0 || (cross_session && chmod(socket_name, 0666) != 0)) return 31;
     char pid_text[32];
     int pid_size = snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)getpid());
     if (pid_size < 0 || (size_t)pid_size >= sizeof(pid_text) ||
@@ -244,7 +244,26 @@ static int receive_handoff(const char *socket_name, const char *result_name,
     memcpy(CMSG_DATA(claimed), &identity, sizeof(identity));
     if (sendmsg(broker_fd, &forged, MSG_NOSIGNAL) != -1 || errno != EPERM) return 40;
     const char *result = "inconclusive\n";
-    if (send_line(broker_fd, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0) {
+    if (model) {
+        const char *remaining = "\"max_tokens\":16,\"mcp_servers\":[]}";
+        if (send_line(broker_fd, remaining) != 0) result = "denied\n";
+        else {
+            char reply[4096] = { 0 };
+            size_t used = 0;
+            while (used + 1 < sizeof(reply)) {
+                ssize_t received = read(broker_fd, reply + used, sizeof(reply) - used - 1);
+                if (received == 0 || (received < 0 && errno == ECONNRESET)) {
+                    if (used == 0) result = "denied\n";
+                    break;
+                }
+                if (received < 0) break;
+                used += (size_t)received;
+                reply[used] = 0;
+            }
+            if (strstr(reply, "HTTP/1.1 403") &&
+                strstr(reply, "Remote model MCP servers are outside this grant.")) result = "accepted\n";
+        }
+    } else if (send_line(broker_fd, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0) {
         result = "denied\n";
     } else {
         char reply[16384];
@@ -258,12 +277,102 @@ static int receive_handoff(const char *socket_name, const char *result_name,
     return write_handoff_result(result_name, result) == 0 ? 0 : 37;
 }
 
+static int connect_model(const char *name) {
+    if (!name || strlen(name) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    strcpy(address.sun_path, name);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct timeval deadline = { .tv_sec = 12, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0 ||
+        connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        int error = errno;
+        close(fd);
+        errno = error;
+        return -1;
+    }
+    return fd;
+}
+
+static int model_headers(int fd, size_t length) {
+    char headers[300];
+    int size = snprintf(headers, sizeof(headers),
+        "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+        "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", length);
+    return size > 0 && (size_t)size < sizeof(headers) && send_line(fd, headers) == 0 ? 0 : -1;
+}
+
+static int strict_model_denied(const char *socket_path) {
+    const char *body = "{\"model\":\"fixture-model\",\"max_tokens\":16,\"mcp_servers\":[]}";
+    int fd = connect_model(socket_path);
+    if (fd < 0) return -1;
+    if (model_headers(fd, strlen(body)) != 0 || send_line(fd, body) != 0) {
+        close(fd);
+        return -1;
+    }
+    char reply[8192] = { 0 };
+    size_t used = 0;
+    while (used + 1 < sizeof(reply)) {
+        ssize_t count = read(fd, reply + used, sizeof(reply) - used - 1);
+        if (count == 0) break;
+        if (count < 0) { close(fd); return -1; }
+        used += (size_t)count;
+        reply[used] = 0;
+    }
+    close(fd);
+    return strstr(reply, "HTTP/1.1 403") &&
+           strstr(reply, "Remote model MCP servers are outside this grant.") ? 0 : -1;
+}
+
+static int model_handoff_probe(const char *socket_path, const char *handoff_path,
+                               const char *ready_path, const char *result_path) {
+    const char *prefix = "{\"model\":\"fixture-model\",";
+    const char *remaining = "\"max_tokens\":16,\"mcp_servers\":[]}";
+    int fd = connect_model(socket_path);
+    if (fd < 0) return -1;
+    if (model_headers(fd, strlen(prefix) + strlen(remaining)) != 0 ||
+        send_line(fd, prefix) != 0 ||
+        write_handoff_result(ready_path, "ready\n") != 0) {
+        close(fd);
+        return -1;
+    }
+    int handoff = handoff_socket(fd, handoff_path);
+    close(fd);
+    if (handoff != 1) return -1;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        if (access(result_path, F_OK) == 0) return 0;
+        usleep(100000);
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
     int claimant = argc == 2 && strcmp(argv[1], "--out-of-cgroup") == 0;
-    if (argc == 9 && strcmp(argv[1], "--receive-handoff") == 0) {
+    int model_claimant = argc == 2 && strcmp(argv[1], "--model-out-of-cgroup") == 0;
+    int model_cross_uid = argc == 2 && strcmp(argv[1], "--model-cross-uid") == 0;
+    int cross_handoff = argc == 10 && strcmp(argv[1], "--receive-cross-model-handoff") == 0;
+    if ((argc == 9 && (strcmp(argv[1], "--receive-handoff") == 0 ||
+                       strcmp(argv[1], "--receive-model-handoff") == 0)) || cross_handoff) {
         signal(SIGPIPE, SIG_IGN);
-        if (enter_agent_netns_and_drop(argv[6], argv[7], argv[8]) != 0) return 39;
-        return receive_handoff(argv[2], argv[3], argv[4], argv[5], positive_number(argv[6]));
+        if (enter_agent_netns_and_drop(cross_handoff ? argv[9] : argv[6], argv[7], argv[8]) != 0) return 39;
+        return receive_handoff(argv[2], argv[3], argv[4], argv[5], positive_number(argv[6]),
+                               strcmp(argv[1], "--receive-handoff") != 0, cross_handoff);
+    }
+    if (model_claimant || model_cross_uid) {
+        signal(SIGPIPE, SIG_IGN);
+        const char *model_socket = getenv("SGW_MODEL_RELAY_SOCKET");
+        int model_fd = connect_model(model_socket);
+        if (model_cross_uid) return model_fd < 0 && (errno == EACCES || errno == EPERM) ? 0 : 44;
+        if (model_fd < 0) return 45;
+        const char *body = "{\"model\":\"fixture-model\",\"max_tokens\":16,\"mcp_servers\":[]}";
+        int sent = model_headers(model_fd, strlen(body)) == 0 && send_line(model_fd, body) == 0;
+        if (!sent) { close(model_fd); return 0; }
+        char byte;
+        ssize_t received = read(model_fd, &byte, 1);
+        int error = errno;
+        close(model_fd);
+        return received == 0 || (received < 0 && error == ECONNRESET) ? 0 : 46;
     }
     if (argc != 11 && !claimant) return 1;
     signal(SIGPIPE, SIG_IGN);
@@ -328,7 +437,7 @@ int main(int argc, char **argv) {
         usleep(100000);
     }
     if (!release) return 27;
-    int handoff = handoff_socket(handoff_fd);
+    int handoff = handoff_socket(handoff_fd, "/workspace/handoff.sock");
     close(handoff_fd);
     if (handoff != 1) return 23;
     int finished = 0;
@@ -338,6 +447,15 @@ int main(int argc, char **argv) {
         usleep(100000);
     }
     if (!finished) return 25;
+    const char *model_socket = getenv("SGW_MODEL_RELAY_SOCKET");
+    if (model_socket) {
+        if (strict_model_denied(model_socket) != 0) return 41;
+        if (model_handoff_probe(model_socket, "/workspace/model-handoff.sock",
+            "/workspace/model-handoff-ready", "/workspace/model-handoff-result") != 0) return 42;
+        if (model_handoff_probe(model_socket, "/run/s-gw/handoff-cross/model.sock",
+            "/workspace/cross-model-handoff-ready", "/run/s-gw/handoff-cross/result") != 0) return 47;
+        if (write_handoff_result("/workspace/model-result", "strict-rejected\n") != 0) return 43;
+    }
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sgw_list_handles\",\"arguments\":{}}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":3") ||
         !strstr(reply, "\"result\"") || !strstr(reply, handle)) return 8;

@@ -19,6 +19,10 @@ const brokerGid = Number(process.argv[4]);
 if (!Number.isSafeInteger(brokerUid) || brokerUid < 1 || !Number.isSafeInteger(brokerGid) || brokerGid < 1) {
   throw new Error("Invalid native fixture broker identity.");
 }
+if (process.env.SGW_TEST_MANAGED_RELAY && process.env.SGW_TEST_MANAGED_RELAY !== "1") {
+  throw new Error("Invalid native fixture model-relay option.");
+}
+const testRelay = process.env.SGW_TEST_MANAGED_RELAY === "1";
 
 function run(command, args, allowFailure = false, env = process.env) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000, env });
@@ -185,10 +189,13 @@ const agents = [0, 1].map(index => {
   const root = `/var/lib/s-gw/agent-roots/${sessionId}`;
   const privateCanary = `${root}/workspace/private-canary`;
   const socketPath = `/run/s-gw/agents/${sessionId}/broker.sock`;
+  const modelSocketPath = `/run/s-gw/agents/${sessionId}/model.sock`;
   const agentUnit = `s-gw-agent-${sessionId}.service`;
   const socketUnit = `s-gw-managed-mcp-${sessionId}.socket`;
+  const modelSocketUnit = `s-gw-managed-model-${sessionId}.socket`;
   const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
   const socketUnitFile = `/run/systemd/system/${socketUnit}`;
+  const modelSocketUnitFile = `/run/systemd/system/${modelSocketUnit}`;
   const brokerUnitFile = `/run/systemd/system/${brokerUnit}`;
   const configPath = `/run/s-gw/ci-config-${runId}-${letter}.json`;
   const planPath = `${planDir}/${sessionId}.json`;
@@ -199,6 +206,7 @@ const agents = [0, 1].map(index => {
   const logicalAgentId = sessionId;
   const plan = { sessionId, uid: agentUid, gid: agentUid, brokerUid,
     rootDirectory: root, brokerSocket: socketPath,
+    ...(testRelay ? { modelRelaySocket: modelSocketPath } : {}),
     executable: "/usr/bin/managed-mcp-probe", args: [],
     launchGate: true, activatedSocket: true, isolatedSharedMemory: true,
     serializedLifecycle: true, sealedStdio: true, supervisedControlUnit: true,
@@ -206,8 +214,9 @@ const agents = [0, 1].map(index => {
   const identityRecord = { logicalAgentId, identityGeneration, uid: agentUid, gid: agentUid };
   const identityPaths = [`${identityDir}/uid-${agentUid}.json`,
     `${identityDir}/generation-${identityGeneration}.json`];
-  return { sessionId, uid: agentUid, userName, root, privateCanary, socketPath, agentUnit, socketUnit,
-    brokerUnit, socketUnitFile, brokerUnitFile, configPath, planPath, claimPaths,
+  return { sessionId, uid: agentUid, userName, root, privateCanary, socketPath, modelSocketPath,
+    agentUnit, socketUnit, modelSocketUnit, brokerUnit, socketUnitFile, modelSocketUnitFile,
+    brokerUnitFile, configPath, planPath, claimPaths,
     identityRecord, identityPaths, name, plan };
 });
 const owned = new Map();
@@ -340,6 +349,8 @@ let controlStarted = false;
 let controlStartAttempted = false;
 const socketStartAttempted = new Set();
 const socketStarted = new Set();
+const modelSocketStartAttempted = new Set();
+const modelSocketStarted = new Set();
 let fixtureOwned = false;
 let planDirCreated = false;
 let identityDirCreated = false;
@@ -351,15 +362,22 @@ let upstream;
 const networkCanaries = [];
 const handoffHelpers = new Map();
 const handoffOutcomes = [];
-async function startHandoffHelper(agent) {
-  const socketPath = `${agent.root}/workspace/handoff.sock`;
-  const resultPath = `${agent.root}/workspace/handoff-result`;
-  const pidPath = `${agent.root}/workspace/handoff-pid`;
+async function startHandoffHelper(agent, model = false, receiver = agent) {
+  const crossSession = receiver !== agent;
+  const channel = crossSession ? "cross-model-handoff" : model ? "model-handoff" : "handoff";
+  const shared = `${agent.root}/run/s-gw/handoff-cross`;
+  const socketPath = crossSession ? `${shared}/model.sock` : `${agent.root}/workspace/${channel}.sock`;
+  const resultPath = crossSession ? `${shared}/result` : `${agent.root}/workspace/${channel}-result`;
+  const pidPath = crossSession ? `${shared}/pid` : `${agent.root}/workspace/${channel}-pid`;
   const agentPid = agentMainPids.get(agent.sessionId);
-  if (!agentPid) throw new Error(`No live agent PID for ${agent.sessionId} descriptor handoff.`);
+  const receiverPid = agentMainPids.get(receiver.sessionId);
+  if (!agentPid || !receiverPid) throw new Error(`No live agent PID for ${agent.sessionId} descriptor handoff.`);
   const child = spawn(`${agent.root}/usr/bin/managed-mcp-probe`,
-    ["--receive-handoff", socketPath, resultPath, pidPath, agent.seeded.handle,
-      String(agentPid), String(agent.uid), String(agent.uid)],
+    [crossSession ? "--receive-cross-model-handoff" : model ? "--receive-model-handoff" : "--receive-handoff",
+      socketPath, resultPath, pidPath,
+      model ? agent.model.handle : agent.seeded.handle,
+      String(agentPid), String(receiver.uid), String(receiver.uid),
+      ...(crossSession ? [String(receiverPid)] : [])],
   { detached: true, stdio: ["ignore", "ignore", "pipe"],
     env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } });
   let errors = "";
@@ -368,7 +386,7 @@ async function startHandoffHelper(agent) {
     child.once("error", error => resolve({ error: error.message }));
     child.once("close", (code, signal) => resolve({ code, signal, errors }));
   });
-  handoffHelpers.set(agent.sessionId, { child, finished, socketPath });
+  handoffHelpers.set(`${agent.sessionId}:${channel}`, { child, finished, socketPath });
   const pid = await until(async () => {
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(`The ${agent.sessionId} descriptor receiver exited: ${JSON.stringify(await finished)}`);
@@ -377,19 +395,20 @@ async function startHandoffHelper(agent) {
     if (!contents) return false;
     if (!/^[1-9][0-9]*\n$/.test(contents)) throw new Error("Invalid descriptor receiver PID.");
     const item = await lstat(socketPath);
-    if (!item.isSocket() || item.uid !== agent.uid) {
+    if (!item.isSocket() || item.uid !== receiver.uid ||
+        (crossSession && (item.mode & 0o777) !== 0o666)) {
       throw new Error("The descriptor receiver did not bind an agent-owned Unix socket.");
     }
     return Number(contents.trim());
-  }, `${agent.sessionId} same-UID out-of-cgroup descriptor receiver`);
+  }, `${agent.sessionId} ${channel} out-of-cgroup descriptor receiver`);
   const status = await readFile(`/proc/${pid}/status`, "utf8");
   const cgroup = await readFile(`/proc/${pid}/cgroup`, "utf8");
   const hostCgroup = await readFile("/proc/self/cgroup", "utf8");
-  const agentCgroup = await readFile(`/proc/${agentPid}/cgroup`, "utf8");
+  const receiverCgroup = await readFile(`/proc/${receiverPid}/cgroup`, "utf8");
   const hostNet = await readlink("/proc/self/ns/net");
-  const agentNet = await readlink(`/proc/${agentPid}/ns/net`);
+  const receiverNet = await readlink(`/proc/${receiverPid}/ns/net`);
   const hostPidNs = await readlink("/proc/self/ns/pid");
-  const agentPidNs = await readlink(`/proc/${agentPid}/ns/pid`);
+  const receiverPidNs = await readlink(`/proc/${receiverPid}/ns/pid`);
   const uidValues = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
   const gidValues = /^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
   const extraGroups = status.split("\n").find(line => line.startsWith("Groups:"));
@@ -397,13 +416,13 @@ async function startHandoffHelper(agent) {
     const value = new RegExp(`^${name}:\\s+([0-9a-fA-F]+)$`, "m").exec(status)?.[1];
     return Boolean(value && /^0+$/.test(value));
   });
-  if (!uidValues || uidValues.slice(1).some(value => Number(value) !== agent.uid) ||
-      !gidValues || gidValues.slice(1).some(value => Number(value) !== agent.uid) ||
-      extraGroups?.trim() !== "Groups:" || cgroup !== hostCgroup || cgroup === agentCgroup ||
-      !unprivileged || agentPidNs !== hostPidNs ||
+  if (!uidValues || uidValues.slice(1).some(value => Number(value) !== receiver.uid) ||
+      !gidValues || gidValues.slice(1).some(value => Number(value) !== receiver.uid) ||
+      extraGroups?.trim() !== "Groups:" || cgroup !== hostCgroup || cgroup === receiverCgroup ||
+      !unprivileged || receiverPidNs !== hostPidNs ||
       await readlink(`/proc/${pid}/ns/pid`) !== hostPidNs ||
-      agentNet === hostNet || await readlink(`/proc/${pid}/ns/net`) !== agentNet) {
-    throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup/PID namespace, zero effective capabilities, or agent network namespace.`);
+      receiverNet === hostNet || await readlink(`/proc/${pid}/ns/net`) !== receiverNet) {
+    throw new Error(`The ${agent.sessionId} descriptor receiver lacks its dedicated UID/GID, host cgroup/PID namespace, zero effective capabilities, or receiver network namespace.`);
   }
 }
 
@@ -428,7 +447,8 @@ try {
   }
   const uniquePaths = [leaseDir, storeHome, recoveryHome, envFile, installed, controlUnitFile,
     ...agents.flatMap(agent => [agent.root, path.dirname(agent.socketPath), agent.configPath,
-      agent.planPath, agent.socketUnitFile, agent.brokerUnitFile, ...agent.claimPaths,
+      agent.planPath, agent.socketUnitFile, agent.brokerUnitFile,
+      ...(testRelay ? [agent.modelSocketUnitFile] : []), ...agent.claimPaths,
       ...agent.identityPaths])];
   for (const filename of uniquePaths) {
     try { await lstat(filename); throw new Error(`Native fixture path already exists: ${filename}`); }
@@ -559,6 +579,11 @@ try {
     accountsCreated.push(agent.userName);
     await chown(`${agent.root}/workspace`, agent.uid, agent.uid);
     await chmod(`${agent.root}/workspace`, 0o700);
+    if (testRelay) {
+      const crossHandoff = `${agent.root}/run/s-gw/handoff-cross`;
+      await mkdir(crossHandoff, { mode: 0o733 });
+      await chmod(crossHandoff, 0o733);
+    }
     await writeFile(agent.privateCanary, `private-${agent.sessionId}\n`,
       { mode: 0o600, flag: "wx" });
     await chown(agent.privateCanary, agent.uid, agent.uid);
@@ -665,7 +690,18 @@ try {
     }
     await writeFile(`${agent.root}/workspace/handle`, `${agent.seeded.handle}\n`, { mode: 0o644 });
     await writeFile(`${agent.root}/workspace/url`, `${url}\n`, { mode: 0o644 });
-    await writeFile(agent.configPath, JSON.stringify({ name: agent.name, leaseDir, plan: agent.plan }) + "\n",
+    if (testRelay) {
+      agent.model = JSON.parse(asBroker("seed-relay", []));
+      if (!/^s-gw:api-token:[A-Za-z0-9_-]+$/.test(agent.model.handle) ||
+          !/^synthetic-managed-model-[A-Za-z0-9-]+$/.test(agent.model.value)) {
+        throw new Error("Invalid native fixture model handle or synthetic value.");
+      }
+      agent.relay = { grant: { handle: agent.model.handle, provider: "anthropic",
+        routes: ["POST /v1/messages"], ttlMs: 30 * 60_000, payloadProfile: "strict",
+        allowedModels: ["fixture-model"], maxRequests: 4 } };
+    }
+    await writeFile(agent.configPath, JSON.stringify({ name: agent.name, leaseDir, plan: agent.plan,
+      ...(testRelay ? { relay: agent.relay } : {}) }) + "\n",
       { mode: 0o640 });
     await chown(agent.configPath, 0, brokerGid);
     await chmod(agent.configPath, 0o640);
@@ -684,16 +720,22 @@ try {
     const config = safeUnitValue(agent.configPath);
     await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
     await remember(agent.socketUnitFile);
+    if (testRelay) {
+      await writeFile(agent.modelSocketUnitFile, `[Unit]\nDescription=Native s-gw managed model fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.modelSocketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-model-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
+      await remember(agent.modelSocketUnitFile);
+    }
     await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=${loaderUnset}\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile}\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile} -- ${config}\nRestart=no\n`, { mode: 0o644 });
     await remember(agent.brokerUnitFile);
     await writeFile(agent.planPath, JSON.stringify({ plan: agent.plan, brokerUnit: agent.brokerUnit,
       brokerUnitFile: agent.brokerUnitFile, brokerEntry: entry, brokerConfig: config,
+      ...(testRelay ? { modelRelaySocketUnitFile: agent.modelSocketUnitFile } : {}),
       brokerNode: node, brokerRuntimeRoot: runtimeRoot, brokerPreflight: verifier,
       brokerEnvironmentFile: environmentFile, brokerCa: certFile }) + "\n",
       { mode: 0o600 });
     await remember(agent.planPath);
     await checkedInstalledFile(agent.configPath);
     await checkedInstalledFile(agent.planPath);
+    if (testRelay) await checkedInstalledFile(agent.modelSocketUnitFile);
     const configInfo = await lstat(agent.configPath);
     const planInfo = await lstat(agent.planPath);
     if (configInfo.gid !== brokerGid || (configInfo.mode & 0o777) !== 0o640 ||
@@ -732,12 +774,59 @@ try {
     socketStartAttempted.add(agent.sessionId);
     run("systemctl", ["--system", "start", agent.socketUnit]);
     socketStarted.add(agent.sessionId);
+    if (testRelay) {
+      modelSocketStartAttempted.add(agent.sessionId);
+      run("systemctl", ["--system", "start", agent.modelSocketUnit]);
+      modelSocketStarted.add(agent.sessionId);
+    }
     await remember(path.dirname(agent.socketPath));
     await new Promise((resolve, reject) => {
       const socket = createConnection(agent.socketPath);
       socket.once("error", reject);
       socket.once("connect", () => { socket.destroy(); resolve(); });
     });
+  }
+  if (testRelay) {
+    for (const agent of agents) {
+      const requestId = await until(() => {
+        const found = asBroker("relay-pending", [agent.sessionId, agent.name,
+          agent.model.handle, agent.plan.identityGeneration]);
+        return found === "none" ? false : found;
+      }, `${agent.sessionId} pending model relay grant`);
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId)) {
+        throw new Error("Invalid native model relay request ID.");
+      }
+      if (run("systemctl", ["--system", "is-active", agent.agentUnit], true).status === 0) {
+        throw new Error("Managed agent launched before model relay approval.");
+      }
+      await until(() => run("systemctl", ["--system", "is-active", agent.brokerUnit], true).status !== 0,
+        `${agent.sessionId} preapproval broker exit`);
+      if (asBroker("approve-relay", [requestId]) !== requestId) {
+        throw new Error("Native model relay approval changed its request ID.");
+      }
+      agent.relay.requestId = requestId;
+    }
+    for (let index = 0; index < agents.length; index++) {
+      const agent = agents[index];
+      const other = agents[1 - index];
+      asBroker("reject-relay-claim", [agent.relay.requestId, other.sessionId,
+        other.name, other.plan.identityGeneration]);
+      const sealed = `${agent.configPath}.sealed`;
+      await writeFile(sealed, JSON.stringify({ name: agent.name, leaseDir,
+        plan: agent.plan, relay: agent.relay }) + "\n", { flag: "wx", mode: 0o640 });
+      await remember(sealed);
+      await chown(sealed, 0, brokerGid);
+      await chmod(sealed, 0o640);
+      await rename(sealed, agent.configPath);
+      await remember(agent.configPath);
+      await checkedInstalledFile(agent.configPath);
+      run("systemctl", ["--system", "reset-failed", agent.brokerUnit], true);
+      run("systemctl", ["--system", "start", agent.brokerUnit]);
+      await until(() => {
+        try { return asBroker("assert-relay-state", [agent.relay.requestId, "executing"]) === "executing"; }
+        catch { return false; }
+      }, `${agent.sessionId} model relay claim`);
+    }
   }
   for (const agent of agents) {
     const ready = await until(() => maybeText(`${agent.root}/workspace/handoff-ready`),
@@ -752,7 +841,13 @@ try {
     }
     agentMainPids.set(agent.sessionId, mainPid);
   }
-  for (const agent of agents) await startHandoffHelper(agent);
+  for (const agent of agents) {
+    await startHandoffHelper(agent);
+    if (testRelay) {
+      await startHandoffHelper(agent, true);
+      await startHandoffHelper(agent, true, agents.find(item => item !== agent));
+    }
+  }
   for (const agent of agents) {
     await writeFile(`${agent.root}/workspace/handoff-go`, "go\n", { mode: 0o644 });
   }
@@ -845,12 +940,41 @@ try {
     if (result !== "denied\n") {
       throw new Error(`The ${agent.sessionId} descriptor handoff was inconclusive: ${result}`);
     }
-    const helper = handoffHelpers.get(agent.sessionId);
+    const helper = handoffHelpers.get(`${agent.sessionId}:handoff`);
     const finished = await helper.finished;
     if (finished.code !== 0) {
       throw new Error(`The ${agent.sessionId} descriptor receiver failed: ${JSON.stringify(finished)}`);
     }
     handoffOutcomes.push(`${agent.sessionId}:${result.trim()}`);
+    if (testRelay) {
+      const modelResult = await until(() => maybeText(`${agent.root}/workspace/model-handoff-result`),
+        `${agent.sessionId} model relay descriptor handoff result`);
+      if (modelResult !== "denied\n") {
+        throw new Error(`The ${agent.sessionId} model descriptor handoff was not denied: ${modelResult}`);
+      }
+      const modelHelper = handoffHelpers.get(`${agent.sessionId}:model-handoff`);
+      const modelFinished = await modelHelper.finished;
+      if (modelFinished.code !== 0) {
+        throw new Error(`The ${agent.sessionId} model descriptor receiver failed: ${JSON.stringify(modelFinished)}`);
+      }
+      const crossResult = await until(() => maybeText(`${agent.root}/run/s-gw/handoff-cross/result`),
+        `${agent.sessionId} cross-session model descriptor handoff result`);
+      if (crossResult !== "denied\n") {
+        throw new Error(`The ${agent.sessionId} model descriptor reached the other agent UID: ${crossResult}`);
+      }
+      const crossHelper = handoffHelpers.get(`${agent.sessionId}:cross-model-handoff`);
+      const crossFinished = await crossHelper.finished;
+      if (crossFinished.code !== 0) {
+        throw new Error(`The ${agent.sessionId} cross-session model descriptor receiver failed: ${JSON.stringify(crossFinished)}`);
+      }
+      const ownResult = await until(() => maybeText(`${agent.root}/workspace/model-result`),
+        `${agent.sessionId} strict model relay response`);
+      if (ownResult !== "strict-rejected\n") {
+        throw new Error(`The ${agent.sessionId} strict relay check failed: ${ownResult}`);
+      }
+      handoffOutcomes.push(`${agent.sessionId}:model-${modelResult.trim()}`);
+      handoffOutcomes.push(`${agent.sessionId}:cross-model-${crossResult.trim()}`);
+    }
   }
   for (const agent of agents) {
     const probe = `${agent.root}/usr/bin/managed-mcp-probe`;
@@ -859,6 +983,21 @@ try {
       { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
     if (claimant.error || claimant.status !== 0) {
       throw new Error(`The same-UID out-of-cgroup process reached ${agent.sessionId}: ${claimant.stderr || claimant.status}`);
+    }
+    if (testRelay) {
+      const outsider = run("runuser", ["-u", agent.userName, "--", "/usr/bin/env",
+        `SGW_MODEL_RELAY_SOCKET=${agent.modelSocketPath}`, probe, "--model-out-of-cgroup"], true,
+        { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
+      if (outsider.error || outsider.status !== 0) {
+        throw new Error(`The same-UID out-of-cgroup process reached ${agent.sessionId}'s model relay: ${outsider.stderr || outsider.status}`);
+      }
+      const other = agents.find(item => item !== agent);
+      const foreign = run("runuser", ["-u", other.userName, "--", "/usr/bin/env",
+        `SGW_MODEL_RELAY_SOCKET=${agent.modelSocketPath}`, probe, "--model-cross-uid"], true,
+        { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
+      if (foreign.error || foreign.status !== 0) {
+        throw new Error(`The other agent UID connected to ${agent.sessionId}'s model relay: ${foreign.stderr || foreign.status}`);
+      }
     }
   }
   for (const agent of agents) {
@@ -901,9 +1040,23 @@ try {
     }
   }
   run("systemctl", ["--system", "stop", agents[0].socketUnit]);
+  if (testRelay) run("systemctl", ["--system", "stop", agents[0].modelSocketUnit]);
   run("systemctl", ["--system", "stop", agents[0].brokerUnit]);
   await until(() => run("systemctl", ["--system", "is-active", agents[0].agentUnit], true).status !== 0,
     "first agent teardown after its broker stopped");
+  if (testRelay) {
+    await until(() => {
+      try { return asBroker("assert-relay-state", [agents[0].relay.requestId, "executed"]) === "executed"; }
+      catch { return false; }
+    }, "first model relay durable session close");
+    if (asBroker("reject-relay-reclaim", [agents[0].relay.requestId, agents[0].sessionId,
+      agents[0].name, agents[0].plan.identityGeneration]) !== "executed") {
+      throw new Error("The stopped model relay approval remained claimable.");
+    }
+    if (run("systemctl", ["--system", "is-active", agents[1].modelSocketUnit], true).status !== 0) {
+      throw new Error("Stopping one broker also stopped the other model socket.");
+    }
+  }
   if (run("systemctl", ["--system", "is-active", agents[1].agentUnit], true).status !== 0) {
     throw new Error("Stopping one broker also stopped the other agent.");
   }
@@ -911,6 +1064,23 @@ try {
     controlUnit]);
   await until(() => run("systemctl", ["--system", "is-active", agents[1].agentUnit], true).status !== 0,
     "second agent teardown after root control death");
+  if (testRelay) {
+    await until(() => {
+      const broker = unitProperties(agents[1].brokerUnit, ["ActiveState", "MainPID"]);
+      return ["inactive", "failed"].includes(broker.get("ActiveState")) && broker.get("MainPID") === "0";
+    }, "second broker exit after root control death");
+    await until(() => run("systemctl", ["--system", "is-active", agents[1].modelSocketUnit], true).status !== 0,
+      "second model socket teardown after root control death");
+    await until(() => {
+      try { return asBroker("assert-relay-state", [agents[1].relay.requestId, "executed"]) === "executed"; }
+      catch { return false; }
+    }, "second model relay durable session close");
+    const last = asBroker("reject-relay-reclaim", [agents[1].relay.requestId,
+      agents[1].sessionId, agents[1].name, agents[1].plan.identityGeneration]);
+    if (last !== "executed") {
+      throw new Error(`The root-control death left an unexpected model relay state: ${last}`);
+    }
+  }
   passed = true;
 } catch (error) {
   const logs = run("journalctl", ["--no-pager", "-n", "80", "-u", "s-gw-agent-control.service",
@@ -931,7 +1101,8 @@ try {
       }
       throw new Error("Root control start was ambiguous; its root-owned fixture tree was preserved.");
     }
-    if ([...socketStartAttempted].some(session => !socketStarted.has(session))) {
+    if ([...socketStartAttempted].some(session => !socketStarted.has(session)) ||
+        [...modelSocketStartAttempted].some(session => !modelSocketStarted.has(session))) {
       const currentControl = unitProperties(controlUnit, controlProperties);
       if (currentControl.get("ActiveState") === "active" && fixtureControl(currentControl) &&
           invocationId(currentControl) === controlInvocation) {
@@ -940,6 +1111,9 @@ try {
       for (const agent of agents) {
         if (await fixtureUnitFile(agent.socketUnit, agent.socketUnitFile)) {
           run("systemctl", ["--system", "stop", agent.socketUnit], true);
+        }
+        if (testRelay && await fixtureUnitFile(agent.modelSocketUnit, agent.modelSocketUnitFile)) {
+          run("systemctl", ["--system", "stop", agent.modelSocketUnit], true);
         }
         if (await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile)) {
           run("systemctl", ["--system", "stop", agent.brokerUnit], true);
@@ -983,10 +1157,21 @@ try {
         if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
         throw new Error("Socket unit changed; native fixture state was preserved.");
       }
-      states.push({ agent, agentActive, brokerActive, socketActive });
+      let modelSocketActive = false;
+      if (testRelay) {
+        const modelState = unitProperties(agent.modelSocketUnit, ["Id", "FragmentPath", "ActiveState"]);
+        modelSocketActive = modelState.get("ActiveState") === "active";
+        const modelOwned = await fixtureUnitFile(agent.modelSocketUnit, agent.modelSocketUnitFile);
+        if (modelSocketActive && !modelOwned) {
+          if (controlActive && controlOwned) run("systemctl", ["--system", "stop", controlUnit], true);
+          throw new Error("Model socket unit changed; native fixture state was preserved.");
+        }
+      }
+      states.push({ agent, agentActive, brokerActive, socketActive, modelSocketActive });
     }
-    for (const { agent, socketActive } of states) {
+    for (const { agent, socketActive, modelSocketActive } of states) {
       if (socketActive) run("systemctl", ["--system", "stop", agent.socketUnit], true);
+      if (modelSocketActive) run("systemctl", ["--system", "stop", agent.modelSocketUnit], true);
     }
     for (const { agent, brokerActive } of states) {
       if (brokerActive) run("systemctl", ["--system", "stop", agent.brokerUnit], true);
@@ -995,7 +1180,8 @@ try {
       if (agentActive) run("systemctl", ["--system", "stop", agent.agentUnit], true);
     }
     if (controlActive) run("systemctl", ["--system", "stop", controlUnit], true);
-    const allUnits = agents.flatMap(agent => [agent.socketUnit, agent.brokerUnit, agent.agentUnit]);
+    const allUnits = agents.flatMap(agent => [agent.socketUnit, agent.brokerUnit, agent.agentUnit,
+      ...(testRelay ? [agent.modelSocketUnit] : [])]);
     if (controlStarted) allUnits.push(controlUnit);
     for (const unit of allUnits) {
       if (run("systemctl", ["--system", "is-active", unit], true).status === 0) {
@@ -1009,6 +1195,7 @@ try {
     }
     for (const agent of agents) {
       await removeOwned(agent.socketUnitFile);
+      if (testRelay) await removeOwned(agent.modelSocketUnitFile);
       await removeOwned(agent.brokerUnitFile);
     }
     await removeOwned(controlUnitFile);
@@ -1027,6 +1214,7 @@ try {
       await removeOwned(path.dirname(agent.socketPath), true);
       await removeOwned(agent.root, true);
       await removeOwned(agent.configPath);
+      if (testRelay) await removeOwned(`${agent.configPath}.sealed`);
       await removeOwned(agent.planPath);
       for (const filename of agent.identityPaths) {
         if (!owned.has(filename)) continue;
@@ -1065,5 +1253,5 @@ try {
   for (const canary of networkCanaries.reverse()) await canary.close();
 }
 if (passed) {
-  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, same-UID connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.`);
+  console.log(`Native Linux managed MCP passed: two UIDs/cgroups/net namespaces, direct IPv4/IPv6/TCP/UDP and private-file denial, connected-descriptor handoff ${handoffOutcomes.join(", ")}, out-of-cgroup direct-connect denial, UID/GID claim-function collisions, cross-session claim denial, two broker-owned HTTPS actions, independent teardown, and root-control death teardown.${testRelay ? " Opt-in model relay: durable approval and claim, strict-body rejection, cross-session/UID/cgroup/FD-transfer denial, and teardown. Positive provider streaming was not exercised." : ""}`);
 }

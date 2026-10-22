@@ -481,7 +481,7 @@ jobs:
   anthropic-linux-e2e:
     name: Linux sandbox package E2E
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -516,3 +516,8 @@ jobs:
           node_path="$(command -v node)"
           sudo "$node_path" scripts/test-linux-broker-runtime-static.mjs
           sudo CI=true "$node_path" scripts/test-linux-managed-mcp-native.mjs --root "$(id -u)" "$(id -g)"
+      - name: Verify managed MCP and model relay together
+        run: |
+          test "$(id -u)" -ne 0
+          node_path="$(command -v node)"
+          sudo CI=true SGW_TEST_MANAGED_RELAY=1 "$node_path" scripts/test-linux-managed-mcp-native.mjs --root "$(id -u)" "$(id -g)"
