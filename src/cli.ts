@@ -16,7 +16,7 @@ import {
 import { getAgentCodeGuardPlan, listAgentProfiles, renderAgentMcpSnippet, resolveAgentProfile } from "./agents.js";
 import { unknownCommandMessage } from "./command-suggest.js";
 import { consoleControlPath, requestConsoleCode } from "./console-control.js";
-import { startConsoleServer } from "./console-server.js";
+import { startConsoleServer, verifyProtectedConsoleUi } from "./console-server.js";
 import { executeApprovedRequest, executeReusablePermit } from "./executor.js";
 import {
   buildEnvCommandAction,
@@ -189,6 +189,18 @@ async function main(): Promise<void> {
   }
 
   if (first === "console") {
+    if (second === "access-mode") {
+      printJson({ consoleAccess: await store.getConsoleAccessMode() });
+      return;
+    }
+    if (second === "protect-store") {
+      const manifestPath = requireFlag(parsed.flags, "ui-manifest");
+      if (!path.isAbsolute(manifestPath)) throw new Error("--ui-manifest requires an absolute path.");
+      await verifyProtectedConsoleUi(await readProtectedUiManifest(manifestPath));
+      await store.enableProtectedConsole();
+      printJson({ ok: true, consoleAccess: await store.getConsoleAccessMode() });
+      return;
+    }
     if (second === "verify-listener") {
       const { url } = appConsoleEndpoint(parsed.flags);
       await waitForInstalledConsoleAuthority(url);
@@ -1537,6 +1549,17 @@ async function handleServiceCommand(
   const ordinaryService = hasFlag(flags, "ordinary");
   const launchdSocket = hasFlag(flags, "launchd-socket");
   const directBind = hasFlag(flags, "direct-bind");
+  const uiManifestPath = getFlag(flags, "ui-manifest");
+  if (hasFlag(flags, "ui-manifest") && !uiManifestPath) {
+    throw new Error("--ui-manifest requires a file path.");
+  }
+  if (uiManifestPath && (!protectedService || process.platform !== "darwin" || action !== "install")) {
+    throw new Error("A console service UI manifest requires macOS install --operator-auth.");
+  }
+  if (uiManifestPath) {
+    if (!path.isAbsolute(uiManifestPath)) throw new Error("--ui-manifest requires an absolute path.");
+    await readProtectedUiManifest(uiManifestPath);
+  }
   if (protectedService && ordinaryService) {
     throw new Error("Choose either --operator-auth or --ordinary for the console service.");
   }
@@ -1610,6 +1633,7 @@ async function handleServiceCommand(
         port: numericFlag(flags, "port", 8718),
         start: hasFlag(flags, "start"),
         operatorAuth: protectedService ? true : ordinaryService ? false : undefined,
+        uiManifestPath,
         socketActivated: launchdSocket ? true : directBind ? false : undefined
       })
     );
@@ -2818,6 +2842,8 @@ Commands:
   s-gw mcp
   s-gw console [--host 127.0.0.1] [--port 8718] [--no-open] [--operator-auth] [--ui-manifest /absolute/trusted.json] [--background]
   s-gw console enroll [--port 8718]
+  s-gw console access-mode
+  s-gw console protect-store --ui-manifest /absolute/trusted.json
   s-gw app app-path
   s-gw app install
   s-gw app open [--port 8718] [--console-url URL] [--browser]
@@ -2828,7 +2854,7 @@ Commands:
   s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env|--allow-raw-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run AGENT [--dry-run] [--strict-broker-env] [--strict-npm-env|--allow-raw-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--strict-legacy-revocation] [--raw]
-  s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary] [--launchd-socket|--direct-bind]
+  s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary] [--ui-manifest /absolute/trusted.json] [--launchd-socket|--direct-bind]
   s-gw service start|stop|status|uninstall
   s-gw menubar app-path
   s-gw menubar open [--port 8718] [--console-url URL] [--count pending|credentials|none] [--show] [--no-notify]

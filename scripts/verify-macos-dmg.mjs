@@ -37,6 +37,7 @@ try {
     path.join(packageRoot, "package.json"),
     path.join(packageRoot, "dist", "cli.js"),
     path.join(packageRoot, "dist", "mcp-server.js"),
+    path.join(packageRoot, "dist", "console-ui-manifest.json"),
     path.join(packageRoot, "dist", "native", "darwin-arm64", "s-gw-core"),
     path.join(packageRoot, "dist", "native", "darwin-arm64", "s-gw-keychain-helper"),
     path.join(packageRoot, "dist", "native", "darwin-arm64", "s-gw-keychain-inspector"),

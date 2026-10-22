@@ -1,6 +1,6 @@
 {
   "name": "@s-gw/s-gw",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "mcpName": "io.github.sgateway/s-gw",
   "description": "Local credential control for AI coding agents.",
   "type": "module",
@@ -52,7 +52,7 @@
   ],
   "scripts": {
     "build": "npm run build:native && npm run build:console-ui && tsc -p tsconfig.json",
-    "build:console-ui": "vite build --config vite.console.config.ts",
+    "build:console-ui": "vite build --config vite.console.config.ts && node scripts/build-console-ui-manifest.mjs",
     "dev:console-ui": "vite --config vite.console.config.ts",
     "build:native": "npm run build:rust-core && node scripts/build-native-keychain.mjs && node scripts/build-macos-console-activate.mjs && node scripts/build-peer-credentials.mjs --optional && node scripts/build-linux-peer-identity.mjs --optional && node scripts/build-linux-activated-socket.mjs --optional && node scripts/build-linux-message-gate.mjs --optional && node scripts/build-menu-bar-helper.mjs && node scripts/build-macos-app.mjs && node scripts/build-windows-client.mjs",
     "build:peer-credentials": "node scripts/build-peer-credentials.mjs",

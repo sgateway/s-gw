@@ -249,6 +249,7 @@ function verifySelfContainedRuntime(appRoot, runtimeRoot, packageRoot) {
     resolve(packageRoot, "package.json"),
     resolve(packageRoot, "dist/cli.js"),
     resolve(packageRoot, "dist/mcp-server.js"),
+    resolve(packageRoot, "dist/console-ui-manifest.json"),
     resolve(packageRoot, "dist/native", nativeTarget, "s-gw-core"),
     resolve(packageRoot, "dist/native", nativeTarget, "s-gw-keychain-helper"),
     resolve(packageRoot, "dist/native", nativeTarget, "s-gw-keychain-inspector"),

@@ -15,7 +15,9 @@ describe("React console source contracts", () => {
     ]);
     const pkg = JSON.parse(pkgRaw);
 
-    expect(pkg.scripts["build:console-ui"]).toBe("vite build --config vite.console.config.ts");
+    expect(pkg.scripts["build:console-ui"]).toBe(
+      "vite build --config vite.console.config.ts && node scripts/build-console-ui-manifest.mjs"
+    );
     expect(pkg.scripts.check).toContain("tsconfig.console.json");
     expect(viteConfig).toContain('root: "src/console-ui"');
     expect(viteConfig).toContain('outDir: "../../dist/console-ui"');

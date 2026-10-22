@@ -1508,6 +1508,10 @@ async function loadProtectedUiBundle(
   return bundle;
 }
 
+export async function verifyProtectedConsoleUi(manifest: Readonly<Record<string, string>>): Promise<void> {
+  await loadProtectedUiBundle(defaultUiDir(), manifest);
+}
+
 async function serveUi(
   req: IncomingMessage,
   res: ServerResponse,

@@ -34,6 +34,7 @@ if (targetName !== hostTarget) {
 
 requireFile(resolve(root, "dist/cli.js"));
 requireFile(resolve(root, "dist/console-ui/index.html"));
+requireFile(resolve(root, "dist/console-ui-manifest.json"));
 
 const workDir = mkdtempSync(resolve(tmpdir(), "s-gw-desktop-runtime-"));
 const stagedRoot = mkdtempSync(resolve(appRoot, ".runtime-staging-"));
@@ -93,6 +94,7 @@ try {
   requireFile(resolve(packageRoot, "dist/cli.js"));
   requireFile(resolve(packageRoot, "dist/mcp-server.js"));
   requireFile(resolve(packageRoot, "dist/console-ui/index.html"));
+  requireFile(resolve(packageRoot, "dist/console-ui-manifest.json"));
   requireFile(resolve(packageRoot, "node_modules"));
   requireFile(resolve(nodeRoot, "LICENSE"));
   requireFile(nodeBinary(nodeRoot));
