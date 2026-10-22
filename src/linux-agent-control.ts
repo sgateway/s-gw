@@ -441,10 +441,12 @@ export function assertControlUnitPreflight(output: string, runtime: {
 }
 
 export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number,
-  output: string, expected?: string): string {
+  output: string, expected?: string, allowStopping = false): string {
   const values = parseUnitProperties(output);
   const invocation = values.get("InvocationID") || "";
-  if (values.get("Id") !== record.brokerUnit || values.get("ActiveState") !== "active" ||
+  const state = values.get("ActiveState");
+  if (values.get("Id") !== record.brokerUnit ||
+      (state !== "active" && !(allowStopping && state === "deactivating")) ||
       values.get("MainPID") !== String(pid) ||
       values.get("ControlGroup") !== `/system.slice/${record.brokerUnit}` ||
       values.get("FragmentPath") !== record.brokerUnitFile ||
@@ -466,7 +468,8 @@ export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number
 }
 
 async function attestBroker(socket: Socket, record: LinuxManagedPlanRecord,
-  brokerUid: number, brokerGid: number, expected?: string, diagnosticUid?: number): Promise<string> {
+  brokerUid: number, brokerGid: number, expected?: string, diagnosticUid?: number,
+  allowStopping = false): Promise<string> {
   const cgroup = `/system.slice/${record.brokerUnit}`;
   if (diagnosticUid !== undefined) traceLinuxManagedStart(diagnosticUid, "broker peer check call");
   const peer = await verifyLinuxPeerProcess(socket, cgroup);
@@ -476,7 +479,7 @@ async function attestBroker(socket: Socket, record: LinuxManagedPlanRecord,
   }
   const properties = await systemctlProperties(record.brokerUnit);
   if (diagnosticUid !== undefined) traceLinuxManagedStart(diagnosticUid, "broker unit show returned");
-  const invocation = brokerUnitInvocation(record, peer.pid, properties, expected);
+  const invocation = brokerUnitInvocation(record, peer.pid, properties, expected, allowStopping);
   const command = (await readFile(`/proc/${peer.pid}/cmdline`)).toString("utf8").split("\0");
   if (command.at(-1) === "") command.pop();
   if (command.length !== 3 || command[1] !== record.brokerEntry ||
@@ -614,7 +617,7 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
           }
           if (closing) throw new Error("Linux root control service is stopping.");
           await attestBroker(socket, record, brokerUid, brokerGid, invocation,
-            call.method === "start" ? undefined : plan.uid);
+            call.method === "start" ? undefined : plan.uid, call.method === "stop");
           traceLinuxManagedStart(plan.uid,
             socket.isPaused() ? "control socket paused after attestation" : "control socket flowing after attestation");
           if (closing || socket.destroyed) throw new Error("Linux root control service is stopping.");

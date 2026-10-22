@@ -217,6 +217,24 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
     expect(() => brokerUnitInvocation(item, 4123, brokerState(item, 4123, "b".repeat(32)), id)).toThrow();
   });
 
+  it("permits only the pinned broker invocation to stop while deactivating", () => {
+    const item = record();
+    const id = "a".repeat(32);
+    const stopping = brokerState(item).replace("ActiveState=active", "ActiveState=deactivating");
+    expect(() => brokerUnitInvocation(item, 4123, stopping, id)).toThrow();
+    expect(brokerUnitInvocation(item, 4123, stopping, id, true)).toBe(id);
+    for (const changed of [
+      stopping.replace("ActiveState=deactivating", "ActiveState=inactive"),
+      stopping.replace("MainPID=4123", "MainPID=9999"),
+      stopping.replace(`InvocationID=${id}`, `InvocationID=${"b".repeat(32)}`),
+      stopping.replace(`ControlGroup=/system.slice/${item.brokerUnit}`, "ControlGroup=/user.slice/other"),
+      stopping.replace(`FragmentPath=${item.brokerUnitFile}`, "FragmentPath=/tmp/other.service"),
+      stopping.replace(`EnvironmentFiles=${item.brokerEnvironmentFile}`, "EnvironmentFiles=/tmp/other.env"),
+      stopping.replace("ExecStartPre={ path=", "ExecStartPre={ path=/tmp/"),
+      stopping.replace("ExecStart={ path=", "ExecStart={ path=/tmp/")
+    ]) expect(() => brokerUnitInvocation(item, 4123, changed, id, true)).toThrow();
+  });
+
   it("requires a native pre-exec gate for the root control unit", () => {
     const attested = controlState();
     expect(() => assertControlUnitPreflight(attested, rootRuntime)).not.toThrow();
