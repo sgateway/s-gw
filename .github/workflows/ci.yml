@@ -463,9 +463,27 @@ jobs:
           if (-not $vsRoot) { throw 'MSVC C tools are unavailable.' }
           $devCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
           if (-not (Test-Path $devCmd)) { throw 'MSVC environment setup is unavailable.' }
-          $compile = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && npm run build:windows-peer-identity && node scripts/test-windows-peer-identity.mjs'
-          & cmd.exe /d /s /c $compile
-          if ($LASTEXITCODE -ne 0) { throw 'The one-shot Windows peer helper failed native acceptance tests.' }
+          $consoleKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Console')
+          if (-not $consoleKey) { throw 'Could not open the Windows console settings.' }
+          $hadLowBoxValue = $consoleKey.GetValueNames() -contains 'LowBoxConsoleEnabled'
+          if ($hadLowBoxValue) {
+            $oldLowBoxValue = $consoleKey.GetValue('LowBoxConsoleEnabled', $null,
+              [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $oldLowBoxKind = $consoleKey.GetValueKind('LowBoxConsoleEnabled')
+          }
+          try {
+            $consoleKey.SetValue('LowBoxConsoleEnabled', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $compile = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && npm run build:windows-peer-identity && node scripts/test-windows-peer-identity.mjs'
+            & cmd.exe /d /s /c $compile
+            if ($LASTEXITCODE -ne 0) { throw 'The one-shot Windows peer helper failed native acceptance tests.' }
+          } finally {
+            if ($hadLowBoxValue) {
+              $consoleKey.SetValue('LowBoxConsoleEnabled', $oldLowBoxValue, $oldLowBoxKind)
+            } else {
+              $consoleKey.DeleteValue('LowBoxConsoleEnabled', $false)
+            }
+            $consoleKey.Dispose()
+          }
       - run: npm run test:windows -- --group ${{ matrix.group }}
 
   windows-preview:

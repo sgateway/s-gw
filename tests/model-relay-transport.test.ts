@@ -550,7 +550,7 @@ describe("model relay transport", () => {
 
     const port = Number(new URL(fixture.url).port);
     const stalled: ReturnType<typeof connect>[] = [];
-    const partial = Buffer.alloc(31 * 1024 * 1024, 0x20);
+    const partial = Buffer.alloc(fullBody.length, 0x20);
     try {
       for (let i = 0; i < 2; i++) {
         const socket = connect(port, "127.0.0.1");
@@ -559,7 +559,7 @@ describe("model relay transport", () => {
         await new Promise<void>((resolve, reject) => {
           socket.once("connect", resolve); socket.once("error", reject);
         });
-        socket.write(`POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${fullBody.length}\r\n\r\n`);
+        socket.write(`POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${fullBody.length + 1}\r\n\r\n`);
         await new Promise<void>((resolve, reject) => socket.write(partial, error => error ? reject(error) : resolve()));
       }
       let denied = false;

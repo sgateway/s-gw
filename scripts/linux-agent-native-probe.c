@@ -472,5 +472,6 @@ int main(int argc, char **argv) {
     close(shared_fd);
     shm_unlink(shared_name);
     const char *rebound = approved(argv[2], argv[1]) ? "rebind=accepted\n" : "rebind=denied\n";
-    return save("/workspace/rebind", rebound) == 0 ? 0 : 70;
+    if (save("/workspace/rebind", rebound) != 0) return 70;
+    for (;;) pause();
 }

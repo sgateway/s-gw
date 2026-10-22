@@ -10,6 +10,7 @@ const helper = path.join(dir, "probe");
 const brokerPath = path.join(dir, "broker.sock");
 const rendezvous = path.join(dir, "shared.sock");
 let broker;
+const socketErrors = [];
 
 function runHelper(args) {
   return new Promise((resolve, reject) => {
@@ -33,6 +34,7 @@ try {
   let accepted = false;
   broker = createServer(socket => {
     let frame = "";
+    socket.on("error", error => { socketErrors.push(error); });
     socket.on("data", chunk => {
       frame += String(chunk);
       if (frame === "XFER-START-V1\n") socket.write("XFER-READY-V1\n");
@@ -52,8 +54,10 @@ try {
   if (received !== "used" || sent !== "sent" || !accepted) {
     throw new Error(`Descriptor transfer failed its local control: donor=${sent}, recipient=${received}.`);
   }
-  process.stdout.write("Native SCM_RIGHTS helper passed a connected Unix socket in a local control.\n");
 } finally {
   if (broker) await new Promise(resolve => broker.close(resolve));
   await rm(dir, { recursive: true, force: true });
 }
+const unexpected = socketErrors.find(error => error.code !== "EPIPE");
+if (unexpected) throw unexpected;
+process.stdout.write("Native SCM_RIGHTS helper passed a connected Unix socket in a local control.\n");
