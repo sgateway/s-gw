@@ -76,6 +76,8 @@ const macosSecurityCli = "/usr/bin/security";
 const lockTimeoutMs = 30_000;
 const windowsLockRenameAttempts = 20;
 const windowsLockRenameDelayMs = 10;
+const windowsFileReplaceAttempts = 40;
+const windowsFileReplaceDelayMs = 25;
 const emptyStoreLockStaleMs = 1_000;
 
 // A request gets claimed into "executing" right before its secret is revealed. If the
@@ -2680,13 +2682,27 @@ async function writeAtomicFile(targetPath: string, content: string): Promise<voi
     await tmpFile.sync();
     await tmpFile.close();
     tmpFile = undefined;
-    await rename(tmpPath, targetPath);
+    await replaceFileWithRetry(tmpPath, targetPath);
     await chmod(targetPath, 0o600);
     await syncDirectory(path.dirname(targetPath));
   } catch (error) {
     await tmpFile?.close().catch(() => undefined);
     await rm(tmpPath, { force: true }).catch(() => undefined);
     throw error;
+  }
+}
+
+async function replaceFileWithRetry(tmpPath: string, targetPath: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(tmpPath, targetPath);
+      return;
+    } catch (error) {
+      if (!shouldRetryWindowsLockOperation(error) || attempt + 1 >= windowsFileReplaceAttempts) {
+        throw error;
+      }
+      await sleep(windowsFileReplaceDelayMs);
+    }
   }
 }
 

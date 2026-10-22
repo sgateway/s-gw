@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +11,7 @@ const rmdirFault = vi.hoisted(() => ({
   markerOpenAttempts: 0,
   markerOpenFailures: 0
 }));
+const renameFault = vi.hoisted(() => ({ target: "", failures: 0, attempts: 0 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -30,6 +31,16 @@ vi.mock("node:fs/promises", async (importOriginal) => {
         }
       }
       return actual.open(...args);
+    },
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      if (renameFault.target === String(args[1])) {
+        renameFault.attempts += 1;
+        if (renameFault.failures > 0) {
+          renameFault.failures -= 1;
+          throw Object.assign(new Error("simulated Windows file sharing violation"), { code: "EPERM" });
+        }
+      }
+      return actual.rename(...args);
     },
     rmdir: async (
       target: Parameters<typeof actual.rmdir>[0],
@@ -70,6 +81,9 @@ beforeEach(async () => {
   rmdirFault.attempts = 0;
   rmdirFault.markerOpenAttempts = 0;
   rmdirFault.markerOpenFailures = 0;
+  renameFault.target = "";
+  renameFault.failures = 0;
+  renameFault.attempts = 0;
 });
 
 afterEach(async () => {
@@ -188,5 +202,54 @@ describe("Windows store lock cleanup", () => {
     expect(rmdirFault.markerOpenFailures).toBe(0);
     expect((await store.listApprovalPolicyRules()).map((rule) => rule.name)).not.toContain("Must not commit");
     await expect(stat(rmdirFault.lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retries transient sharing violations while replacing the store file", async () => {
+    const { SecretStore } = await import("../src/store.js");
+    const store = new SecretStore();
+    await store.init();
+    renameFault.target = store.storePath;
+    renameFault.failures = 3;
+
+    const rule = await store.addApprovalPolicyRule({
+      name: "Retried store replacement",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+
+    expect(renameFault.attempts).toBe(4);
+    expect((await store.listApprovalPolicyRules()).map((item) => item.id)).toContain(rule.id);
+  });
+
+  it("preserves the store file when replacement stays blocked", async () => {
+    const { SecretStore } = await import("../src/store.js");
+    const store = new SecretStore();
+    await store.init();
+    const before = await readFile(store.storePath, "utf8");
+    renameFault.target = store.storePath;
+    renameFault.failures = 40;
+
+    await expect(store.addApprovalPolicyRule({
+      name: "Must not replace the store",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    })).rejects.toMatchObject({ code: "EPERM" });
+
+    expect(renameFault.attempts).toBe(40);
+    expect(await readFile(store.storePath, "utf8")).toBe(before);
+    expect((await readdir(path.dirname(store.storePath))).filter((name) =>
+      name.startsWith(".store.json.") && name.endsWith(".tmp"))).toEqual([]);
+    const pendingPath = path.join(path.dirname(store.storePath), ".store-control.pending.json");
+    await stat(pendingPath);
+
+    renameFault.target = "";
+    expect((await store.listApprovalPolicyRules()).map((item) => item.name)).not.toContain("Must not replace the store");
+    await expect(stat(pendingPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const later = await store.addApprovalPolicyRule({
+      name: "Store remains writable",
+      decision: "allow",
+      conditions: { agents: ["codex"] }
+    });
+    expect((await store.listApprovalPolicyRules()).map((item) => item.id)).toContain(later.id);
   });
 });
