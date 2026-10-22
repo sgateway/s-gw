@@ -514,6 +514,26 @@ describe("model relay transport", () => {
     } finally { socket.destroy(); }
   });
 
+  it("closes the provider stream when the client cancels a response", async () => {
+    let providerClosed!: () => void;
+    const closed = new Promise<void>(resolve => { providerClosed = resolve; });
+    const fixture = await startFixture("anthropic", async (req, res) => {
+      for await (const _chunk of req) {}
+      res.once("close", providerClosed);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('event: message_start\ndata: {"type":"message_start"}\n\n' + "padding".repeat(12));
+    });
+    const abort = new AbortController();
+    const response = await fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal: abort.signal
+    });
+    expect(response.status).toBe(200);
+    expect((await response.body!.getReader().read()).done).toBe(false);
+    abort.abort();
+    await Promise.race([closed, new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("Canceled model stream stayed open upstream.")), 2500))]);
+  }, 10_000);
+
   it("bounds simultaneous request bodies and admits another after stalled clients leave", async () => {
     const fixture = await startFixture("anthropic", async (req, res) => {
       let bytes = 0;
