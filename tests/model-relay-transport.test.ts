@@ -542,11 +542,23 @@ describe("model relay transport", () => {
         socket.write(`POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${fullBody.length}\r\n\r\n`);
         await new Promise<void>((resolve, reject) => socket.write(partial, error => error ? reject(error) : resolve()));
       }
-      const crowded = await fetch(endpoint, {
-        method: "POST", headers: { "content-type": "application/json" }, body: Buffer.alloc(3 * 1024 * 1024, 0x20)
-      });
-      expect(crowded.status).toBe(503);
-      expect(fixture.outbound).toHaveLength(1);
+      let denied = false;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const outboundBefore = fixture.outbound.length;
+        const crowded = await fetch(endpoint, {
+          method: "POST", headers: { "content-type": "application/json" }, body: Buffer.alloc(3 * 1024 * 1024, 0x20)
+        });
+        if (crowded.status === 503) {
+          expect(await crowded.text()).toContain("Model relay request buffer is full");
+          expect(fixture.outbound).toHaveLength(outboundBefore);
+          denied = true;
+          break;
+        }
+        expect(crowded.status).toBe(200);
+        await crowded.arrayBuffer();
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      expect(denied).toBe(true);
     } finally {
       for (const socket of stalled) socket.destroy();
     }

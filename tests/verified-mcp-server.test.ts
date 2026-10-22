@@ -69,8 +69,8 @@ afterEach(async () => {
   server = undefined;
   upstream = undefined;
   process.env = { ...originalEnv };
-  if (root) await rm(root, { recursive: true, force: true });
-  if (socketDir && socketDir !== root) await rm(socketDir, { recursive: true, force: true });
+  if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  if (socketDir && socketDir !== root) await rm(socketDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   root = "";
   socketDir = "";
 });
