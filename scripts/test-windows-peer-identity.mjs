@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -74,6 +74,16 @@ function pipeName() {
 
 function jobName() {
   return String.raw`Local\s-gw-agent-` + randomBytes(16).toString("hex");
+}
+
+function aclTrail(path) {
+  const lines = [];
+  for (let at = path; ; at = dirname(at)) {
+    const acl = spawnSync("icacls", [at], { encoding: "utf8", windowsHide: true });
+    lines.push(`${at}: ${acl.stdout.trim() || acl.stderr.trim() || `icacls exit ${acl.status}`}`);
+    if (dirname(at) === at) break;
+  }
+  return lines.join("\n");
 }
 
 async function rejectsBeforePipe(args, label, expectedStderr) {
@@ -191,7 +201,8 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
     if (!jobReady) {
       const failed = await client.done;
       assert.fail("The launcher did not create and retain the Job before the pipe opened: " +
-        (failed.spawnError?.message || failed.stderr.trim() || `exit ${failed.code}`));
+        (failed.spawnError?.message || failed.stderr.trim() || `exit ${failed.code}`) +
+        `\nImage and ancestor ACLs:\n${aclTrail(profile.executable)}`);
     }
     assert.equal(await deadline(client.wfpReady, 30_000, "AppContainer WFP policy"), true,
       "The package-SID WFP deny was not installed before the agent resumed.");
@@ -409,7 +420,7 @@ try {
       profile.executable = join(profile.fixtureDir, "test-appcontainer.exe");
       profile.sharedPath = join(profile.fixtureDir, "agent-readable.txt");
       profile.canaryPath = join(tmp, `broker-only-canary-${name}.txt`);
-      copyFileSync(appContainerFixture, profile.executable);
+      writeFileSync(profile.executable, readFileSync(appContainerFixture));
       const executableAcl = spawnSync("icacls", [profile.executable, "/grant", `*${sid}:RX`],
         { encoding: "utf8", windowsHide: true });
       assert.equal(executableAcl.status, 0, executableAcl.stderr || executableAcl.stdout);

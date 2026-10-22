@@ -1026,10 +1026,10 @@ async function checkedExecutableParents(root: string, executable: string): Promi
 }
 
 async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUnitPlan): Promise<void> {
-  const [status, cgroup, procRoot, net, hostNet, ipc, hostIpc, mounts, hostMounts] = await Promise.all([
+  const [status, cgroup, procRoot, configuredRoot, net, hostNet, ipc, hostIpc, mounts, hostMounts] = await Promise.all([
     readFile(`/proc/${state.mainPid}/status`, "utf8"),
     readFile(`/proc/${state.mainPid}/cgroup`, "utf8"),
-    readlink(`/proc/${state.mainPid}/root`),
+    stat(`/proc/${state.mainPid}/root`, { bigint: true }), stat(plan.rootDirectory, { bigint: true }),
     readlink(`/proc/${state.mainPid}/ns/net`), readlink("/proc/self/ns/net"),
     readlink(`/proc/${state.mainPid}/ns/ipc`), readlink("/proc/self/ns/ipc"),
     readlink(`/proc/${state.mainPid}/ns/mnt`), readlink("/proc/self/ns/mnt")
@@ -1047,7 +1047,8 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
   if (!gid || gid.slice(1).some(value => Number(value) !== state.gid)) failed.push("gid");
   if (!linuxProcessGroupsAreDedicated(status, state.gid)) failed.push("groups");
   if (current !== state.cgroup && !current?.startsWith(`${state.cgroup}/`)) failed.push("cgroup");
-  if (procRoot !== plan.rootDirectory) failed.push("root directory");
+  if (!procRoot.isDirectory() || procRoot.dev !== configuredRoot.dev ||
+      procRoot.ino !== configuredRoot.ino) failed.push("root directory");
   if (net === hostNet) failed.push("network namespace");
   if (ipc === hostIpc) failed.push("IPC namespace");
   if (mounts === hostMounts) failed.push("mount namespace");

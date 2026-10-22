@@ -17,6 +17,7 @@ const build = fileURLToPath(new URL("../scripts/build-linux-peer-identity.mjs", 
 let tmpDir = "";
 let server: Server | undefined;
 let client: Socket | undefined;
+let acceptedSocket: Socket | undefined;
 
 beforeAll(() => {
   if (!compiler) return;
@@ -27,6 +28,8 @@ beforeAll(() => {
 afterEach(async () => {
   client?.destroy();
   client = undefined;
+  acceptedSocket?.destroy();
+  acceptedSocket = undefined;
   if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
   server = undefined;
   if (tmpDir) await rm(tmpDir, { recursive: true, force: true });
@@ -38,7 +41,7 @@ async function connect(): Promise<Socket> {
   const location = path.join(tmpDir, "peer.sock");
   let accepted!: (socket: Socket) => void;
   const peer = new Promise<Socket>(resolve => { accepted = resolve; });
-  server = createServer(socket => { socket.pause(); accepted(socket); });
+  server = createServer(socket => { acceptedSocket = socket; socket.pause(); accepted(socket); });
   await new Promise<void>((resolve, reject) => {
     server!.once("error", reject);
     server!.listen(location, resolve);

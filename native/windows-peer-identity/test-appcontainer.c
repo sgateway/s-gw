@@ -446,7 +446,27 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
         environment, agent_dir,
         &startup.StartupInfo, &process)) {
-        fprintf(stderr, "AppContainer process launch failed: %lu\n", GetLastError());
+        DWORD launch_error = GetLastError();
+        DWORD probe_error = ERROR_BAD_PATHNAME;
+        wchar_t system_image[MAX_PATH];
+        int image_size = swprintf(system_image, MAX_PATH, L"%ls\\System32\\whoami.exe", system_dir);
+        if (image_size > 0 && image_size < MAX_PATH) {
+            wchar_t probe_command[MAX_PATH + 3];
+            int command_size = swprintf(probe_command, MAX_PATH + 3, L"\"%ls\"", system_image);
+            PROCESS_INFORMATION probe = { 0 };
+            if (command_size > 0 && command_size < MAX_PATH + 3) {
+                if (CreateProcessW(system_image, probe_command, NULL, NULL, FALSE,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    environment, agent_dir, &startup.StartupInfo, &probe)) {
+                    probe_error = ERROR_SUCCESS;
+                    TerminateProcess(probe.hProcess, 1);
+                    CloseHandle(probe.hThread);
+                    CloseHandle(probe.hProcess);
+                } else probe_error = GetLastError();
+            }
+        }
+        fprintf(stderr, "AppContainer process launch failed: %lu; system image probe: %lu\n",
+            (unsigned long)launch_error, (unsigned long)probe_error);
         CloseHandle(job);
         goto done;
     }

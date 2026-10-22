@@ -55,7 +55,9 @@ jobs:
           npm run build:linux-activated-socket
           test -x "dist/native/linux-$(node -p process.arch)/s-gw-linux-activated-socket"
           npm exec -- vitest run tests/linux-activated-socket.test.ts tests/linux-agent-gate.test.ts --no-file-parallelism
-      - run: npm test
+      - run: npm test -- --no-file-parallelism
+        env:
+          SGW_ALLOW_NO_CGROUP: "1"
       - run: npm run audit:release
       - run: npm run package:dry-run
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createWriteStream, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -121,7 +121,7 @@ it.skipIf(process.platform === "win32")("spools named-pipe bytes before approval
   expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
 });
 
-it.skipIf(process.platform === "win32")("bounds spooled streams, clears failed captures, and keeps legacy pipe timing", async () => {
+it.skipIf(process.platform === "win32")("clears timed-out captures and keeps legacy pipe timing", async () => {
   const source = path.join(root, "bounded.pipe"), home = path.join(root, "store");
   execFileSync("mkfifo", [source]);
   await expect(prepareUpload(source, "/tmp/output", home,
@@ -130,16 +130,32 @@ it.skipIf(process.platform === "win32")("bounds spooled streams, clears failed c
   const old = await prepareUpload(source, "/tmp/output", home);
   expect(old.approvalScope).toBe("path-stream");
   expect(old.sha256).toBeUndefined();
-
-  const writer = createWriteStream(source);
-  const writing = new Promise<void>((resolve) => { writer.once("finish", resolve); writer.once("error", resolve); writer.once("close", resolve); });
-  writer.end(Buffer.alloc(32 * 1024 * 1024 + 1, 65));
-  await expect(prepareUpload(source, "/tmp/output", home, { pipeMode: "spooled-content-sha256" }))
-    .rejects.toThrow("exceeds 32 MiB");
-  writer.destroy();
-  await writing;
-  expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
 });
+
+it.skipIf(process.platform === "win32")("bounds spooled streams without leaving a blocked pipe writer", async () => {
+  const source = path.join(root, "bounded.pipe"), home = path.join(root, "store");
+  execFileSync("mkfifo", [source]);
+  const writer = spawn(process.execPath, ["-e", `
+    const fs = require('node:fs');
+    const fd = fs.openSync(process.argv[1], 'w');
+    const chunk = Buffer.alloc(64 * 1024, 65);
+    let left = 32 * 1024 * 1024 + 1;
+    while (left > 0) left -= fs.writeSync(fd, chunk, 0, Math.min(left, chunk.length));
+    fs.closeSync(fd);
+  `, source], { stdio: "ignore" });
+  const exited = new Promise<void>((resolve, reject) => {
+    writer.once("error", reject);
+    writer.once("exit", () => resolve());
+  });
+  try {
+    await expect(prepareUpload(source, "/tmp/output", home, { pipeMode: "spooled-content-sha256" }))
+      .rejects.toThrow("exceeds 32 MiB");
+  } finally {
+    writer.kill("SIGKILL");
+    await exited;
+  }
+  expect(await readdir(path.join(home, "uploads", "spooled"))).toEqual([]);
+}, 35_000);
 
 it.skipIf(process.platform === "win32")("deletes only the prepared spool whose metadata matches the request", async () => {
   const source = path.join(root, "discard.pipe"), home = path.join(root, "store");
