@@ -201,11 +201,16 @@ describe.skipIf(process.platform === "win32")("Linux systemd agent unit plan", (
       "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
     expect(systemdRunArgs(restricted)).toContain("--property=SystemCallArchitectures=native");
     expect(parseSystemdAgentState(restricted, attestation(restricted)).mainPid).toBe(1234);
+    expect(parseSystemdAgentState(restricted, attestation(restricted).replace(
+      "AF_UNIX AF_INET AF_INET6", "AF_INET6 AF_UNIX AF_INET")).mainPid).toBe(1234);
     expect(lifecyclePlanKey(restricted)).not.toBe(lifecyclePlanKey(ordinary));
-    for (const value of [
-      attestation(restricted).replace("AF_UNIX AF_INET AF_INET6", "AF_UNIX AF_INET AF_INET6 AF_NETLINK"),
-      attestation(restricted).replace("SystemCallArchitectures=native", "SystemCallArchitectures=")
-    ]) expect(() => parseSystemdAgentState(restricted, value)).toThrow("did not attest");
+    for (const families of ["", "AF_UNIX AF_INET", "AF_UNIX AF_INET AF_UNIX",
+      "AF_UNIX AF_INET AF_INET6 AF_NETLINK", "~AF_UNIX AF_INET AF_INET6"]) {
+      expect(() => parseSystemdAgentState(restricted, attestation(restricted).replace(
+        "AF_UNIX AF_INET AF_INET6", families))).toThrow("did not attest");
+    }
+    expect(() => parseSystemdAgentState(restricted, attestation(restricted).replace(
+      "SystemCallArchitectures=native", "SystemCallArchitectures="))).toThrow("did not attest");
     expect(() => validateLinuxAgentPlan({ ...ordinary, restrictedSocketFamilies: true }))
       .toThrow("arguments");
     expect(() => validateLinuxAgentPlan({ ...restricted, restrictedSocketFamilies: "yes" as never }))

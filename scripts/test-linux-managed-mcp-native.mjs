@@ -348,10 +348,16 @@ function agentAttestationSummary(agent) {
     for (const name of ["StandardInput", "StandardOutput", "StandardError"]) exact.set(name, "null");
   }
   if (p.restrictedSocketFamilies) {
-    exact.set("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6");
     exact.set("SystemCallArchitectures", "native");
   }
   const checks = new Map([...exact].map(([name, wanted]) => [name, value => value === wanted]));
+  if (p.restrictedSocketFamilies) {
+    checks.set("RestrictAddressFamilies", value => {
+      const wanted = new Set(["AF_UNIX", "AF_INET", "AF_INET6"]);
+      const names = value.split(" ");
+      return names.length === wanted.size && names.every(name => wanted.delete(name)) && wanted.size === 0;
+    });
+  }
   const readOnly = [`${p.brokerSocket}:/run/s-gw/broker.sock`];
   if (p.modelRelaySocket) readOnly.push(`${p.modelRelaySocket}:/run/s-gw/model.sock`);
   if (p.launchGate) readOnly.push(`/run/s-gw/launch-gates/${p.sessionId}:/run/s-gw/launch-gate`);

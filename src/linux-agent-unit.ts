@@ -278,6 +278,13 @@ function attestedReadOnlyPaths(plan: LinuxAgentUnitPlan, value: string | undefin
     actual.every((entry, index) => entry === expected[index] || entry === `${expected[index]}:rbind`);
 }
 
+function attestedAddressFamilies(value: string | undefined): boolean {
+  if (!value) return false;
+  const wanted = new Set(["AF_UNIX", "AF_INET", "AF_INET6"]);
+  const names = value.split(" ");
+  return names.length === wanted.size && names.every(name => wanted.delete(name)) && wanted.size === 0;
+}
+
 export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string): LinuxAgentUnitState {
   validateLinuxAgentPlan(plan);
   const fields = new Map<string, string>();
@@ -308,7 +315,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
     ["StandardOutput", !plan.sealedStdio || matches("StandardOutput", "null")],
     ["StandardError", !plan.sealedStdio || matches("StandardError", "null")],
     ["RestrictAddressFamilies", !plan.restrictedSocketFamilies ||
-      matches("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6")],
+      attestedAddressFamilies(fields.get("RestrictAddressFamilies"))],
     ["SystemCallArchitectures", !plan.restrictedSocketFamilies || matches("SystemCallArchitectures", "native")],
     ["BindPaths", matches("BindPaths", "")],
     ["Environment", matches("Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
