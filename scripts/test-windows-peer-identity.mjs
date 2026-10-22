@@ -16,8 +16,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = resolve(root, "dist/native", `win32-${process.arch}`, "s-gw-windows-peer-identity.exe");
 const tokenSource = resolve(root, "native/windows-peer-identity/test-token.c");
 const appContainerSource = resolve(root, "native/windows-peer-identity/test-appcontainer.c");
+const rootGuardSource = resolve(root, "native/windows-peer-identity/test-root-guard.c");
 const wfpSource = resolve(root, "native/windows-peer-identity/wfp-boundary.c");
 const parentEnvCanary = randomBytes(16).toString("hex");
+let rootGuardFixture;
 assert.ok(existsSync(helper), "The native peer helper must be built before its acceptance test.");
 
 function deadline(promise, ms, label) {
@@ -41,6 +43,8 @@ function launch(args, executable = helper) {
   const jobReady = new Promise(resolve => { jobReadyDone = resolve; });
   let wfpReadyDone;
   const wfpReady = new Promise(resolve => { wfpReadyDone = resolve; });
+  let rootReadyDone;
+  const rootReady = new Promise(resolve => { rootReadyDone = resolve; });
   let finish;
   const done = new Promise(resolve => { finish = resolve; });
   let reportPid;
@@ -54,6 +58,7 @@ function launch(args, executable = helper) {
     if (match) reportPid(Number(match[1]));
     if (/JOB-READY\r?\n/.test(report)) jobReadyDone(true);
     if (/WFP-READY\r?\n/.test(report)) wfpReadyDone(true);
+    if (/ROOT-READY\r?\n/.test(report)) rootReadyDone(true);
     if (output.length) readyDone(output[0] === 0x52);
   });
   child.stderr.on("data", chunk => { stderr += chunk.toString(); });
@@ -62,10 +67,11 @@ function launch(args, executable = helper) {
     readyDone(false);
     jobReadyDone(false);
     wfpReadyDone(false);
+    rootReadyDone(false);
     reportPid(null);
     finish({ code, signal, output, stderr, spawnError });
   });
-  return { child, ready, jobReady, wfpReady, done, processPid };
+  return { child, ready, jobReady, wfpReady, rootReady, done, processPid };
 }
 
 function pipeName() {
@@ -85,6 +91,10 @@ function aclTrail(path) {
   for (const at of new Set(targets)) {
     const acl = spawnSync("icacls", [at], { encoding: "utf8", windowsHide: true });
     lines.push(`${at}: ${acl.stdout.trim() || acl.stderr.trim() || `icacls exit ${acl.status}`}`);
+    if (at === targets[0] && rootGuardFixture) {
+      const nul = spawnSync(rootGuardFixture, ["null-acl"], { encoding: "utf8", windowsHide: true });
+      lines.push(`\\Device\\Null: ${nul.stdout.trim() || nul.stderr.trim() || `probe exit ${nul.status}`}`);
+    }
   }
   return lines.join("\n");
 }
@@ -353,6 +363,7 @@ try {
   const tokenProbe = compileFixture(tokenSource, "test-token", ["advapi32.lib"]);
   const appContainerFixture = compileFixture(appContainerSource, "test-appcontainer",
     ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib", "fwpuclnt.lib"], [wfpSource]);
+  rootGuardFixture = compileFixture(rootGuardSource, "test-root-guard", ["advapi32.lib"]);
 
   const probed = spawnSync(tokenProbe, [], { encoding: "utf8", windowsHide: true });
   assert.equal(probed.status, 0, probed.stderr || "Could not inspect the CI process token.");
@@ -403,6 +414,7 @@ try {
   }
 
   const profiles = [];
+  let rootGuard;
   try {
     for (let i = 0; i < 2; i++) {
       const name = `sgw-pipe-test-${randomBytes(8).toString("hex")}`;
@@ -440,6 +452,15 @@ try {
       { encoding: "utf8", windowsHide: true, timeout: 30_000 });
     assert.equal(wfpCheck.status, 0, wfpCheck.stderr || "The WFP policy self-test failed.");
     assert.match(wfpCheck.stdout, /WFP-REVOCATION-DETECTED/);
+    if (process.env.GITHUB_ACTIONS === "true" && process.env.SGW_TEST_PREP_WINDOWS_ROOT === "1") {
+      rootGuard = launch(["root-guard"], rootGuardFixture);
+      const ready = await deadline(rootGuard.rootReady, 15_000, "CI system-drive ACL guard");
+      if (!ready) {
+        const failed = await rootGuard.done;
+        assert.fail("The CI system-drive ACL guard did not apply its metadata-only grant: " +
+          (failed.spawnError?.message || failed.stderr.trim() || `exit ${failed.code}`));
+      }
+    }
     await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
       { intruderProfile: profiles[1], sameProfileOutOfJob: true });
     await acceptsAppContainer(profiles[1], brokerSid, logonLuid, sessionId,
@@ -454,12 +475,33 @@ try {
         "The broker canary changed during AppContainer execution.");
     }
   } finally {
-    for (const { name, fixtureDir } of profiles.reverse()) {
-      if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
-      const deleted = spawnSync(appContainerFixture, ["delete", name],
-        { encoding: "utf8", windowsHide: true });
-      assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
+    let guardError;
+    if (rootGuard) {
+      try {
+        if (rootGuard.child.exitCode === null && rootGuard.child.signalCode === null) {
+          rootGuard.child.stdin.end("R");
+        }
+        const restored = await deadline(rootGuard.done, 15_000, "CI system-drive ACL restoration");
+        assert.equal(restored.code, 0, restored.stderr || "The CI system-drive DACL was not restored.");
+        assert.match(restored.output.toString(), /(?:^|\n)ROOT-RESTORED\r?\n/,
+          "The CI system-drive original DACL was not verified after restoration.");
+      } catch (error) {
+        guardError = error;
+      }
     }
+    let profileError;
+    for (const { name, fixtureDir } of profiles.reverse()) {
+      try {
+        if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
+        const deleted = spawnSync(appContainerFixture, ["delete", name],
+          { encoding: "utf8", windowsHide: true });
+        assert.equal(deleted.status, 0, deleted.stderr || "Could not delete a temporary AppContainer profile.");
+      } catch (error) {
+        profileError ??= error;
+      }
+    }
+    if (guardError) throw guardError;
+    if (profileError) throw profileError;
   }
   console.log("Native Windows two-agent pipe, same-profile out-of-Job and connected-handle transfer denials to same-profile and host targets, process-handle, IPv4/IPv6 loopback, canary, Job teardown, and exchange passed.");
 } finally {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
-  chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync,
+  chmodSync, chownSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync,
   lstatSync, realpathSync, rmSync, symlinkSync, writeFileSync
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -180,6 +180,7 @@ try {
 
   rmSync(nodePath);
   copyFileSync(process.execPath, nodePath);
+  chownSync(nodePath, 0, 0);
   chmodSync(nodePath, 0o755);
   writeFileSync(entry, 'import { writeFileSync } from "node:fs"; writeFileSync(process.argv[2], "executed")\n');
   passes("copied Node baseline");

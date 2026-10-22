@@ -456,6 +456,8 @@ jobs:
       - name: Compile and test one-shot Windows peer helper
         if: matrix.group == 'acl'
         shell: pwsh
+        env:
+          SGW_TEST_PREP_WINDOWS_ROOT: '1'
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           if (-not (Test-Path $vswhere)) { throw 'Visual Studio installation discovery is unavailable.' }
