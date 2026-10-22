@@ -1017,14 +1017,18 @@ try {
       }
     }
     await remember(path.dirname(agent.socketPath));
-    await new Promise((resolve, reject) => {
-      const socket = createConnection(agent.socketPath);
-      socket.once("error", reject);
-      socket.once("connect", () => { socket.destroy(); resolve(); });
-    });
+    if (!testRelay) {
+      await new Promise((resolve, reject) => {
+        const socket = createConnection(agent.socketPath);
+        socket.once("error", reject);
+        socket.once("connect", () => { socket.destroy(); resolve(); });
+      });
+    }
   }
   if (testRelay) {
+    // An unhandled activation connection would restart the preapproval broker until systemd hits its limit.
     for (const agent of agents) {
+      run("systemctl", ["--system", "start", agent.brokerUnit]);
       const requestId = await until(() => {
         const found = asBroker("relay-pending", [agent.sessionId, agent.name,
           agent.model.handle, agent.plan.identityGeneration]);
@@ -1038,6 +1042,19 @@ try {
       }
       await until(() => run("systemctl", ["--system", "is-active", agent.brokerUnit], true).status !== 0,
         `${agent.sessionId} preapproval broker exit`);
+      const preparedUnit = unitProperties(agent.brokerUnit, ["Id", "FragmentPath", "ActiveState",
+        "Result", "ExecMainStatus", "InvocationID", "MainPID"]);
+      if (preparedUnit.get("Id") !== agent.brokerUnit ||
+          preparedUnit.get("FragmentPath") !== agent.brokerUnitFile ||
+          preparedUnit.get("ActiveState") !== "inactive" ||
+          preparedUnit.get("Result") !== "success" ||
+          preparedUnit.get("ExecMainStatus") !== "0" ||
+          preparedUnit.get("MainPID") !== "0" || !invocationId(preparedUnit) ||
+          !await fixtureUnitFile(agent.brokerUnit, agent.brokerUnitFile) ||
+          run("systemctl", ["--system", "is-active", agent.socketUnit], true).status !== 0 ||
+          run("systemctl", ["--system", "is-active", agent.modelSocketUnit], true).status !== 0) {
+        throw new Error("Preapproval request was not prepared by the verified broker unit with both sockets active.");
+      }
       if (asBroker("approve-relay", [requestId]) !== requestId) {
         throw new Error("Native model relay approval changed its request ID.");
       }
