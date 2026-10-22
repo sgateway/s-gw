@@ -389,17 +389,25 @@ export function assertControlUnitPreflight(output: string, runtime: {
   node: string; entry: string; args: string[];
 }): void {
   const unit = parseUnitProperties(output);
-  if (unit.get("Id") !== "s-gw-agent-control.service" || unit.get("ActiveState") !== "active" ||
-      unit.get("FragmentPath") !== runtime.unitFile || unit.get("EnvironmentFiles") !== "" ||
-      !unitCommand(unit.get("ExecStartPre"), runtime.preflight,
-        ["verify", runtime.runtimeRoot, runtime.node, runtime.entry, runtime.unitFile, "-", "-"]) ||
-      !unitCommand(unit.get("ExecStart"), runtime.preflight,
-        ["verify-exec", runtime.runtimeRoot, runtime.node, runtime.entry,
-          runtime.unitFile, "-", "-", "--", ...runtime.args]) ||
-      !safeUnitEnvironment(unit.get("UnsetEnvironment")) ||
-      !unit.get("UnsetEnvironment")?.split(/\s+/).includes("NODE_EXTRA_CA_CERTS")) {
-    throw new Error("Linux root control did not pass the native pre-exec runtime gate.");
+  const failed: string[] = [];
+  if (unit.get("Id") !== "s-gw-agent-control.service") failed.push("Id");
+  if (unit.get("ActiveState") !== "active") failed.push("ActiveState");
+  if (unit.get("FragmentPath") !== runtime.unitFile) failed.push("FragmentPath");
+  if (unit.get("EnvironmentFiles") !== "") failed.push("EnvironmentFiles");
+  if (!unitCommand(unit.get("ExecStartPre"), runtime.preflight,
+    ["verify", runtime.runtimeRoot, runtime.node, runtime.entry, runtime.unitFile, "-", "-"])) {
+    failed.push("ExecStartPre");
   }
+  if (!unitCommand(unit.get("ExecStart"), runtime.preflight,
+    ["verify-exec", runtime.runtimeRoot, runtime.node, runtime.entry,
+      runtime.unitFile, "-", "-", "--", ...runtime.args])) {
+    failed.push("ExecStart");
+  }
+  if (!safeUnitEnvironment(unit.get("UnsetEnvironment")) ||
+      !unit.get("UnsetEnvironment")?.split(/\s+/).includes("NODE_EXTRA_CA_CERTS")) {
+    failed.push("UnsetEnvironment");
+  }
+  if (failed.length) throw new Error(`Linux root control did not pass the native pre-exec runtime gate: ${failed.join(", ")}.`);
 }
 
 export function brokerUnitInvocation(record: LinuxManagedPlanRecord, pid: number,

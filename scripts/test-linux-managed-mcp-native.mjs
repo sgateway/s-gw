@@ -67,7 +67,7 @@ async function tcpCanary(host) {
     server.listen(0, host, () => { server.off("error", reject); resolve(); });
   });
   return { host, port: server.address().port, hits: () => hits,
-    close: () => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }) };
+    close: () => new Promise(resolve => server.close(resolve)) };
 }
 
 async function udpCanary(host, family) {
