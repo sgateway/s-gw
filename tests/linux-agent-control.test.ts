@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit, brokerUnitInvocation, claimIdentityMarkers, controlHandshakeFailure, sendControlReply, startTrackedManagedUnit,
   stopTrackedManagedUnit, validateLinuxManagedPlan, linuxRelayPreparationHash,
+  withLinuxPreparationReservation,
   validateLinuxManagedPlanRecord, type LinuxManagedPlanRecord } from "../src/linux-agent-control.js";
 import { assertLinuxPreparationSocketEnvironment } from "../src/linux-agent-control.js";
 import { validateLinuxManagedMcpConfig } from "../src/linux-managed-mcp.js";
@@ -224,6 +225,27 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
     for (const name of ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"]) {
       expect(() => assertLinuxPreparationSocketEnvironment({ [name]: "1" })).toThrow();
     }
+  });
+
+  it("reserves a preparation before its first await and releases it on either outcome", async () => {
+    const busy = new Set<string>();
+    let releaseFirst!: () => void;
+    const held = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const first = withLinuxPreparationReservation(busy, "managed-session", async () => {
+      await held;
+      return "first";
+    });
+    expect(busy.has("managed-session")).toBe(true);
+    await expect(withLinuxPreparationReservation(busy, "managed-session",
+      async () => "duplicate")).rejects.toThrow(/already preparing/);
+    await expect(withLinuxPreparationReservation(busy, "other-session",
+      async () => "other")).resolves.toBe("other");
+    releaseFirst();
+    await expect(first).resolves.toBe("first");
+    expect(busy.has("managed-session")).toBe(false);
+    await expect(withLinuxPreparationReservation(busy, "managed-session",
+      async () => { throw new Error("failed preparation"); })).rejects.toThrow(/failed preparation/);
+    expect(busy.size).toBe(0);
   });
 
   it("rejects broker unit replacement, a foreign PID, and a new invocation", () => {

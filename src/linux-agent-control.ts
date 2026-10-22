@@ -642,6 +642,36 @@ interface RelayPreparation {
   reject(error: Error): void;
 }
 
+export async function withLinuxPreparationReservation<T>(busy: Set<string>, sessionId: string,
+  work: () => Promise<T>): Promise<T> {
+  if (busy.has(sessionId)) throw new Error("Linux relay session is already preparing.");
+  busy.add(sessionId);
+  try { return await work(); }
+  finally { busy.delete(sessionId); }
+}
+
+async function waitForLinuxRelayRequest(unit: string, completed: Promise<string>,
+  preparation: RelayPreparation): Promise<string> {
+  const settled = completed.then(requestId => ({ requestId }), error => ({ error }));
+  while (true) {
+    const result = await Promise.race([settled,
+      new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 250))]);
+    if (result) {
+      if ("error" in result) throw result.error;
+      return result.requestId;
+    }
+    const state = parseUnitProperties(await systemctlProperties(unit, ["Id", "ActiveState", "MainPID"]));
+    if (state.get("Id") !== unit ||
+        ((state.get("ActiveState") === "inactive" || state.get("ActiveState") === "failed") &&
+          state.get("MainPID") === "0")) {
+      if (preparation.completed) return completed;
+      const error = new Error("Verified Linux broker exited before completing relay preparation.");
+      preparation.reject(error);
+      throw error;
+    }
+  }
+}
+
 export async function startLinuxAgentControlService(brokerUid: number, brokerGid: number): Promise<LinuxAgentControlService> {
   await checkedRootRuntime();
   if (!Number.isSafeInteger(brokerUid) || brokerUid < 1 ||
@@ -653,6 +683,7 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
   const draining = new Set<string>();
   const usedSessions = new Set<string>();
   const preparations = new Map<string, RelayPreparation>();
+  const preparing = new Set<string>();
   const connections = new Set<Socket>();
   const cleanups = new Set<Promise<void>>();
   let closing = false;
@@ -801,59 +832,65 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
   const prepareConnections = new Set<Socket>();
   const prepareRelay = async (sessionId: string): Promise<string> => {
     linuxAgentUnitName(sessionId);
-    if (closing || owners.has(sessionId) || draining.has(sessionId) ||
-        usedSessions.has(sessionId) || preparations.has(sessionId)) {
-      throw new Error("Linux relay session is active or already preparing.");
-    }
-    const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
-    await assertInactiveUnit(linuxAgentUnitName(sessionId));
-    await assertInactiveUnit(brokerUnit);
-    const mcpUnit = `s-gw-managed-mcp-${sessionId}.socket`;
-    const mcpState = parseUnitProperties(await systemctlProperties(mcpUnit,
-      ["ActiveState"])).get("ActiveState");
-    if (mcpState !== "active" && mcpState !== "inactive") {
-      throw new Error("Linux MCP socket is not in a preparable state.");
-    }
-    const record = await registeredPlan(sessionId, brokerUid, brokerGid, mcpState);
-    if (!record.modelRelaySocketUnitFile) {
-      throw new Error("Linux relay preparation requires its registered model socket.");
-    }
-    const initialHash = linuxRelayPreparationHash(record,
-      await readFile(record.brokerConfig, "utf8"));
-    const modelUnit = path.basename(record.modelRelaySocketUnitFile);
-    if (mcpState === "active") {
-      await systemctlAction("stop", mcpUnit);
-      await systemctlAction("stop", modelUnit);
-    }
-    await assertInactiveUnit(brokerUnit);
-    await registeredPlan(sessionId, brokerUid, brokerGid, "inactive");
-    const configHash = linuxRelayPreparationHash(record,
-      await readFile(record.brokerConfig, "utf8"));
-    if (configHash !== initialHash) {
-      throw new Error("Linux relay preparation config changed while sockets stopped.");
-    }
-    let timeout: NodeJS.Timeout | undefined;
-    const completed = new Promise<string>((resolve, reject) => {
-      const lease: RelayPreparation = { configHash, consumed: false, completed: false,
-        resolve, reject };
-      preparations.set(sessionId, lease);
-      timeout = setTimeout(() => reject(new Error("Linux relay preparation timed out.")), 45_000);
-    });
-    void completed.catch(() => {});
-    try {
-      await systemctlAction("start", record.brokerUnit);
-      const requestId = await completed;
-      await waitForPreparedBroker(record.brokerUnit);
-      const deadline = Date.now() + 5000;
-      while (owners.has(sessionId) && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 50));
+    return withLinuxPreparationReservation(preparing, sessionId, async () => {
+      if (closing || owners.has(sessionId) || draining.has(sessionId) ||
+          usedSessions.has(sessionId) || preparations.has(sessionId)) {
+        throw new Error("Linux relay session is active or already preparing.");
       }
-      if (owners.has(sessionId)) throw new Error("Linux broker retained control after preparation.");
-      return requestId;
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      preparations.delete(sessionId);
-    }
+      const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
+      await assertInactiveUnit(linuxAgentUnitName(sessionId));
+      await assertInactiveUnit(brokerUnit);
+      const mcpUnit = `s-gw-managed-mcp-${sessionId}.socket`;
+      const mcpState = parseUnitProperties(await systemctlProperties(mcpUnit,
+        ["ActiveState"])).get("ActiveState");
+      if (mcpState !== "active" && mcpState !== "inactive") {
+        throw new Error("Linux MCP socket is not in a preparable state.");
+      }
+      const record = await registeredPlan(sessionId, brokerUid, brokerGid, mcpState);
+      if (!record.modelRelaySocketUnitFile) {
+        throw new Error("Linux relay preparation requires its registered model socket.");
+      }
+      const initialHash = linuxRelayPreparationHash(record,
+        await readFile(record.brokerConfig, "utf8"));
+      const modelUnit = path.basename(record.modelRelaySocketUnitFile);
+      if (mcpState === "active") {
+        await systemctlAction("stop", mcpUnit);
+        await systemctlAction("stop", modelUnit);
+      }
+      await assertInactiveUnit(brokerUnit);
+      await registeredPlan(sessionId, brokerUid, brokerGid, "inactive");
+      const configHash = linuxRelayPreparationHash(record,
+        await readFile(record.brokerConfig, "utf8"));
+      if (configHash !== initialHash) {
+        throw new Error("Linux relay preparation config changed while sockets stopped.");
+      }
+      let timeout: NodeJS.Timeout | undefined;
+      let preparation!: RelayPreparation;
+      const completed = new Promise<string>((resolve, reject) => {
+        preparation = { configHash, consumed: false, completed: false,
+          resolve, reject };
+        preparations.set(sessionId, preparation);
+        timeout = setTimeout(() => reject(new Error("Linux relay preparation timed out.")), 45_000);
+      });
+      void completed.catch(() => {});
+      try {
+        await systemctlAction("start", record.brokerUnit);
+        const requestId = await waitForLinuxRelayRequest(record.brokerUnit, completed, preparation);
+        await waitForPreparedBroker(record.brokerUnit);
+        const deadline = Date.now() + 5000;
+        while (owners.has(sessionId) && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        if (owners.has(sessionId)) throw new Error("Linux broker retained control after preparation.");
+        return requestId;
+      } catch (error) {
+        preparation.reject(error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      } finally {
+        if (timeout) clearTimeout(timeout);
+        preparations.delete(sessionId);
+      }
+    });
   };
   const prepareServer = createServer(socket => {
     if (closing || prepareConnections.size >= 4) { socket.destroy(); return; }
