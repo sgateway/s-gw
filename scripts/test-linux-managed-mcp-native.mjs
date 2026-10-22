@@ -1047,13 +1047,25 @@ try {
     }
   }
   for (const agent of agents) {
-    const broker = unitProperties(agent.brokerUnit,
-      ["Id", "FragmentPath", "ActiveState", "InvocationID", "MainPID"]);
+    const broker = await until(() => {
+      const current = unitProperties(agent.brokerUnit,
+        ["Id", "FragmentPath", "ActiveState", "InvocationID", "MainPID"]);
+      if (current.get("Id") !== agent.brokerUnit || current.get("FragmentPath") !== agent.brokerUnitFile) {
+        throw new Error("The managed MCP broker changed before fixture activation.");
+      }
+      const brokerPid = Number(current.get("MainPID"));
+      if (!Number.isSafeInteger(brokerPid) || brokerPid < 0) {
+        throw new Error("The managed MCP broker has an invalid main PID.");
+      }
+      if (current.get("ActiveState") === "failed") {
+        throw new Error("The managed MCP broker failed before fixture activation.");
+      }
+      return current.get("ActiveState") === "active" && brokerPid > 0 ? current : false;
+    }, `${agent.sessionId} active managed broker`);
     const brokerInvocation = invocationId(broker);
     const brokerPid = Number(broker.get("MainPID"));
     if (broker.get("Id") !== agent.brokerUnit || broker.get("FragmentPath") !== agent.brokerUnitFile ||
-        broker.get("ActiveState") !== "active" || !brokerInvocation ||
-        !Number.isSafeInteger(brokerPid) || brokerPid < 1) {
+        !brokerInvocation || !Number.isSafeInteger(brokerPid) || brokerPid < 1) {
       throw new Error("The managed MCP broker has no verified fixture invocation.");
     }
     await assertSafeNodeEnv(broker, certFile);
