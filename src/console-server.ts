@@ -1606,6 +1606,7 @@ async function validSignedOperatorRequest(req: IncomingMessage, url: URL, sessio
   const prefix = `sgw-operator-v1\n${req.method}\n${url.pathname}${url.search}\n${nonce}\n`;
   const expected = createHmac("sha256", session.proof).update(prefix).update(body).digest("base64url");
   if (!sameSecret(signature, expected)) return false;
+  if (session.usedNonces.has(nonce) || session.usedNonces.size >= 20_000) return false;
   session.usedNonces.add(nonce);
   verifiedOperatorBodies.set(req, body);
   return true;

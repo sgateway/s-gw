@@ -216,6 +216,33 @@ describe("local console server", () => {
         Origin: new URL(running.url).origin, "Content-Type": "application/json" },
       body: JSON.stringify({ text: "changed", persist: false })
     })).status).toBe(403);
+
+    const replayHeaders = {
+      ...signedHeaders("POST", "/api/scan", signedBody, "E".repeat(22)),
+      Origin: new URL(running.url).origin,
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(signedBody),
+      Expect: "100-continue"
+    };
+    const heldPost = () => {
+      let req!: ReturnType<typeof httpRequest>;
+      const done = new Promise<number>((resolve, reject) => {
+        req = httpRequest(`${running!.url}api/scan`, { method: "POST", headers: replayHeaders }, (response) => {
+          response.resume();
+          response.on("end", () => resolve(response.statusCode || 0));
+        });
+        req.on("error", reject);
+      });
+      const ready = new Promise<void>((resolve) => req.once("continue", resolve));
+      req.flushHeaders();
+      return { ready, done, send: () => req.end(signedBody) };
+    };
+    const first = heldPost();
+    const second = heldPost();
+    await Promise.all([first.ready, second.ready]);
+    first.send();
+    second.send();
+    expect([await first.done, await second.done].sort()).toEqual([200, 403]);
   });
 
   it.skipIf(process.platform !== "darwin")("enrolls a background operator from a private local control socket", async () => {
