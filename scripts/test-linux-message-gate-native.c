@@ -192,7 +192,7 @@ static int test_shutdown(const char *cgroup, int mode) {
         close(from_gate[0]);
         close(from_gate[1]);
         close(client);
-        _exit(run_gate(getuid(), getgid(), cgroup, mode != 3));
+        _exit(run_gate(getuid(), getgid(), cgroup, mode != 3, 0));
     }
     close(SOCKET_FD);
     close(to_gate[0]);

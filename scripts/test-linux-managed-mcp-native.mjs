@@ -1047,6 +1047,17 @@ try {
     }
   }
   for (const agent of agents) {
+    const broker = unitProperties(agent.brokerUnit,
+      ["Id", "FragmentPath", "ActiveState", "InvocationID", "MainPID"]);
+    const brokerInvocation = invocationId(broker);
+    const brokerPid = Number(broker.get("MainPID"));
+    if (broker.get("Id") !== agent.brokerUnit || broker.get("FragmentPath") !== agent.brokerUnitFile ||
+        broker.get("ActiveState") !== "active" || !brokerInvocation ||
+        !Number.isSafeInteger(brokerPid) || brokerPid < 1) {
+      throw new Error("The managed MCP broker has no verified fixture invocation.");
+    }
+    await assertSafeNodeEnv(broker, certFile);
+    brokerInvocations.set(agent.sessionId, brokerInvocation);
     const ready = await until(() => maybeText(`${agent.root}/workspace/handoff-ready`),
       `${agent.sessionId} initialized MCP handoff gate`);
     if (ready !== "ready\n") throw new Error(`Unexpected MCP handoff gate: ${ready}`);
@@ -1104,11 +1115,10 @@ try {
     const broker = unitProperties(agent.brokerUnit, ["Id", "FragmentPath", "InvocationID", "MainPID"]);
     const brokerInvocation = invocationId(broker);
     if (broker.get("Id") !== agent.brokerUnit || broker.get("FragmentPath") !== agent.brokerUnitFile ||
-        !brokerInvocation) {
+        !brokerInvocation || brokerInvocation !== brokerInvocations.get(agent.sessionId)) {
       throw new Error("The managed MCP broker has no verified fixture invocation.");
     }
     await assertSafeNodeEnv(broker, certFile);
-    brokerInvocations.set(agent.sessionId, brokerInvocation);
     if (run("systemctl", ["--system", "is-active", agent.agentUnit], true).status !== 0) {
       throw new Error("The protected agent unit stopped before control-service revocation.");
     }

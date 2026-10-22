@@ -189,7 +189,11 @@ static int prepare_listener(void) {
     return 0;
 }
 
-static int run_gate(uid_t uid, gid_t gid, const char *cgroup, int http_half_close) {
+static void gate_trace(int enabled, const char *stage) {
+    if (enabled) fprintf(stderr, "gate-stage:%s\n", stage);
+}
+
+static int run_gate(uid_t uid, gid_t gid, const char *cgroup, int http_half_close, int trace) {
     struct sockaddr_storage address = { 0 };
     socklen_t address_size = sizeof(address);
     struct ucred peer = { 0 };
@@ -205,12 +209,17 @@ static int run_gate(uid_t uid, gid_t gid, const char *cgroup, int http_half_clos
         getsockopt(SOCKET_FD, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) != 0 ||
         peer_size != sizeof(peer) || peer.pid <= 0 || peer.uid != uid || peer.gid != gid ||
         !socket_flag(SOCKET_FD, SO_PASSCRED) || !socket_flag(SOCKET_FD, SO_PASSPIDFD) ||
-        !nonblocking(SOCKET_FD) || !nonblocking(STDIN_FILENO) || !nonblocking(STDOUT_FILENO)) return 1;
+        !nonblocking(SOCKET_FD) || !nonblocking(STDIN_FILENO) || !nonblocking(STDOUT_FILENO)) {
+        gate_trace(trace, "socket-check-failed");
+        return 3;
+    }
+    gate_trace(trace, "socket-ready");
 
     struct pending inbound = { 0 };
     struct pending outbound = { 0 };
     int input_open = 1;
     int socket_input_open = 1;
+    int exit_code = 1;
     while (1) {
         struct pollfd items[3] = {
             { .fd = SOCKET_FD,
@@ -228,23 +237,39 @@ static int run_gate(uid_t uid, gid_t gid, const char *cgroup, int http_half_clos
                 inbound.used - inbound.sent);
             if (amount > 0) inbound.sent += (size_t)amount;
             else if (amount < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
-            if (inbound.sent == inbound.used) inbound = (struct pending){ 0 };
+            if (inbound.sent == inbound.used) {
+                inbound = (struct pending){ 0 };
+                gate_trace(trace, "message-forwarded");
+            }
         }
         if (outbound.used && (items[0].revents & POLLOUT)) {
             ssize_t amount = send(SOCKET_FD, outbound.bytes + outbound.sent,
                 outbound.used - outbound.sent, MSG_NOSIGNAL);
             if (amount > 0) outbound.sent += (size_t)amount;
             else if (amount < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
-            if (outbound.sent == outbound.used) outbound = (struct pending){ 0 };
+            if (outbound.sent == outbound.used) {
+                outbound = (struct pending){ 0 };
+                gate_trace(trace, "reply-sent");
+            }
         }
         if (socket_input_open && !inbound.used && (items[0].revents & (POLLIN | POLLHUP))) {
             int result = verified_read(&inbound, uid, gid, cgroup);
-            if (result < 0 || (result == 0 && !http_half_close)) break;
+            if (result < 0) {
+                gate_trace(trace, "message-rejected");
+                exit_code = 2;
+                break;
+            }
+            if (result == 0 && !http_half_close) break;
             if (result == 0) socket_input_open = 0;
+            if (result == 1) gate_trace(trace, "message-verified");
         }
         if (input_open && !outbound.used && (items[2].revents & POLLIN)) {
             ssize_t amount = read(STDIN_FILENO, outbound.bytes, sizeof(outbound.bytes));
-            if (amount > 0) { outbound.used = (size_t)amount; outbound.sent = 0; }
+            if (amount > 0) {
+                outbound.used = (size_t)amount;
+                outbound.sent = 0;
+                gate_trace(trace, "reply-read");
+            }
             else if (amount == 0) input_open = 0;
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
         }
@@ -255,17 +280,20 @@ static int run_gate(uid_t uid, gid_t gid, const char *cgroup, int http_half_clos
         if (!input_open && !outbound.used) break;
     }
     shutdown(SOCKET_FD, SHUT_RDWR);
-    return 1;
+    return exit_code;
 }
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "prepare") == 0) return prepare_listener();
     unsigned int uid = 0;
     unsigned int gid = 0;
-    if ((argc == 5 || (argc == 6 && strcmp(argv[5], "http") == 0)) &&
+    int http = argc >= 6 && strcmp(argv[5], "http") == 0;
+    int trace = (argc == 6 && strcmp(argv[5], "trace") == 0) ||
+        (argc == 7 && http && strcmp(argv[6], "trace") == 0);
+    if ((argc == 5 || (argc == 6 && (http || trace)) || (argc == 7 && http && trace)) &&
         strcmp(argv[1], "run") == 0 && read_id(argv[2], &uid) &&
         read_id(argv[3], &gid) && uid > 0 && gid > 0) {
-        return run_gate((uid_t)uid, (gid_t)gid, argv[4], argc == 6);
+        return run_gate((uid_t)uid, (gid_t)gid, argv[4], http, trace);
     }
     return 1;
 }

@@ -524,9 +524,19 @@ int main(int argc, char **argv) {
     char handle[256], url[256], request_id[256], foreign_id[256], call[1024];
     if (read_field("/workspace/handle", handle, sizeof(handle)) != 0 ||
         read_field("/workspace/url", url, sizeof(url)) != 0) return 11;
-    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"forged-agent\",\"version\":\"1\"}}\n") != 0 ||
-        receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "\"id\":1") ||
-        !strstr(reply, "\"result\"")) return 6;
+    if (write_probe_stage("initialize-send\n") != 0) return 48;
+    if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"forged-agent\",\"version\":\"1\"}}\n") != 0) return 6;
+    if (write_probe_stage("initialize-receive\n") != 0) return 48;
+    int initialized = receive_line(fd, reply, sizeof(reply));
+    if (initialized != 0) {
+        write_probe_stage(initialized == -2 ? "initialize-closed\n" : "initialize-read-failed\n");
+        return 6;
+    }
+    if (!strstr(reply, "\"id\":1") || !strstr(reply, "\"result\"")) {
+        write_probe_stage("initialize-invalid-reply\n");
+        return 6;
+    }
+    if (write_probe_stage("initialize-ok\n") != 0) return 48;
     if (send_line(fd, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n") != 0 ||
         send_line(fd, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n") != 0 ||
         receive_line(fd, reply, sizeof(reply)) != 0 || !strstr(reply, "sgw_list_handles") ||

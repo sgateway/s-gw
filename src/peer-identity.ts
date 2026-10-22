@@ -7,6 +7,7 @@ import { principalForVerifiedPeer, type VerifiedAgentPrincipal } from "./agent-c
 import { checkLinuxActivatedSocket } from "./linux-activated-socket.js";
 import { checkLinuxPeerVerifier, verifyLinuxPeerProcess } from "./linux-peer-identity.js";
 import { prepareLinuxMessageListener } from "./linux-message-gate.js";
+import { traceLinuxManagedStart } from "./linux-agent-unit.js";
 import { assertNoMacAclAllow } from "./macos-path-acl.js";
 
 export interface UnixPeer {
@@ -151,14 +152,23 @@ export async function startVerifiedPeerServer(options: VerifiedPeerServerOptions
     socket.setTimeout(idleTimeoutMs, () => socket.destroy());
     socket.once("close", () => { sockets.delete(socket); pending.delete(socket); });
     const accepted = registry.snapshot();
+    let peerUid: number | undefined;
     void (activated ? checkLinuxActivatedSocket(socketPath, options.activatedFd!, options.socketGid!) : Promise.resolve())
       .then(() => readUnixPeer(socket)).then(async peer => {
+      peerUid = peer.uid;
+      if (options.requireLinuxMessageGate) traceLinuxManagedStart(peer.uid, "mcp peer credentials read");
       if (socket.destroyed) return;
       const principal = await registry.authenticate(peer, socket, accepted);
+      if (options.requireLinuxMessageGate) traceLinuxManagedStart(peer.uid, "mcp peer identity accepted");
       pending.delete(socket);
       if (socket.destroyed) return;
       await options.onConnection(socket, principal, peer);
-    }).catch(() => socket.destroy());
+    }).catch(() => {
+      if (options.requireLinuxMessageGate && peerUid !== undefined) {
+        traceLinuxManagedStart(peerUid, "mcp peer connection rejected");
+      }
+      socket.destroy();
+    });
   });
 
   try {

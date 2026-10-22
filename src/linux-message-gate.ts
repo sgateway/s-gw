@@ -4,6 +4,7 @@ import type { Socket } from "node:net";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { traceLinuxManagedStart } from "./linux-agent-unit.js";
 
 export interface LinuxMessageGate {
   input: Readable;
@@ -36,12 +37,33 @@ export async function startLinuxMessageGate(socket: Socket, uid: number, gid: nu
   if (socket.destroyed) throw new Error("Agent socket closed before message gate started.");
   const args = ["run", String(uid), String(gid), cgroup];
   if (mode === "http") args.push("http");
+  const trace = process.env.SGW_CI_LINUX_START_TRACE === "1";
+  if (trace) args.push("trace");
   const child = spawn(helper, args, {
-    stdio: ["pipe", "pipe", "ignore", socket], env: {}
+    stdio: ["pipe", "pipe", trace ? "pipe" : "ignore", socket], env: {}
   });
+  if (trace) {
+    let output = "";
+    let stages = 0;
+    child.stderr!.on("data", chunk => {
+      output += String(chunk);
+      if (output.length > 512) { output = ""; return; }
+      let end;
+      while ((end = output.indexOf("\n")) >= 0) {
+        const line = output.slice(0, end);
+        output = output.slice(end + 1);
+        if (stages++ >= 12 || !/^gate-stage:(socket-ready|socket-check-failed|message-verified|message-rejected|message-forwarded|reply-read|reply-sent)$/.test(line)) continue;
+        traceLinuxManagedStart(uid, `message gate ${line.slice(11)}`);
+      }
+    });
+  }
+  child.once("spawn", () => traceLinuxManagedStart(uid, "message gate spawned"));
   socket.setTimeout(0);
   child.once("error", () => socket.destroy());
-  child.once("close", () => socket.destroy());
+  child.once("close", code => {
+    traceLinuxManagedStart(uid, `message gate closed status=${code ?? "signal"}`);
+    socket.destroy();
+  });
   socket.once("close", () => child.kill());
   child.stdin!.on("error", () => socket.destroy());
   child.stdout!.on("error", () => socket.destroy());

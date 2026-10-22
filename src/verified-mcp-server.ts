@@ -5,6 +5,7 @@ import { executeApprovedRequest } from "./executor.js";
 import { buildHttpRequestAction } from "./http-action.js";
 import type { OwnedHttpOptions } from "./http-executor.js";
 import { managedSshHostFingerprint } from "./managed-ssh.js";
+import { traceLinuxManagedStart } from "./linux-agent-unit.js";
 import { startLinuxMessageGate } from "./linux-message-gate.js";
 import { startVerifiedPeerServer, type PeerSession, type VerifiedPeerServerOptions } from "./peer-identity.js";
 import { defaultSshInjectEnv } from "./ssh.js";
@@ -43,6 +44,7 @@ export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions):
     async onConnection(socket, principal) {
       const session = principal.sessionId ? sessions.get(principal.sessionId) : undefined;
       if (!session) { socket.destroy(); return; }
+      if (gated) traceLinuxManagedStart(session.uid, "mcp peer authenticated");
       const connection = new AbortController();
       socket.once("close", () => connection.abort());
       const active = () => {
@@ -133,8 +135,11 @@ export async function startVerifiedMcpServer(options: VerifiedMcpServerOptions):
       socket.once("close", () => { void server.close().catch(() => {}); });
       if (gated) {
         const gate = await startLinuxMessageGate(socket, session.uid, session.gid!, session.linuxCgroup!);
+        traceLinuxManagedStart(session.uid, "mcp message gate started");
         void server.connect(new StdioServerTransport(gate.input, gate.output,
-          { maxBufferSize: 1024 * 1024 })).catch(() => socket.destroy());
+          { maxBufferSize: 1024 * 1024 })).then(
+          () => traceLinuxManagedStart(session.uid, "mcp transport connected"),
+          () => { traceLinuxManagedStart(session.uid, "mcp transport rejected"); socket.destroy(); });
       } else {
         void server.connect(new StdioServerTransport(socket, socket, { maxBufferSize: 1024 * 1024 }))
           .then(() => socket.resume(), () => socket.destroy());
