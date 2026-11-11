@@ -19,6 +19,8 @@ import { basename, dirname, extname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildLegacyBridge } from "./build-legacy-bridge.mjs";
+import { stageAnthropicRuntime } from "./stage-anthropic-runtime.mjs";
+import { validatePackedConsumer } from "./validate-packed-consumer.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageInfo = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
@@ -45,6 +47,7 @@ try {
   rmSync(outputDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
+  stageAnthropicRuntime();
   run("npm", ["pack", "--ignore-scripts", "--pack-destination", workDir], root);
   const packed = resolve(workDir, packedFile);
   requireFile(packed);
@@ -52,6 +55,7 @@ try {
   const macArtifact = buildMacInstaller(packed);
   const windowsArtifact = buildWindowsInstaller(packed);
   copyFileSync(packed, resolve(outputDir, packageFile));
+  validatePackedConsumer(resolve(outputDir, packageFile));
   buildLegacyBridge(packed, resolve(outputDir, legacyBridgeFile), version);
 
   const artifacts = [legacyBridgeFile, packageFile, ...macArtifact.paths.map((file) => basename(file)), basename(windowsArtifact)];
@@ -172,6 +176,8 @@ function unpackRuntimePackage(packed, packageRoot) {
   run("tar", ["-xzf", packed, "--strip-components=1", "-C", packageRoot], root);
   copyFileSync(resolve(root, "package-lock.json"), resolve(packageRoot, "package-lock.json"));
   run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], packageRoot);
+  stageAnthropicRuntime(packageRoot);
+  run("npm", ["ls", "@anthropic-ai/sandbox-runtime", "zod", "--all"], packageRoot);
   rmSync(resolve(packageRoot, "package-lock.json"), { force: true });
 
   // The outer app is the only GUI bundle in this distribution. Keeping the thin

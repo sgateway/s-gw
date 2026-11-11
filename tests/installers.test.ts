@@ -91,7 +91,7 @@ describe("platform installers", () => {
       expect(files).toContain("dist/s-gw Menu Bar.app/Contents/MacOS/s-gw-menu-bar-helper");
     }
     expect(files).toContain("dist/windows/s-gw-helper-bootstrap.ps1");
-    expect(files.some((file) => file.endsWith(".map"))).toBe(false);
+    expect(files.some((file) => file.startsWith("dist/") && file.endsWith(".map"))).toBe(false);
     expect(files.some((file) => file.startsWith("native/"))).toBe(false);
     expect(files.some((file) => file.startsWith("scripts/"))).toBe(false);
   }, 20_000);
@@ -274,7 +274,7 @@ describe("platform installers", () => {
     expect(npmJob).toContain("repository: barryqy/s-gw-rust-core");
     expect(npmJob).toContain("ref: ${{ inputs.release_tag }}");
     expect(npmJob).not.toContain("github.event.release");
-    expect(npmJob).toContain("name: Pin release build npm");
+    expect(npmJob).toContain("name: Pin release dependency install npm");
     expect(npmJob).toContain("npx --yes --package npm@10.9.8 npm ci --ignore-scripts");
     expect(npmJob).toContain('test "$(npx --yes --package npm@10.9.8 npm --version)" = 10.9.8');
     expect(npmJob).not.toContain("npm install --global npm@10.9.8");
@@ -286,7 +286,8 @@ describe("platform installers", () => {
     expect(npmJob).toContain("Verify an existing immutable release");
     expect(npmJob).toContain("npm run audit:release");
     expect(npmJob).toContain('npm view "@s-gw/s-gw@${package_version}" dist.integrity');
-    expect(npmJob).toContain("npm publish --access public --ignore-scripts");
+    expect(npmJob).toContain('node scripts/validate-packed-consumer.mjs --tarball "$pack_dir/$package_filename"');
+    expect(npmJob).toContain('npm publish "$SGW_NPM_TARBALL" --access public --ignore-scripts');
     expect(npmJob).toContain("-verify_arch arm64");
     expect(npmJob).toContain('npm install --global --prefix "$prefix"');
     expect(npmJob).toContain('"@s-gw/s-gw@${package_version}"');

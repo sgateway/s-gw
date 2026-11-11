@@ -9,3 +9,11 @@ not licensed under the Apache License, Version 2.0.
 Distributed packages may include the separately maintained proprietary
 s-gw Rust execution core. That binary is not licensed under the Apache
 License, Version 2.0.
+
+The npm package bundles @anthropic-ai/sandbox-runtime 0.0.50 from the npm
+registry. s-gw changes only that package's manifest dependency on zod from
+^3.24.1 to ^4.6.7 so the bundled runtime resolves Zod 4.6.7. This is an
+s-gw packaging change; Anthropic did not publish that modified manifest.
+npm also bundles the runtime's required dependencies:
+@pondwader/socks5-server 1.0.10, commander 12.1.0, and shell-quote 1.12.0.
+Their registry sources and integrity hashes are recorded in package-lock.json.

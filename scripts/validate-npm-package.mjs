@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stageAnthropicRuntime } from "./stage-anthropic-runtime.mjs";
+import { validateBundledFiles, validatePackedConsumer } from "./validate-packed-consumer.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const expectedPlatform = "darwin";
@@ -19,12 +21,14 @@ if (packageInfo.name !== "@s-gw/s-gw" || !packageInfo.version) {
   throw new Error("Unexpected npm package identity.");
 }
 
+stageAnthropicRuntime();
 const packed = npmPackManifest();
 if (packed.name !== packageInfo.name || packed.version !== packageInfo.version) {
   throw new Error("npm pack metadata does not match package.json.");
 }
 
 const files = new Map(packed.files.map((entry) => [entry.path, entry]));
+validateBundledFiles(packed.files);
 const requiredFiles = [
   "dist/windows/s-gw-helper-bootstrap.ps1"
 ];
@@ -82,6 +86,7 @@ for (const filePath of targetExecutables) {
   }
 }
 
+validatePackedConsumer();
 console.log(`Validated ${packageInfo.name}@${packageInfo.version} for ${target}.`);
 
 function npmPackManifest() {

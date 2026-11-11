@@ -14,6 +14,7 @@ import { basename, dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { replaceDirectory } from "./replace-directory.mjs";
+import { stageAnthropicRuntime } from "./stage-anthropic-runtime.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const appRoot = resolve(root, "native/desktop-app");
@@ -42,6 +43,7 @@ const packageRoot = resolve(stagedRoot, "package");
 const nodeRoot = resolve(stagedRoot, "node");
 
 try {
+  stageAnthropicRuntime();
   const packOutput = runOutput(
     process.execPath,
     [npmCli, "pack", "--ignore-scripts", "--json", "--pack-destination", workDir],
@@ -58,6 +60,8 @@ try {
     [npmCli, "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
     packageRoot
   );
+  stageAnthropicRuntime(packageRoot);
+  run(process.execPath, [npmCli, "ls", "@anthropic-ai/sandbox-runtime", "zod", "--all"], packageRoot);
   rmSync(resolve(packageRoot, "package-lock.json"), { force: true });
   rmSync(resolve(packageRoot, "dist/installers"), { recursive: true, force: true });
   rmSync(resolve(packageRoot, "dist/s-gw.app"), { recursive: true, force: true });

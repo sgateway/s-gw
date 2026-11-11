@@ -60,6 +60,7 @@ jobs:
           SGW_ALLOW_NO_CGROUP: "1"
       - run: npm run audit:release
       - run: npm run package:dry-run
+      - run: npm run test:packed-consumer
 
   macos-native:
     name: macOS native surfaces

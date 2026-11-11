@@ -8,6 +8,7 @@ import { connect } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { stageAnthropicRuntime } from './stage-anthropic-runtime.mjs';
 
 if (!['darwin', 'linux'].includes(process.platform)) throw new Error('Package confinement E2E requires macOS or Linux.');
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -84,6 +85,7 @@ try {
   await writeFile(syntheticAuthPath, JSON.stringify({ fake_token: 'synthetic-only' }));
   await writeFile(path.join(root, 'npmrc'), 'registry=https://registry.npmjs.org/\n');
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  stageAnthropicRuntime();
   const packed = JSON.parse(run(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], { cwd: repo }))[0];
   assert(packed.files.some(file => file.path === 'dist/http-executor.js'));
   assert(packed.files.some(file => file.path === 'dist/sandbox-child.js'));
