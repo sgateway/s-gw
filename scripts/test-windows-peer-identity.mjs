@@ -241,7 +241,8 @@ function requestFrame(child) {
 }
 
 async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
-  { intruderProfile, stopJob = false, sameProfileOutOfJob = false, transferTo = null } = {}) {
+  { intruderProfile, stopJob = false, revokeWfp = false,
+    sameProfileOutOfJob = false, transferTo = null } = {}) {
   const name = pipeName();
   const job = jobName();
   let run;
@@ -277,7 +278,7 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
         "The same-profile target process ID was not reported.");
     }
     const launchMode = transferTo ? "launch-transfer-paused"
-      : stopJob ? "launch-stop-paused" : "launch-paused";
+      : stopJob ? "launch-stop-paused" : revokeWfp ? "launch-revoke-paused" : "launch-paused";
     const clientArgs = [launchMode, profile.name, name,
       String(ipv4.address().port), String(ipv6.address().port), profile.sharedPath,
       profile.canaryPath, job];
@@ -369,10 +370,12 @@ async function acceptsAppContainer(profile, brokerSid, logonLuid, sessionId,
         "The same-profile process-handle probe did not run.");
     }
 
-    if (stopJob) {
-      client.child.stdin.end("K");
+    if (stopJob || revokeWfp) {
+      client.child.stdin.end(revokeWfp ? "R" : "K");
       const stopped = await deadline(client.done, 15_000, "AppContainer job teardown");
-      assert.equal(stopped.code, 0, stopped.stderr || "Closing the Job Object did not stop its child.");
+      assert.equal(stopped.code, 0, stopped.stderr || "The Job Object did not stop its child.");
+      if (revokeWfp) assert.match(stopped.output.toString(), /(?:^|\n)WFP-JOB-REVOKED\r?\n/,
+        "The active AppContainer Job did not stop after WFP filter revocation.");
       run.child.stdin.end();
       const broker = await deadline(run.done, 10_000, "broker after agent teardown");
       assert.notEqual(broker.code, 0, "The broker completed a request after the agent was killed.");
@@ -538,6 +541,8 @@ try {
       { encoding: "utf8", windowsHide: true, timeout: 30_000 });
     assert.equal(wfpCheck.status, 0, wfpCheck.stderr || "The WFP policy self-test failed.");
     assert.match(wfpCheck.stdout, /WFP-REVOCATION-DETECTED/);
+    assert.match(wfpCheck.stdout, /WFP-JOB-REVOKED/);
+    assert.match(wfpCheck.stdout, /WFP-PREFLIGHT-REVOKED/);
     if (!sharedHost) {
       dnsCapture = await startDnsCapture();
       await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
@@ -549,6 +554,7 @@ try {
       await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
         { transferTo: "host" });
       await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { stopJob: true });
+      await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId, { revokeWfp: true });
       await deadline(new Promise(resolveWait => setTimeout(resolveWait, 1000)), 2_000,
         "late DNS query capture");
       for (const profile of profiles) {

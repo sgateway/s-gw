@@ -452,7 +452,7 @@ static DWORD probe_suspended_alt(const wchar_t *image, const wchar_t *cwd,
 static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
     const wchar_t *ipv4_port, const wchar_t *ipv6_port,
     const wchar_t *shared_path, const wchar_t *canary_path, const wchar_t *job_name,
-    int stop_job, int pause_start, int without_job,
+    int teardown, int pause_start, int without_job,
     const wchar_t *other_agent_pid, const wchar_t *broker_pid,
     const wchar_t *transfer_target_pid) {
     wchar_t parent_canary[64];
@@ -622,7 +622,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         puts("JOB-READY");
         fflush(stdout);
     }
-    if (!other_agent_pid && !stop_job && !without_job) {
+    if (!other_agent_pid && !teardown && !without_job) {
         printf("CHILD-PID=%lu\n", (unsigned long)process.dwProcessId);
         fflush(stdout);
     }
@@ -639,7 +639,7 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
             goto done;
         }
     }
-    if (ResumeThread(process.hThread) == (DWORD)-1) {
+    if (!sgw_wfp_healthy(&wfp) || ResumeThread(process.hThread) == (DWORD)-1) {
         TerminateProcess(process.hProcess, 1);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
@@ -647,30 +647,36 @@ static int launch_client(const wchar_t *name, const wchar_t *pipe_name,
         goto done;
     }
     DWORD exit_code = 1;
-    if (stop_job) {
+    if (teardown) {
         char signal = 0;
         DWORD amount = 0;
         HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
         if (input != INVALID_HANDLE_VALUE && ReadFile(input, &signal, 1, &amount, NULL) &&
-            amount == 1 && signal == 'K' && WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
-            CloseHandle(job);
-            job = NULL;
-            if (WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0 &&
-                GetExitCodeProcess(process.hProcess, &exit_code) && exit_code != 0) result = 0;
-        }
-        if (result) TerminateProcess(process.hProcess, 1);
-    } else {
-        DWORD waited = WAIT_TIMEOUT;
-        for (int i = 0; i < 120 && waited == WAIT_TIMEOUT; i++) {
-            waited = WaitForSingleObject(process.hProcess, 250);
-            if (waited == WAIT_TIMEOUT && !sgw_wfp_healthy(&wfp)) {
-                fputs("AppContainer WFP deny disappeared during execution.\n", stderr);
-                TerminateJobObject(job, 1);
-                break;
+            amount == 1 && signal == (teardown == 1 ? 'K' : 'R') &&
+            WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
+            if (teardown == 1) {
+                CloseHandle(job);
+                job = NULL;
+                if (WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0 &&
+                    GetExitCodeProcess(process.hProcess, &exit_code) && exit_code != 0) result = 0;
+            } else if (FwpmFilterDeleteById0(wfp.engine, wfp.filters[0]) == ERROR_SUCCESS &&
+                sgw_wfp_supervise_process(&wfp, job, process.hProcess, 2000) == ERROR_NETWORK_ACCESS_DENIED &&
+                GetExitCodeProcess(process.hProcess, &exit_code) && exit_code != 0) {
+                puts("WFP-JOB-REVOKED");
+                result = 0;
             }
         }
-        if (waited != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
+        if (result) TerminateProcess(process.hProcess, 1);
+    } else if (without_job) {
+        if (WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0)
+            TerminateProcess(process.hProcess, 1);
         else if (GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0) result = 0;
+    } else {
+        DWORD guarded = sgw_wfp_supervise_process(&wfp, job, process.hProcess, 30000);
+        if (guarded != ERROR_SUCCESS) {
+            fprintf(stderr, "AppContainer WFP supervision failed: %lu\n", (unsigned long)guarded);
+            TerminateProcess(process.hProcess, 1);
+        } else if (GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0) result = 0;
     }
     if (result) fprintf(stderr, "AppContainer child failed: %lu\n", (unsigned long)exit_code);
     if (other_agent_pid && !result) puts("PROCESS-DUP-DENIED");
@@ -710,6 +716,138 @@ static int hold_empty_job(const wchar_t *name, DWORD flags) {
     return 0;
 }
 
+static HANDLE create_supervisor_test_job(DWORD flags) {
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (!job) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+    limits.BasicLimitInformation.LimitFlags = flags;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        CloseHandle(job);
+        return NULL;
+    }
+    return job;
+}
+
+static int start_supervisor_test_child(HANDLE job, PROCESS_INFORMATION *process) {
+    wchar_t executable[MAX_PATH], command[MAX_PATH + 16];
+    DWORD image_length = GetModuleFileNameW(NULL, executable, MAX_PATH);
+    if (!image_length || image_length >= MAX_PATH) return 0;
+    int command_length = swprintf(command, sizeof(command) / sizeof(command[0]),
+        L"\"%ls\" sleep", executable);
+    if (command_length < 1 || command_length >= (int)(sizeof(command) / sizeof(command[0]))) return 0;
+    STARTUPINFOW startup = { 0 };
+    startup.cb = sizeof(startup);
+    memset(process, 0, sizeof(*process));
+    if (!CreateProcessW(executable, command, NULL, NULL, FALSE,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &startup, process)) return 0;
+    if ((job && !AssignProcessToJobObject(job, process->hProcess)) ||
+        ResumeThread(process->hThread) == (DWORD)-1) {
+        TerminateProcess(process->hProcess, 1);
+        CloseHandle(process->hThread);
+        CloseHandle(process->hProcess);
+        memset(process, 0, sizeof(*process));
+        return 0;
+    }
+    return 1;
+}
+
+static int supervisor_child_stopped(PROCESS_INFORMATION *process) {
+    DWORD exit_code = 0;
+    return WaitForSingleObject(process->hProcess, 1000) == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process->hProcess, &exit_code) && exit_code != 0;
+}
+
+static void close_supervisor_test_child(PROCESS_INFORMATION *process) {
+    if (!process->hProcess) return;
+    if (WaitForSingleObject(process->hProcess, 0) == WAIT_TIMEOUT)
+        TerminateProcess(process->hProcess, 1);
+    CloseHandle(process->hThread);
+    CloseHandle(process->hProcess);
+}
+
+static int supervisor_revokes_job(const SGW_WFP_BOUNDARY *boundary) {
+    HANDLE job = create_supervisor_test_job(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if (!job) return 0;
+    PROCESS_INFORMATION process = { 0 };
+    int revoked = start_supervisor_test_child(job, &process) &&
+        sgw_wfp_supervise_process(boundary, job, process.hProcess, 2000) == ERROR_NETWORK_ACCESS_DENIED &&
+        supervisor_child_stopped(&process);
+    close_supervisor_test_child(&process);
+    CloseHandle(job);
+    return revoked;
+}
+
+static int supervisor_rejects_bad_flags(const SGW_WFP_BOUNDARY *boundary, DWORD flags) {
+    HANDLE job = create_supervisor_test_job(flags);
+    if (!job) return 0;
+    PROCESS_INFORMATION process = { 0 };
+    int revoked = start_supervisor_test_child(job, &process) &&
+        sgw_wfp_supervise_process(boundary, job, process.hProcess, 2000) == ERROR_INVALID_DATA &&
+        supervisor_child_stopped(&process);
+    close_supervisor_test_child(&process);
+    CloseHandle(job);
+    return revoked;
+}
+
+static int supervisor_rejects_nonmember(const SGW_WFP_BOUNDARY *boundary) {
+    HANDLE job = create_supervisor_test_job(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if (!job) return 0;
+    PROCESS_INFORMATION member = { 0 }, outsider = { 0 };
+    int revoked = start_supervisor_test_child(job, &member) &&
+        start_supervisor_test_child(NULL, &outsider) &&
+        sgw_wfp_supervise_process(boundary, job, outsider.hProcess, 2000) == ERROR_INVALID_DATA &&
+        supervisor_child_stopped(&member) && supervisor_child_stopped(&outsider);
+    close_supervisor_test_child(&member);
+    close_supervisor_test_child(&outsider);
+    CloseHandle(job);
+    return revoked;
+}
+
+static int supervisor_rejects_query_error(const SGW_WFP_BOUNDARY *boundary) {
+    HANDLE job = create_supervisor_test_job(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if (!job) return 0;
+    PROCESS_INFORMATION process = { 0 };
+    HANDLE terminate_only = NULL;
+    int revoked = start_supervisor_test_child(job, &process) &&
+        DuplicateHandle(GetCurrentProcess(), job, GetCurrentProcess(), &terminate_only,
+            JOB_OBJECT_TERMINATE, FALSE, 0);
+    if (revoked) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+        revoked = !QueryInformationJobObject(terminate_only, JobObjectExtendedLimitInformation,
+            &limits, sizeof(limits), NULL) && GetLastError() == ERROR_ACCESS_DENIED &&
+            sgw_wfp_supervise_process(boundary, terminate_only, process.hProcess, 2000) == ERROR_ACCESS_DENIED &&
+            supervisor_child_stopped(&process);
+    }
+    if (terminate_only) CloseHandle(terminate_only);
+    close_supervisor_test_child(&process);
+    CloseHandle(job);
+    return revoked;
+}
+
+static int supervisor_rejects_missing_boundary(void) {
+    HANDLE job = create_supervisor_test_job(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if (!job) return 0;
+    PROCESS_INFORMATION process = { 0 };
+    int revoked = start_supervisor_test_child(job, &process) &&
+        sgw_wfp_supervise_process(NULL, job, process.hProcess, 2000) == ERROR_INVALID_PARAMETER &&
+        supervisor_child_stopped(&process);
+    close_supervisor_test_child(&process);
+    CloseHandle(job);
+    return revoked;
+}
+
+static int supervisor_preflight_revokes_job(const SGW_WFP_BOUNDARY *boundary) {
+    if (!supervisor_rejects_bad_flags(boundary, 0) ||
+        !supervisor_rejects_bad_flags(boundary,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK) ||
+        !supervisor_rejects_bad_flags(boundary,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) ||
+        !supervisor_rejects_nonmember(boundary) ||
+        !supervisor_rejects_query_error(boundary) ||
+        !supervisor_rejects_missing_boundary()) return 0;
+    return sgw_wfp_healthy(boundary);
+}
+
 static int test_wfp_revocation(const wchar_t *first_profile, const wchar_t *second_profile) {
     PSID first_sid = NULL, second_sid = NULL;
     if (FAILED(DeriveAppContainerSidFromAppContainerName(first_profile, &first_sid)) ||
@@ -733,10 +871,12 @@ static int test_wfp_revocation(const wchar_t *first_profile, const wchar_t *seco
         sgw_wfp_stop(&first);
         return 1;
     }
-    int healthy = sgw_wfp_healthy(&first) && sgw_wfp_healthy(&second);
+    int healthy = sgw_wfp_healthy(&first) && sgw_wfp_healthy(&second) &&
+        supervisor_preflight_revokes_job(&second);
     result = FwpmFilterDeleteById0(first.engine, first.filters[0]);
     int revoked = healthy && result == ERROR_SUCCESS &&
-        !sgw_wfp_healthy(&first) && sgw_wfp_healthy(&second);
+        !sgw_wfp_healthy(&first) && sgw_wfp_healthy(&second) &&
+        supervisor_revokes_job(&first);
     UINT64 second_filter = second.filters[0];
     sgw_wfp_stop(&first);
     if (revoked) revoked = sgw_wfp_healthy(&second);
@@ -755,10 +895,16 @@ static int test_wfp_revocation(const wchar_t *first_profile, const wchar_t *seco
         return 1;
     }
     puts("WFP-REVOCATION-DETECTED");
+    puts("WFP-JOB-REVOKED");
+    puts("WFP-PREFLIGHT-REVOKED");
     return 0;
 }
 
 int wmain(int argc, wchar_t **argv) {
+    if (argc == 2 && wcscmp(argv[1], L"sleep") == 0) {
+        Sleep(30000);
+        return 0;
+    }
     if (argc == 3 && wcscmp(argv[1], L"create") == 0) return create_profile(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"delete") == 0) {
         HRESULT status = DeleteAppContainerProfile(argv[2]);
@@ -783,9 +929,12 @@ int wmain(int argc, wchar_t **argv) {
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
             0, 0, 0, NULL, NULL, NULL);
     if (argc == 9 && (wcscmp(argv[1], L"launch-paused") == 0 ||
-        wcscmp(argv[1], L"launch-stop-paused") == 0))
+        wcscmp(argv[1], L"launch-stop-paused") == 0 ||
+        wcscmp(argv[1], L"launch-revoke-paused") == 0))
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
-            wcscmp(argv[1], L"launch-stop-paused") == 0, 1, 0, NULL, NULL, NULL);
+            wcscmp(argv[1], L"launch-stop-paused") == 0 ? 1 :
+            wcscmp(argv[1], L"launch-revoke-paused") == 0 ? 2 : 0,
+            1, 0, NULL, NULL, NULL);
     if (argc == 9 && wcscmp(argv[1], L"launch-unassigned") == 0)
         return launch_client(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
             0, 0, 1, NULL, NULL, NULL);

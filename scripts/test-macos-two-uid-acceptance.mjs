@@ -17,6 +17,7 @@ const policyControl = "/private/var/db/s-gw/agent-network-policy.sock";
 const runnerLeases = "/private/var/db/s-gw/agent-uid-leases";
 const scriptPath = fileURLToPath(import.meta.url);
 const sessionPattern = /^[A-Za-z0-9_-]{1,64}$/;
+const maxAgentChecks = 131_072;
 const nonRemote = new BlockList();
 nonRemote.addSubnet("127.0.0.0", 8, "ipv4");
 nonRemote.addAddress("0.0.0.0", "ipv4");
@@ -51,6 +52,62 @@ function validProtectedCanaries(value) {
     value.store !== value.recovery;
 }
 
+function validConsoleUiAssets(value) {
+  if (!value || typeof value !== "object" ||
+      Object.keys(value).sort().join(",") !== "bundleFile,manifestPath,uiDir") return false;
+  const paths = [value.uiDir, value.manifestPath, value.bundleFile];
+  return paths.every(item => typeof item === "string" && path.isAbsolute(item) &&
+    path.resolve(item) === item) &&
+    value.bundleFile.startsWith(`${value.uiDir}/`) &&
+    value.manifestPath !== value.bundleFile;
+}
+
+function validConsoleUiProbe(value) {
+  if (!value || typeof value !== "object" ||
+      Object.keys(value).sort().join(",") !== "files,manifestPath,uiDir" ||
+      typeof value.uiDir !== "string" || typeof value.manifestPath !== "string" ||
+      !Array.isArray(value.files) || value.files.length < 1 || value.files.length > 512) return false;
+  if (!path.isAbsolute(value.uiDir) || path.resolve(value.uiDir) !== value.uiDir ||
+      !path.isAbsolute(value.manifestPath) || path.resolve(value.manifestPath) !== value.manifestPath) return false;
+  const seen = new Set();
+  for (const file of value.files) {
+    if (typeof file !== "string" || !path.isAbsolute(file) || path.resolve(file) !== file ||
+        !file.startsWith(`${value.uiDir}/`) || seen.has(file)) return false;
+    seen.add(file);
+  }
+  return seen.has(path.join(value.uiDir, "index.html")) ||
+    seen.has(path.join(value.uiDir, "local-console.html"));
+}
+
+function encodeAgentChecks(checks) {
+  const encoded = Buffer.from(JSON.stringify(checks)).toString("base64url");
+  requireValue(encoded.length <= maxAgentChecks,
+    "The operator UI asset list is too large for the native acceptance plan.");
+  return encoded;
+}
+
+function consoleUiFilesFromManifest(uiDir, manifest, bundleFile) {
+  requireValue(manifest && typeof manifest === "object" && !Array.isArray(manifest),
+    "The operator UI manifest is invalid.");
+  const entries = Object.entries(manifest);
+  requireValue(entries.length > 0 && entries.length <= 512 &&
+    (typeof manifest["index.html"] === "string" ||
+      typeof manifest["local-console.html"] === "string") &&
+    typeof manifest[path.relative(uiDir, bundleFile)] === "string",
+  "The tested bundle file and entry page must be in the protected manifest.");
+  const files = [];
+  for (const [name, digest] of entries) {
+    requireValue(name && !name.startsWith("/") && !name.includes("\\") &&
+      name.split("/").every(part => part && part !== "." && part !== "..") &&
+      typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest),
+    "The operator UI manifest has an invalid asset.");
+    const asset = path.resolve(uiDir, name);
+    requireValue(asset.startsWith(`${uiDir}/`), "The operator UI asset escaped its bundle directory.");
+    files.push(asset);
+  }
+  return files;
+}
+
 function parsePlan(raw) {
   const plan = JSON.parse(raw);
   requireValue(plan?.purpose === "s-gw-macos-two-uid-acceptance" && plan.dedicatedTestHost === true,
@@ -69,6 +126,10 @@ function parsePlan(raw) {
       plan.protectedCanaries.store !== plan.brokerCanary &&
       plan.protectedCanaries.recovery !== plan.brokerCanary,
     "Protected store and recovery canaries must be distinct fixture files.");
+  }
+  if (plan.consoleUiAssets !== undefined) {
+    requireValue(validConsoleUiAssets(plan.consoleUiAssets),
+      "Console UI assets need a canonical directory, manifest, and contained bundle file.");
   }
   if (plan.consoleCanary !== undefined) {
     requireValue(plan.consoleCanary === true, "The synthetic console canary must be enabled with true.");
@@ -101,6 +162,11 @@ function parsePlan(raw) {
     sessions.add(agent.sessionId);
     sockets.add(agent.socketPath);
     sockets.add(agent.reportSocketPath);
+    if (plan.consoleUiAssets) {
+      requireValue(!Object.values(plan.consoleUiAssets).some(item =>
+        item === agent.workspace || item.startsWith(`${agent.workspace}/`)),
+      "Console UI assets cannot be inside an agent workspace.");
+    }
   }
   requireValue(!sockets.has(plan.leaseDir) && !sockets.has(plan.stagedAgentScript) &&
     !sockets.has(plan.brokerCanary),
@@ -190,6 +256,28 @@ async function checkedExecutableParents(value, brokerUid) {
   }
 }
 
+async function checkedConsoleUiFile(value, brokerUid) {
+  const info = await lstat(value);
+  requireValue(info.isFile() && (info.uid === 0 || info.uid === brokerUid) &&
+    (info.mode & 0o022) === 0 && info.nlink === 1 && await realpath(value) === value,
+  `Unsafe operator UI file: ${value}`);
+  await assertNoAclAllow(value);
+}
+
+async function checkedConsoleUiParents(value, brokerUid) {
+  let current = path.dirname(value);
+  while (true) {
+    const info = await lstat(current);
+    requireValue(info.isDirectory() && (info.uid === 0 || info.uid === brokerUid) &&
+      (info.mode & 0o022) === 0 && await realpath(current) === current,
+    `Unsafe operator UI directory: ${current}`);
+    await assertNoAclAllow(current);
+    const next = path.dirname(current);
+    if (next === current) return;
+    current = next;
+  }
+}
+
 function accountId(flag, name) {
   const output = execFileSync("/usr/bin/id", [flag, name], { encoding: "utf8", timeout: 1500 }).trim();
   requireValue(/^\d+$/.test(output), `Cannot resolve ${name}.`);
@@ -244,6 +332,20 @@ async function preflight(plan) {
       const parent = path.dirname(file);
       await checkedPath(parent, "directory", process.getuid(), 0o700);
       await checkedRootParents(parent);
+    }
+  }
+  let consoleUiFiles = [];
+  if (plan.consoleUiAssets) {
+    const { uiDir, manifestPath, bundleFile } = plan.consoleUiAssets;
+    await checkedConsoleUiParents(manifestPath, process.getuid());
+    await checkedConsoleUiFile(manifestPath, process.getuid());
+    const manifestInfo = await lstat(manifestPath);
+    requireValue(manifestInfo.size <= 256 * 1024, "The operator UI manifest is too large.");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    consoleUiFiles = consoleUiFilesFromManifest(uiDir, manifest, bundleFile);
+    for (const asset of consoleUiFiles) {
+      await checkedConsoleUiParents(asset, process.getuid());
+      await checkedConsoleUiFile(asset, process.getuid());
     }
   }
   const node = await lstat(plan.nodeExecutable);
@@ -310,6 +412,18 @@ async function preflight(plan) {
     }
   }
   requireNoExtendedAclParents(plan.agents[0].socketPath);
+  encodeAgentChecks({
+    unixProxyCanary: "x".repeat(100),
+    ...(plan.protectedCanaries ? { protectedCanaries: plan.protectedCanaries } : {}),
+    ...(plan.consoleUiAssets ? { consoleUiAssets: {
+      uiDir: plan.consoleUiAssets.uiDir,
+      manifestPath: plan.consoleUiAssets.manifestPath,
+      files: consoleUiFiles
+    } } : {}),
+    ...(plan.consoleCanary ? { consoleCanary: { host: "127.0.0.1", port: 65_535 } } : {}),
+    ...(plan.remoteTcpCanaries ? { remoteTcpCanaries: plan.remoteTcpCanaries } : {})
+  });
+  return consoleUiFiles;
 }
 
 function startLoopback(host) {
@@ -386,6 +500,33 @@ async function deniedFileOpen(location, flags) {
   }
   await file.close();
   return false;
+}
+
+async function deniedWriteAccess(location) {
+  try { await access(location, constants.W_OK); }
+  catch (error) { return error?.code === "EACCES" || error?.code === "EPERM"; }
+  return false;
+}
+
+async function consoleUiWriteDenied(assets) {
+  const dirs = new Set([assets.uiDir, path.dirname(assets.manifestPath)]);
+  for (const file of assets.files) {
+    let current = path.dirname(file);
+    while (current !== assets.uiDir) {
+      dirs.add(current);
+      const next = path.dirname(current);
+      if (next === current || (next !== assets.uiDir && !next.startsWith(`${assets.uiDir}/`))) return false;
+      current = next;
+    }
+  }
+  for (const dir of dirs) {
+    if (!await deniedWriteAccess(dir)) return false;
+  }
+  if (!await deniedFileOpen(assets.manifestPath, constants.O_WRONLY)) return false;
+  for (const file of assets.files) {
+    if (!await deniedFileOpen(file, constants.O_WRONLY)) return false;
+  }
+  return true;
 }
 
 function sendUdpProbe(host, port) {
@@ -490,13 +631,22 @@ function requireTransferDenial(donor, recipient, transferStarted) {
     `Descriptor-transfer result is inconclusive: donor=${donor}, recipient=${recipient}.`);
 }
 
+function validRevokedReport(result, plan) {
+  return result.phase === "revoked" && result.heldClosed === true &&
+    result.reconnectDenied === true && result.ipv4StillDenied === true &&
+    result.ipv6StillDenied === true && result.unixProxyStillDenied === true &&
+    (!plan.hostIpv4Probe || result.hostIpv4StillDenied === true) &&
+    (!plan.consoleCanary || result.consoleStillDenied === true) &&
+    (!plan.remoteTcpCanaries || result.remoteTcpStillDenied === true);
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 }
 
-async function runBroker(plan) {
+async function runBroker(plan, consoleUiFiles) {
   const { startVerifiedPeerServer } = await import("../dist/peer-identity.js");
   const { MacAgentSessionLeases } = await import("../dist/macos-agent-session.js");
   const { acknowledgeMacAgentLaunch } = await import("../dist/macos-agent-probe.js");
@@ -615,6 +765,10 @@ async function runBroker(plan) {
                   result.recoveryReadDenied === true && result.recoveryWriteDenied === true,
                 `Agent ${agent.uid} reached a protected store or recovery canary.`);
               }
+              if (plan.consoleUiAssets) {
+                requireValue(result.consoleUiWriteDenied === true,
+                  `Agent ${agent.uid} can change a protected console UI file or directory.`);
+              }
               if (plan.consoleCanary) {
                 requireValue(result.consoleDenied === true,
                   `Agent ${agent.uid} reached the synthetic console canary.`);
@@ -644,9 +798,8 @@ async function runBroker(plan) {
               socket.end("ACK-V1\n", () => transferReports.get(agent.uid).resolve());
               return;
             }
-            requireValue(result.phase === "revoked" && revoking.has(agent.uid) &&
-              heldSockets.has(agent.uid) && result.heldClosed === true &&
-              result.reconnectDenied === true && !revokedReports.has(agent.uid),
+            requireValue(revoking.has(agent.uid) && heldSockets.has(agent.uid) &&
+              validRevokedReport(result, plan) && !revokedReports.has(agent.uid),
             `Agent ${agent.uid} failed live peer revocation.`);
             revokedReports.set(agent.uid, result);
             socket.end("ACK-V1\n", () => finalReports.get(agent.uid).resolve());
@@ -672,9 +825,15 @@ async function runBroker(plan) {
       const extraChecks = {
         unixProxyCanary: unixCanary.socketPath,
         ...(plan.protectedCanaries ? { protectedCanaries: plan.protectedCanaries } : {}),
+        ...(plan.consoleUiAssets ? { consoleUiAssets: {
+          uiDir: plan.consoleUiAssets.uiDir,
+          manifestPath: plan.consoleUiAssets.manifestPath,
+          files: consoleUiFiles
+        } } : {}),
         ...(plan.consoleCanary ? { consoleCanary: { host: "127.0.0.1", port: consoleCanary.port } } : {}),
         ...(plan.remoteTcpCanaries ? { remoteTcpCanaries: plan.remoteTcpCanaries } : {})
       };
+      const encodedChecks = encodeAgentChecks(extraChecks);
       return {
         account: agent.account,
         runnerArgv: [String(agent.uid), String(agent.gid), agent.sessionId, agent.workspace,
@@ -684,8 +843,7 @@ async function runBroker(plan) {
           String(ipv4.port), String(ipv6.port), String(udp4.port), String(udp6.port),
           plan.brokerCanary, other.workspace,
           ...(plan.hostIpv4Probe ? [`--host-ipv4=${plan.hostIpv4Probe},${hostIpv4Tcp.port},${hostIpv4Udp.port}`] : []),
-          ...(Object.keys(extraChecks).length ?
-            [`--checks=${Buffer.from(JSON.stringify(extraChecks)).toString("base64url")}`] : []),
+          [`--checks=${encodedChecks}`],
           ...(plan.fdTransferProbe ? [i === 0 ? "send" : "recv",
             plan.fdTransferProbe.helperExecutable, plan.fdTransferProbe.rendezvousPath] : [])]
       };
@@ -718,7 +876,7 @@ async function runBroker(plan) {
     await delay(200);
     requireValue(ipv4.hits() === 0 && ipv6.hits() === 0 &&
       udp4.hits() === 0 && udp6.hits() === 0 && unixCanary.hits() === 0,
-      "An agent reached a host-loopback or local Unix listener directly.");
+      "An agent reached a host-loopback or local Unix listener before or after revocation.");
     if (plan.hostIpv4Probe) {
       requireValue(hostIpv4Tcp.hits() === 0 && hostIpv4Udp.hits() === 0,
         "An agent reached the host's non-loopback IPv4 listener directly.");
@@ -736,6 +894,20 @@ async function runBroker(plan) {
         await access(file, constants.R_OK | constants.W_OK);
       }
     }
+    requireValue(await canConnect("127.0.0.1", ipv4.port) &&
+      await canConnect("::1", ipv6.port) && await canConnect(unixCanary.socketPath),
+    "The broker lost a network-denial control listener.");
+    await sendUdpProbe("127.0.0.1", udp4.port);
+    await sendUdpProbe("::1", udp6.port);
+    if (plan.hostIpv4Probe) {
+      requireValue(await canConnect(plan.hostIpv4Probe, hostIpv4Tcp.port),
+        "The broker lost its non-loopback IPv4 control listener.");
+      await sendUdpProbe(plan.hostIpv4Probe, hostIpv4Udp.port);
+    }
+    await delay(50);
+    requireValue(udp4.hits() > 0 && udp6.hits() > 0 &&
+      (!plan.hostIpv4Probe || hostIpv4Udp.hits() > 0),
+    "The broker lost a network-denial UDP control listener.");
     for (const stop of stops) stop();
     await Promise.all(plan.agents.map(async agent => {
       try {
@@ -749,6 +921,8 @@ async function runBroker(plan) {
     process.stdout.write(`${JSON.stringify({ event: "passed", uids: plan.agents.map(agent => agent.uid),
       brokerLeasesRetained: true, livePeerRevocation: true,
       hostLoopbackDenied: true, udpHostLoopbackDenied: true, localUnixProxyDenied: true,
+      networkDenialRetainedAfterRevocation: true,
+      ...(plan.consoleUiAssets ? { protectedConsoleUiWriteDenied: true } : {}),
       ...(plan.hostIpv4Probe ? { hostIpv4Denied: true } : {}),
       ...(plan.protectedCanaries ? { protectedStoreAndRecoveryDenied: true } : {}),
       ...(plan.consoleCanary ? { syntheticConsoleCanaryDenied: true } : {}),
@@ -820,6 +994,11 @@ async function selfTestReport() {
     protectedCanaries: {
       store: `${fixtureRoot}/store/canary`, recovery: `${fixtureRoot}/recovery/canary`
     },
+    consoleUiAssets: {
+      uiDir: `${fixtureRoot}/console-ui`,
+      manifestPath: `${fixtureRoot}/console-ui-manifest.json`,
+      bundleFile: `${fixtureRoot}/console-ui/index.html`
+    },
     consoleCanary: true,
     remoteTcpCanaries: [{ host: "203.0.113.10", port: 443 }, { host: "2001:db8::10", port: 443 }],
     agents: [1, 2].map(i => ({
@@ -836,6 +1015,12 @@ async function selfTestReport() {
     invalid(() => parsePlan(JSON.stringify({ ...samplePlan, remoteTcpCanaries: [{ host: "::ffff:127.0.0.1", port: 443 }] }))) &&
     invalid(() => parsePlan(JSON.stringify({ ...samplePlan, protectedCanaries: {
       store: `${fixtureRoot}/store/canary`, recovery: "/Users/example/live-store"
+    } }))) &&
+    invalid(() => parsePlan(JSON.stringify({ ...samplePlan, consoleUiAssets: {
+      ...samplePlan.consoleUiAssets, bundleFile: `${fixtureRoot}/work-1/index.html`
+    } }))) &&
+    invalid(() => parsePlan(JSON.stringify({ ...samplePlan, consoleUiAssets: {
+      ...samplePlan.consoleUiAssets, manifestPath: "relative/manifest.json"
     } }))),
   "Malformed optional fixture canaries were accepted.");
   const encoded = Buffer.from(JSON.stringify({ consoleCanary: { host: "127.0.0.1", port: 12345 } })).toString("base64url");
@@ -843,9 +1028,32 @@ async function selfTestReport() {
     invalid(() => parseAgentChecks("not-base64!")) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ consoleCanary: { host: "localhost", port: 12345 } })).toString("base64url"))) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ remoteTcpCanaries: [{ host: "127.0.0.1", port: 80 }] })).toString("base64url"))) &&
+    invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ consoleUiAssets: {
+      uiDir: samplePlan.consoleUiAssets.uiDir,
+      manifestPath: samplePlan.consoleUiAssets.manifestPath,
+      files: ["/tmp/index.html"]
+    } })).toString("base64url"))) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ unixProxyCanary: "/tmp/proxy.sock" })).toString("base64url"))) &&
     invalid(() => parseAgentChecks(Buffer.from(JSON.stringify({ unexpected: true })).toString("base64url"))),
   "Malformed optional agent check payloads were accepted.");
+  const uiProbe = { uiDir: samplePlan.consoleUiAssets.uiDir,
+    manifestPath: samplePlan.consoleUiAssets.manifestPath,
+    files: [samplePlan.consoleUiAssets.bundleFile, `${samplePlan.consoleUiAssets.uiDir}/assets/extra.js`] };
+  const manifestFiles = consoleUiFilesFromManifest(uiProbe.uiDir, {
+    "index.html": "a".repeat(64), "assets/extra.js": "b".repeat(64)
+  }, samplePlan.consoleUiAssets.bundleFile);
+  requireValue(manifestFiles.length === 2 && manifestFiles.includes(uiProbe.files[1]) &&
+    invalid(() => consoleUiFilesFromManifest(uiProbe.uiDir, {
+      "index.html": "a".repeat(64), "../outside.js": "b".repeat(64)
+    }, samplePlan.consoleUiAssets.bundleFile)) &&
+    validConsoleUiProbe(uiProbe) &&
+    parseAgentChecks(encodeAgentChecks({ consoleUiAssets: uiProbe })).consoleUiAssets.files.length === 2 &&
+    invalid(() => encodeAgentChecks({ consoleUiAssets: {
+      ...uiProbe,
+      files: Array.from({ length: 512 }, (_, i) => `${uiProbe.uiDir}/${"x".repeat(200)}${i}`)
+    } })) &&
+    invalid(() => parseAgentChecks("x".repeat(maxAgentChecks + 1))),
+  "The native UI asset transport accepted an oversized plan.");
   const unixDir = await mkdtemp(path.join(tmpdir(), "sgw-unix-canary-"));
   try {
     const unix = await startLocalUnixCanary(unixDir);
@@ -860,6 +1068,46 @@ async function selfTestReport() {
     requireValue(acl.status === 0, "Could not stage the local Unix ACL rejection control.");
     requireValue(invalid(() => requireNoExtendedAcl(aclFile)),
       "An extended ACL could mask the local Unix denial probe.");
+    const uiDir = await mkdtemp(path.join(unixDir, "ui-"));
+    const manifestDir = await mkdtemp(path.join(unixDir, "manifest-"));
+    const manifestPath = path.join(manifestDir, "console-ui-manifest.json");
+    const bundleFile = path.join(uiDir, "index.html");
+    const assetDir = await mkdtemp(path.join(uiDir, "assets-"));
+    const secondFile = path.join(assetDir, "extra.js");
+    try {
+      await writeFile(manifestPath, JSON.stringify({ "index.html": "test",
+        [path.relative(uiDir, secondFile)]: "test" }) + "\n");
+      await writeFile(bundleFile, "test\n");
+      await writeFile(secondFile, "test\n");
+      await chmod(manifestPath, 0o444);
+      await chmod(bundleFile, 0o444);
+      await chmod(secondFile, 0o444);
+      await chmod(assetDir, 0o555);
+      await chmod(uiDir, 0o555);
+      await chmod(manifestDir, 0o555);
+      const ui = { uiDir, manifestPath, files: [bundleFile, secondFile] };
+      requireValue(await consoleUiWriteDenied(ui),
+        "A read-only UI directory and manifest were not recognized as protected.");
+      await chmod(uiDir, 0o755);
+      requireValue(!await consoleUiWriteDenied(ui),
+        "An agent-writable UI directory passed the effective-access probe.");
+      await chmod(uiDir, 0o555);
+      await chmod(manifestPath, 0o644);
+      requireValue(!await consoleUiWriteDenied(ui),
+        "An agent-writable UI manifest passed the effective-access probe.");
+      await chmod(manifestPath, 0o444);
+      await chmod(assetDir, 0o755);
+      requireValue(!await consoleUiWriteDenied(ui),
+        "A writable nested UI asset directory passed the effective-access probe.");
+      await chmod(assetDir, 0o555);
+      await chmod(secondFile, 0o644);
+      requireValue(!await consoleUiWriteDenied(ui),
+        "A second writable UI asset passed the effective-access probe.");
+    } finally {
+      await chmod(uiDir, 0o700);
+      await chmod(assetDir, 0o700);
+      await chmod(manifestDir, 0o700);
+    }
   } finally { await rm(unixDir, { recursive: true, force: true }); }
   const udp4 = await startUdpLoopback("127.0.0.1");
   const udp6 = await startUdpLoopback("::1");
@@ -950,6 +1198,14 @@ async function selfTestReport() {
   catch (error) { rejectedUsed = String(error).includes("used a donor-authenticated descriptor"); }
   requireValue(rejectedUsed, "A recipient that used the descriptor was accepted after a donor denial.");
   requireTransferDenial("denied", "unreachable", false);
+  const revoked = { phase: "revoked", heldClosed: true, reconnectDenied: true,
+    ipv4StillDenied: true, ipv6StillDenied: true, unixProxyStillDenied: true,
+    consoleStillDenied: true, remoteTcpStillDenied: true };
+  requireValue(validRevokedReport(revoked, samplePlan) &&
+    !validRevokedReport({ ...revoked, ipv4StillDenied: false }, samplePlan) &&
+    !validRevokedReport({ ...revoked, consoleStillDenied: false }, samplePlan) &&
+    !validRevokedReport({ ...revoked, remoteTcpStillDenied: false }, samplePlan),
+  "A lost network denial was accepted after revocation.");
   process.stdout.write("Native acceptance result, held-probe framing, and network controls passed local round trips.\n");
 }
 
@@ -971,13 +1227,14 @@ function runTransferHelper(role, helperExecutable, rendezvousPath, reportSocket)
 }
 
 function parseAgentChecks(encoded) {
-  requireValue(/^[A-Za-z0-9_-]{1,8192}$/.test(encoded), "Malformed optional agent checks.");
+  requireValue(encoded.length <= maxAgentChecks && /^[A-Za-z0-9_-]+$/.test(encoded),
+    "Malformed optional agent checks.");
   const bytes = Buffer.from(encoded, "base64url");
   requireValue(bytes.toString("base64url") === encoded, "Malformed optional agent checks.");
   const checks = JSON.parse(bytes.toString("utf8"));
   requireValue(checks && typeof checks === "object" && !Array.isArray(checks) &&
     Object.keys(checks).length > 0 &&
-    Object.keys(checks).every(key => ["protectedCanaries", "consoleCanary", "remoteTcpCanaries", "unixProxyCanary"].includes(key)),
+    Object.keys(checks).every(key => ["protectedCanaries", "consoleUiAssets", "consoleCanary", "remoteTcpCanaries", "unixProxyCanary"].includes(key)),
   "Unknown optional agent check.");
   if (checks.unixProxyCanary !== undefined) {
     requireValue(isFixturePath(checks.unixProxyCanary) &&
@@ -985,6 +1242,9 @@ function parseAgentChecks(encoded) {
   }
   if (checks.protectedCanaries !== undefined) {
     requireValue(validProtectedCanaries(checks.protectedCanaries), "Malformed protected agent canaries.");
+  }
+  if (checks.consoleUiAssets !== undefined) {
+    requireValue(validConsoleUiProbe(checks.consoleUiAssets), "Malformed operator UI assets.");
   }
   if (checks.consoleCanary !== undefined) {
     requireValue(validTcpCanary(checks.consoleCanary) && checks.consoleCanary.host === "127.0.0.1",
@@ -1075,6 +1335,9 @@ async function runAgent(args) {
       recoveryReadDenied: await deniedFileOpen(checks.protectedCanaries.recovery, constants.O_RDONLY),
       recoveryWriteDenied: await deniedFileOpen(checks.protectedCanaries.recovery, constants.O_WRONLY)
     } : {}),
+    ...(checks.consoleUiAssets ? {
+      consoleUiWriteDenied: await consoleUiWriteDenied(checks.consoleUiAssets)
+    } : {}),
     ...(checks.consoleCanary ? { consoleDenied: !await canConnect(checks.consoleCanary.host, checks.consoleCanary.port) } : {}),
     ...(checks.remoteTcpCanaries ? { remoteTcpDenied } : {})
   };
@@ -1086,10 +1349,24 @@ async function runAgent(args) {
     await sendReport(reportSocket, { phase: "fd-transfer", uid, sessionId, status });
   }
   await waitForHeldProbeClose(ownSocket);
+  await sendUdpProbe("127.0.0.1", udp4Port);
+  await sendUdpProbe("::1", udp6Port);
+  if (hostIpv4Probe) await sendUdpProbe(hostIpv4Probe.address, hostIpv4Probe.udpPort);
+  let remoteTcpStillDenied = true;
+  for (const canary of checks.remoteTcpCanaries || []) {
+    if (await canConnect(canary.host, canary.port)) remoteTcpStillDenied = false;
+  }
   const revoked = { phase: "revoked", uid, sessionId,
-    heldClosed: true, reconnectDenied: await sendProbe(ownSocket, uid, sessionId) === "" };
+    heldClosed: true, reconnectDenied: await sendProbe(ownSocket, uid, sessionId) === "",
+    ipv4StillDenied: !await canConnect("127.0.0.1", ipv4Port),
+    ipv6StillDenied: !await canConnect("::1", ipv6Port),
+    unixProxyStillDenied: !await canConnect(checks.unixProxyCanary),
+    ...(hostIpv4Probe ? { hostIpv4StillDenied: !await canConnect(hostIpv4Probe.address, hostIpv4Probe.tcpPort) } : {}),
+    ...(checks.consoleCanary ? { consoleStillDenied: !await canConnect(checks.consoleCanary.host, checks.consoleCanary.port) } : {}),
+    ...(checks.remoteTcpCanaries ? { remoteTcpStillDenied } : {}) };
   await sendReport(reportSocket, revoked);
-  requireValue(revoked.reconnectDenied, "A revoked agent reconnected to the broker probe.");
+  requireValue(Object.values(revoked).slice(3).every(value => value === true),
+    "A revoked agent reconnected or lost its network denial.");
 }
 
 async function main() {
@@ -1099,9 +1376,9 @@ async function main() {
   requireValue((mode === "--check" || mode === "--run") && config && extra.length === 0 &&
     path.isAbsolute(config), "Usage: script --check|--run /absolute/plan.json");
   const plan = parsePlan(await readFile(config, "utf8"));
-  await preflight(plan);
+  const consoleUiFiles = await preflight(plan);
   if (mode === "--check") { process.stdout.write("Preprovisioned macOS acceptance paths and accounts passed read-only checks.\n"); return; }
-  await runBroker(plan);
+  await runBroker(plan, consoleUiFiles);
 }
 
 main().catch(error => {

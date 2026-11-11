@@ -20,7 +20,7 @@ const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
 const rootPidfdHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-linux-peer-identity`, import.meta.url));
 const rootPeerHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-peer-credentials`, import.meta.url));
 const maxFrame = 32 * 1024;
-const unsafeStartupEnv = ["NODE_OPTIONS", "NODE_PATH", "NODE_TLS_REJECT_UNAUTHORIZED",
+export const unsafeStartupEnv = ["NODE_OPTIONS", "NODE_PATH", "NODE_TLS_REJECT_UNAUTHORIZED",
   "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "OPENSSL_CONF", "SSL_CERT_FILE", "SSL_CERT_DIR",
   "GLIBC_TUNABLES", "MALLOC_CHECK_", "MALLOC_PERTURB_", "TZDIR"];
 const handshakeReasons = new Set([

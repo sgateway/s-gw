@@ -108,6 +108,68 @@ BOOL sgw_wfp_healthy(const SGW_WFP_BOUNDARY *boundary) {
     return TRUE;
 }
 
+static DWORD stop_job(HANDLE job, HANDLE process, DWORD reason) {
+    DWORD job_error = ERROR_SUCCESS;
+    if (job && job != INVALID_HANDLE_VALUE && !TerminateJobObject(job, 1))
+        job_error = GetLastError();
+
+    DWORD process_error = ERROR_SUCCESS;
+    if (process && process != INVALID_HANDLE_VALUE) {
+        DWORD waited = WaitForSingleObject(process, 0);
+        if (waited != WAIT_OBJECT_0) {
+            if (!TerminateProcess(process, 1)) process_error = GetLastError();
+            waited = WaitForSingleObject(process, 10000);
+            if (waited == WAIT_OBJECT_0) process_error = ERROR_SUCCESS;
+            else if (waited == WAIT_FAILED && !process_error) process_error = GetLastError();
+            else if (waited == WAIT_TIMEOUT && !process_error) process_error = WAIT_TIMEOUT;
+        }
+    }
+    if (job_error) return job_error;
+    return process_error ? process_error : reason;
+}
+
+DWORD sgw_wfp_supervise_process(const SGW_WFP_BOUNDARY *boundary, HANDLE job,
+    HANDLE process, DWORD timeout_ms) {
+    if (!boundary || !job || job == INVALID_HANDLE_VALUE ||
+        !process || process == INVALID_HANDLE_VALUE)
+        return stop_job(job, process, ERROR_INVALID_PARAMETER);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+    BOOL assigned = FALSE;
+    if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation,
+        &limits, sizeof(limits), NULL) || !IsProcessInJob(process, job, &assigned)) {
+        DWORD error = GetLastError();
+        return stop_job(job, process, error ? error : ERROR_GEN_FAILURE);
+    }
+    DWORD flags = limits.BasicLimitInformation.LimitFlags;
+    if (!assigned || !(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) ||
+        (flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK))) {
+        return stop_job(job, process, ERROR_INVALID_DATA);
+    }
+
+    ULONGLONG started = GetTickCount64();
+    for (;;) {
+        if (!sgw_wfp_healthy(boundary))
+            return stop_job(job, process, ERROR_NETWORK_ACCESS_DENIED);
+
+        DWORD delay = 100;
+        if (timeout_ms != INFINITE) {
+            ULONGLONG elapsed = GetTickCount64() - started;
+            if (elapsed >= timeout_ms) break;
+            if (timeout_ms - elapsed < delay) delay = (DWORD)(timeout_ms - elapsed);
+        }
+        DWORD waited = WaitForSingleObject(process, delay);
+        if (waited == WAIT_OBJECT_0) {
+            if (sgw_wfp_healthy(boundary)) return ERROR_SUCCESS;
+            return stop_job(job, process, ERROR_NETWORK_ACCESS_DENIED);
+        }
+        if (waited != WAIT_TIMEOUT) {
+            DWORD error = GetLastError();
+            return stop_job(job, process, error ? error : ERROR_GEN_FAILURE);
+        }
+    }
+    return stop_job(job, process, WAIT_TIMEOUT);
+}
+
 void sgw_wfp_stop(SGW_WFP_BOUNDARY *boundary) {
     if (!boundary) return;
     if (boundary->engine) FwpmEngineClose0(boundary->engine);

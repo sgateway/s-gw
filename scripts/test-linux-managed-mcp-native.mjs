@@ -927,12 +927,6 @@ try {
         routes: ["POST /v1/messages"], ttlMs: 30 * 60_000, payloadProfile: "strict",
         allowedModels: ["fixture-model"], maxRequests: 8 } };
     }
-    await writeFile(agent.configPath, JSON.stringify({ name: agent.name, leaseDir, plan: agent.plan,
-      ...(testRelay ? { relay: agent.relay } : {}) }) + "\n",
-      { mode: 0o640 });
-    await chown(agent.configPath, 0, brokerGid);
-    await chmod(agent.configPath, 0o640);
-    await remember(agent.configPath);
   }
   const node = safeUnitValue(rootNode);
   const entry = safeUnitValue(path.join(brokerPackage, "dist/linux-managed-mcp.js"));
@@ -941,25 +935,43 @@ try {
   const environmentFile = safeUnitValue(envFile);
   await writeFile(envFile, `CI=true\nSGW_CI_LINUX_START_TRACE=1\nSGW_HOME=${storeHome}\nSGW_RECOVERY_HOME=${recoveryHome}\nSGW_MASTER_PASSPHRASE=${secret}\nSGW_DISABLE_KEYCHAIN=1\nSGW_DISABLE_ONEPASSWORD_BACKUP=1\nNODE_EXTRA_CA_CERTS=${certFile}\n`, { mode: 0o600 });
   await remember(envFile);
-  await writeFile(controlUnitFile, `[Unit]\nDescription=${controlDescription}\n[Service]\nType=exec\nEnvironment=SGW_CI_LINUX_START_TRACE=1\nExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - -\nUnsetEnvironment=${loaderUnset} NODE_EXTRA_CA_CERTS\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${controlEntry} ${controlUnitFile} - - -- --serve ${brokerUid} ${brokerGid}\nRestart=no\n`, { mode: 0o644 });
+  const { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle } =
+    await import(new URL("../dist/linux-agent-provision.js", import.meta.url));
+  const rootControlUnit = renderLinuxAgentControlUnit({ unitFile: controlUnitFile,
+    runtimeRoot, preflight: verifier, node, entry: controlEntry, brokerUid, brokerGid })
+    .replace("Description=s-gw root agent control", `Description=${controlDescription}`)
+    .replace("Type=exec\n", "Type=exec\nEnvironment=SGW_CI_LINUX_START_TRACE=1\n");
+  await writeFile(controlUnitFile, rootControlUnit, { mode: 0o644 });
   await rememberUnitFile(controlUnitFile);
   for (const agent of agents) {
     const config = safeUnitValue(agent.configPath);
-    await writeFile(agent.socketUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.socketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-agent-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
-    await rememberUnitFile(agent.socketUnitFile);
-    if (testRelay) {
-      await writeFile(agent.modelSocketUnitFile, `[Unit]\nDescription=Native s-gw managed model fixture socket\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Socket]\nListenStream=${agent.modelSocketPath}\nSocketUser=root\nSocketGroup=${agent.userName}\nSocketMode=0660\nDirectoryMode=0711\nPassCredentials=yes\nFileDescriptorName=s-gw-model-${agent.sessionId}\nAccept=no\nRemoveOnStop=no\nService=${agent.brokerUnit}\n`, { mode: 0o644 });
-      await rememberUnitFile(agent.modelSocketUnitFile);
-    }
-    await writeFile(agent.brokerUnitFile, `[Unit]\nDescription=Native s-gw managed MCP fixture broker\nBindsTo=s-gw-agent-control.service\nAfter=s-gw-agent-control.service\n[Service]\nType=exec\nUser=${brokerUser}\nGroup=${brokerGroup}\nEnvironmentFile=${environmentFile}\nUnsetEnvironment=${loaderUnset}\n${testRelay ? `BindReadOnlyPaths=${modelHostsFile}:/etc/hosts\nExecCondition=/usr/bin/grep -qFx "${modelAddress} api.anthropic.com" /etc/hosts\n` : ""}ExecStartPre=${verifier} verify ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile}\nExecStart=${verifier} verify-exec ${runtimeRoot} ${node} ${entry} ${config} ${certFile} ${environmentFile} -- ${config}\nRestart=no\n`, { mode: 0o644 });
-    await rememberUnitFile(agent.brokerUnitFile);
-    await writeFile(agent.planPath, JSON.stringify({ plan: agent.plan, brokerUnit: agent.brokerUnit,
+    const record = { plan: agent.plan, brokerUnit: agent.brokerUnit,
       brokerUnitFile: agent.brokerUnitFile, mcpSocketUnitFile: agent.socketUnitFile,
       brokerEntry: entry, brokerConfig: config,
       ...(testRelay ? { modelRelaySocketUnitFile: agent.modelSocketUnitFile } : {}),
       brokerNode: node, brokerRuntimeRoot: runtimeRoot, brokerPreflight: verifier,
-      brokerEnvironmentFile: environmentFile, brokerCa: certFile }) + "\n",
-      { mode: 0o600 });
+      brokerEnvironmentFile: environmentFile, brokerCa: certFile };
+    agent.provisionRecord = record;
+    const bundle = renderLinuxManagedUnitBundle({ name: agent.name, leaseDir, plan: agent.plan,
+      ...(testRelay ? { relay: agent.relay } : {}) }, record, brokerGid,
+    testRelay ? "prepare" : "runtime");
+    await writeFile(agent.configPath, bundle.brokerConfig, { mode: 0o640 });
+    await chown(agent.configPath, 0, brokerGid);
+    await chmod(agent.configPath, 0o640);
+    await remember(agent.configPath);
+    await writeFile(agent.socketUnitFile, bundle.mcpSocketUnit, { mode: 0o644 });
+    await rememberUnitFile(agent.socketUnitFile);
+    if (testRelay) {
+      await writeFile(agent.modelSocketUnitFile, bundle.modelSocketUnit, { mode: 0o644 });
+      await rememberUnitFile(agent.modelSocketUnitFile);
+    }
+    const brokerUnitText = testRelay ? bundle.brokerUnit.replace("ExecStartPre=",
+      `BindReadOnlyPaths=${modelHostsFile}:/etc/hosts\n` +
+      `ExecCondition=/usr/bin/grep -qFx "${modelAddress} api.anthropic.com" /etc/hosts\nExecStartPre=`) :
+      bundle.brokerUnit;
+    await writeFile(agent.brokerUnitFile, brokerUnitText, { mode: 0o644 });
+    await rememberUnitFile(agent.brokerUnitFile);
+    await writeFile(agent.planPath, bundle.planRecord, { mode: 0o600 });
     await remember(agent.planPath);
     await checkedInstalledFile(agent.configPath);
     await checkedInstalledFile(agent.planPath);
@@ -1136,8 +1148,9 @@ try {
       asBroker("reject-relay-claim", [agent.relay.requestId, other.sessionId,
         other.name, other.plan.identityGeneration]);
       const sealed = `${agent.configPath}.sealed`;
-      await writeFile(sealed, JSON.stringify({ name: agent.name, leaseDir,
-        plan: agent.plan, relay: agent.relay }) + "\n", { flag: "wx", mode: 0o640 });
+      const sealedBundle = renderLinuxManagedUnitBundle({ name: agent.name, leaseDir,
+        plan: agent.plan, relay: agent.relay }, agent.provisionRecord, brokerGid, "runtime");
+      await writeFile(sealed, sealedBundle.brokerConfig, { flag: "wx", mode: 0o640 });
       await remember(sealed);
       await chown(sealed, 0, brokerGid);
       await chmod(sealed, 0o640);

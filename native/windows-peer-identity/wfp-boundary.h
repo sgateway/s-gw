@@ -19,6 +19,8 @@ typedef struct {
 
 DWORD sgw_wfp_start(PSID package_sid, SGW_WFP_BOUNDARY *boundary);
 BOOL sgw_wfp_healthy(const SGW_WFP_BOUNDARY *boundary);
+DWORD sgw_wfp_supervise_process(const SGW_WFP_BOUNDARY *boundary, HANDLE job,
+    HANDLE process, DWORD timeout_ms);
 void sgw_wfp_stop(SGW_WFP_BOUNDARY *boundary);
 
 #endif
