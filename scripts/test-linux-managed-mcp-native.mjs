@@ -785,7 +785,8 @@ try {
   }
   const controlFiles = ["linux-agent-control.js", "linux-agent-unit.js",
     "linux-peer-identity.js", "linux-agent-identity.js", "linux-managed-forwarder-attestation.js",
-    "linux-managed-forwarder-binding.js", "linux-forwarder-identity.js", "model-relay-action.js"];
+    "linux-managed-forwarder-binding.js", "linux-forwarder-identity.js",
+    "linux-forwarder-runtime.js", "model-relay-action.js"];
   for (const name of controlFiles) {
     await copyFile(path.join(project, "dist", name), path.join(controlDir, name));
     await chmod(path.join(controlDir, name), 0o755);
