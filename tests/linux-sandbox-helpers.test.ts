@@ -9,7 +9,7 @@ import { findTrustedLinuxHelper, trustedLinuxExecutable, withTrustedLinuxPathAsy
 let fixture = "";
 afterEach(async () => { if (fixture) await rm(fixture, { recursive: true, force: true }); });
 
-it("rejects fake bwrap and which in an agent-writable directory", async () => {
+it.skipIf(process.platform === "win32")("rejects fake bwrap and which in an agent-writable directory", async () => {
   fixture = await mkdtemp(path.join(os.tmpdir(), "sgw-helper-path-"));
   const marker = path.join(fixture, "executed");
   for (const name of ["bwrap", "which"]) {
@@ -24,7 +24,7 @@ it("rejects fake bwrap and which in an agent-writable directory", async () => {
   await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it("accepts a root-owned helper and ignores an earlier fake which", async () => {
+it.skipIf(process.platform === "win32")("accepts a root-owned helper and ignores an earlier fake which", async () => {
   fixture = await mkdtemp(path.join(os.tmpdir(), "sgw-helper-path-"));
   await writeFile(path.join(fixture, "which"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   const systemWhich = trustedLinuxExecutable("/usr/bin/which") || trustedLinuxExecutable("/bin/which");
@@ -33,7 +33,7 @@ it("accepts a root-owned helper and ignores an earlier fake which", async () => 
   expect(trustedLinuxExecutable("/bin/sh")).toBeTruthy();
 });
 
-it("restores the caller PATH after a failed trusted upstream call", async () => {
+it.skipIf(process.platform === "win32")("restores the caller PATH after a failed trusted upstream call", async () => {
   const previous = process.env.PATH;
   await expect(withTrustedLinuxPathAsync("/usr/bin:/bin", async () => {
     expect(process.env.PATH).toBe("/usr/bin:/bin");
@@ -42,7 +42,7 @@ it("restores the caller PATH after a failed trusted upstream call", async () => 
   expect(process.env.PATH).toBe(previous);
 });
 
-it("restores the requested PATH only in sandbox-child", async () => {
+it.skipIf(process.platform === "win32")("restores the requested PATH only in sandbox-child", async () => {
   fixture = await mkdtemp(path.join(os.tmpdir(), "sgw-helper-path-"));
   const manifest = path.join(fixture, "launch.json");
   const loader = new URL("../node_modules/tsx/dist/esm/index.mjs", import.meta.url).href;

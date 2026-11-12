@@ -27,7 +27,7 @@ afterEach(async () => {
   if (fixture) await rm(fixture, { recursive: true, force: true });
 });
 
-it("uses trusted PATH through the outer wrapper, then restores agent PATH", async () => {
+it.skipIf(process.platform === "win32")("uses trusted PATH through the outer wrapper, then restores agent PATH", async () => {
   fixture = await mkdtemp(path.join(os.tmpdir(), "sgw-trusted-launch-"));
   const workspace = path.join(fixture, "workspace");
   const fake = path.join(fixture, "fake-path");
@@ -62,7 +62,7 @@ it("uses trusted PATH through the outer wrapper, then restores agent PATH", asyn
   await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it("rejects missing Unix-socket filtering before a trusted isolated launch", async () => {
+it.skipIf(process.platform === "win32")("rejects missing Unix-socket filtering before a trusted isolated launch", async () => {
   fixture = await mkdtemp(path.join(os.tmpdir(), "sgw-trusted-launch-"));
   const workspace = path.join(fixture, "workspace");
   await mkdir(workspace);
