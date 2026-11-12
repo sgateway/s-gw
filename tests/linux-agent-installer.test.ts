@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildModelRelayAction } from "../src/model-relay-action.js";
 import { LinuxManagedUnitInstaller, assertApprovedLinuxManagedRelay,
   type LinuxManagedInstallHost, type LinuxManagedInstallPlan } from "../src/linux-agent-installer.js";
@@ -56,6 +56,10 @@ class Host implements LinuxManagedInstallHost {
   failStop?: string;
   badRealpath?: string;
   controlProperties = new Map<string, string>();
+  controlSocketReadsUntilReady = 0;
+  controlSocketMode = 0o660;
+  controlReadbacks = 0;
+  controlInvocationFlipAfter = Number.POSITIVE_INFINITY;
   nextIno = 10;
   constructor(readonly input: LinuxManagedInstallPlan) {
     for (const dir of ["/", "/run", "/run/systemd", "/run/systemd/system", "/run/s-gw",
@@ -76,7 +80,20 @@ class Host implements LinuxManagedInstallHost {
     return { filename, dev: 1, ino };
   }
   async assertRoot() {}
-  async file(filename: string) { return this.files.get(filename); }
+  async file(filename: string) {
+    if (this.active.has("s-gw-agent-control.service") &&
+        ["/run/s-gw/agent-control.sock", "/run/s-gw/agent-prepare.sock"].includes(filename) &&
+        !this.files.has(filename) && this.controlSocketReadsUntilReady > 0) {
+      this.controlSocketReadsUntilReady--;
+      if (this.controlSocketReadsUntilReady === 0) this.publishControlSockets();
+    }
+    return this.files.get(filename);
+  }
+  private publishControlSockets() {
+    this.add("/run/s-gw/agent-control.sock", "socket", "", 0,
+      this.input.brokerGid, this.controlSocketMode);
+    this.add("/run/s-gw/agent-prepare.sock", "socket", "", 0, 0, 0o600);
+  }
   async realpath(filename: string) { return filename === this.badRealpath ? "/different" : filename; }
   async read(filename: string) {
     const item = this.files.get(filename);
@@ -137,9 +154,13 @@ class Host implements LinuxManagedInstallHost {
     const c = this.input.control;
     const args = `${c.runtimeRoot} ${c.node} ${c.entry} ${c.unitFile} - -`;
     const unit = "s-gw-agent-control.service";
+    if (this.active.has(unit)) this.controlReadbacks++;
     return [`Id=${unit}`, `LoadState=${this.files.has(c.unitFile) ? "loaded" : "not-found"}`,
       `ActiveState=${this.active.has(unit) ? "active" : "inactive"}`, `FragmentPath=${c.unitFile}`,
       "DropInPaths=", "User=root", "Group=root", "EnvironmentFiles=",
+      "MainPID=" + (this.active.has(unit) ? "420" : "0"),
+      "InvocationID=" + (this.active.has(unit)
+        ? (this.controlReadbacks >= this.controlInvocationFlipAfter ? "c" : "b").repeat(32) : ""),
       `UnsetEnvironment=${unsafeEnv} NODE_EXTRA_CA_CERTS`,
       `ExecStartPre={ path=${c.preflight} ; argv[]=${c.preflight} verify ${args} ; ignore_errors=no ; status=0 }`,
       `ExecStart={ path=${c.preflight} ; argv[]=${c.preflight} verify-exec ${args} -- --serve ${c.brokerUid} ${c.brokerGid} ; ignore_errors=no ; status=0 }`];
@@ -165,6 +186,9 @@ class Host implements LinuxManagedInstallHost {
     this.actions.push(`${action}:${unit || ""}`);
     if (action === "start" && unit) {
       this.active.add(unit);
+      if (unit === "s-gw-agent-control.service" && this.controlSocketReadsUntilReady === 0) {
+        this.publishControlSockets();
+      }
       if (unit.endsWith(".socket")) {
         const model = unit.includes("managed-model");
         const filename = model ? this.input.record.plan.modelRelaySocket! : this.input.record.plan.brokerSocket;
@@ -175,6 +199,10 @@ class Host implements LinuxManagedInstallHost {
     if (action === "stop" && unit) {
       if (this.failStop === unit) throw new Error(`Fixture stop failed: ${unit}`);
       this.active.delete(unit);
+      if (unit === "s-gw-agent-control.service") {
+        this.files.delete("/run/s-gw/agent-control.sock");
+        this.files.delete("/run/s-gw/agent-prepare.sock");
+      }
       if (unit.endsWith(".socket")) {
         const filename = unit.includes("managed-model") ? this.input.record.plan.modelRelaySocket! :
           this.input.record.plan.brokerSocket;
@@ -184,7 +212,60 @@ class Host implements LinuxManagedInstallHost {
   }
 }
 
-describe("Linux managed unit installer", () => {
+describe.skipIf(process.platform === "win32")("Linux managed unit installer", () => {
+  it("waits for both verified root control sockets before staging completes", async () => {
+    const input = setup();
+    const host = new Host(input);
+    host.controlSocketReadsUntilReady = 2;
+    await new LinuxManagedUnitInstaller(host).stage(input);
+    expect(host.files.get("/run/s-gw/agent-control.sock"))
+      .toMatchObject({ kind: "socket", uid: 0, gid: input.brokerGid, mode: 0o660 });
+    expect(host.files.get("/run/s-gw/agent-prepare.sock"))
+      .toMatchObject({ kind: "socket", uid: 0, gid: 0, mode: 0o600 });
+  });
+
+  it("stops control and rolls back when a control socket has unsafe permissions", async () => {
+    const input = setup();
+    const host = new Host(input);
+    host.controlSocketMode = 0o666;
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/untrusted root control socket/);
+    expect(host.actions).toContain("stop:s-gw-agent-control.service");
+    expect(host.active.size).toBe(0);
+    expect(host.files.has(input.control.unitFile)).toBe(false);
+    expect(host.files.has("/run/s-gw/agent-control.sock")).toBe(false);
+  });
+
+  it("times out and rolls back if root control sockets never appear", async () => {
+    const input = setup();
+    const host = new Host(input);
+    host.controlSocketReadsUntilReady = Number.POSITIVE_INFINITY;
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => { now += 6000; return now; });
+    try {
+      await expect(new LinuxManagedUnitInstaller(host).stage(input))
+        .rejects.toThrow(/sockets did not become ready/);
+    } finally {
+      clock.mockRestore();
+    }
+    expect(host.actions).toContain("stop:s-gw-agent-control.service");
+    expect(host.active.size).toBe(0);
+    expect(host.files.has(input.control.unitFile)).toBe(false);
+    expect(host.files.has(input.record.brokerConfig)).toBe(false);
+    expect(host.files.has("/run/s-gw/agent-prepare.sock")).toBe(false);
+  });
+
+  it("rejects a restarted root control while waiting for its sockets", async () => {
+    const input = setup();
+    const host = new Host(input);
+    host.controlSocketReadsUntilReady = 2;
+    host.controlInvocationFlipAfter = 2;
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/changed while opening its sockets/);
+    expect(host.actions).toContain("stop:s-gw-agent-control.service");
+    expect(host.files.has(input.control.unitFile)).toBe(false);
+  });
+
   it("stages an unsealed root bundle and activates sockets only after exact approval", async () => {
     const input = setup();
     const host = new Host(input);

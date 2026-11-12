@@ -50,6 +50,8 @@ export interface LinuxManagedInstallHost {
 }
 
 const controlName = "s-gw-agent-control.service";
+const controlSocket = "/run/s-gw/agent-control.sock";
+const prepareSocket = "/run/s-gw/agent-prepare.sock";
 const unitFields = ["Id", "LoadState", "ActiveState", "FragmentPath", "DropInPaths", "User", "Group",
   "EnvironmentFiles", "UnsetEnvironment", "ExecStartPre", "ExecStart", "BindsTo", "After",
   "Triggers", "SocketUser", "SocketGroup", "SocketMode", "DirectoryMode", "PassCredentials",
@@ -265,8 +267,9 @@ async function readbackBroker(host: LinuxManagedInstallHost,
 }
 
 async function readbackControl(host: LinuxManagedInstallHost,
-  input: LinuxManagedInstallPlan, expectedState: "active" | "inactive" = "active"): Promise<void> {
-  const output = await host.unit(controlName, unitFields);
+  input: LinuxManagedInstallPlan, expectedState: "active" | "inactive" = "active"):
+  Promise<{ pid: number; invocationId: string } | undefined> {
+  const output = await host.unit(controlName, [...unitFields, "MainPID", "InvocationID"]);
   const values = parseProperties(output);
   if (values.get("DropInPaths") || values.get("LoadState") !== "loaded" ||
       values.get("User") !== "root" || values.get("Group") !== "root") {
@@ -275,6 +278,50 @@ async function readbackControl(host: LinuxManagedInstallHost,
   assertControlUnitPreflight(output, { ...input.control,
     args: ["--serve", String(input.control.brokerUid), String(input.control.brokerGid)] },
   expectedState);
+  if (expectedState === "inactive") return;
+  const pid = Number(values.get("MainPID"));
+  const invocationId = values.get("InvocationID") || "";
+  if (!Number.isSafeInteger(pid) || pid < 1 || !/^[a-f0-9]{32}$/.test(invocationId)) {
+    throw new Error("Linux installer root control has no stable live invocation.");
+  }
+  return { pid, invocationId };
+}
+
+async function controlSocketReady(host: LinuxManagedInstallHost, filename: string,
+  gid: number, mode: number): Promise<boolean> {
+  const item = await host.file(filename);
+  if (!item) return false;
+  if (item.kind !== "socket" || item.uid !== 0 || item.gid !== gid ||
+      item.mode !== mode || item.nlink !== 1 || await host.realpath(filename) !== filename) {
+    throw new Error("Linux installer found an untrusted root control socket: " + filename);
+  }
+  return true;
+}
+
+async function waitForControlSockets(host: LinuxManagedInstallHost, input: LinuxManagedInstallPlan,
+  started: { pid: number; invocationId: string }): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const current = await readbackControl(host, input);
+    if (current?.pid !== started.pid || current.invocationId !== started.invocationId) {
+      throw new Error("Linux installer root control changed while opening its sockets.");
+    }
+    const brokerReady = await controlSocketReady(host, controlSocket, input.brokerGid, 0o660);
+    const prepareReady = await controlSocketReady(host, prepareSocket, 0, 0o600);
+    if (brokerReady && prepareReady) {
+      const after = await readbackControl(host, input);
+      if (after?.pid !== started.pid || after.invocationId !== started.invocationId) {
+        throw new Error("Linux installer root control changed after opening its sockets.");
+      }
+      if (!await controlSocketReady(host, controlSocket, input.brokerGid, 0o660) ||
+          !await controlSocketReady(host, prepareSocket, 0, 0o600)) {
+        throw new Error("Linux installer root control sockets vanished during staging.");
+      }
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error("Linux installer root control sockets did not become ready.");
 }
 
 export class LinuxManagedUnitInstaller {
@@ -306,6 +353,11 @@ export class LinuxManagedUnitInstaller {
     await assertInactive(host, modelUnit);
     await assertInactive(host, record.brokerUnit);
     await assertInactive(host, linuxAgentUnitName(plan.sessionId));
+    for (const filename of [controlSocket, prepareSocket]) {
+      if (await host.file(filename)) {
+        throw new Error("Linux installer found a preexisting root control socket: " + filename);
+      }
+    }
     await ensureDirectory(host, "/run/s-gw", 0, 0, 0o755);
     await ensureDirectory(host, "/run/s-gw/agents", 0, 0, 0o711);
     await ensureDirectory(host, `/run/s-gw/agents/${plan.sessionId}`, 0, 0, 0o711);
@@ -342,12 +394,22 @@ export class LinuxManagedUnitInstaller {
       await readbackControl(host, input, "inactive");
       startedControl = true;
       await host.action("start", controlName);
-      await readbackControl(host, input);
+      const started = await readbackControl(host, input);
+      if (!started) throw new Error("Linux installer root control did not start.");
+      await waitForControlSockets(host, input, started);
     } catch (error) {
       const cleanup: unknown[] = [];
       if (startedControl) {
         try { await host.action("stop", controlName); }
         catch (failure) { cleanup.push(failure); }
+        try {
+          await assertInactive(host, controlName);
+          for (const filename of [controlSocket, prepareSocket]) {
+            if (await host.file(filename)) {
+              throw new Error("Linux root control socket remained after staging failure: " + filename);
+            }
+          }
+        } catch (failure) { cleanup.push(failure); }
       }
       try {
         await assertInactive(host, mcpUnit);
