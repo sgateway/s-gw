@@ -43,7 +43,7 @@ This monitor polls rather than providing atomic revocation. A command can act be
 
 ## Explicit policy controls
 
-- `--allow-host HOST` adds an agent network destination. `--strict-egress` removes the default agent provider allowlist, so needed login/model hosts must be explicitly allowed.
+- `--allow-host HOST` adds an agent network destination. `--strict-egress` removes the default agent provider allowlist, so needed login/model hosts must be explicitly allowed. On Linux, the pinned runtime's host proxy checks the requested hostname but does not pin or reject its resolved IP. A permitted name resolving to loopback or a private address can still reach that address from the host proxy. Use an owned action for sensitive local services; the proposed managed backend needs resolved-address filtering before it can claim host-local isolation.
 - `--allow-write PATH` adds a writable path. `--deny-read PATH` restricts a path or supported glob.
 - Saved agent login files remain readable by default. `--deny-agent-auth` blocks known login files. A disposable macOS Keychain test showed that flag alone still permits native item retrieval through another IPC route. `--deny-keychain` blocks both known Keychain service endpoints and denied the tested item read; `--isolated-auth` also applies that stricter IPC denial. Complete native Keychain isolation has not been established.
 - macOS `--allow-agent-keychain` allows read access to only the encrypted login Keychain database for agents that use native authentication. That database contains more than agent credentials. Keychain services still authorize item access, writes and sibling databases remain blocked, and explicit read denies win.
