@@ -15,6 +15,7 @@ const archiveUrl = `https://github.com/openai/codex/releases/download/rust-v${ve
   "codex-x86_64-unknown-linux-musl.tar.gz";
 const archiveSha256 = "64bcc99c32e434b4bcb0508a97df9b7aeecdb97e956d976fb13661096ec4e3e2";
 const project = fileURLToPath(new URL("..", import.meta.url));
+const runuser = ["/usr/sbin/runuser", "/usr/bin/runuser"].find(candidate => existsSync(candidate));
 
 if (process.platform !== "linux" || process.arch !== "x64" || process.geteuid() !== 0 ||
     process.env.CI !== "true" || process.env.SGW_TEST_NATIVE_CODEX !== "1" ||
@@ -31,6 +32,7 @@ if (!existsSync(path.join(project, "dist/linux-managed-mcp.js")) ||
     !existsSync(path.join(project, "node_modules"))) {
   throw new Error("Build the package and install its dependencies before the native Codex fixture.");
 }
+if (!runuser) throw new Error("The native Codex fixture requires runuser in a system directory.");
 
 function run(command, args, allowFailure = false, env = process.env, timeoutMs = 120_000) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs, env,
@@ -595,7 +597,7 @@ try {
     SGW_HOME: storeHome, SGW_RECOVERY_HOME: recoveryHome,
     SGW_MASTER_PASSPHRASE: secret, SGW_DISABLE_KEYCHAIN: "1",
     SGW_DISABLE_ONEPASSWORD_BACKUP: "1" };
-  const asBroker = (mode, args) => run("runuser", ["-u", brokerUser, "--",
+  const asBroker = (mode, args) => run(runuser, ["-u", brokerUser, "--",
     process.execPath, operator, mode, ...args], false, brokerEnv).stdout.trim();
   for (const agent of agents) {
     agent.secret = JSON.parse(asBroker("seed", []));
