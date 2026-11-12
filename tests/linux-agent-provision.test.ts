@@ -38,7 +38,7 @@ function setup(relay = true): { config: LinuxManagedMcpConfig; record: LinuxMana
   return { config, record };
 }
 
-describe("Linux managed unit provisioning", () => {
+describe.skipIf(process.platform === "win32")("Linux managed unit provisioning", () => {
   it("renders a pinned root control service without a startup environment file", () => {
     const text = renderLinuxAgentControlUnit({
       unitFile: "/run/systemd/system/s-gw-agent-control.service",
