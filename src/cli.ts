@@ -2743,6 +2743,10 @@ async function openPreferredUi(port: number, consoleUrl: string, protectedStore 
       return { kind: "desktop-app", ...opened };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      if (protectedStore) {
+        throw new Error(`${detail} Open the protected console from a trusted terminal with ` +
+          "`s-gw console --operator-auth --ui-manifest <trusted manifest>`.");
+      }
       throw new Error(`${detail} To use the browser backup, run \`s-gw app open --browser\`.`);
     }
   }

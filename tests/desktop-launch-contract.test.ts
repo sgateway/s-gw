@@ -153,7 +153,7 @@ describe("native desktop launch contract", () => {
       ].join("\n"));
       await chmod(fakeSystemctl, 0o755);
 
-      const result = spawnSync(process.execPath, [
+      const cliArgs = [
         "--import",
         "tsx",
         "--import",
@@ -161,23 +161,25 @@ describe("native desktop launch contract", () => {
         path.join(repoRoot, "src/cli.ts"),
         "app",
         "open"
-      ], {
+      ];
+      const cliEnv = {
+        ...process.env,
+        HOME: home,
+        NODE_OPTIONS: "",
+        SGW_DESKTOP_APP_PATH: path.join(tmpRoot, "missing", "s-gw-desktop"),
+        SGW_DISABLE_UPDATE_CHECK: "1",
+        SGW_HOME: path.join(tmpRoot, "state"),
+        SGW_RECOVERY_HOME: path.join(tmpRoot, "recovery"),
+        SGW_SYSTEMCTL: fakeSystemctl,
+        SGW_TEST_HOME_ROOT: tmpRoot,
+        SGW_TEST_MODE: "1",
+        XDG_CONFIG_HOME: path.join(tmpRoot, "config")
+      };
+      const result = spawnSync(process.execPath, cliArgs, {
         cwd: repoRoot,
         encoding: "utf8",
         timeout: 5_000,
-        env: {
-          ...process.env,
-          HOME: home,
-          NODE_OPTIONS: "",
-          SGW_DESKTOP_APP_PATH: path.join(tmpRoot, "missing", "s-gw-desktop"),
-          SGW_DISABLE_UPDATE_CHECK: "1",
-          SGW_HOME: path.join(tmpRoot, "state"),
-          SGW_RECOVERY_HOME: path.join(tmpRoot, "recovery"),
-          SGW_SYSTEMCTL: fakeSystemctl,
-          SGW_TEST_HOME_ROOT: tmpRoot,
-          SGW_TEST_MODE: "1",
-          XDG_CONFIG_HOME: path.join(tmpRoot, "config")
-        },
+        env: cliEnv,
         stdio: ["ignore", "pipe", "pipe"]
       });
 
@@ -187,6 +189,22 @@ describe("native desktop launch contract", () => {
       expect(result.stderr).toContain("s-gw app open --browser");
       expect(existsSync(systemctlLog)).toBe(false);
       expect(result.stdout).toBe("");
+
+      const protectedEnv = { ...cliEnv, SGW_MASTER_PASSPHRASE: "synthetic protected fixture",
+        SGW_SECRET_BACKEND: "local", SGW_DISABLE_KEYCHAIN: "1" };
+      const prepared = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
+        "import { SecretStore } from './src/store.ts'; await new SecretStore().enableProtectedConsole();"], {
+        cwd: repoRoot, env: protectedEnv, encoding: "utf8", timeout: 5_000
+      });
+      expect(prepared.status).toBe(0);
+      const protectedResult = spawnSync(process.execPath, cliArgs, {
+        cwd: repoRoot, env: protectedEnv, encoding: "utf8", timeout: 5_000,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      expect(protectedResult.status).toBe(1);
+      expect(protectedResult.stderr).toContain("s-gw console --operator-auth --ui-manifest");
+      expect(protectedResult.stderr).not.toContain("s-gw app open --browser");
+      expect(existsSync(systemctlLog)).toBe(false);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
