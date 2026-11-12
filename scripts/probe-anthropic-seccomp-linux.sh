@@ -87,7 +87,7 @@ probe() {
   if [ "$status" -eq 0 ]; then
     if [ ! -f "$sentinel" ] || [[ "$output" != *SGW_PAYLOAD_STARTED* || "$output" != *SGW_AF_UNIX_DENIED* ]]; then
       echo "$label ran without proving Unix-socket filtering." >&2
-      return 1
+      return 2
     fi
     echo "$label: filtered launch available"
     return 0
@@ -95,15 +95,34 @@ probe() {
 
   if [ -e "$sentinel" ] || [[ "$output" == *SGW_PAYLOAD_STARTED* ]]; then
     echo "$label failed after starting the payload." >&2
-    return 1
+    return 2
   fi
   if known_policy_denial "$output"; then
     echo "$label: blocked before payload by host policy; filtered launch is unavailable." >&2
     return 1
   fi
   echo "$label failed for an unclassified reason." >&2
-  return 1
+  return 2
 }
 
-probe standalone "$helper"
-probe inside-bwrap /usr/bin/bwrap "${bwrap_args[@]}" "$helper"
+if probe standalone "$helper"; then
+  standalone_result=0
+else
+  standalone_result=$?
+fi
+if probe inside-bwrap /usr/bin/bwrap "${bwrap_args[@]}" "$helper"; then
+  inside_result=0
+else
+  inside_result=$?
+fi
+
+if [ "$standalone_result" -eq 1 ]; then
+  echo "::warning title=Anthropic seccomp availability::Standalone helper is blocked before payload by host policy; the product's inside-bwrap path was checked separately."
+elif [ "$standalone_result" -ne 0 ]; then
+  echo "Standalone helper failed after payload start or for an unclassified reason." >&2
+  exit 1
+fi
+if [ "$inside_result" -ne 0 ]; then
+  echo "The product's inside-bwrap helper did not prove a filtered payload launch." >&2
+  exit 1
+fi

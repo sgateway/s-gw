@@ -24,6 +24,7 @@ zig cc -target aarch64-linux-musl -static -O2 -s -Wall -Wextra -Werror \
 `scripts/stage-anthropic-runtime.mjs` checks the original and replacement
 hashes and updates both copies in the bundled runtime. The Ubuntu 26.04
 probe must confirm that the payload starts and `socket(AF_UNIX)` is denied
-both standalone and within bubblewrap before this candidate is accepted.
+within the product's bubblewrap path before this candidate is accepted.
+A standalone pre-payload host-policy denial is recorded separately.
 If that host also denies a later `uid_map`, `gid_map`, or namespace operation,
 the helper still stops before the payload and needs a different design.
