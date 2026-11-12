@@ -4,6 +4,7 @@
 
 #include "policy-core.h"
 
+#include <Security/SecRandom.h>
 #include <Security/Security.h>
 #include <bsm/libbsm.h>
 #include <errno.h>
@@ -18,10 +19,12 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BROKER_CONTROL_SOCKET "/private/var/db/s-gw/agent-launch-control.sock"
 #define POLICY_SOCKET "/private/var/db/s-gw/agent-network-policy.sock"
+#define PROVIDER_SOCKET "/private/var/db/s-gw/agent-provider-attestation.sock"
 
 #ifndef SGW_POLICY_SERVICE_REQUIREMENT
 #define SGW_POLICY_SERVICE_REQUIREMENT ""
@@ -304,21 +307,76 @@ static int read_registration(int fd, struct sgw_policy_state *state, uid_t broke
     return -1;
 }
 
-static struct sgw_policy_proof provider_proof(uid_t uid, const char *session) {
-    (void)uid;
-    (void)session;
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int provider_exchange(int fd, const struct sgw_policy_state *state, uid_t uid,
+                             const char *session, struct sgw_policy_proof *proof) {
+    unsigned char random[16];
+    if (!proof) return -1;
+    memset(proof, 0, sizeof(*proof));
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(random), random) != errSecSuccess) return -1;
+    char nonce[33];
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); i++) {
+        nonce[i * 2] = hex[random[i] >> 4];
+        nonce[i * 2 + 1] = hex[random[i] & 15];
+    }
+    nonce[32] = '\0';
+    char challenge[512];
+    int length = sgw_policy_format_provider_challenge(challenge, sizeof(challenge), state,
+                                                       nonce, uid, session);
+    int no_sigpipe = 1;
+    if (length < 0 || setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) ||
+        send(fd, challenge, (size_t)length, MSG_DONTWAIT) != length) return -1;
+
+    int64_t deadline = monotonic_ms();
+    if (deadline < 0) return -1;
+    deadline += 500;
+    char frame[512];
+    size_t used = 0;
+    while (used < sizeof(frame) - 1) {
+        int64_t current = monotonic_ms();
+        if (current < 0) return -1;
+        int64_t remaining = deadline - current;
+        if (remaining <= 0) return -1;
+        struct pollfd ready = { .fd = fd, .events = POLLIN };
+        int polled = poll(&ready, 1, (int)remaining);
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled != 1 || (ready.revents & (POLLERR | POLLNVAL)) ||
+            !(ready.revents & POLLIN)) return -1;
+        ssize_t count = recv(fd, frame + used, sizeof(frame) - used - 1, MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count <= 0) return -1;
+        used += (size_t)count;
+        char *newline = memchr(frame, '\n', used);
+        if (!newline) continue;
+        if (newline != frame + used - 1) return -1;
+        frame[used] = '\0';
+        return sgw_policy_parse_provider_reply(frame, nonce, state, uid, session, proof);
+    }
+    return -1;
+}
+
+static struct sgw_policy_proof provider_proof(int provider, const struct sgw_policy_state *state,
+                                              uid_t uid, const char *session) {
     struct sgw_policy_proof proof = {0};
-    proof.signed_provider = signed_provider_bundle();
-    // A valid installed binary does not prove an enabled filter or live denial.
+    if (!signed_provider_bundle() || provider_exchange(provider, state, uid, session, &proof))
+        return (struct sgw_policy_proof){0};
+    proof.signed_provider = 1;
+    // The reply proves only a fresh signed peer response, not effective filtering.
     return proof;
 }
 
-static int reply_check(struct runner_connection *runner, const struct sgw_policy_state *state,
-                       const char *frame) {
+static int reply_check(struct runner_connection *runner, int provider,
+                       const struct sgw_policy_state *state, const char *frame) {
     uid_t uid;
     char session[SGW_POLICY_SESSION_MAX + 1];
     if (sgw_policy_parse_check(frame, &uid, session)) return -1;
-    struct sgw_policy_proof proof = provider_proof(uid, session);
+    struct sgw_policy_proof proof = provider_proof(provider, state, uid, session);
     int ready = sgw_policy_ready(state, runner->peer_uid, uid, session, &proof);
     char response[128];
     int length = snprintf(response, sizeof(response), "%s-V1 %u %s\n",
@@ -327,7 +385,8 @@ static int reply_check(struct runner_connection *runner, const struct sgw_policy
     return send(runner->fd, response, (size_t)length, 0) == length ? 0 : -1;
 }
 
-static int receive_checks(struct runner_connection *runner, const struct sgw_policy_state *state) {
+static int receive_checks(struct runner_connection *runner, int provider,
+                          const struct sgw_policy_state *state) {
     ssize_t count = recv(runner->fd, runner->input + runner->used,
                          sizeof(runner->input) - runner->used - 1, 0);
     if (count <= 0) return -1;
@@ -339,14 +398,14 @@ static int receive_checks(struct runner_connection *runner, const struct sgw_pol
         char frame[256];
         memcpy(frame, runner->input, frame_len);
         frame[frame_len] = '\0';
-        if (reply_check(runner, state, frame)) return -1;
+        if (reply_check(runner, provider, state, frame)) return -1;
         runner->used -= frame_len;
         memmove(runner->input, runner->input + frame_len, runner->used);
     }
     return runner->used < sizeof(runner->input) - 1 ? 0 : -1;
 }
 
-static int serve(int broker, int listener, uid_t broker_uid) {
+static int serve(int broker, int listener, int provider, uid_t broker_uid) {
     struct sgw_policy_state state = {0};
     struct runner_connection runners[2] = {{ .fd = -1 }, { .fd = -1 }};
     if (read_registration(broker, &state, broker_uid)) return -1;
@@ -373,7 +432,7 @@ static int serve(int broker, int listener, uid_t broker_uid) {
         } else if (fds[1].revents) break;
         for (int i = 0; i < 2; i++) {
             if (runners[i].fd < 0 || !fds[i + 2].revents) continue;
-            if (!(fds[i + 2].revents & POLLIN) || receive_checks(&runners[i], &state)) {
+            if (!(fds[i + 2].revents & POLLIN) || receive_checks(&runners[i], provider, &state)) {
                 close(runners[i].fd);
                 runners[i].fd = -1;
             }
@@ -393,10 +452,13 @@ int main(void) {
     if (!self_signed() || lstat(BROKER_CONTROL_SOCKET, &broker_node) ||
         !broker_node.st_uid || checked_socket(BROKER_CONTROL_SOCKET, broker_node.st_uid, 0600) ||
         checked_socket(POLICY_SOCKET, 0, 0600) ||
+        checked_socket(PROVIDER_SOCKET, 0, 0600) ||
         socket_at(3, BROKER_CONTROL_SOCKET, 0) || socket_at(4, POLICY_SOCKET, 1) ||
-        !signed_peer(3, broker_node.st_uid, SGW_POLICY_BROKER_REQUIREMENT)) {
+        socket_at(5, PROVIDER_SOCKET, 0) ||
+        !signed_peer(3, broker_node.st_uid, SGW_POLICY_BROKER_REQUIREMENT) ||
+        !signed_peer(5, 0, SGW_POLICY_PROVIDER_REQUIREMENT)) {
         fputs("s-gw root policy service has no trusted broker, socket, or signing requirement.\n", stderr);
         return 1;
     }
-    return serve(3, 4, broker_node.st_uid) == 0 ? 0 : 1;
+    return serve(3, 4, 5, broker_node.st_uid) == 0 ? 0 : 1;
 }

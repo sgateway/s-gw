@@ -1,6 +1,7 @@
 #ifndef SGW_MACOS_POLICY_CORE_H
 #define SGW_MACOS_POLICY_CORE_H
 
+#include <stddef.h>
 #include <sys/types.h>
 
 #define SGW_POLICY_SESSION_MAX 64
@@ -31,6 +32,12 @@ struct sgw_policy_proof {
 int sgw_policy_parse_register(const char *frame, struct sgw_policy_agent agents[2]);
 int sgw_policy_parse_check(const char *frame, uid_t *uid, char session[SGW_POLICY_SESSION_MAX + 1]);
 int sgw_policy_register(struct sgw_policy_state *state, const struct sgw_policy_agent agents[2]);
+int sgw_policy_format_provider_challenge(char *out, size_t out_size,
+                                         const struct sgw_policy_state *state,
+                                         const char *nonce, uid_t uid, const char *session);
+int sgw_policy_parse_provider_reply(const char *frame, const char *nonce,
+                                    const struct sgw_policy_state *state, uid_t uid,
+                                    const char *session, struct sgw_policy_proof *proof);
 int sgw_policy_ready(const struct sgw_policy_state *state, uid_t runner_uid, uid_t agent_uid,
                      const char *session, const struct sgw_policy_proof *proof);
 void sgw_policy_reset(struct sgw_policy_state *state);

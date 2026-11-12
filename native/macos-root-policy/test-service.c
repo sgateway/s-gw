@@ -2,6 +2,8 @@
 #include "policy-service.c"
 #undef main
 
+#include <sys/wait.h>
+
 static int entitlement_cases(void) {
     const void *allowed[] = { CFSTR("content-filter-provider-systemextension") };
     const void *wrong[] = { CFSTR("content-filter-provider") };
@@ -24,6 +26,55 @@ static int entitlement_cases(void) {
     return 0;
 }
 
+static int exchange_cases(const struct sgw_policy_state *state) {
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return 20;
+    pid_t child = fork();
+    if (child < 0) return 21;
+    if (child == 0) {
+        close(sockets[0]);
+        char frame[512] = {0};
+        size_t used = 0;
+        while (used < sizeof(frame) - 1 && recv(sockets[1], frame + used, 1, 0) == 1) {
+            if (frame[used++] == '\n') break;
+        }
+        const char prefix[] = "CHALLENGE-V1 ";
+        if (strncmp(frame, prefix, sizeof(prefix) - 1)) _exit(22);
+        char reply[512];
+        int length = snprintf(reply, sizeof(reply), "ATTEST-V1 %s", frame + sizeof(prefix) - 1);
+        if (length < 1 || length >= (int)sizeof(reply) ||
+            send(sockets[1], reply, (size_t)length, 0) != length) _exit(23);
+        close(sockets[1]);
+        _exit(0);
+    }
+    close(sockets[1]);
+    struct sgw_policy_proof proof = {0};
+    int exchanged = provider_exchange(sockets[0], state, 231000, "alpha", &proof);
+    close(sockets[0]);
+    int child_status = 0;
+    proof.signed_provider = 1;
+    if (waitpid(child, &child_status, 0) != child || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0 || exchanged || !proof.provider_alive ||
+        sgw_policy_ready(state, 0, 231000, "alpha", &proof)) return 24;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return 25;
+    const char *stale = "ATTEST-V1 00000000000000000000000000000000 231000 alpha "
+                        "231000 231000 alpha 231001 231001 beta\n";
+    if (send(sockets[1], stale, strlen(stale), 0) != (ssize_t)strlen(stale)) return 26;
+    proof.provider_alive = 1;
+    int accepted_stale = provider_exchange(sockets[0], state, 231000, "alpha", &proof);
+    close(sockets[0]);
+    close(sockets[1]);
+    if (accepted_stale == 0 || proof.provider_alive) return 27;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return 28;
+    close(sockets[1]);
+    proof.provider_alive = 1;
+    int accepted_closed = provider_exchange(sockets[0], state, 231000, "alpha", &proof);
+    close(sockets[0]);
+    return accepted_closed == 0 || proof.provider_alive ? 29 : 0;
+}
+
 int main(int argc, char **argv) {
     int entitlement_result = entitlement_cases();
     if (entitlement_result) return entitlement_result;
@@ -41,13 +92,15 @@ int main(int argc, char **argv) {
         { .uid = 231001, .gid = 231001, .session = "beta" }
     };
     if (sgw_policy_register(&state, agents)) return 1;
-    struct sgw_policy_proof proof = provider_proof(231000, "alpha");
+    int exchange_result = exchange_cases(&state);
+    if (exchange_result) return exchange_result;
+    struct sgw_policy_proof proof = provider_proof(-1, &state, 231000, "alpha");
     if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 2;
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return 3;
     if (signed_peer(sockets[0], getuid(), "")) return 6;
     struct runner_connection runner = { .fd = sockets[0], .peer_uid = 0 };
-    if (reply_check(&runner, &state, "CHECK-V1 231000 alpha\n")) return 4;
+    if (reply_check(&runner, -1, &state, "CHECK-V1 231000 alpha\n")) return 4;
     char result[128] = {0};
     ssize_t count = recv(sockets[1], result, sizeof(result), 0);
     close(sockets[0]);

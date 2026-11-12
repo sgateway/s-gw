@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,10 +17,20 @@ static int valid_session(const char *value) {
     return 1;
 }
 
-static int one_line(const char *frame) {
-    size_t len = strnlen(frame, 256);
-    if (!len || len >= 256 || frame[len - 1] != '\n') return 0;
+static int one_line_with_limit(const char *frame, size_t limit) {
+    size_t len = strnlen(frame, limit);
+    if (!len || len >= limit || frame[len - 1] != '\n') return 0;
     return memchr(frame, '\n', len - 1) == NULL;
+}
+
+static int one_line(const char *frame) { return one_line_with_limit(frame, 256); }
+
+static int valid_nonce(const char *value) {
+    if (!value || strnlen(value, 33) != 32) return 0;
+    for (int i = 0; i < 32; i++) {
+        if ((value[i] < '0' || value[i] > '9') && (value[i] < 'a' || value[i] > 'f')) return 0;
+    }
+    return 1;
 }
 
 static int next_id(const char **cursor, unsigned int *value) {
@@ -87,6 +98,56 @@ int sgw_policy_register(struct sgw_policy_state *state, const struct sgw_policy_
     state->agents[0] = agents[0];
     state->agents[1] = agents[1];
     state->registered = 1;
+    return 0;
+}
+
+static int registered_agent(const struct sgw_policy_state *state, uid_t uid, const char *session) {
+    if (!state || !state->registered || !uid || !session || !valid_session(session)) return 0;
+    for (int i = 0; i < 2; i++) {
+        if (state->agents[i].uid == uid && !strcmp(state->agents[i].session, session)) return 1;
+    }
+    return 0;
+}
+
+int sgw_policy_format_provider_challenge(char *out, size_t out_size,
+                                         const struct sgw_policy_state *state,
+                                         const char *nonce, uid_t uid, const char *session) {
+    if (!out || !out_size || !valid_nonce(nonce) || !registered_agent(state, uid, session)) return -1;
+    int length = snprintf(out, out_size,
+        "CHALLENGE-V1 %s %u %s %u %u %s %u %u %s\n", nonce, (unsigned)uid, session,
+        (unsigned)state->agents[0].uid, (unsigned)state->agents[0].gid, state->agents[0].session,
+        (unsigned)state->agents[1].uid, (unsigned)state->agents[1].gid, state->agents[1].session);
+    return length < 0 || (size_t)length >= out_size ? -1 : length;
+}
+
+int sgw_policy_parse_provider_reply(const char *frame, const char *nonce,
+                                    const struct sgw_policy_state *state, uid_t uid,
+                                    const char *session, struct sgw_policy_proof *proof) {
+    if (proof) memset(proof, 0, sizeof(*proof));
+    if (!proof || !frame || !valid_nonce(nonce) || !registered_agent(state, uid, session) ||
+        !one_line_with_limit(frame, 512)) return -1;
+    const char prefix[] = "ATTEST-V1 ";
+    if (strncmp(frame, prefix, sizeof(prefix) - 1)) return -1;
+    const char *cursor = frame + sizeof(prefix) - 1;
+    if (strncmp(cursor, nonce, 32) || cursor[32] != ' ') return -1;
+    cursor += 33;
+    unsigned int checked_uid, uid_a, gid_a, uid_b, gid_b;
+    char checked_session[SGW_POLICY_SESSION_MAX + 1];
+    char session_a[SGW_POLICY_SESSION_MAX + 1], session_b[SGW_POLICY_SESSION_MAX + 1];
+    if (next_id(&cursor, &checked_uid) || next_session(&cursor, checked_session, 0) ||
+        next_id(&cursor, &uid_a) || next_id(&cursor, &gid_a) ||
+        next_session(&cursor, session_a, 0) || next_id(&cursor, &uid_b) ||
+        next_id(&cursor, &gid_b) || next_session(&cursor, session_b, 1)) return -1;
+    if ((uid_t)checked_uid != uid || strcmp(checked_session, session) ||
+        (uid_t)uid_a != state->agents[0].uid || (gid_t)gid_a != state->agents[0].gid ||
+        strcmp(session_a, state->agents[0].session) ||
+        (uid_t)uid_b != state->agents[1].uid || (gid_t)gid_b != state->agents[1].gid ||
+        strcmp(session_b, state->agents[1].session)) return -1;
+    proof->checked_uid = uid;
+    strcpy(proof->checked_session, session);
+    proof->policy_agents[0] = state->agents[0];
+    proof->policy_agents[1] = state->agents[1];
+    proof->provider_alive = 1;
     return 0;
 }
 

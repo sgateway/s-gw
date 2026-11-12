@@ -93,9 +93,55 @@ static int state_cases(void) {
     return 0;
 }
 
+static int provider_reply_cases(void) {
+    const char *nonce = "00112233445566778899aabbccddeeff";
+    struct sgw_policy_agent pair[2] = {
+        { .uid = 231000, .gid = 231000, .session = "alpha" },
+        { .uid = 231001, .gid = 231001, .session = "beta" }
+    };
+    struct sgw_policy_state state = {0};
+    struct sgw_policy_proof proof = {0};
+    char challenge[512];
+    if (sgw_policy_register(&state, pair)) return 1;
+    if (sgw_policy_format_provider_challenge(challenge, sizeof(challenge), &state,
+                                             nonce, 231000, "alpha") < 0 ||
+        strcmp(challenge, "CHALLENGE-V1 00112233445566778899aabbccddeeff 231000 alpha "
+                          "231000 231000 alpha 231001 231001 beta\n")) return 2;
+
+    const char *valid = "ATTEST-V1 00112233445566778899aabbccddeeff 231000 alpha "
+                        "231000 231000 alpha 231001 231001 beta\n";
+    if (sgw_policy_parse_provider_reply(valid, nonce, &state, 231000, "alpha", &proof)) return 3;
+    proof.signed_provider = 1;
+    if (proof.checked_uid != 231000 || strcmp(proof.checked_session, "alpha") ||
+        !proof.provider_alive || proof.enabled_socket_filter || proof.exact_uid_policy ||
+        proof.current_boot_probes || proof.continuous_denial ||
+        sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 4;
+
+    const char *bad[] = {
+        "ATTEST-V1 00112233445566778899aabbccddee00 231000 alpha 231000 231000 alpha 231001 231001 beta\n",
+        "ATTEST-V1 00112233445566778899aabbccddeeff 231001 alpha 231000 231000 alpha 231001 231001 beta\n",
+        "ATTEST-V1 00112233445566778899aabbccddeeff 231000 beta 231000 231000 alpha 231001 231001 beta\n",
+        "ATTEST-V1 00112233445566778899aabbccddeeff 231000 alpha 231000 231000 alpha 231002 231001 beta\n",
+        "ATTEST-V1 00112233445566778899aabbccddeeff 231000 alpha 231000 231000 alpha 231001 231001 beta extra\n",
+        "ATTEST-V1 00112233445566778899aabbccddeeff 231000 alpha 231000 231000 alpha 231001 231001 beta\nATTEST-V1 1 x\n"
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        proof.provider_alive = 1;
+        if (!sgw_policy_parse_provider_reply(bad[i], nonce, &state, 231000, "alpha", &proof) ||
+            proof.provider_alive) return 5;
+    }
+    if (sgw_policy_format_provider_challenge(challenge, sizeof(challenge), &state,
+                                             nonce, 231002, "alpha") >= 0 ||
+        sgw_policy_format_provider_challenge(challenge, 10, &state,
+                                             nonce, 231000, "alpha") >= 0) return 6;
+    return 0;
+}
+
 int main(void) {
     int parsed = parse_cases();
     int state = state_cases();
-    if (parsed || state) fprintf(stderr, "policy core failed: parse=%d state=%d\n", parsed, state);
-    return parsed || state ? 1 : 0;
+    int provider = provider_reply_cases();
+    if (parsed || state || provider)
+        fprintf(stderr, "policy core failed: parse=%d state=%d provider=%d\n", parsed, state, provider);
+    return parsed || state || provider ? 1 : 0;
 }
