@@ -333,6 +333,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     }
   });
 
+  // Windows process startup makes this multi-command case slower.
   it("updates and auto-arranges approval policies, and requires a verified agent for approve-policy", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-policy-"));
     const recoveryHome = `${home}-recovery`;
@@ -520,7 +521,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       await rm(recoveryHome, { recursive: true, force: true });
       await rm(cargoTarget, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, process.platform === "win32" ? 30_000 : 15_000);
 
   it("keeps name-only CLI requests pending even with an explicit --any-command allow rule", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-any-command-"));
