@@ -107,7 +107,7 @@ function liveUnit(unit, name) {
       fields.get("User") !== name || fields.get("Group") !== name ||
       fields.get("ControlGroup") !== `/system.slice/${unit}` ||
       !/^[0-9a-f]{32}$/.test(fields.get("InvocationID") || "") ||
-      fields.get("PrivatePIDs") !== "yes" ||
+      fields.get("PrivatePIDs") !== (unit === agentUnit ? "yes" : "no") ||
       (unit === agentUnit && fields.get("PrivateNetwork") !== "yes")) {
     throw new Error(`The ${unit} systemd identity or isolation differs from the fixture.`);
   }
@@ -233,10 +233,11 @@ function systemdOptions(unit, name) {
   return ["--unit=" + unit, "--property=Description=" + expectedDescription(unit),
     "--property=Type=exec", "--property=User=" + name, "--property=Group=" + name,
     "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",
-    "--property=PrivatePIDs=yes", "--property=PrivateIPC=yes", "--property=PrivateTmp=yes",
+    "--property=PrivateIPC=yes", "--property=PrivateTmp=yes",
     "--property=ProtectSystem=strict", "--property=ProtectHome=read-only",
     "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-    "--property=SystemCallFilter=~@privileged", "--property=KillMode=control-group"];
+    "--property=SystemCallFilter=~@privileged", "--property=KillMode=control-group",
+    "--property=TimeoutStopSec=5s"];
 }
 
 function startUnit(unit, args) {
@@ -384,14 +385,17 @@ try {
   assert.equal(originalSocket.mode & 0o777, 0o660);
 
   startUnit(agentUnit, [...systemdOptions(agentUnit, agentName),
-    "--property=PrivateNetwork=yes", "--property=ReadWritePaths=" + output,
+    "--property=PrivateNetwork=yes", "--property=PrivatePIDs=yes",
+    "--property=ReadWritePaths=" + output,
     "--property=BindReadOnlyPaths=" + sdkModules + ":" + path.join(work, "node_modules"),
     process.execPath, agentScript, project, work, bridge, String(agentUid)]);
   await outputMarker("ready");
   const agentPid = liveUnit(agentUnit, agentName);
   const agentNs = await processState(agentPid, agentUid, agentUid);
   const hostNet = await readlink("/proc/self/ns/net");
+  const hostPid = await readlink("/proc/self/ns/pid");
   if (agentNs.net === hostNet) throw new Error("The agent retained the host network namespace.");
+  if (agentNs.pid === hostPid) throw new Error("The agent retained the host PID namespace.");
   if (broker.namespace !== hostNet) throw new Error("The synthetic broker left the host network namespace.");
 
   const release = path.join(work, "release-forwarder");
@@ -407,7 +411,7 @@ try {
   assert.equal(liveUnit(forwarderUnit, forwarderName), forwarderPid);
   const forwarderNs = await processState(forwarderPid, forwarderUid, forwarderUid);
   if (forwarderNs.net !== agentNs.net || forwarderNs.net === hostNet ||
-      forwarderNs.pid === agentNs.pid || forwarderNs.ipc === agentNs.ipc ||
+      forwarderNs.pid !== hostPid || forwarderNs.ipc === agentNs.ipc ||
       forwarderNs.mount === agentNs.mount) {
     throw new Error("Forwarder and agent lack a shared private network and separate process namespaces.");
   }

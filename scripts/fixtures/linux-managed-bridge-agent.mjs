@@ -16,6 +16,7 @@ const { Client } = await import(pathToFileURL(path.join(sdkRoot, "index.js")).hr
 const { StdioClientTransport } = await import(pathToFileURL(path.join(sdkRoot, "stdio.js")).href);
 const output = path.join(work, "agent-output");
 const brokerPath = "/run/s-gw/broker.sock";
+process.once("SIGTERM", () => process.exit(0));
 
 async function assertBridgeScope(pid) {
   assert.ok(Number.isSafeInteger(pid) && pid > 0, "SDK transport has no bridge PID.");
