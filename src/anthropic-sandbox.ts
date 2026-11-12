@@ -24,6 +24,7 @@ export interface AnthropicSandboxOptions {
   isolatedAuth?: boolean;
   strictIsolatedAuth?: boolean;
   strictBrokerEnv?: boolean;
+  probeLaunch?: boolean;
 }
 
 export function macAgentKeychainReadPath(cwd: string, options: AnthropicSandboxOptions = {}, platform = process.platform): string | undefined {
@@ -60,7 +61,7 @@ export function anthropicSandboxReadiness(platform = process.platform) {
     dependencies.errors.push("Linux isolation requires a writable delegated cgroup v2.");
   }
   return { provider: "anthropic", version: "0.0.50", platform, supported,
-    ready: supported && dependencies.errors.length === 0, dependencies, tlsInterception: false,
+    ready: supported && dependencies.errors.length === 0, dependencies, readinessScope: "dependencies", launchVerified: false, tlsInterception: false,
     credentialOperations: ["ssh", "https"], nativeWindows: "pending; no account or VM is provisioned automatically" };
 }
 
@@ -259,6 +260,44 @@ async function createSandboxSession(config: SandboxRuntimeConfig, strictPaths = 
 
 let running = false;
 
+async function probeLinuxSandboxLaunch(wrapped: string, cwd: string, manifestPath: string,
+  agentTmp: string, launchPath: string | undefined): Promise<void> {
+  await writeFile(manifestPath, JSON.stringify({ command: "/bin/sh", args: ["-c", ":"], tmpdir: agentTmp }), { mode: 0o600 });
+  const probeEnv: NodeJS.ProcessEnv = { HOME: agentTmp, TMPDIR: agentTmp };
+  if (launchPath !== undefined) probeEnv.PATH = launchPath;
+  const child = spawnIsolated("/bin/bash", ["-c", wrapped], { cwd, env: probeEnv, stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr?.on("data", chunk => { if (stderr.length < 2048) stderr += String(chunk).slice(0, 2048 - stderr.length); });
+  let timer: NodeJS.Timeout | undefined;
+  let closed = false;
+  const drained = new Promise<void>(resolve => child.once("close", () => { closed = true; resolve(); }));
+  let rejectInterrupted!: (error: Error) => void;
+  const interrupted = new Promise<never>((_resolve, reject) => { rejectInterrupted = reject; });
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const handlers = signals.map(signal => () => {
+    killProcessTree(child, signal);
+    rejectInterrupted(new Error(`interrupted by ${signal}`));
+  });
+  signals.forEach((signal, index) => process.on(signal, handlers[index]));
+  try {
+    const exited = new Promise<number>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (exitCode, signal) => signal ? reject(new Error(`terminated by ${signal}`)) : resolve(exitCode ?? 1));
+      timer = setTimeout(() => reject(new Error("timed out after 15 seconds")), 15_000);
+    });
+    const code = await Promise.race([exited, interrupted]);
+    if (code !== 0) throw new Error(`exited with status ${code}`);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Anthropic Linux sandbox launch probe failed before starting the agent: ${reason}${stderr ? `; ${stderr.trim()}` : ""}`);
+  } finally {
+    signals.forEach((signal, index) => process.off(signal, handlers[index]));
+    if (timer) clearTimeout(timer);
+    killProcessTree(child, "SIGKILL");
+    if (!closed) await Promise.race([drained, new Promise<void>(resolve => setTimeout(resolve, 2_000))]);
+  }
+}
+
 function macSandboxProfileArgs(wrapped: string): { args: string[]; at: number } {
   const parsed = parseShell(wrapped);
   const args = parsed.map(token => {
@@ -311,6 +350,9 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
   if (!["darwin", "linux"].includes(process.platform)) {
     throw new Error("The Anthropic s-gw launcher currently supports macOS and Linux. Native Windows integration is pending alpha-runtime validation.");
   }
+  if (options.probeLaunch && process.platform !== "linux") {
+    throw new Error("The Anthropic sandbox launch probe currently supports Linux only.");
+  }
   if (options.isolatedAuth && process.platform === "linux" &&
     SandboxManager.checkDependencies().warnings.some(warning => warning.includes("unix socket access not restricted"))) {
     throw new Error("Isolated authentication on Linux requires Anthropic's Unix-socket seccomp filter.");
@@ -343,7 +385,9 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     const mcpConfig = path.join(sessionDir, "mcp.json");
     await writeFile(mcpConfig, JSON.stringify({ mcpServers: { "s-gw": { ...mcpEntry, env: capabilityEnv } } }), { mode: 0o600 });
     const agentArgs = sandboxAgentArguments(prepared.plan.command, prepared.plan.args, mcpConfig, mcpEntry, capabilityEnv);
-    await writeFile(manifestPath, JSON.stringify({ command: prepared.plan.command, args: agentArgs, tmpdir: agentTmp }), { mode: 0o600 });
+    const agentManifest = JSON.stringify({ command: prepared.plan.command, args: agentArgs, tmpdir: agentTmp });
+    const probeLaunch = process.platform === "linux" && options.probeLaunch === true;
+    if (!probeLaunch) await writeFile(manifestPath, agentManifest, { mode: 0o600 });
     const entry = ownedModuleCommand("sandbox-child");
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
     const fixedCommand = [entry.command, ...entry.args, manifestPath].map(quote).join(" ");
@@ -373,6 +417,10 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     for (const name of Object.keys(env)) {
       if (["BASH_ENV", "ENV", "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "CDPATH", "GIT_CONFIG", "GIT_CONFIG_GLOBAL"].includes(name) ||
           name.startsWith("BASH_FUNC_") || name.startsWith("DYLD_") || name.startsWith("LD_")) delete env[name];
+    }
+    if (probeLaunch) {
+      await probeLinuxSandboxLaunch(wrapped, prepared.plan.cwd, manifestPath, agentTmp, env.PATH);
+      await writeFile(manifestPath, agentManifest, { mode: 0o600 });
     }
     const child = spawnIsolated("/bin/bash", ["-c", wrapped], { cwd: prepared.plan.cwd, env, stdio: "inherit" });
     const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;

@@ -113,6 +113,28 @@ describe("Anthropic sandbox", () => {
     expect(JSON.parse(deniedKeychainPlan).sandbox.policy.allowRead).toEqual([]);
   });
 
+  it("parses the optional Linux launch probe flag in guard run", async () => {
+    await fixtureStore();
+    const loader = new URL("../node_modules/tsx/dist/esm/index.mjs", import.meta.url).href;
+    const argv = ["--import", loader, "src/cli.ts", "guard", "run", "codex", "--sandbox", "anthropic",
+      "--dry-run", "--command", process.execPath, "--", "-v"];
+    const defaultPlan = JSON.parse(execFileSync(process.execPath, argv, { encoding: "utf8", env: process.env }));
+    expect(defaultPlan.sandbox.probeLaunch).toBe(false);
+    const probeArgs = [...argv.slice(0, -2), "--probe-launch", ...argv.slice(-2)];
+    if (process.platform === "linux") {
+      const probePlan = JSON.parse(execFileSync(process.execPath, probeArgs, { encoding: "utf8", env: process.env }));
+      expect(probePlan.sandbox.probeLaunch).toBe(true);
+    } else {
+      expect(() => execFileSync(process.execPath, probeArgs, { encoding: "utf8", env: process.env }))
+        .toThrow("launch probe currently supports Linux only");
+    }
+    expect(() => execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "guard", "run", "codex",
+      "--dry-run", "--command", process.execPath, "--probe-launch", "--", "-v"],
+    { encoding: "utf8", env: process.env })).toThrow("require --sandbox anthropic");
+    expect(execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "help"],
+      { encoding: "utf8", env: process.env })).toContain("--probe-launch");
+  });
+
   it("adds stricter egress and authentication-file protection only when selected", () => {
     const cwd = path.resolve("fixture-workspace");
     const store = path.resolve("fixture-store");
@@ -122,7 +144,8 @@ describe("Anthropic sandbox", () => {
     expect(strict.network.allowedDomains).toEqual(["api.example.test"]);
     expect(base.network.allowedDomains.length).toBeGreaterThan(1);
     for (const file of agentAuthenticationPaths(env)) { expect(strict.filesystem.denyRead).toContain(file); expect(base.filesystem.denyRead).not.toContain(file); }
-    expect(anthropicSandboxReadiness("win32")).toMatchObject({ supported: false, ready: false, tlsInterception: false });
+    expect(anthropicSandboxReadiness("win32")).toMatchObject({ supported: false, ready: false,
+      readinessScope: "dependencies", launchVerified: false, tlsInterception: false });
   });
 
   it("rejects Windows session storage without a native user boundary", () => {
@@ -305,6 +328,130 @@ writeFileSync('native-home-result.json', JSON.stringify({ native: read(${JSON.st
       vi.spyOn(SandboxManager, "checkDependencies").mockReturnValue({ errors: [],
         warnings: ["seccomp not available - unix socket access not restricted"] });
       await expect(runAnthropicSandbox(prepared, store.home, opts)).rejects.toThrow("Unix-socket seccomp filter");
+    } finally { Object.defineProperty(process, "platform", { value: platform }); }
+  });
+
+  it.skipIf(process.platform === "win32")("fails a Linux launch probe before starting the agent", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const marker = path.join(workspace, "agent-started");
+    const capturedEnv = path.join(workspace, "probe-secret");
+    const probePath = path.join(workspace, "probe-path");
+    const agent = path.join(workspace, "agent.mjs");
+    await writeFile(agent, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'started');`);
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      args: [agent], cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic" });
+    prepared.env.SECRET_FIXTURE = "private-marker";
+    prepared.env.PATH = `${path.join(root, "path-control")}${path.delimiter}${process.env.PATH}`;
+    const platform = process.platform;
+    try {
+      Object.defineProperty(process, "platform", { value: "linux" });
+      vi.spyOn(SandboxManager, "initialize").mockResolvedValue(undefined);
+      const wrap = vi.spyOn(SandboxManager, "wrapWithSandbox").mockImplementation(async command => {
+        const manifest = /'([^']+launch\.json)'$/.exec(command)?.[1];
+        if (!manifest) throw new Error("Missing probe manifest in fixture wrapper.");
+        return `printf '%s' "$PATH" > '${probePath}'; if grep -Fq '"command":"/bin/sh"' '${manifest}'; then printf '%s' "$SECRET_FIXTURE" > '${capturedEnv}'; exit 37; fi; ${command}`;
+      });
+      await expect(runAnthropicSandbox(prepared, store.home, { probeLaunch: true })).rejects.toThrow(/launch probe failed before starting the agent: exited with status 37/);
+      expect(wrap).toHaveBeenCalledTimes(1);
+      expect(await readFile(capturedEnv, "utf8")).toBe("");
+      expect(await readFile(probePath, "utf8")).toBe(prepared.env.PATH);
+      await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      prepared.env.PATH = "";
+      wrap.mockResolvedValue(`printf '%s' "$PATH" > '${probePath}'; exit 38`);
+      await expect(runAnthropicSandbox(prepared, store.home, { probeLaunch: true })).rejects.toThrow(/exited with status 38/);
+      expect(await readFile(probePath, "utf8")).toBe("");
+      prepared.env.PATH = process.env.PATH;
+      const order = path.join(workspace, "launch-order");
+      wrap.mockImplementation(async command => {
+        const manifest = /'([^']+launch\.json)'$/.exec(command)?.[1];
+        if (!manifest) throw new Error("Missing probe manifest in fixture wrapper.");
+        return `if grep -Fq '"command":"/bin/sh"' '${manifest}'; then printf 'probe\n' >> '${order}'; else printf 'agent\n' >> '${order}'; fi; ${command}`;
+      });
+      expect(await runAnthropicSandbox(prepared, store.home, { probeLaunch: true })).toBe(0);
+      expect(await readFile(order, "utf8")).toBe("probe\nagent\n");
+      expect(await readFile(marker, "utf8")).toBe("started");
+    } finally { Object.defineProperty(process, "platform", { value: platform }); }
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the default Linux launch to the agent", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const marker = path.join(workspace, "agent-started");
+    const order = path.join(workspace, "launch-order");
+    const agent = path.join(workspace, "agent.mjs");
+    await writeFile(agent, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'started');`);
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      args: [agent], cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic" });
+    const platform = process.platform;
+    try {
+      Object.defineProperty(process, "platform", { value: "linux" });
+      vi.spyOn(SandboxManager, "initialize").mockResolvedValue(undefined);
+      const wrap = vi.spyOn(SandboxManager, "wrapWithSandbox").mockImplementation(async command => {
+        const manifest = /'([^']+launch\.json)'$/.exec(command)?.[1];
+        if (!manifest) throw new Error("Missing agent manifest in fixture wrapper.");
+        return `if grep -Fq '"command":"/bin/sh"' '${manifest}'; then printf 'probe\n' >> '${order}'; else printf 'agent\n' >> '${order}'; fi; ${command}`;
+      });
+      expect(await runAnthropicSandbox(prepared, store.home)).toBe(0);
+      expect(wrap).toHaveBeenCalledTimes(1);
+      expect(await readFile(order, "utf8")).toBe("agent\n");
+      expect(await readFile(marker, "utf8")).toBe("started");
+    } finally { Object.defineProperty(process, "platform", { value: platform }); }
+  });
+
+  it.skipIf(process.platform === "win32")("kills a timed-out Linux probe and its child", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const started = path.join(workspace, "probe-started");
+    const lateWrite = path.join(workspace, "probe-survived");
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic" });
+    const platform = process.platform;
+    const nativeSetTimeout = globalThis.setTimeout;
+    try {
+      Object.defineProperty(process, "platform", { value: "linux" });
+      vi.spyOn(SandboxManager, "initialize").mockResolvedValue(undefined);
+      vi.spyOn(SandboxManager, "wrapWithSandbox").mockResolvedValue(
+        `(sleep 0.5; printf survived > '${lateWrite}') & printf ready > '${started}'; exit 0`);
+      vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) =>
+        nativeSetTimeout(callback, delay === 15_000 ? 100 : delay, ...args));
+      await expect(runAnthropicSandbox(prepared, store.home, { probeLaunch: true })).rejects.toThrow("timed out after 15 seconds");
+      expect(await readFile(started, "utf8")).toBe("ready");
+      await new Promise(resolve => nativeSetTimeout(resolve, 650));
+      await expect(readFile(lateWrite)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { Object.defineProperty(process, "platform", { value: platform }); }
+  });
+
+  it.skipIf(process.platform === "win32")("kills a Linux probe when its supervisor receives a stop signal", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    const started = path.join(workspace, "probe-started");
+    const lateWrite = path.join(workspace, "probe-survived");
+    const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath,
+      cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic" });
+    const platform = process.platform;
+    const previous = new Set(process.listeners("SIGTERM"));
+    try {
+      Object.defineProperty(process, "platform", { value: "linux" });
+      vi.spyOn(SandboxManager, "initialize").mockResolvedValue(undefined);
+      vi.spyOn(SandboxManager, "wrapWithSandbox").mockResolvedValue(
+        `(sleep 0.5; printf survived > '${lateWrite}') & printf ready > '${started}'; wait`);
+      const launch = runAnthropicSandbox(prepared, store.home, { probeLaunch: true });
+      let ready = false;
+      for (let i = 0; i < 50; i++) {
+        try { ready = await readFile(started, "utf8") === "ready"; }
+        catch { ready = false; }
+        if (ready) break;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      expect(ready).toBe(true);
+      const handler = process.listeners("SIGTERM").find(listener => !previous.has(listener)) as (() => void) | undefined;
+      expect(handler).toBeDefined();
+      handler!();
+      await expect(launch).rejects.toThrow("interrupted by SIGTERM");
+      expect(process.listeners("SIGTERM")).not.toContain(handler);
+      await new Promise(resolve => setTimeout(resolve, 650));
+      await expect(readFile(lateWrite)).rejects.toMatchObject({ code: "ENOENT" });
     } finally { Object.defineProperty(process, "platform", { value: platform }); }
   });
 

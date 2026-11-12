@@ -56,6 +56,7 @@ export interface GuardRunPlan {
   sandbox: {
     provider: "builtin" | "anthropic";
     tlsInterception: false;
+    probeLaunch?: boolean;
     policy?: { denyRead: string[]; allowRead: string[]; allowWrite: string[]; denyWrite: string[]; allowedDomains: string[]; credentialOperations: Array<"ssh" | "https"> };
   };
 }
@@ -128,6 +129,9 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   }
   if (options.sandbox !== "anthropic" && Object.values(options.sandboxOptions || {}).some(value => Array.isArray(value) ? value.length > 0 : value === true)) {
     throw new Error("Sandbox path and host options require --sandbox anthropic.");
+  }
+  if (options.sandboxOptions?.probeLaunch && process.platform !== "linux") {
+    throw new Error("The Anthropic sandbox launch probe currently supports Linux only.");
   }
   const command = options.command || defaultAgentCommands[profile.id];
   if (!command) {
@@ -219,7 +223,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
       warnings,
       sandbox: {
         provider: options.sandbox || "builtin", tlsInterception: false,
-        ...(sandboxConfig ? { policy: {
+        ...(sandboxConfig ? { probeLaunch: options.sandboxOptions?.probeLaunch === true, policy: {
           denyRead: sandboxConfig.filesystem.denyRead,
           allowRead: [...(sandboxConfig.filesystem.allowRead || []), ...(loginKeychain ? [loginKeychain] : [])],
           allowWrite: sandboxConfig.filesystem.allowWrite,
