@@ -216,6 +216,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
     if (loginKeychain) warnings.push("--allow-agent-keychain permits this process tree to read the encrypted login Keychain database, which contains credentials beyond the agent's login. Remove the flag to restore the block.");
     else if (options.sandboxOptions?.allowAgentKeychain) warnings.push("--allow-agent-keychain is inactive on this platform or overridden by an explicit credential deny.");
     if (!options.sandboxOptions?.strictEgress && !options.sandboxOptions?.isolatedAuth) warnings.push("Default agent destinations are permitted. Use --strict-egress with explicit --allow-host entries to constrain that list.");
+    if (options.sandboxOptions?.pinPublicProxy) warnings.push("Public-pinned proxy mode rejects private, mixed, and special-use DNS answers. Parent proxies are unsupported in this mode.");
     guardedEnv.SGW_GUARD_INSTRUCTIONS = `s-gw Anthropic sandbox is active for ${profile.displayName}. Use s-gw MCP to request approved SSH or HTTPS operations through the external trusted executor. Credentials enrolled in s-gw remain outside this sandbox. Generic credential-bearing commands and file scans are unavailable in this mode.`;
   }
 
@@ -243,6 +244,7 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
       sandbox: {
         provider: options.sandbox || "builtin", tlsInterception: false,
         ...(sandboxConfig ? { probeLaunch: options.sandboxOptions?.probeLaunch === true,
+          pinPublicProxy: options.sandboxOptions?.pinPublicProxy === true,
           trustedLinuxHelpers: options.sandboxOptions?.trustedLinuxHelpers === true,
           trustedMacHelpers: options.sandboxOptions?.trustedMacHelpers === true, policy: {
           denyRead: sandboxConfig.filesystem.denyRead,

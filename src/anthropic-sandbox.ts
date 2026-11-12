@@ -14,6 +14,7 @@ import { ownedModuleCommand, startSandboxBroker } from "./sandbox-broker.js";
 import { getSgwRecoveryHome } from "./paths.js";
 import { resolveTrustedLinuxSandboxHelpers, withTrustedLinuxPathAsync } from "./linux-sandbox-helpers.js";
 import { resolveTrustedMacSandboxHelpers, withTrustedMacPathAsync } from "./macos-sandbox-helpers.js";
+import { rejectManagedProxyParentRoute, startManagedProxyServers, type ManagedProxyServers } from "./managed-proxy.js";
 
 export interface AnthropicSandboxOptions {
   allowHosts?: string[];
@@ -29,6 +30,7 @@ export interface AnthropicSandboxOptions {
   probeLaunch?: boolean;
   trustedLinuxHelpers?: boolean;
   trustedMacHelpers?: boolean;
+  pinPublicProxy?: boolean;
 }
 
 export function macAgentKeychainReadPath(cwd: string, options: AnthropicSandboxOptions = {}, platform = process.platform): string | undefined {
@@ -69,7 +71,12 @@ export function anthropicSandboxReadiness(platform = process.platform) {
     credentialOperations: ["ssh", "https"], nativeWindows: "pending; no account or VM is provisioned automatically" };
 }
 
-export function anthropicSandboxConfig(cwd: string, home: string, options: AnthropicSandboxOptions = {}, env: NodeJS.ProcessEnv = process.env, command?: string): SandboxRuntimeConfig {
+export function anthropicSandboxConfig(cwd: string, home: string, options: AnthropicSandboxOptions = {}, env: NodeJS.ProcessEnv = process.env, command?: string, platform = process.platform): SandboxRuntimeConfig {
+  if (options.pinPublicProxy) {
+    if (platform !== "linux") throw new Error("Public-pinned Anthropic proxy currently supports Linux only.");
+    rejectManagedProxyParentRoute(env);
+    rejectManagedProxyParentRoute(process.env);
+  }
   if (options.strictIsolatedAuth && !options.isolatedAuth) throw new Error("Strict isolated authentication requires isolated authentication.");
   if (options.isolatedAuth && options.allowAgentKeychain) throw new Error("Isolated authentication cannot allow the agent login Keychain.");
   const workspace = path.resolve(cwd);
@@ -387,6 +394,7 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
   let sessionDir: string | undefined;
   let agentTmp: string | undefined;
   let broker: Awaited<ReturnType<typeof startSandboxBroker>> | undefined;
+  let managedProxy: ManagedProxyServers | undefined;
   try {
     sessionDir = await createSandboxSession(config, options.strictIsolatedAuth);
     agentTmp = await mkdtemp(path.join(prepared.plan.cwd, ".sgw-tmp-"));
@@ -396,6 +404,13 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
       { strictEnv: options.strictBrokerEnv || options.isolatedAuth, agentWritablePaths: config.filesystem.allowWrite,
         ...(options.isolatedAuth ? { uploadWorkspace: prepared.plan.cwd } : {}) });
     const brokerPort = broker.port;
+    if (options.pinPublicProxy) {
+      managedProxy = await startManagedProxyServers({ allowedDomains: config.network.allowedDomains,
+        deniedDomains: config.network.deniedDomains, brokerPort, env: prepared.env,
+        parentProxy: config.network.parentProxy });
+      config.network.httpProxyPort = managedProxy.httpPort;
+      config.network.socksProxyPort = managedProxy.socksPort;
+    }
     const initialize = () => SandboxManager.initialize(config, async ({ host, port }) => host === "127.0.0.1" && port === brokerPort);
     await withTrustedPath(async () => {
       await initialize();
@@ -479,13 +494,16 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
       killProcessTree(child, "SIGKILL");
     }
   } finally {
-    try { await broker?.close(); }
+    try { await managedProxy?.close(); }
     finally {
-      try { await SandboxManager.reset(); }
+      try { await broker?.close(); }
       finally {
-        running = false;
-        try { if (sessionDir) await rm(sessionDir, { recursive: true, force: true }); }
-        finally { if (agentTmp) await rm(agentTmp, { recursive: true, force: true }); }
+        try { await SandboxManager.reset(); }
+        finally {
+          running = false;
+          try { if (sessionDir) await rm(sessionDir, { recursive: true, force: true }); }
+          finally { if (agentTmp) await rm(agentTmp, { recursive: true, force: true }); }
+        }
       }
     }
   }

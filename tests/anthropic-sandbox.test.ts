@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from "node:fs/promises";
 import { createServer, connect } from "node:net";
 import { createServer as createHttpsServer } from "node:https";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -107,6 +107,19 @@ describe("Anthropic sandbox", () => {
     const loader = new URL("../node_modules/tsx/dist/esm/index.mjs", import.meta.url).href;
     const cli = execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "run", "codex", "--sandbox", "anthropic", "--dry-run", "--command", process.execPath, "--allow-host", "example.test", "--", "-v"], { encoding: "utf8", env: process.env });
     expect(JSON.parse(cli).sandbox.provider).toBe("anthropic");
+    expect(JSON.parse(cli).sandbox.pinPublicProxy).toBe(false);
+    const proxyEnv = { ...process.env };
+    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) delete proxyEnv[name];
+    const pinnedCli = spawnSync(process.execPath, ["--import", loader, "src/cli.ts", "run", "codex", "--sandbox", "anthropic", "--dry-run",
+      "--command", process.execPath, "--pin-public-proxy", "--strict-egress", "--allow-host", "example.test", "--", "-v"],
+    { encoding: "utf8", env: proxyEnv });
+    if (process.platform === "linux") {
+      expect(pinnedCli.status).toBe(0);
+      expect(JSON.parse(pinnedCli.stdout).sandbox.pinPublicProxy).toBe(true);
+    } else {
+      expect(pinnedCli.status).not.toBe(0);
+      expect(pinnedCli.stderr).toContain("currently supports Linux only");
+    }
     const keychainPlan = execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "run", "claude-code", "--sandbox", "anthropic", "--dry-run", "--command", process.execPath, "--allow-agent-keychain", "--", "-v"], { encoding: "utf8", env: process.env });
     expect(JSON.parse(keychainPlan).sandbox.policy.allowRead).toEqual(process.platform === "darwin" ? [path.join(os.homedir(), "Library", "Keychains", "login.keychain-db")] : []);
     const deniedKeychainPlan = execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "run", "claude-code", "--sandbox", "anthropic", "--dry-run", "--command", process.execPath, "--allow-agent-keychain", "--deny-keychain", "--", "-v"], { encoding: "utf8", env: process.env });
@@ -789,6 +802,52 @@ writeFileSync('keychain-result.json', JSON.stringify({ read: result.status === 0
     expect(SandboxManager.getProxyPort()).toBeUndefined();
     prepared.plan.command = "/missing/sandbox-fixture-command";
     expect(await runAnthropicSandbox(prepared, store.home)).toBe(1);
+  });
+
+  it.skipIf(process.platform !== "linux")("launches through SRT's external HTTP and SOCKS ports in public-pinned mode", async () => {
+    const store = await fixtureStore();
+    const workspace = path.join(root, "workspace");
+    let connections = 0;
+    const canary = createServer(socket => { connections += 1; socket.destroy(); });
+    await new Promise<void>(resolve => canary.listen(0, "127.0.0.1", resolve));
+    const proxyNames = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"];
+    const priorProxyEnv = proxyNames.map(name => [name, process.env[name]] as const);
+    try {
+      const address = canary.address();
+      if (!address || typeof address === "string") throw new Error("Canary has no TCP port.");
+      const script = path.join(workspace, "proxy-probe.mjs");
+      await writeFile(script, `import { request } from 'node:http';
+import { writeFileSync } from 'node:fs';
+const req = request({ host: '127.0.0.1', port: 3128, method: 'CONNECT', path: '127.0.0.1:${address.port}' });
+req.on('connect', (res, socket) => {
+  writeFileSync('proxy-result.json', JSON.stringify({ code: res.statusCode, http: process.env.HTTP_PROXY, socks: process.env.ALL_PROXY }));
+  socket.destroy();
+});
+req.on('error', error => { console.error(error); process.exitCode = 1; });
+req.end();
+`);
+      for (const name of proxyNames) delete process.env[name];
+      const opts = { strictEgress: true, allowHosts: ["127.0.0.1"], pinPublicProxy: true };
+      const prepared = await prepareGuardedRun(store, { agent: "codex", command: process.execPath, args: [script],
+        cwd: workspace, env: { PATH: process.env.PATH }, sandbox: "anthropic", sandboxOptions: opts });
+      const initialize = vi.spyOn(SandboxManager, "initialize");
+      expect(await runAnthropicSandbox(prepared, store.home, opts)).toBe(0);
+      const config = initialize.mock.calls[0]?.[0];
+      expect(config?.network.httpProxyPort).toBeGreaterThan(0);
+      expect(config?.network.socksProxyPort).toBeGreaterThan(0);
+      expect(config?.network.httpProxyPort).not.toBe(config?.network.socksProxyPort);
+      expect(JSON.parse(await readFile(path.join(workspace, "proxy-result.json"), "utf8"))).toMatchObject({
+        code: 403, http: "http://localhost:3128", socks: "socks5h://localhost:1080"
+      });
+      expect(connections).toBe(0);
+      expect(SandboxManager.getProxyPort()).toBeUndefined();
+    } finally {
+      for (const [name, value] of priorProxyEnv) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await new Promise<void>(resolve => canary.close(() => resolve()));
+    }
   });
 
   it.skipIf(!["darwin", "linux"].includes(process.platform))("passes shell metacharacters as inert arguments through a protected manifest", async () => {
