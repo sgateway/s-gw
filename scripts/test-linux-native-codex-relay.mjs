@@ -16,6 +16,7 @@ const archiveUrl = `https://github.com/openai/codex/releases/download/rust-v${ve
 const archiveSha256 = "64bcc99c32e434b4bcb0508a97df9b7aeecdb97e956d976fb13661096ec4e3e2";
 const project = fileURLToPath(new URL("..", import.meta.url));
 const runuser = ["/usr/sbin/runuser", "/usr/bin/runuser"].find(candidate => existsSync(candidate));
+const chrootBinary = ["/usr/sbin/chroot", "/usr/bin/chroot"].find(candidate => existsSync(candidate));
 
 if (process.platform !== "linux" || process.arch !== "x64" || process.geteuid() !== 0 ||
     process.env.CI !== "true" || process.env.SGW_TEST_NATIVE_CODEX !== "1" ||
@@ -33,6 +34,7 @@ if (!existsSync(path.join(project, "dist/linux-managed-mcp.js")) ||
   throw new Error("Build the package and install its dependencies before the native Codex fixture.");
 }
 if (!runuser) throw new Error("The native Codex fixture requires runuser in a system directory.");
+if (!chrootBinary) throw new Error("The native Codex fixture requires chroot in a system directory.");
 
 function run(command, args, allowFailure = false, env = process.env, timeoutMs = 120_000) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs, env,
@@ -181,7 +183,7 @@ async function stageNode(root, agentUid) {
       throw new Error(`Staged Node dependency is not root controlled: ${target}`);
     }
   }
-  run("chroot", [`--userspec=${agentUid}:${agentUid}`, root, "/usr/bin/node", "--version"],
+  run(chrootBinary, [`--userspec=${agentUid}:${agentUid}`, root, "/usr/bin/node", "--version"],
     false, { PATH: "/usr/bin", HOME: "/workspace", LANG: "C.UTF-8" });
 }
 
@@ -531,7 +533,7 @@ try {
       { mode: 0o644 });
     await writeFile(path.join(agent.root, "etc/group"),
       `root:x:0:\n${agent.user}:x:${agent.uid}:\n`, { mode: 0o644 });
-    if (run("chroot", [`--userspec=${agent.uid}:${agent.uid}`, agent.root,
+    if (run(chrootBinary, [`--userspec=${agent.uid}:${agent.uid}`, agent.root,
       "/usr/bin/codex", "--version"], false, {
       PATH: "/usr/bin", HOME: "/workspace", CODEX_HOME: "/workspace/codex", LANG: "C.UTF-8"
     }).stdout.trim() !== `codex-cli ${version}`) {
@@ -931,7 +933,11 @@ try {
       await removeOwned(dir, true);
     }
     for (const name of accounts.reverse()) run("userdel", [name]);
-    for (const name of groups.reverse()) run("groupdel", [name]);
+    for (const name of groups.reverse()) {
+      const lookup = run("getent", ["group", name], true);
+      if (lookup.status === 0) run("groupdel", [name]);
+      else if (lookup.status !== 2) throw new Error(`Could not check fixture group ${name}.`);
+    }
   });
   await cleanupStep(() => removeOwned(tempDir, true));
   const cleanupError = cleanupErrors.length ?
