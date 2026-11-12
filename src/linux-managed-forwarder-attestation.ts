@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { lstat, readFile, readlink, realpath, stat } from "node:fs/promises";
-import path from "node:path";
+import { posix as path } from "node:path";
 import { promisify } from "node:util";
 import { attestDurableLinuxAgentIdentity } from "./linux-agent-identity.js";
 import type { LinuxManagedPlanRecord } from "./linux-agent-control.js";
