@@ -2,7 +2,39 @@
 #include "policy-service.c"
 #undef main
 
-int main(void) {
+static int entitlement_cases(void) {
+    const void *allowed[] = { CFSTR("content-filter-provider-systemextension") };
+    const void *wrong[] = { CFSTR("content-filter-provider") };
+    CFArrayRef expected = CFArrayCreate(NULL, allowed, 1, &kCFTypeArrayCallBacks);
+    CFArrayRef other = CFArrayCreate(NULL, wrong, 1, &kCFTypeArrayCallBacks);
+    CFMutableDictionaryRef values = CFDictionaryCreateMutable(NULL, 2,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!expected || !other || !values) return 10;
+    CFDictionarySetValue(values, CFSTR("com.apple.developer.networking.networkextension"), expected);
+    if (!provider_entitlements_valid(values)) return 11;
+    CFDictionarySetValue(values, CFSTR("com.apple.security.get-task-allow"), kCFBooleanTrue);
+    if (provider_entitlements_valid(values)) return 12;
+    CFDictionarySetValue(values, CFSTR("com.apple.security.get-task-allow"), kCFBooleanFalse);
+    if (!provider_entitlements_valid(values)) return 13;
+    CFDictionarySetValue(values, CFSTR("com.apple.developer.networking.networkextension"), other);
+    if (provider_entitlements_valid(values)) return 14;
+    CFRelease(values);
+    CFRelease(other);
+    CFRelease(expected);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int entitlement_result = entitlement_cases();
+    if (entitlement_result) return entitlement_result;
+    if (argc == 3 && !strcmp(argv[1], "--tree"))
+        return provider_bundle_contents_safe(argv[2], getuid()) ? 0 : 18;
+    if (argc == 2) {
+        if (provider_signature_at(argv[1], "identifier com.sgw.test-provider",
+                                  "com.sgw.test-provider", "NOTAREALTEAM")) return 8;
+        return 0;
+    }
+    if (argc != 1 || signed_provider_bundle()) return 9;
     struct sgw_policy_state state = {0};
     struct sgw_policy_agent agents[2] = {
         { .uid = 231000, .gid = 231000, .session = "alpha" },

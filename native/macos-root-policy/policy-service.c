@@ -7,6 +7,7 @@
 #include <Security/Security.h>
 #include <bsm/libbsm.h>
 #include <errno.h>
+#include <fts.h>
 #include <poll.h>
 #include <pwd.h>
 #include <stdint.h>
@@ -30,6 +31,18 @@
 #endif
 #ifndef SGW_POLICY_RUNNER_REQUIREMENT
 #define SGW_POLICY_RUNNER_REQUIREMENT ""
+#endif
+#ifndef SGW_POLICY_PROVIDER_PATH
+#define SGW_POLICY_PROVIDER_PATH ""
+#endif
+#ifndef SGW_POLICY_PROVIDER_REQUIREMENT
+#define SGW_POLICY_PROVIDER_REQUIREMENT ""
+#endif
+#ifndef SGW_POLICY_PROVIDER_BUNDLE_ID
+#define SGW_POLICY_PROVIDER_BUNDLE_ID ""
+#endif
+#ifndef SGW_POLICY_PROVIDER_TEAM_ID
+#define SGW_POLICY_PROVIDER_TEAM_ID ""
 #endif
 
 struct runner_connection {
@@ -81,6 +94,117 @@ static int checked_socket(const char *location, uid_t owner, mode_t mode) {
             no_acl_allow(parent)) return -1;
         if (!strcmp(parent, "/")) return 0;
     }
+}
+
+static int root_owned_provider_path(const char *location) {
+    if (!location || location[0] != '/' || !location[1]) return 0;
+    char resolved[PATH_MAX], parent[PATH_MAX];
+    struct stat info;
+    if (strlen(location) >= sizeof(parent) || !realpath(location, resolved) ||
+        strcmp(location, resolved) || lstat(location, &info) || !S_ISDIR(info.st_mode) ||
+        info.st_uid != 0 || (info.st_mode & 022) || no_acl_allow(location)) return 0;
+    strcpy(parent, location);
+    for (;;) {
+        char *slash = strrchr(parent, '/');
+        if (!slash) return 0;
+        if (slash == parent) parent[1] = '\0';
+        else *slash = '\0';
+        if (!realpath(parent, resolved) || strcmp(parent, resolved) || lstat(parent, &info) ||
+            !S_ISDIR(info.st_mode) || info.st_uid != 0 || (info.st_mode & 022) ||
+            no_acl_allow(parent)) return 0;
+        if (!strcmp(parent, "/")) return 1;
+    }
+}
+
+static int provider_bundle_contents_safe(const char *location, uid_t owner) {
+    if (!location || !location[0]) return 0;
+    char *root = strdup(location);
+    if (!root) return 0;
+    char *paths[] = { root, NULL };
+    FTS *tree = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
+    if (!tree) {
+        free(root);
+        return 0;
+    }
+    int safe = 1;
+    for (;;) {
+        errno = 0;
+        FTSENT *entry = fts_read(tree);
+        if (!entry) {
+            if (errno) safe = 0;
+            break;
+        }
+        if (entry->fts_info == FTS_DP) continue;
+        if ((entry->fts_info != FTS_D && entry->fts_info != FTS_F) ||
+            !entry->fts_statp || entry->fts_statp->st_uid != owner ||
+            (entry->fts_statp->st_mode & 022) || no_acl_allow(entry->fts_path)) {
+            safe = 0;
+            break;
+        }
+    }
+    if (fts_close(tree)) safe = 0;
+    free(root);
+    return safe;
+}
+
+static int provider_entitlements_valid(CFTypeRef value) {
+    if (!value || CFGetTypeID(value) != CFDictionaryGetTypeID()) return 0;
+    CFDictionaryRef entitlements = (CFDictionaryRef)value;
+    CFTypeRef capabilities = CFDictionaryGetValue(entitlements,
+        CFSTR("com.apple.developer.networking.networkextension"));
+    CFTypeRef debug = CFDictionaryGetValue(entitlements, CFSTR("com.apple.security.get-task-allow"));
+    if (!capabilities || CFGetTypeID(capabilities) != CFArrayGetTypeID() ||
+        (debug && debug != kCFBooleanFalse)) return 0;
+    CFStringRef required = CFSTR("content-filter-provider-systemextension");
+    return CFArrayContainsValue(capabilities, CFRangeMake(0, CFArrayGetCount(capabilities)), required);
+}
+
+static int provider_signature_at(const char *location, const char *requirement_string,
+                                 const char *expected_id, const char *expected_team) {
+    if (!location || !location[0] || !requirement_string || !requirement_string[0] ||
+        !expected_id || !expected_id[0] || !expected_team || !expected_team[0]) return 0;
+    CFStringRef requirement_text = CFStringCreateWithCString(NULL, requirement_string,
+                                                              kCFStringEncodingUTF8);
+    CFStringRef bundle_id = CFStringCreateWithCString(NULL, expected_id,
+                                                      kCFStringEncodingUTF8);
+    CFStringRef team_id = CFStringCreateWithCString(NULL, expected_team,
+                                                    kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL,
+        (const UInt8 *)location, strlen(location), true);
+    SecRequirementRef requirement = NULL;
+    SecStaticCodeRef code = NULL;
+    CFDictionaryRef signing = NULL;
+    int valid = 0;
+    if (!requirement_text || !bundle_id || !team_id || !url ||
+        SecRequirementCreateWithString(requirement_text, kSecCSDefaultFlags, &requirement) != errSecSuccess ||
+        SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) != errSecSuccess ||
+        SecStaticCodeCheckValidity(code, kSecCSStrictValidate | kSecCSCheckAllArchitectures |
+                                    kSecCSCheckNestedCode, requirement) != errSecSuccess ||
+        SecCodeCopySigningInformation(code, kSecCSSigningInformation, &signing) != errSecSuccess ||
+        !signing) goto done;
+    CFTypeRef actual_id = CFDictionaryGetValue(signing, kSecCodeInfoIdentifier);
+    CFTypeRef actual_team = CFDictionaryGetValue(signing, kSecCodeInfoTeamIdentifier);
+    CFTypeRef entitlements = CFDictionaryGetValue(signing, kSecCodeInfoEntitlementsDict);
+    if (!actual_id || CFGetTypeID(actual_id) != CFStringGetTypeID() ||
+        !CFEqual(actual_id, bundle_id) || !actual_team ||
+        CFGetTypeID(actual_team) != CFStringGetTypeID() || !CFEqual(actual_team, team_id)) goto done;
+    valid = provider_entitlements_valid(entitlements);
+done:
+    if (signing) CFRelease(signing);
+    if (code) CFRelease(code);
+    if (requirement) CFRelease(requirement);
+    if (url) CFRelease(url);
+    if (team_id) CFRelease(team_id);
+    if (bundle_id) CFRelease(bundle_id);
+    if (requirement_text) CFRelease(requirement_text);
+    return valid;
+}
+
+static int signed_provider_bundle(void) {
+    return root_owned_provider_path(SGW_POLICY_PROVIDER_PATH) &&
+        provider_bundle_contents_safe(SGW_POLICY_PROVIDER_PATH, 0) &&
+        provider_signature_at(SGW_POLICY_PROVIDER_PATH, SGW_POLICY_PROVIDER_REQUIREMENT,
+                              SGW_POLICY_PROVIDER_BUNDLE_ID, SGW_POLICY_PROVIDER_TEAM_ID);
 }
 
 static int socket_at(int fd, const char *location, int listening) {
@@ -183,8 +307,10 @@ static int read_registration(int fd, struct sgw_policy_state *state, uid_t broke
 static struct sgw_policy_proof provider_proof(uid_t uid, const char *session) {
     (void)uid;
     (void)session;
-    // A configured filter or heartbeat cannot prove continuous denial; release stays closed until a signed provider supplies this evidence.
-    return (struct sgw_policy_proof){0};
+    struct sgw_policy_proof proof = {0};
+    proof.signed_provider = signed_provider_bundle();
+    // A valid installed binary does not prove an enabled filter or live denial.
+    return proof;
 }
 
 static int reply_check(struct runner_connection *runner, const struct sgw_policy_state *state,

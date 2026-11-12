@@ -17,6 +17,9 @@ struct sgw_policy_state {
 };
 
 struct sgw_policy_proof {
+    uid_t checked_uid;
+    char checked_session[SGW_POLICY_SESSION_MAX + 1];
+    struct sgw_policy_agent policy_agents[2];
     int signed_provider;
     int enabled_socket_filter;
     int provider_alive;

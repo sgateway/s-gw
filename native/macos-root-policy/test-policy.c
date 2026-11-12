@@ -40,15 +40,37 @@ static int state_cases(void) {
         { .uid = 231000, .gid = 231000, .session = "alpha" },
         { .uid = 231001, .gid = 231001, .session = "beta" }
     };
-    struct sgw_policy_proof proof = {1, 1, 1, 1, 1, 1};
+    struct sgw_policy_proof proof = {
+        .checked_uid = 231000, .checked_session = "alpha",
+        .signed_provider = 1, .enabled_socket_filter = 1, .provider_alive = 1,
+        .exact_uid_policy = 1, .current_boot_probes = 1, .continuous_denial = 1
+    };
+    proof.policy_agents[0] = pair[0];
+    proof.policy_agents[1] = pair[1];
     if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof) ||
         sgw_policy_register(&state, pair) || !sgw_policy_register(&state, pair)) return 1;
-    if (!sgw_policy_ready(&state, 0, 231000, "alpha", &proof) ||
-        !sgw_policy_ready(&state, 0, 231001, "beta", &proof)) return 2;
+    if (!sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 2;
+    proof.checked_uid = 231001;
+    strcpy(proof.checked_session, "beta");
+    if (!sgw_policy_ready(&state, 0, 231001, "beta", &proof)) return 2;
+    proof.checked_uid = 231000;
+    strcpy(proof.checked_session, "alpha");
     if (sgw_policy_ready(&state, 501, 231000, "alpha", &proof) ||
         sgw_policy_ready(&state, 0, 231000, "beta", &proof) ||
         sgw_policy_ready(&state, 0, 231002, "alpha", &proof) ||
         sgw_policy_ready(&state, 0, 231000, "alpha", NULL)) return 3;
+    proof.checked_uid = 231001;
+    if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 8;
+    proof.checked_uid = 231000;
+    strcpy(proof.checked_session, "beta");
+    if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 9;
+    strcpy(proof.checked_session, "alpha");
+    proof.policy_agents[1].uid = 231002;
+    if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 10;
+    proof.policy_agents[1].uid = 231001;
+    strcpy(proof.policy_agents[1].session, "wrong");
+    if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 11;
+    proof.policy_agents[1] = pair[1];
     int *parts[] = {
         &proof.signed_provider, &proof.enabled_socket_filter, &proof.provider_alive,
         &proof.exact_uid_policy, &proof.current_boot_probes, &proof.continuous_denial

@@ -94,8 +94,16 @@ int sgw_policy_ready(const struct sgw_policy_state *state, uid_t runner_uid, uid
                      const char *session, const struct sgw_policy_proof *proof) {
     if (!state || !state->registered || runner_uid != 0 || !agent_uid ||
         !session || !valid_session(session) || !proof ||
+        proof->checked_uid != agent_uid || !valid_session(proof->checked_session) ||
+        strcmp(proof->checked_session, session) ||
         !proof->signed_provider || !proof->enabled_socket_filter || !proof->provider_alive ||
         !proof->exact_uid_policy || !proof->current_boot_probes || !proof->continuous_denial) return 0;
+    for (int i = 0; i < 2; i++) {
+        if (proof->policy_agents[i].uid != state->agents[i].uid ||
+            proof->policy_agents[i].gid != state->agents[i].gid ||
+            !valid_session(proof->policy_agents[i].session) ||
+            strcmp(proof->policy_agents[i].session, state->agents[i].session)) return 0;
+    }
     for (int i = 0; i < 2; i++) {
         if (state->agents[i].uid == agent_uid && !strcmp(state->agents[i].session, session)) return 1;
     }
