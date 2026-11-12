@@ -4,7 +4,7 @@ import { constants, type Stats } from "node:fs";
 import { chmod, chown, link, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit,
-  brokerUnitInvocation, linuxManagedControlMaxFrame,
+  brokerUnitInvocation, linuxManagedControlMaxFrame, unsafeStartupEnv,
   type LinuxManagedPlanRecord } from "./linux-agent-control.js";
 import { linuxAgentIdentityDir } from "./linux-agent-identity.js";
 import { linuxAgentUnitName } from "./linux-agent-unit.js";
@@ -47,6 +47,24 @@ export interface LinuxManagedInstallHost {
   unit(unit: string, fields: string[]): Promise<string>;
   action(action: "daemon-reload" | "start" | "stop", unit?: string): Promise<void>;
   account(uid: number): Promise<{ gid: number; groups: number[] }>;
+}
+
+export const linuxManagedInstallPayloadMaxBytes = 256 * 1024;
+
+export async function readRootLinuxManagedInstallPlan(filename: string,
+  host: LinuxManagedInstallHost = nativeLinuxInstallHost): Promise<LinuxManagedInstallPlan> {
+  await host.assertRoot();
+  if (!path.isAbsolute(filename) || path.resolve(filename) !== filename) {
+    throw new Error("Linux install plan needs an absolute root-owned path.");
+  }
+  const item = await host.file(filename);
+  if (!item || item.size > linuxManagedInstallPayloadMaxBytes) {
+    throw new Error("Linux install plan is absent or too large.");
+  }
+  await checkedFile(host, filename, 0, 0, 0o600);
+  const input = JSON.parse(await host.read(filename)) as LinuxManagedInstallPlan;
+  validateInstallPlan(input);
+  return input;
 }
 
 const controlName = "s-gw-agent-control.service";
@@ -502,6 +520,46 @@ export class LinuxManagedUnitInstaller {
   }
 }
 
+export function linuxManagedApprovalReaderArgs(input: LinuxManagedInstallPlan,
+  requestId: string, unitName: string): string[] {
+  validateInstallPlan(input);
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId) ||
+      !/^s-gw-approval-[a-f0-9]{32}$/.test(unitName)) {
+    throw new Error("Linux approval reader needs a bounded request and fresh unit name.");
+  }
+  const record = input.record;
+  const reader = path.join(path.dirname(record.brokerEntry), "linux-managed-approval-reader.js");
+  return ["--system", "--quiet", "--wait", "--pipe", "--collect", "--no-ask-password",
+    `--unit=${unitName}`,
+    `--property=User=${record.plan.brokerUid}`,
+    `--property=Group=${input.brokerGid}`,
+    `--property=EnvironmentFile=${record.brokerEnvironmentFile}`,
+    `--property=UnsetEnvironment=${unsafeStartupEnv.join(" ")}`,
+    "--property=Type=exec", "--property=NoNewPrivileges=yes",
+    "--property=PrivateNetwork=yes", "--property=CapabilityBoundingSet=",
+    "--property=RestrictAddressFamilies=AF_UNIX", "--property=RuntimeMaxSec=15s",
+    record.brokerPreflight, "verify-exec", record.brokerRuntimeRoot, record.brokerNode,
+    reader, record.brokerConfig, record.brokerCa ?? "-", record.brokerEnvironmentFile,
+    "--", record.brokerConfig, requestId];
+}
+
+export async function readApprovedLinuxManagedRelayFromBroker(input: LinuxManagedInstallPlan,
+  requestId: string, host: LinuxManagedInstallHost = nativeLinuxInstallHost): Promise<RequestRecord> {
+  await host.assertRoot();
+  const reader = path.join(path.dirname(input.record.brokerEntry), "linux-managed-approval-reader.js");
+  await checkedFile(host, reader, 0, 0);
+  await checkedFile(host, input.record.brokerEnvironmentFile, 0, 0, 0o600);
+  const args = linuxManagedApprovalReaderArgs(input, requestId,
+    `s-gw-approval-${randomBytes(16).toString("hex")}`);
+  const output = await run("/usr/bin/systemd-run", args, 20_000, linuxManagedInstallPayloadMaxBytes);
+  let request: RequestRecord;
+  try { request = JSON.parse(output) as RequestRecord; }
+  catch { throw new Error("Linux broker approval reader returned invalid JSON."); }
+  assertApprovedLinuxManagedRelay({ ...input.config,
+    relay: { ...input.config.relay!, requestId } }, request);
+  return request;
+}
+
 async function checkedSocketNode(host: LinuxManagedInstallHost,
   filename: string, gid: number): Promise<void> {
   await checkedDirectory(host, path.dirname(filename), 0, 0, 0o711);
@@ -551,16 +609,22 @@ async function writeTemp(filename: string, content: string,
   return tmp;
 }
 
-async function run(command: string, args: string[]): Promise<string> {
+async function run(command: string, args: string[], timeout = 10_000,
+  maxOutput = 32_768): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { env: { PATH: "/usr/bin:/bin", LANG: "C" },
-      stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 });
-    let out = "";
+      stdio: ["ignore", "pipe", "pipe"], timeout });
+    const stdout: Buffer[] = [];
+    let outBytes = 0;
     let err = "";
-    child.stdout!.on("data", chunk => { out += String(chunk); if (out.length > 32_768) child.kill(); });
+    child.stdout!.on("data", (chunk: Buffer) => {
+      outBytes += chunk.length;
+      if (outBytes > maxOutput) { child.kill(); return; }
+      stdout.push(chunk);
+    });
     child.stderr!.on("data", chunk => { err += String(chunk); if (err.length > 4096) child.kill(); });
     child.once("error", reject);
-    child.once("close", code => code === 0 ? resolve(out) :
+    child.once("close", code => code === 0 && outBytes <= maxOutput ? resolve(Buffer.concat(stdout).toString("utf8")) :
       reject(new Error(`Linux provisioner command failed: ${path.basename(command)} (${code ?? "signal"}).`)));
   });
 }

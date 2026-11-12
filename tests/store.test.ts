@@ -122,6 +122,22 @@ afterEach(async () => {
 });
 
 describe("SecretStore", () => {
+  it("reads an approval request without repairing a damaged store", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({ name: "read-only approval",
+      type: "api-token", value: fakeOpenAiToken("readonly_approval"),
+      policy: { injectEnv: "READONLY_TOKEN", allowedCommands: [process.execPath] } });
+    const request = await store.createRequest(secret.handle,
+      buildEnvCommandAction({ command: process.execPath, args: [], injectEnv: "READONLY_TOKEN" }),
+      "approval reader test");
+    expect((await new SecretStore().getRequestWithoutRecovery(request.id)).id).toBe(request.id);
+
+    await rm(path.join(tmpHome, ".store-control.json"));
+    await expect(new SecretStore().getRequestWithoutRecovery(request.id))
+      .rejects.toThrow(/read-only approval check/);
+    expect(await readdir(tmpHome)).not.toContain(".store-control.json");
+  });
+
   it("keeps legacy homes ordinary until a sealed protected-console migration", async () => {
     const store = new SecretStore();
     await writeFile(store.storePath, `${JSON.stringify({

@@ -1356,6 +1356,21 @@ export class SecretStore {
     return found;
   }
 
+  async getRequestWithoutRecovery(id: string): Promise<RequestRecord> {
+    const before = await captureStoreRevision(this.home, this.storePath);
+    if (!before.storeText || !before.controlStateHash || before.pendingStateHash) {
+      throw new Error("s-gw ledger is unavailable for a read-only approval check.");
+    }
+    const store = parseStoreFile(before.storeText, this.storePath);
+    if (!await controlStateMatches(this.home, store)) {
+      throw new Error("s-gw control state failed a read-only approval check.");
+    }
+    await assertStoreRevision(this.home, this.storePath, before);
+    const request = store.requests.find(item => item.id === id);
+    if (!request) throw new Error(`Unknown request: ${id}`);
+    return request;
+  }
+
   async approveRequest(id: string, options: ApproveRequestOptions = {}): Promise<RequestRecord> {
     return this.updateRequest(id, (request, store) => {
       approvePendingRequest(store, request, id, options);

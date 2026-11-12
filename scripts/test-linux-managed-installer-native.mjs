@@ -92,6 +92,8 @@ const node = path.join(installed, "node");
 const verifier = path.join(installed, "s-gw-linux-broker-runtime");
 const controlEntry = path.join(controlDir, "linux-agent-control.js");
 const brokerEntry = path.join(brokerPackage, "dist/linux-managed-mcp.js");
+const installEntry = path.join(brokerPackage, "dist/linux-managed-install.js");
+const installPlan = "/run/s-gw/ci-installer-input-" + runId + ".json";
 const rootDir = "/var/lib/s-gw/agent-roots/" + sessionId;
 const probe = path.join(rootDir, "usr/bin/installer-probe");
 const gate = path.join(rootDir, "usr/libexec/s-gw/agent-launch-gate");
@@ -394,21 +396,24 @@ try {
       routes: ["POST /v1/messages"], ttlMs: 30 * 60_000,
       payloadProfile: "strict", allowedModels: ["fixture-model"], maxRequests: 2 } } };
   const input = { control, config, record, brokerGid: brokerUid };
+  await writeFile(installPlan, JSON.stringify(input) + "\n", { mode: 0o600, flag: "wx" });
+  await remember(installPlan);
+  const install = (mode, id, allowFailure = false) => run(verifier,
+    ["verify-exec", installed, node, installEntry, installPlan, "-", "-", "--",
+      mode, installPlan, ...(id ? [id] : [])], allowFailure);
   const { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle } =
     await import(new URL("../dist/linux-agent-provision.js", import.meta.url));
-  const { nativeLinuxManagedUnitInstaller } =
-    await import(new URL("../dist/linux-agent-installer.js", import.meta.url));
   controlText = renderLinuxAgentControlUnit(control);
   bundle = renderLinuxManagedUnitBundle(config, record, brokerUid, "prepare");
   stageAttempted = true;
-  await nativeLinuxManagedUnitInstaller.stage(input);
+  install("stage");
   await captureStageFiles();
   await captureStageDirs();
-  const prepared = JSON.parse(run(node, [controlEntry, "--prepare", sessionId]).stdout);
-  if (prepared.sessionId !== sessionId || !/^[A-Za-z0-9_-]{1,256}$/.test(prepared.requestId)) {
+  const prepared = install("prepare").stdout.trim();
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(prepared)) {
     throw new Error("Root preparation returned an invalid installer request.");
   }
-  requestId = prepared.requestId;
+  requestId = prepared;
   const getRequest = async id => JSON.parse(asBroker("relay-request", [id]));
   const pending = await getRequest(requestId);
   if (pending.state !== "pending" || pending.agentSource !== "managed-peer" ||
@@ -419,12 +424,8 @@ try {
       pending.action.model?.routes?.join(",") !== "POST /v1/messages") {
     throw new Error("Root preparation did not create the expected pending request.");
   }
-  let pendingDenied = false;
-  try { await nativeLinuxManagedUnitInstaller.activate(input, requestId, getRequest); }
-  catch (error) {
-    if (!String(error).includes("exact manually approved model relay request")) throw error;
-    pendingDenied = true;
-  }
+  const pendingAttempt = install("activate", requestId, true);
+  const pendingDenied = pendingAttempt.status !== 0;
   if (!pendingDenied || await readFile(record.brokerConfig, "utf8") !== bundle.brokerConfig) {
     throw new Error("Pending model relay request activated or changed the staged config.");
   }
@@ -436,7 +437,7 @@ try {
   sealedConfig.relay.requestId = requestId;
   sealedConfigText = JSON.stringify(sealedConfig) + "\n";
   approvedActivationAttempted = true;
-  await nativeLinuxManagedUnitInstaller.activate(input, requestId, getRequest);
+  install("activate", requestId);
   activated = true;
   await remember(record.brokerConfig);
   configReplacedCaptured = true;
@@ -596,7 +597,7 @@ try {
         await removeFile(filename);
       }
     }
-    for (const filename of [record.mcpSocketUnitFile, record.modelRelaySocketUnitFile,
+    for (const filename of [installPlan, record.mcpSocketUnitFile, record.modelRelaySocketUnitFile,
       record.brokerUnitFile, control.unitFile, record.brokerConfig, planFile, ...receipts]) {
       await removeFile(filename);
     }

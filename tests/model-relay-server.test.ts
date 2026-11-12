@@ -72,7 +72,7 @@ async function ownSession(): Promise<PeerSession> {
   return session;
 }
 
-async function registerOwn(handle: string, ttlMs = 30_000): Promise<() => void> {
+async function registerOwn(handle: string, ttlMs = 30_000, payloadProfile?: "strict"): Promise<() => void> {
   const session = await ownSession();
   const brokerUid = process.getuid!();
   const fake = brokerUid === 0 ? 1 : 0;
@@ -80,7 +80,7 @@ async function registerOwn(handle: string, ttlMs = 30_000): Promise<() => void> 
   const euid = vi.spyOn(process, "geteuid").mockReturnValue(fake);
   try {
     return server!.registerSession(session,
-      { provider: "anthropic", handle, ttlMs });
+      { provider: "anthropic", handle, ttlMs, ...(payloadProfile ? { payloadProfile } : {}) });
   } finally {
     uid.mockRestore();
     euid.mockRestore();
@@ -133,6 +133,16 @@ async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
 }
 
 describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay listener", () => {
+  it("requires strict grants when the listener is confined", async () => {
+    server = await startVerifiedModelRelayServer({ socketPath, store,
+      requireStrictPayload: true, approval: { async assertAuthorized() {} } });
+    const session = await ownSession();
+    const grant = { provider: "anthropic" as const, handle: "s-gw:api-token:fixture", ttlMs: 30_000 };
+    expect(() => server!.registerSession(session, grant)).toThrow(/strict payload grant/);
+    const stop = await registerOwn(grant.handle, grant.ttlMs, "strict");
+    stop();
+  });
+
   it("requires an activated Linux listener for the opt-in message gate", async () => {
     await expect(startVerifiedModelRelayServer({ socketPath, store,
       requireLinuxMessageGate: true, approval: { async assertAuthorized() {} } }))

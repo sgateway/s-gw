@@ -22,6 +22,7 @@ export interface ModelRelayServerOptions extends Pick<VerifiedPeerServerOptions,
   "socketPath" | "socketMode" | "socketGid" | "activatedFd" | "requireLinuxMessageGate"> {
   store: SecretStore;
   approval: ModelRelayApproval;
+  requireStrictPayload?: boolean;
   maxActiveRequestsPerSession?: number;
   maxPendingBrokerOperations?: number;
   maxVerifiedConnections?: number;
@@ -97,6 +98,7 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
   if (!options.store || typeof options.approval?.assertAuthorized !== "function") {
     throw new Error("The model relay needs a broker store and an approval verifier.");
   }
+  const strictPayloadRequired = options.requireStrictPayload === true;
   const perSession = options.maxActiveRequestsPerSession ?? 4;
   if (!Number.isSafeInteger(perSession) || perSession < 1 || perSession > 8) {
     throw new Error("Invalid model relay request limit.");
@@ -293,6 +295,9 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
     registerSession(session, input) {
       if (closed) throw new Error("Model relay listener is closed.");
       const grant = checkGrant(input);
+      if (strictPayloadRequired && grant.payloadProfile !== "strict") {
+        throw new Error("This model relay listener requires a strict payload grant.");
+      }
       if (grants.has(session.sessionId)) throw new Error("This model relay session is already registered.");
       const stopPeer = peer.registerSession(session);
       const active: ActiveGrant = { session, grant, expiresAt: Date.now() + grant.ttlMs,

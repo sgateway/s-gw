@@ -193,7 +193,7 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
       relay = await startVerifiedModelRelayServer({ store, approval: approvals!,
         socketPath: config.plan.modelRelaySocket!, socketGid: config.plan.gid,
         activatedFd: (fds as { mcp: number; model: number }).model,
-        requireLinuxMessageGate: true });
+        requireLinuxMessageGate: true, requireStrictPayload: true });
     }
     const leases = new LinuxAgentSessionLeases(config.leaseDir, control);
     stopAgent = await leases.launch(config.plan, config.name,

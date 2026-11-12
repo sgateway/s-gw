@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { buildModelRelayAction } from "../src/model-relay-action.js";
 import { LinuxManagedUnitInstaller, assertApprovedLinuxManagedRelay,
+  linuxManagedInstallPayloadMaxBytes, linuxManagedApprovalReaderArgs, readRootLinuxManagedInstallPlan,
   type LinuxManagedInstallHost, type LinuxManagedInstallPlan } from "../src/linux-agent-installer.js";
 import type { RequestRecord } from "../src/types.js";
 
@@ -213,6 +214,46 @@ class Host implements LinuxManagedInstallHost {
 }
 
 describe.skipIf(process.platform === "win32")("Linux managed unit installer", () => {
+  it("accepts the largest escaped model grant within the approval reader bound", () => {
+    const input = setup();
+    input.config.relay!.grant = {
+      handle: "s-gw:api-token:fixture", provider: "openai", routes: ["POST /v1/responses"],
+      ttlMs: 30_000, payloadProfile: "strict",
+      allowedModels: Array.from({ length: 64 }, (_, i) => "\ud800".repeat(253) + `-${String(i).padStart(2, "0")}`),
+      allowedBetaValues: Array.from({ length: 16 }, (_, i) => "\ud800".repeat(509) + `-${String(i).padStart(2, "0")}`),
+      organizationId: "\ud800".repeat(512), projectId: "\ud800".repeat(512)
+    };
+    const request = approved(input);
+    assertApprovedLinuxManagedRelay({ ...input.config,
+      relay: { ...input.config.relay!, requestId: request.id } }, request);
+    const readerOutput = { ...request, reason: "" };
+    expect(Buffer.byteLength(JSON.stringify(readerOutput))).toBeLessThan(linuxManagedInstallPayloadMaxBytes);
+    const planText = JSON.stringify(input);
+    expect(Buffer.byteLength(planText)).toBeLessThan(linuxManagedInstallPayloadMaxBytes);
+    const host = new Host(input);
+    host.add("/run/s-gw/max-plan.json", "file", planText, 0, 0, 0o600);
+    return expect(readRootLinuxManagedInstallPlan("/run/s-gw/max-plan.json", host)).resolves.toEqual(input);
+  });
+
+  it("pins a broker-owned approval reader to the staged runtime and store environment", async () => {
+    const input = setup();
+    const host = new Host(input);
+    host.add("/run/s-gw/install.json", "file", JSON.stringify(input), 0, 0, 0o600);
+    expect(await readRootLinuxManagedInstallPlan("/run/s-gw/install.json", host)).toEqual(input);
+    const args = linuxManagedApprovalReaderArgs(input, "req_approved",
+      `s-gw-approval-${"a".repeat(32)}`);
+    expect(args).toContain(`--property=User=${input.record.plan.brokerUid}`);
+    expect(args).toContain(`--property=Group=${input.brokerGid}`);
+    expect(args).toContain(`--property=EnvironmentFile=${input.record.brokerEnvironmentFile}`);
+    expect(args).toContain("--property=PrivateNetwork=yes");
+    expect(args.slice(-9)).toEqual([input.record.brokerRuntimeRoot, input.record.brokerNode,
+      "/usr/libexec/s-gw/dist/linux-managed-approval-reader.js", input.record.brokerConfig,
+      "-", input.record.brokerEnvironmentFile, "--", input.record.brokerConfig, "req_approved"]);
+    host.files.get("/run/s-gw/install.json")!.mode = 0o644;
+    await expect(readRootLinuxManagedInstallPlan("/run/s-gw/install.json", host))
+      .rejects.toThrow(/Untrusted Linux provisioner file/);
+  });
+
   it("waits for both verified root control sockets before staging completes", async () => {
     const input = setup();
     const host = new Host(input);
