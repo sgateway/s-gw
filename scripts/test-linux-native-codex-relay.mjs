@@ -60,6 +60,11 @@ async function maybeText(filename) {
   catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
 }
 
+async function maybeEntries(dirname) {
+  try { return await readdir(dirname); }
+  catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+}
+
 function properties(unit, names) {
   const result = run("systemctl", ["--system", "--all", "show", unit,
     ...names.flatMap(name => ["-p", name])]);
@@ -324,7 +329,7 @@ async function adoptAgentNodes(agent) {
   if (owned.has(gate)) {
     const allowed = new Set(["release", "ready.tmp", "forwarder.tmp",
       "forwarder-attestation.json"]);
-    for (const name of await readdir(gate)) {
+    for (const name of await maybeEntries(gate) || []) {
       const child = await lstat(path.join(gate, name));
       if (!allowed.has(name) || !child.isFile() || child.uid !== 0 ||
           child.nlink !== 1 || (child.mode & 0o022) !== 0 ||
@@ -336,22 +341,24 @@ async function adoptAgentNodes(agent) {
   const lifecycle = `/run/s-gw/agent-unit-lifecycle/${agent.agentUnit}`;
   await adoptGenerated(lifecycle, "directory");
   if (owned.has(lifecycle)) {
-    const names = await readdir(lifecycle);
-    if (names.length !== 1 || names[0] !== "owner" ||
-        !/^[a-f0-9]{32}:[a-f0-9]{32}:\d+\n$/.test(
-          await readFile(path.join(lifecycle, "owner"), "utf8"))) {
-      throw new Error(`Unrecognized native Codex lifecycle node preserved: ${lifecycle}`);
-    }
-    const owner = await lstat(path.join(lifecycle, "owner"));
-    if (!owner.isFile() || owner.uid !== 0 || owner.nlink !== 1 ||
-        (owner.mode & 0o777) !== 0o600) {
-      throw new Error(`Unrecognized native Codex lifecycle owner preserved: ${lifecycle}`);
+    const names = await maybeEntries(lifecycle);
+    if (names) {
+      if (names.length !== 1 || names[0] !== "owner" ||
+          !/^[a-f0-9]{32}:[a-f0-9]{32}:\d+\n$/.test(
+            await readFile(path.join(lifecycle, "owner"), "utf8"))) {
+        throw new Error(`Unrecognized native Codex lifecycle node preserved: ${lifecycle}`);
+      }
+      const owner = await lstat(path.join(lifecycle, "owner"));
+      if (!owner.isFile() || owner.uid !== 0 || owner.nlink !== 1 ||
+          (owner.mode & 0o777) !== 0o600) {
+        throw new Error(`Unrecognized native Codex lifecycle owner preserved: ${lifecycle}`);
+      }
     }
   }
   const socketDir = agent.socketDir;
   await adoptGenerated(socketDir, "directory");
   if (owned.has(socketDir)) {
-    for (const name of await readdir(socketDir)) {
+    for (const name of await maybeEntries(socketDir) || []) {
       const socket = await lstat(path.join(socketDir, name));
       if (!["broker.sock", "model.sock"].includes(name) || !socket.isSocket() ||
           socket.uid !== 0) {
@@ -743,7 +750,16 @@ try {
       await remember(marker);
     }
     await procIdentity(agent.mainPid, agent, agent.netns, "/usr/bin/node");
-    const ready = await until(() => maybeText(`${agent.root}/workspace/forwarder-ready`),
+    const ready = await until(async () => {
+      const result = await maybeText(`${agent.root}/workspace/codex-result.json`);
+      if (result) {
+        let output;
+        try { output = JSON.parse(result); }
+        catch { return false; }
+        if (output.error) throw new Error(`${agent.sessionId} forwarder failed: ${output.error}`);
+      }
+      return maybeText(`${agent.root}/workspace/forwarder-ready`);
+    },
       `${agent.sessionId} attested forwarder`);
     if (!/^\d{1,5}\n$/.test(ready)) throw new Error("Native Codex forwarder did not bind loopback.");
   }
