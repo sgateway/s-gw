@@ -272,8 +272,16 @@ async function cleanup() {
         if (fields.get("Description") !== expectedDescription(unit)) {
           throw new Error(`Fixture unit changed before cleanup: ${unit}`);
         }
-        run("systemctl", ["--system", "stop", unit]);
-        run("systemctl", ["--system", "reset-failed", unit]);
+        const stop = run("systemctl", ["--system", "stop", unit], true);
+        if (stop.status !== 0 &&
+            unitProperties(unit, ["LoadState"]).get("LoadState") !== "not-found") {
+          throw new Error(`Could not stop the fixture unit: ${unit}: ${stop.stderr}`);
+        }
+        const reset = run("systemctl", ["--system", "reset-failed", unit], true);
+        if (reset.status !== 0 &&
+            unitProperties(unit, ["LoadState"]).get("LoadState") !== "not-found") {
+          throw new Error(`Could not reset the fixture unit after stop: ${unit}: ${reset.stderr}`);
+        }
       }
     } catch (error) { errors.push(error); }
   }
