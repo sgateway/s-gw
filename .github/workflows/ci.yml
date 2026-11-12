@@ -145,9 +145,29 @@ jobs:
           test "$(id -u)" -ne 0
           node_path="$(command -v node)"
           sudo CI=true "$node_path" scripts/test-linux-managed-mcp-bridge-systemd.mjs --root "$(id -u)" "$(id -g)"
+
+  managed-forwarder-newer-host:
+    name: MCP forwarder staging (Ubuntu 26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y build-essential binutils libc6-dev iproute2 util-linux
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Verify native loopback namespace and route rejection
+        run: |
+          test "$(id -u)" -ne 0
+          node_path="$(command -v node)"
+          sudo CI=true "$node_path" scripts/test-linux-managed-netns-native.mjs --root
       - name: Stage MCP-only forwarder on systemd 259
         run: |
           test "$(id -u)" -ne 0
+          systemctl --version | sed -n '1p'
           node_path="$(command -v node)"
           sudo CI=true "$node_path" scripts/test-linux-managed-forwarder-installer-native.mjs --root
 
@@ -604,7 +624,6 @@ jobs:
         run: |
           test "$(id -u)" -ne 0
           node_path="$(command -v node)"
-          sudo CI=true "$node_path" scripts/test-linux-managed-netns-native.mjs --root
           sudo CI=true "$node_path" scripts/test-linux-managed-installer-native.mjs --root
       - name: Verify two native Linux agent identities with a staged listener
         run: |

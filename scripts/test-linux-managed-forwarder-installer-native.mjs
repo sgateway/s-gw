@@ -86,7 +86,8 @@ async function ensureDir(filename, mode) {
   if (old) {
     if (!old.isDirectory() || old.uid !== 0 || (old.mode & 0o777) !== mode ||
         await realpath(filename) !== filename) {
-      throw new Error("Untrusted forwarder fixture directory: " + filename);
+      throw new Error(`Untrusted forwarder fixture directory: ${filename} ` +
+        `(uid=${old.uid}, mode=${(old.mode & 0o777).toString(8)})`);
     }
     return;
   }

@@ -20,9 +20,19 @@ const made = [];
 function call(command, args, shouldPass = true) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: 10_000,
     env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C" } });
-  if (result.error || (shouldPass ? result.status !== 0 : result.status === 0)) {
+  if (result.error || result.signal || result.status === null ||
+      (shouldPass ? result.status !== 0 : result.status === 0)) {
     throw new Error(`${path.basename(command)} ${args[0]} failed: ` +
       (result.error?.message || result.stderr || result.stdout || result.status));
+  }
+  return result;
+}
+
+function routeMustFail() {
+  const result = call(helper, ["check", filename], false);
+  if (!result.stderr.includes("route invariant failed")) {
+    throw new Error("Namespace check failed for a reason other than the injected route: " +
+      (result.stderr || result.status));
   }
 }
 
@@ -60,17 +70,17 @@ try {
     throw new Error("Pinned namespace has an unexpected network interface.");
   }
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "add", "default", "dev", "lo"]);
-  call(helper, ["check", filename], false);
+  routeMustFail();
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "del", "default", "dev", "lo"]);
   call(helper, ["check", filename]);
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "add",
     "198.51.100.1/32", "dev", "lo"]);
-  call(helper, ["check", filename], false);
+  routeMustFail();
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "del",
     "198.51.100.1/32", "dev", "lo"]);
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "-6", "route", "add",
     "2001:db8::1/128", "dev", "lo"]);
-  call(helper, ["check", filename], false);
+  routeMustFail();
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "-6", "route", "del",
     "2001:db8::1/128", "dev", "lo"]);
   call(helper, ["check", filename]);
