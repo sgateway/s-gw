@@ -760,7 +760,19 @@ try {
         let output;
         try { output = JSON.parse(result); }
         catch { return false; }
-        if (output.error) throw new Error(`${agent.sessionId} forwarder failed: ${output.error}`);
+        if (output.error) {
+          let detail = "";
+          if (output.error.includes("Linux forwarder path is not controlled")) {
+            const [staged, live, mountinfo] = await Promise.all([
+              lstat(path.join(agent.root, "run")), lstat(`/proc/${agent.mainPid}/root/run`),
+              readFile(`/proc/${agent.mainPid}/mountinfo`, "utf8")
+            ]);
+            const runMount = mountinfo.split("\n").find(line => line.split(" ")[4] === "/run");
+            detail = ` stagedRun=${(staged.mode & 0o7777).toString(8)}` +
+              ` liveRun=${(live.mode & 0o7777).toString(8)} mount=${runMount?.slice(0, 300) || "none"}`;
+          }
+          throw new Error(`${agent.sessionId} forwarder failed: ${output.error}${detail}`);
+        }
       }
       return maybeText(`${agent.root}/workspace/forwarder-ready`);
     },
