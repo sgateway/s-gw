@@ -231,6 +231,14 @@ async function assertAccountIsolation(host: LinuxManagedInstallHost,
       plan.gid === input.brokerGid) {
     throw new Error("Linux installer needs separate agent and broker accounts with dedicated groups.");
   }
+  const forwarder = input.record.mcpForwarder;
+  if (forwarder) {
+    const account = await host.account(forwarder.uid);
+    if (account.gid !== forwarder.gid || account.groups.length !== 1 ||
+        account.groups[0] !== forwarder.gid) {
+      throw new Error("Linux installer needs a separate dedicated MCP forwarder account.");
+    }
+  }
 }
 
 async function assertInactive(host: LinuxManagedInstallHost, unit: string): Promise<void> {
@@ -247,7 +255,8 @@ async function readbackSocket(host: LinuxManagedInstallHost, record: LinuxManage
   const values = parseProperties(output);
   if (values.get("LoadState") !== "loaded" || values.get("DropInPaths") ||
       values.get("SocketUser") !== "root" ||
-      values.get("SocketGroup") !== String(record.plan.gid) ||
+      values.get("SocketGroup") !== String(filename === record.mcpSocketUnitFile ?
+        record.mcpForwarder?.gid ?? record.plan.gid : record.plan.gid) ||
       !["0660", "660"].includes(values.get("SocketMode") || "") ||
       !["0711", "711"].includes(values.get("DirectoryMode") || "") ||
       values.get("PassCredentials") !== "yes" || values.get("Accept") !== "no" ||

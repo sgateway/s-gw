@@ -116,6 +116,21 @@ describe.skipIf(process.platform === "win32")("Linux managed unit provisioning",
       .toThrow(/model relay/);
   });
 
+  it("assigns an opt-in MCP listener to the root-registered forwarder group", () => {
+    const { config, record } = setup();
+    config.mcpForwarder = { uid: 230104, gid: 230105 };
+    record.mcpForwarder = { ...config.mcpForwarder,
+      unitFile: "/run/systemd/system/s-gw-forwarder-example-agent.service",
+      rootDirectory: "/var/lib/s-gw/forwarder-roots/example-agent",
+      networkNamespacePath: "/run/s-gw/netns/example-agent" };
+    const files = renderLinuxManagedUnitBundle(config, record, 230103, "runtime");
+    expect(files.mcpSocketUnit).toContain("SocketGroup=230105\n");
+    expect(files.modelSocketUnit).toContain("SocketGroup=230102\n");
+    expect(() => renderLinuxManagedUnitBundle({ ...config,
+      mcpForwarder: { uid: 230104, gid: 230106 } }, record, 230103, "runtime"))
+      .toThrow(/forwarder differs/);
+  });
+
   it("rejects mismatched, untrusted, and loose relay plans", () => {
     const { config, record } = setup();
     expect(() => renderLinuxManagedUnitBundle({ ...config,

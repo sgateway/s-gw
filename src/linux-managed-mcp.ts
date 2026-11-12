@@ -25,6 +25,7 @@ export interface LinuxManagedMcpConfig {
   leaseDir: string;
   plan: LinuxAgentUnitPlan;
   relay?: LinuxManagedRelayConfig;
+  mcpForwarder?: { uid: number; gid: number };
 }
 
 export function validateLinuxManagedMcpConfig(value: LinuxManagedMcpConfig): void {
@@ -40,6 +41,13 @@ export function validateLinuxManagedMcpConfig(value: LinuxManagedMcpConfig): voi
   validateLinuxManagedPlan(value.plan, uid, gid);
   if (Boolean(value.relay) !== Boolean(value.plan.modelRelaySocket)) {
     throw new Error("Managed model relay needs its own root-provisioned activated socket.");
+  }
+  if (value.mcpForwarder && (Object.keys(value.mcpForwarder).sort().join(",") !== "gid,uid" ||
+      !Number.isSafeInteger(value.mcpForwarder.uid) || value.mcpForwarder.uid < 1 ||
+      !Number.isSafeInteger(value.mcpForwarder.gid) || value.mcpForwarder.gid < 1 ||
+      [value.plan.uid, uid].includes(value.mcpForwarder.uid) ||
+      [value.plan.gid, gid].includes(value.mcpForwarder.gid))) {
+    throw new Error("Managed MCP forwarder needs its own UID and GID.");
   }
   if (value.relay) {
     if (!value.plan.identityGeneration ||
@@ -188,7 +196,8 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
   try {
     control = await connectLinuxAgentControl(config.plan);
     mcp = await startVerifiedMcpServer({ store, socketPath: config.plan.brokerSocket,
-      socketGid: config.plan.gid, activatedFd: fds.mcp, requireLinuxMessageGate: true });
+      socketGid: config.mcpForwarder?.gid ?? config.plan.gid,
+      activatedFd: fds.mcp, requireLinuxMessageGate: true });
     if (config.relay) {
       relay = await startVerifiedModelRelayServer({ store, approval: approvals!,
         socketPath: config.plan.modelRelaySocket!, socketGid: config.plan.gid,
@@ -198,10 +207,17 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
     const leases = new LinuxAgentSessionLeases(config.leaseDir, control);
     stopAgent = await leases.launch(config.plan, config.name,
       async session => {
+        const mcpSession = config.mcpForwarder ? await control!.bindForwarder(config.plan) : session;
+        if (config.mcpForwarder && (mcpSession.uid !== config.mcpForwarder.uid ||
+            mcpSession.gid !== config.mcpForwarder.gid ||
+            mcpSession.sessionId !== config.plan.sessionId ||
+            mcpSession.linuxIdentityGeneration !== config.plan.identityGeneration)) {
+          throw new Error("Root-attested MCP forwarder differs from the sealed broker configuration.");
+        }
         const stopRelay = config.relay ? await registerDurableModelRelaySession(
           relay!, approvals!, session, config.relay.requestId!, config.relay.grant) : undefined;
         try {
-          const stopMcp = mcp!.registerSession(session);
+          const stopMcp = mcp!.registerSession(mcpSession);
           return () => { stopMcp(); stopRelay?.(); };
         } catch (error) {
           stopRelay?.();

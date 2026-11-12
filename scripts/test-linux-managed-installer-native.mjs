@@ -320,7 +320,8 @@ try {
   await mkdir(path.dirname(operatorEntry), { mode: 0o755 });
   await copyFile(path.join(project, "scripts/linux-managed-mcp-operator.mjs"), operatorEntry);
   for (const filename of ["linux-agent-control.js", "linux-agent-unit.js",
-    "linux-peer-identity.js", "linux-agent-identity.js", "model-relay-action.js"]) {
+    "linux-peer-identity.js", "linux-agent-identity.js", "linux-managed-forwarder-attestation.js",
+    "linux-managed-forwarder-binding.js", "model-relay-action.js"]) {
     await copyFile(path.join(project, "dist", filename), path.join(controlDir, filename));
   }
   await writeFile(path.join(controlDir, "package.json"), '{"type":"module"}\n', { mode: 0o644 });

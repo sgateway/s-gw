@@ -10,7 +10,9 @@ import { lifecyclePlanKey, SystemdRunAgentUnitManager, validateLinuxAgentPlan,
   linuxAgentUnitName, traceLinuxManagedStart, traceLinuxManagedStop,
   type LinuxAgentUnitManager, type LinuxAgentUnitPlan, type LinuxAgentUnitState } from "./linux-agent-unit.js";
 import { attestDurableLinuxAgentIdentity } from "./linux-agent-identity.js";
+import { collectRootManagedForwarderSession } from "./linux-managed-forwarder-attestation.js";
 import { verifyLinuxPeerProcess } from "./linux-peer-identity.js";
+import type { PeerSession } from "./peer-identity.js";
 import { normalizeModelRelayGrant, type ModelRelayGrant } from "./model-relay-action.js";
 
 const controlSocket = "/run/s-gw/agent-control.sock";
@@ -64,9 +66,16 @@ export interface LinuxManagedPlanRecord {
   brokerPreflight: string;
   brokerEnvironmentFile: string;
   brokerCa: string | null;
+  mcpForwarder?: {
+    uid: number;
+    gid: number;
+    unitFile: string;
+    rootDirectory: string;
+    networkNamespacePath: string;
+  };
 }
 
-type Method = "start" | "inspect" | "release" | "stop" | "prepare" | "prepared";
+type Method = "start" | "inspect" | "bind-forwarder" | "release" | "stop" | "prepare" | "prepared";
 interface ControlCall {
   id: number;
   method: Method;
@@ -94,6 +103,8 @@ export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
   const modelUnit = `s-gw-managed-model-${sessionId}.socket`;
   const modelFile = value?.modelRelaySocketUnitFile;
   const modelExpected = value?.plan?.modelRelaySocket !== undefined;
+  const forwarder = value?.mcpForwarder;
+  const forwarderKeys = forwarder && Object.keys(forwarder).sort().join(",");
   if (!value || typeof value !== "object" || !value.plan ||
       value.plan.sessionId !== sessionId ||
       value.brokerUnit !== `s-gw-managed-mcp-${sessionId}.service` ||
@@ -113,10 +124,19 @@ export function validateLinuxManagedPlanRecord(value: LinuxManagedPlanRecord,
       !value.brokerNode.startsWith(`${value.brokerRuntimeRoot}/`) ||
       !value.brokerEntry.startsWith(`${value.brokerRuntimeRoot}/`) ||
       !value.brokerPreflight.startsWith(`${value.brokerRuntimeRoot}/`) ||
+      (forwarder !== undefined && (forwarderKeys !== "gid,networkNamespacePath,rootDirectory,uid,unitFile" ||
+        !value.plan.identityGeneration || !value.plan.logicalAgentId ||
+        !Number.isSafeInteger(forwarder.uid) || forwarder.uid < 1 ||
+        !Number.isSafeInteger(forwarder.gid) || forwarder.gid < 1 ||
+        [value.plan.uid, brokerUid].includes(forwarder.uid) ||
+        [value.plan.gid, brokerGid].includes(forwarder.gid) ||
+        forwarder.unitFile !== `/run/systemd/system/s-gw-forwarder-${sessionId}.service` ||
+        forwarder.rootDirectory !== `/var/lib/s-gw/forwarder-roots/${sessionId}` ||
+        forwarder.networkNamespacePath !== `/run/s-gw/netns/${sessionId}`)) ||
       Object.keys(value).sort().join(",") !==
         (modelExpected
-          ? "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,mcpSocketUnitFile,modelRelaySocketUnitFile,plan"
-          : "brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,mcpSocketUnitFile,plan")) {
+          ? `brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,${forwarder ? "mcpForwarder," : ""}mcpSocketUnitFile,modelRelaySocketUnitFile,plan`
+          : `brokerCa,brokerConfig,brokerEntry,brokerEnvironmentFile,brokerNode,brokerPreflight,brokerRuntimeRoot,brokerUnit,brokerUnitFile,${forwarder ? "mcpForwarder," : ""}mcpSocketUnitFile,plan`)) {
     throw new Error("Invalid root-provisioned Linux managed plan record.");
   }
   validateLinuxManagedPlan(value.plan, brokerUid, brokerGid);
@@ -178,12 +198,18 @@ async function registeredPlan(sessionId: string, brokerUid: number,
   await checkedRootFile(value.brokerConfig);
   const brokerConfig = JSON.parse(await readFile(value.brokerConfig, "utf8")) as {
     plan?: LinuxAgentUnitPlan; relay?: { grant?: unknown; requestId?: unknown };
+    mcpForwarder?: { uid: number; gid: number };
   };
   if (!brokerConfig?.plan || lifecyclePlanKey(brokerConfig.plan) !== lifecyclePlanKey(value.plan)) {
     throw new Error("Linux broker config differs from its root plan registration.");
   }
   if (Boolean(brokerConfig.relay) !== Boolean(value.plan.modelRelaySocket)) {
     throw new Error("Linux broker relay config differs from its root plan registration.");
+  }
+  if (Boolean(brokerConfig.mcpForwarder) !== Boolean(value.mcpForwarder) ||
+      (value.mcpForwarder && (brokerConfig.mcpForwarder?.uid !== value.mcpForwarder.uid ||
+        brokerConfig.mcpForwarder?.gid !== value.mcpForwarder.gid))) {
+    throw new Error("Linux MCP forwarder differs from its root plan registration.");
   }
   await checkedBrokerFile(value.brokerEntry);
   return value;
@@ -261,6 +287,8 @@ async function checkedRootRuntime(): Promise<void> {
   }
   for (const filename of [fileURLToPath(import.meta.url), path.join(runtimeDir, "linux-agent-unit.js"),
     path.join(runtimeDir, "linux-peer-identity.js"), path.join(runtimeDir, "linux-agent-identity.js"),
+    path.join(runtimeDir, "linux-managed-forwarder-attestation.js"),
+    path.join(runtimeDir, "linux-managed-forwarder-binding.js"),
     path.join(runtimeDir, "model-relay-action.js"),
     path.join(runtimeDir, "package.json"),
     rootPidfdHelper, rootPeerHelper, await realpath(process.execPath)]) {
@@ -586,7 +614,7 @@ function controlCall(value: unknown): ControlCall {
   if (!value || typeof value !== "object") throw new Error("Invalid Linux control call.");
   const call = value as ControlCall;
   if (!Number.isSafeInteger(call.id) || call.id < 1 ||
-      !["start", "inspect", "release", "stop", "prepare", "prepared"].includes(call.method) || !call.plan) {
+      !["start", "inspect", "bind-forwarder", "release", "stop", "prepare", "prepared"].includes(call.method) || !call.plan) {
     throw new Error("Invalid Linux control call.");
   }
   return call;
@@ -716,6 +744,7 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
       owners.set(sessionId, socket);
       const plan = record.plan;
       const state = { started: false };
+      let forwarderBinding: Awaited<ReturnType<typeof collectRootManagedForwarderSession>> | undefined;
       let used = false;
       let queued = 0;
       let chain = Promise.resolve();
@@ -787,8 +816,26 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
             traceLinuxManagedStart(plan.uid, "control inspect returned");
             return inspected;
           }
+          if (call.method === "bind-forwarder") {
+            if (!record.mcpForwarder || forwarderBinding) {
+              throw new Error("Linux MCP forwarder is unavailable or already bound.");
+            }
+            const config = JSON.parse(await readFile(record.brokerConfig, "utf8")) as { name?: unknown };
+            if (typeof config.name !== "string") throw new Error("Linux forwarder name is not root registered.");
+            const current = await manager.inspect(plan);
+            forwarderBinding = await collectRootManagedForwarderSession(record, current, config.name);
+            return forwarderBinding.peer;
+          }
           if (call.method === "release") {
             if (!call.state) throw new Error("Linux gate release needs its attested unit state.");
+            if (record.mcpForwarder) {
+              if (!forwarderBinding) throw new Error("Linux forwarder was not root attested before release.");
+              const current = await manager.inspect(plan);
+              const bound = await collectRootManagedForwarderSession(record, current, forwarderBinding.peer.name);
+              if (JSON.stringify(bound.proof) !== JSON.stringify(forwarderBinding.proof)) {
+                throw new Error("Linux forwarder binding changed before gate release.");
+              }
+            }
             traceLinuxManagedStart(plan.uid, "control release call");
             await manager.release!(plan, call.state);
             traceLinuxManagedStart(plan.uid, "control release returned");
@@ -975,6 +1022,7 @@ export async function startLinuxAgentControlService(brokerUid: number, brokerGid
 }
 
 export interface LinuxAgentControlClient extends LinuxAgentUnitManager {
+  bindForwarder(plan: LinuxAgentUnitPlan): Promise<PeerSession>;
   signal: AbortSignal;
   prepare(configHash: string): Promise<void>;
   prepared(requestId: string): Promise<void>;
@@ -1118,6 +1166,7 @@ export async function connectLinuxAgentControl(plan: LinuxAgentUnitPlan): Promis
     },
     start: async plan => { await call("start", plan); },
     inspect: async plan => await call("inspect", plan) as LinuxAgentUnitState,
+    bindForwarder: async plan => await call("bind-forwarder", plan) as PeerSession,
     release: async (plan, state) => { await call("release", plan, state); },
     stop: async plan => { await call("stop", plan); },
     close: async () => {

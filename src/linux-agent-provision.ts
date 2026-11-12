@@ -85,12 +85,17 @@ export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
     throw new Error("Linux managed provisioning needs strict isolation options.");
   }
   if (!config || typeof config !== "object" ||
-      Object.keys(config).some(key => !["name", "leaseDir", "plan", "relay"].includes(key)) ||
+      Object.keys(config).some(key => !["name", "leaseDir", "plan", "relay", "mcpForwarder"].includes(key)) ||
       typeof config.name !== "string" || !config.name.trim() || config.name.length > 120 ||
       typeof config.leaseDir !== "string" || !path.isAbsolute(config.leaseDir) ||
       path.resolve(config.leaseDir) !== config.leaseDir ||
       !isDeepStrictEqual(config.plan, record.plan)) {
     throw new Error("Linux broker configuration differs from its managed root plan.");
+  }
+  if (Boolean(config.mcpForwarder) !== Boolean(record.mcpForwarder) ||
+      (record.mcpForwarder && (config.mcpForwarder?.uid !== record.mcpForwarder.uid ||
+        config.mcpForwarder?.gid !== record.mcpForwarder.gid))) {
+    throw new Error("Linux MCP forwarder differs from its root-managed plan.");
   }
   if (!config.leaseDir.startsWith("/run/s-gw/") ||
       !record.brokerConfig.startsWith("/run/s-gw/")) {
@@ -141,7 +146,8 @@ export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
     brokerConfig: `${JSON.stringify(config)}\n`,
     planRecord: `${JSON.stringify(record)}\n`,
     brokerUnit,
-    mcpSocketUnit: managedSocketUnit(record.plan.brokerSocket, record.plan.gid,
+    mcpSocketUnit: managedSocketUnit(record.plan.brokerSocket,
+      record.mcpForwarder?.gid ?? record.plan.gid,
       `s-gw-agent-${sessionId}`, unit),
     ...(record.plan.modelRelaySocket ? { modelSocketUnit: managedSocketUnit(
       record.plan.modelRelaySocket, record.plan.gid, `s-gw-model-${sessionId}`, unit) } : {})
