@@ -93,6 +93,12 @@ async function sha256(filename) {
   return hash.digest("hex");
 }
 
+async function copyRootFile(source, target, mode) {
+  await copyFile(source, target);
+  await chown(target, 0, 0);
+  await chmod(target, mode);
+}
+
 async function enoughSpace(requirements) {
   const byDevice = new Map();
   for (const [location, bytes] of requirements) {
@@ -112,11 +118,13 @@ async function enoughSpace(requirements) {
 async function loadCodex(tempDir) {
   const archive = path.join(tempDir, "codex.tar.gz");
   if (process.env.SGW_CODEX_ARCHIVE) {
-    await copyFile(process.env.SGW_CODEX_ARCHIVE, archive);
+    await copyRootFile(process.env.SGW_CODEX_ARCHIVE, archive, 0o600);
   } else {
     run("curl", ["--fail", "--location", "--silent", "--show-error", "--retry", "3",
       "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "--output",
       archive, archiveUrl], false, process.env, 300_000);
+    await chown(archive, 0, 0);
+    await chmod(archive, 0o600);
   }
   if (await sha256(archive) !== archiveSha256) {
     throw new Error(`Pinned Codex ${version} archive SHA-256 mismatch.`);
@@ -138,6 +146,7 @@ async function loadCodex(tempDir) {
   await pipeline(child.stdout, createWriteStream(output, { mode: 0o755, flags: "wx" }));
   const code = await exited;
   if (code !== 0) throw new Error(`Pinned Codex extraction failed: ${stderr.slice(0, 500)}`);
+  await chown(output, 0, 0);
   await chmod(output, 0o755);
   const file = await open(output, "r");
   try {
@@ -153,8 +162,7 @@ async function loadCodex(tempDir) {
 
 async function stageNode(root, agentUid) {
   const binary = path.join(root, "usr/bin/node");
-  await copyFile(process.execPath, binary);
-  await chmod(binary, 0o755);
+  await copyRootFile(process.execPath, binary, 0o755);
   const deps = run("ldd", [process.execPath], true);
   if (deps.error || (deps.status !== 0 && !/not a dynamic executable/.test(deps.stdout + deps.stderr)) ||
       /not found/.test(deps.stdout + deps.stderr)) {
@@ -165,8 +173,7 @@ async function stageNode(root, agentUid) {
   for (const dep of paths) {
     const target = path.join(root, dep);
     await mkdir(path.dirname(target), { recursive: true, mode: 0o755 });
-    await copyFile(dep, target);
-    await chmod(target, 0o755);
+    await copyRootFile(dep, target, 0o755);
     const info = await lstat(target);
     if (!info.isFile() || info.uid !== 0 || (info.mode & 0o022)) {
       throw new Error(`Staged Node dependency is not root controlled: ${target}`);
@@ -465,19 +472,18 @@ try {
   await mkdir(path.join(brokerPackage, "tools"), { mode: 0o755 });
   run("cp", ["-R", path.join(project, "tools/desktop-packager"),
     path.join(brokerPackage, "tools")]);
-  await copyFile(path.join(project, "package.json"), path.join(brokerPackage, "package.json"));
+  await copyRootFile(path.join(project, "package.json"),
+    path.join(brokerPackage, "package.json"), 0o644);
   run("chmod", ["-R", "go-w", brokerPackage]);
   const controlFiles = ["linux-agent-control.js", "linux-agent-unit.js",
     "linux-peer-identity.js", "linux-agent-identity.js", "model-relay-action.js"];
   for (const filename of controlFiles) {
     const staged = path.join(controlDir, filename);
-    await copyFile(path.join(project, "dist", filename), staged);
-    await chmod(staged, 0o644);
+    await copyRootFile(path.join(project, "dist", filename), staged, 0o644);
     await trustedFile(staged);
   }
   await writeFile(path.join(controlDir, "package.json"), '{"type":"module"}\n', { mode: 0o644 });
-  await copyFile(process.execPath, rootNode);
-  await chmod(rootNode, 0o755);
+  await copyRootFile(process.execPath, rootNode, 0o755);
   run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/linux-broker-runtime/verify.c"), "-o", verifier]);
   await chmod(verifier, 0o755);
@@ -510,15 +516,12 @@ try {
     await chmod(path.join(agent.root, "workspace"), 0o700);
     await mkdir(path.join(agent.root, "workspace/codex"), { mode: 0o700 });
     await chown(path.join(agent.root, "workspace/codex"), agent.uid, agent.uid);
-    await copyFile(codexBinary, path.join(agent.root, "usr/bin/codex"));
-    await chmod(path.join(agent.root, "usr/bin/codex"), 0o755);
+    await copyRootFile(codexBinary, path.join(agent.root, "usr/bin/codex"), 0o755);
     await stageNode(agent.root, agent.uid);
-    await copyFile(path.join(project, "dist/agent-local-model-forwarder.js"),
-      path.join(agent.root, "usr/libexec/s-gw/agent-local-model-forwarder.js"));
-    await copyFile(path.join(project, "scripts/linux-native-codex-agent.mjs"),
-      path.join(agent.root, "usr/libexec/s-gw/native-codex-agent.mjs"));
-    await chmod(path.join(agent.root, "usr/libexec/s-gw/agent-local-model-forwarder.js"), 0o644);
-    await chmod(path.join(agent.root, "usr/libexec/s-gw/native-codex-agent.mjs"), 0o644);
+    await copyRootFile(path.join(project, "dist/agent-local-model-forwarder.js"),
+      path.join(agent.root, "usr/libexec/s-gw/agent-local-model-forwarder.js"), 0o644);
+    await copyRootFile(path.join(project, "scripts/linux-native-codex-agent.mjs"),
+      path.join(agent.root, "usr/libexec/s-gw/native-codex-agent.mjs"), 0o644);
     await writeFile(path.join(agent.root, "usr/libexec/s-gw/package.json"),
       '{"type":"module"}\n', { mode: 0o644 });
     await writeFile(path.join(agent.root, "etc/passwd"),
