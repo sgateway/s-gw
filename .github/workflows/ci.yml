@@ -522,6 +522,13 @@ jobs:
         run: |
           node_path="$(command -v node)"
           sudo systemd-run --wait --pipe --collect --unit=sgw-sandbox-e2e --property=Delegate=yes             /bin/bash -c 'chown -R "$1:$(id -gn "$1")" /sys/fs/cgroup/system.slice/sgw-sandbox-e2e.service; cd "$2"; exec runuser -u "$1" -- /usr/bin/env "PATH=$4" "$3" scripts/test-anthropic-e2e.mjs --require-cgroup'             bash "$(id -un)" "$PWD" "$node_path" "$PATH"
+      - name: Verify trusted Linux helpers with the real sandbox wrapper
+        run: |
+          test "$(id -u)" -ne 0
+          node_path="$(command -v node)"
+          sudo systemd-run --wait --pipe --collect --unit=sgw-trusted-helper-e2e --property=Delegate=yes \
+            "$node_path" "$PWD/scripts/test-linux-trusted-helpers-native.mjs" --root \
+            "$(id -u)" "$(id -g)" "$(id -un)" "$node_path"
       - name: Verify native Linux managed unit installer
         run: |
           test "$(id -u)" -ne 0

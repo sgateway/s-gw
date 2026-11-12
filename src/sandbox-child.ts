@@ -9,6 +9,11 @@ if (typeof manifest.command !== "string" || !Array.isArray(manifest.args) || man
 if (typeof manifest.tmpdir !== "string") throw new Error("Invalid sandbox temporary directory.");
 // The runtime's wrapper overrides TMPDIR before it reaches this trusted entry point.
 process.env.TMPDIR = manifest.tmpdir;
+if (manifest.restorePath === true) {
+  if (manifest.agentPath === null) delete process.env.PATH;
+  else if (typeof manifest.agentPath === "string") process.env.PATH = manifest.agentPath;
+  else throw new Error("Invalid sandbox agent PATH.");
+}
 const child = spawn(manifest.command, manifest.args, { stdio: "inherit", shell: false });
 let launchFailed = false;
 child.once("error", error => { launchFailed = true; process.stderr.write(`${error.message}\n`); process.exitCode = 1; });

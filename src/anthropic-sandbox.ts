@@ -12,6 +12,8 @@ import { linuxCgroupRequired, writableCgroupRoot } from "./linux-cgroup.js";
 import { spawnIsolated, killProcessTree } from "./process-tree.js";
 import { ownedModuleCommand, startSandboxBroker } from "./sandbox-broker.js";
 import { getSgwRecoveryHome } from "./paths.js";
+import { resolveTrustedLinuxSandboxHelpers, withTrustedLinuxPathAsync } from "./linux-sandbox-helpers.js";
+import { resolveTrustedMacSandboxHelpers, withTrustedMacPathAsync } from "./macos-sandbox-helpers.js";
 
 export interface AnthropicSandboxOptions {
   allowHosts?: string[];
@@ -25,6 +27,8 @@ export interface AnthropicSandboxOptions {
   strictIsolatedAuth?: boolean;
   strictBrokerEnv?: boolean;
   probeLaunch?: boolean;
+  trustedLinuxHelpers?: boolean;
+  trustedMacHelpers?: boolean;
 }
 
 export function macAgentKeychainReadPath(cwd: string, options: AnthropicSandboxOptions = {}, platform = process.platform): string | undefined {
@@ -261,11 +265,11 @@ async function createSandboxSession(config: SandboxRuntimeConfig, strictPaths = 
 let running = false;
 
 async function probeLinuxSandboxLaunch(wrapped: string, cwd: string, manifestPath: string,
-  agentTmp: string, launchPath: string | undefined): Promise<void> {
+  agentTmp: string, launchPath: string | undefined, shell = "/bin/bash"): Promise<void> {
   await writeFile(manifestPath, JSON.stringify({ command: "/bin/sh", args: ["-c", ":"], tmpdir: agentTmp }), { mode: 0o600 });
   const probeEnv: NodeJS.ProcessEnv = { HOME: agentTmp, TMPDIR: agentTmp };
   if (launchPath !== undefined) probeEnv.PATH = launchPath;
-  const child = spawnIsolated("/bin/bash", ["-c", wrapped], { cwd, env: probeEnv, stdio: ["ignore", "ignore", "pipe"] });
+  const child = spawnIsolated(shell, ["-c", wrapped], { cwd, env: probeEnv, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   child.stderr?.on("data", chunk => { if (stderr.length < 2048) stderr += String(chunk).slice(0, 2048 - stderr.length); });
   let timer: NodeJS.Timeout | undefined;
@@ -353,12 +357,32 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
   if (options.probeLaunch && process.platform !== "linux") {
     throw new Error("The Anthropic sandbox launch probe currently supports Linux only.");
   }
-  if (options.isolatedAuth && process.platform === "linux" &&
+  if (options.trustedLinuxHelpers && process.platform !== "linux") {
+    throw new Error("Trusted Anthropic sandbox helpers currently support Linux only.");
+  }
+  if (options.trustedMacHelpers && process.platform !== "darwin") {
+    throw new Error("Trusted macOS Anthropic sandbox helpers require macOS.");
+  }
+  const trustedLinux = options.trustedLinuxHelpers ? resolveTrustedLinuxSandboxHelpers(prepared.env.PATH) : undefined;
+  const trustedMac = options.trustedMacHelpers ? await resolveTrustedMacSandboxHelpers() : undefined;
+  const trusted = trustedLinux || trustedMac;
+  const withTrustedPath = <T>(action: () => Promise<T>): Promise<T> => {
+    if (trustedLinux) return withTrustedLinuxPathAsync(trustedLinux.pathEnv, action);
+    if (trustedMac) return withTrustedMacPathAsync(trustedMac.pathEnv, action);
+    return action();
+  };
+  if (options.isolatedAuth && process.platform === "linux" && !trustedLinux &&
     SandboxManager.checkDependencies().warnings.some(warning => warning.includes("unix socket access not restricted"))) {
     throw new Error("Isolated authentication on Linux requires Anthropic's Unix-socket seccomp filter.");
   }
   if (running) throw new Error("An Anthropic sandbox is already running in this process.");
   const config = anthropicSandboxConfig(prepared.plan.cwd, home, options, prepared.env, prepared.plan.command);
+  if (trustedLinux) {
+    config.bwrapPath = trustedLinux.bwrap;
+    config.socatPath = trustedLinux.socat;
+    config.ripgrep = { command: trustedLinux.rg };
+    config.seccomp = { applyPath: trustedLinux.applySeccomp };
+  }
   running = true;
   let sessionDir: string | undefined;
   let agentTmp: string | undefined;
@@ -372,7 +396,14 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
       { strictEnv: options.strictBrokerEnv || options.isolatedAuth, agentWritablePaths: config.filesystem.allowWrite,
         ...(options.isolatedAuth ? { uploadWorkspace: prepared.plan.cwd } : {}) });
     const brokerPort = broker.port;
-    await SandboxManager.initialize(config, async ({ host, port }) => host === "127.0.0.1" && port === brokerPort);
+    const initialize = () => SandboxManager.initialize(config, async ({ host, port }) => host === "127.0.0.1" && port === brokerPort);
+    await withTrustedPath(async () => {
+      await initialize();
+      if (trustedLinux && options.isolatedAuth && SandboxManager.checkDependencies().warnings
+        .some(warning => warning.includes("unix socket access not restricted"))) {
+        throw new Error("Isolated authentication on Linux requires Anthropic's Unix-socket seccomp filter.");
+      }
+    });
     const proxyPort = process.platform === "linux" ? 3128 : SandboxManager.getProxyPort();
     if (!proxyPort) throw new Error("Anthropic sandbox HTTP proxy did not initialize.");
     const capabilityEnv = {
@@ -385,7 +416,8 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     const mcpConfig = path.join(sessionDir, "mcp.json");
     await writeFile(mcpConfig, JSON.stringify({ mcpServers: { "s-gw": { ...mcpEntry, env: capabilityEnv } } }), { mode: 0o600 });
     const agentArgs = sandboxAgentArguments(prepared.plan.command, prepared.plan.args, mcpConfig, mcpEntry, capabilityEnv);
-    const agentManifest = JSON.stringify({ command: prepared.plan.command, args: agentArgs, tmpdir: agentTmp });
+    const agentManifest = JSON.stringify({ command: prepared.plan.command, args: agentArgs, tmpdir: agentTmp,
+      ...(trusted ? { restorePath: true, agentPath: prepared.env.PATH ?? null } : {}) });
     const probeLaunch = process.platform === "linux" && options.probeLaunch === true;
     if (!probeLaunch) await writeFile(manifestPath, agentManifest, { mode: 0o600 });
     const entry = ownedModuleCommand("sandbox-child");
@@ -395,11 +427,21 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
     const oldHome = process.env.HOME;
     // The runtime adds HOME-based write paths; keep those inside this session's temporary home.
     if (options.strictIsolatedAuth) process.env.HOME = agentTmp;
-    try { wrapped = await SandboxManager.wrapWithSandbox(fixedCommand, "/bin/bash"); }
+    try {
+      const wrap = () => SandboxManager.wrapWithSandbox(fixedCommand, trusted?.bash || "/bin/bash");
+      wrapped = await withTrustedPath(wrap);
+    }
     finally {
       if (options.strictIsolatedAuth) {
         if (oldHome === undefined) delete process.env.HOME;
         else process.env.HOME = oldHome;
+      }
+    }
+    if (trustedMac) {
+      const { args, at } = macSandboxProfileArgs(wrapped);
+      if (args.slice(1, at).some(arg => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) ||
+          args.length !== at + 6 || args[at + 3] !== trustedMac.bash || args[at + 4] !== "-c" || args[at + 5] !== fixedCommand) {
+        throw new Error("Trusted macOS Anthropic wrapper changed its sandbox launch format.");
       }
     }
     const loginFile = macAgentKeychainReadPath(prepared.plan.cwd, options);
@@ -418,11 +460,12 @@ export async function runAnthropicSandbox(prepared: GuardRunPreparation, home: s
       if (["BASH_ENV", "ENV", "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "CDPATH", "GIT_CONFIG", "GIT_CONFIG_GLOBAL"].includes(name) ||
           name.startsWith("BASH_FUNC_") || name.startsWith("DYLD_") || name.startsWith("LD_")) delete env[name];
     }
+    if (trusted) env.PATH = trusted.pathEnv;
     if (probeLaunch) {
-      await probeLinuxSandboxLaunch(wrapped, prepared.plan.cwd, manifestPath, agentTmp, env.PATH);
+      await probeLinuxSandboxLaunch(wrapped, prepared.plan.cwd, manifestPath, agentTmp, env.PATH, trustedLinux?.bash);
       await writeFile(manifestPath, agentManifest, { mode: 0o600 });
     }
-    const child = spawnIsolated("/bin/bash", ["-c", wrapped], { cwd: prepared.plan.cwd, env, stdio: "inherit" });
+    const child = spawnIsolated(trusted?.bash || "/bin/bash", ["-c", wrapped], { cwd: prepared.plan.cwd, env, stdio: "inherit" });
     const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
     const handlers = signals.map(signal => () => killProcessTree(child, signal));
     signals.forEach((signal, index) => process.on(signal, handlers[index]));

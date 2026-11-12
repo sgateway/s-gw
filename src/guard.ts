@@ -8,6 +8,9 @@ import { previewHandle, scanText, tokenForHandle } from "./scanner.js";
 import { SecretStore } from "./store.js";
 import type { ScanCandidate } from "./types.js";
 import { anthropicSandboxConfig, anthropicSandboxReadiness, macAgentKeychainReadPath, runAnthropicSandbox, type AnthropicSandboxOptions } from "./anthropic-sandbox.js";
+import { resolveTrustedLinuxSandboxHelpers } from "./linux-sandbox-helpers.js";
+import { resolveTrustedMacSandboxHelpers } from "./macos-sandbox-helpers.js";
+import { linuxCgroupRequired, writableCgroupRoot } from "./linux-cgroup.js";
 
 export interface GuardRunOptions {
   agent: string;
@@ -57,6 +60,8 @@ export interface GuardRunPlan {
     provider: "builtin" | "anthropic";
     tlsInterception: false;
     probeLaunch?: boolean;
+    trustedLinuxHelpers?: boolean;
+    trustedMacHelpers?: boolean;
     policy?: { denyRead: string[]; allowRead: string[]; allowWrite: string[]; denyWrite: string[]; allowedDomains: string[]; credentialOperations: Array<"ssh" | "https"> };
   };
 }
@@ -133,6 +138,12 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   if (options.sandboxOptions?.probeLaunch && process.platform !== "linux") {
     throw new Error("The Anthropic sandbox launch probe currently supports Linux only.");
   }
+  if (options.sandboxOptions?.trustedLinuxHelpers && process.platform !== "linux") {
+    throw new Error("Trusted Anthropic sandbox helpers currently support Linux only.");
+  }
+  if (options.sandboxOptions?.trustedMacHelpers && process.platform !== "darwin") {
+    throw new Error("Trusted macOS Anthropic sandbox helpers require macOS.");
+  }
   const command = options.command || defaultAgentCommands[profile.id];
   if (!command) {
     throw new Error(`Guard run for ${profile.displayName} needs --command because it has no safe default CLI launcher yet.`);
@@ -146,8 +157,16 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
   const sandboxConfig = options.sandbox === "anthropic" ? anthropicSandboxConfig(cwd, store.home, options.sandboxOptions, baseEnv, command) : undefined;
   const loginKeychain = sandboxConfig ? macAgentKeychainReadPath(cwd, options.sandboxOptions) : undefined;
   if (options.sandbox === "anthropic" && options.persist === true) {
-    const readiness = anthropicSandboxReadiness();
-    if (!readiness.ready) throw new Error(`Anthropic sandbox dependencies are unavailable: ${readiness.dependencies.errors.join("; ")}`);
+    if (options.sandboxOptions?.trustedMacHelpers) await resolveTrustedMacSandboxHelpers();
+    if (options.sandboxOptions?.trustedLinuxHelpers) {
+      resolveTrustedLinuxSandboxHelpers(baseEnv.PATH);
+      if (linuxCgroupRequired() && !writableCgroupRoot()) {
+        throw new Error("Anthropic sandbox dependencies are unavailable: Linux isolation requires a writable delegated cgroup v2.");
+      }
+    } else {
+      const readiness = anthropicSandboxReadiness();
+      if (!readiness.ready) throw new Error(`Anthropic sandbox dependencies are unavailable: ${readiness.dependencies.errors.join("; ")}`);
+    }
   }
 
   const scrubbedEnv: GuardEnvFinding[] = [];
@@ -223,7 +242,9 @@ export async function prepareGuardedRun(store: SecretStore, options: GuardRunOpt
       warnings,
       sandbox: {
         provider: options.sandbox || "builtin", tlsInterception: false,
-        ...(sandboxConfig ? { probeLaunch: options.sandboxOptions?.probeLaunch === true, policy: {
+        ...(sandboxConfig ? { probeLaunch: options.sandboxOptions?.probeLaunch === true,
+          trustedLinuxHelpers: options.sandboxOptions?.trustedLinuxHelpers === true,
+          trustedMacHelpers: options.sandboxOptions?.trustedMacHelpers === true, policy: {
           denyRead: sandboxConfig.filesystem.denyRead,
           allowRead: [...(sandboxConfig.filesystem.allowRead || []), ...(loginKeychain ? [loginKeychain] : [])],
           allowWrite: sandboxConfig.filesystem.allowWrite,

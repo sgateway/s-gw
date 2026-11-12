@@ -113,26 +113,45 @@ describe("Anthropic sandbox", () => {
     expect(JSON.parse(deniedKeychainPlan).sandbox.policy.allowRead).toEqual([]);
   });
 
-  it("parses the optional Linux launch probe flag in guard run", async () => {
+  it("parses optional launch controls in guard run", async () => {
     await fixtureStore();
     const loader = new URL("../node_modules/tsx/dist/esm/index.mjs", import.meta.url).href;
     const argv = ["--import", loader, "src/cli.ts", "guard", "run", "codex", "--sandbox", "anthropic",
       "--dry-run", "--command", process.execPath, "--", "-v"];
     const defaultPlan = JSON.parse(execFileSync(process.execPath, argv, { encoding: "utf8", env: process.env }));
     expect(defaultPlan.sandbox.probeLaunch).toBe(false);
+    expect(defaultPlan.sandbox.trustedLinuxHelpers).toBe(false);
+    expect(defaultPlan.sandbox.trustedMacHelpers).toBe(false);
     const probeArgs = [...argv.slice(0, -2), "--probe-launch", ...argv.slice(-2)];
+    const trustedArgs = [...argv.slice(0, -2), "--trusted-linux-helpers", ...argv.slice(-2)];
+    const macArgs = [...argv.slice(0, -2), "--trusted-mac-helpers", ...argv.slice(-2)];
     if (process.platform === "linux") {
       const probePlan = JSON.parse(execFileSync(process.execPath, probeArgs, { encoding: "utf8", env: process.env }));
       expect(probePlan.sandbox.probeLaunch).toBe(true);
+      const trustedPlan = JSON.parse(execFileSync(process.execPath, trustedArgs, { encoding: "utf8", env: process.env }));
+      expect(trustedPlan.sandbox.trustedLinuxHelpers).toBe(true);
     } else {
       expect(() => execFileSync(process.execPath, probeArgs, { encoding: "utf8", env: process.env }))
         .toThrow("launch probe currently supports Linux only");
+      expect(() => execFileSync(process.execPath, trustedArgs, { encoding: "utf8", env: process.env }))
+        .toThrow("helpers currently support Linux only");
+    }
+    if (process.platform === "darwin") {
+      const macPlan = JSON.parse(execFileSync(process.execPath, macArgs, { encoding: "utf8", env: process.env }));
+      expect(macPlan.sandbox.trustedMacHelpers).toBe(true);
+    } else {
+      expect(() => execFileSync(process.execPath, macArgs, { encoding: "utf8", env: process.env }))
+        .toThrow("helpers require macOS");
     }
     expect(() => execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "guard", "run", "codex",
       "--dry-run", "--command", process.execPath, "--probe-launch", "--", "-v"],
     { encoding: "utf8", env: process.env })).toThrow("require --sandbox anthropic");
     expect(execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "help"],
       { encoding: "utf8", env: process.env })).toContain("--probe-launch");
+    expect(execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "help"],
+      { encoding: "utf8", env: process.env })).toContain("--trusted-linux-helpers");
+    expect(execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "help"],
+      { encoding: "utf8", env: process.env })).toContain("--trusted-mac-helpers");
   });
 
   it("adds stricter egress and authentication-file protection only when selected", () => {

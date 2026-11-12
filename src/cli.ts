@@ -2691,6 +2691,8 @@ async function handleGuardRun(
       strictEgress: hasFlag(flags, "strict-egress"),
       strictBrokerEnv: hasFlag(flags, "strict-broker-env"),
       probeLaunch: hasFlag(flags, "probe-launch"),
+      trustedLinuxHelpers: hasFlag(flags, "trusted-linux-helpers"),
+      trustedMacHelpers: hasFlag(flags, "trusted-mac-helpers"),
       isolatedAuth: hasFlag(flags, "isolated-auth") || hasFlag(flags, "strict-isolated-auth"),
       strictIsolatedAuth: hasFlag(flags, "strict-isolated-auth"),
       denyAgentAuth: hasFlag(flags, "deny-agent-auth"),
@@ -2852,8 +2854,8 @@ Commands:
   s-gw app refresh-agents [--lock-timeout-ms 35000]
   s-gw guard doctor
   s-gw guard status
-  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--probe-launch] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env|--allow-raw-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
-  s-gw run AGENT [--dry-run] [--strict-broker-env] [--probe-launch] [--strict-npm-env|--allow-raw-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw guard run AGENT [--sandbox builtin|anthropic] [--allow-host HOST] [--deny-read PATH] [--allow-write PATH] [--strict-egress] [--strict-broker-env] [--probe-launch] [--trusted-linux-helpers] [--trusted-mac-helpers] [--isolated-auth] [--strict-isolated-auth] [--strict-npm-env|--allow-raw-npm-env] [--deny-agent-auth] [--deny-keychain] [--allow-agent-keychain] [--dry-run] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
+  s-gw run AGENT [--dry-run] [--strict-broker-env] [--probe-launch] [--trusted-linux-helpers] [--trusted-mac-helpers] [--strict-npm-env|--allow-raw-npm-env] [--command CMD] [--env KEY=VALUE] [--allow-command CMD] [--] [agent args...]
   s-gw run env-command HANDLE --command CMD --inject-env ENV [--with-env ENV=HANDLE] [--arg VALUE] [--strict-legacy-revocation] [--raw]
   s-gw service install [--port 8718] [--start] [--menubar] [--operator-auth|--ordinary] [--ui-manifest /absolute/trusted.json] [--launchd-socket|--direct-bind]
   s-gw service start|stop|status|uninstall
