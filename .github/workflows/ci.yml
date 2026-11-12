@@ -129,7 +129,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: sudo apt-get update && sudo apt-get install -y build-essential libc6-dev bubblewrap socat ripgrep iproute2
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libc6-dev bubblewrap socat ripgrep iproute2 util-linux procps
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: ./node_modules/.bin/vitest run tests/linux-managed-mcp-stdio-bridge.test.ts tests/linux-managed-mcp-forwarder.test.ts --no-file-parallelism
@@ -140,6 +140,11 @@ jobs:
           node_path="$(command -v node)"
           sudo "$node_path" scripts/test-linux-broker-runtime-static.mjs
           sudo CI=true SGW_TEST_MANAGED_RELAY=1 "$node_path" scripts/test-linux-managed-mcp-native.mjs --root "$(id -u)" "$(id -g)"
+      - name: Verify managed MCP bridge across two systemd UIDs
+        run: |
+          test "$(id -u)" -ne 0
+          node_path="$(command -v node)"
+          sudo CI=true "$node_path" scripts/test-linux-managed-mcp-bridge-systemd.mjs --root "$(id -u)" "$(id -g)"
 
   filter-only-newer-host:
     name: Filter-only seccomp payload (Ubuntu 26.04)
