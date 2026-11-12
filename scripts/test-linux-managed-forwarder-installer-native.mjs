@@ -310,7 +310,7 @@ try {
     `throw new Error("wrong forwarder namespace");\n` +
     `const server = createServer(); server.listen(0, "127.0.0.1", () => { ` +
     `server.close(() => console.log("FORWARDER_ROOT_PROBE_OK")); });\n`;
-  const probeOutput = run("/usr/bin/systemd-run", ["--system", "--wait", "--pipe", "--collect",
+  const probeRun = run("/usr/bin/systemd-run", ["--system", "--wait", "--pipe",
     "--quiet", "--no-ask-password", `--unit=${probeUnit}`, "--property=Type=exec",
     `--property=User=${forwarderUid}`, `--property=Group=${forwarderUid}`,
     `--property=RootDirectory=${forwarderRoot}`, "--property=WorkingDirectory=/",
@@ -321,7 +321,19 @@ try {
     "--property=PrivateDevices=yes", "--property=NoNewPrivileges=yes",
     "--property=CapabilityBoundingSet=", "--property=AmbientCapabilities=",
     "--property=RestrictNamespaces=yes", "--property=SystemCallArchitectures=native",
-    "--", node, "--input-type=module", "--eval", probe]).stdout;
+    "--", node, "--input-type=module", "--eval", probe], true);
+  if (probeRun.error || probeRun.status !== 0) {
+    const state = run("/usr/bin/systemctl", ["--system", "--no-pager", "show", probeUnit,
+      "-p", "LoadState", "-p", "ActiveState", "-p", "Result", "-p", "ExecMainCode",
+      "-p", "ExecMainStatus", "-p", "StatusErrno"], true);
+    const journal = run("/usr/bin/journalctl", ["--no-pager", "--unit", probeUnit,
+      "--lines=12", "--output=cat"], true);
+    throw new Error("Forwarder root probe failed: " + [
+      `systemd-run status=${probeRun.status} error=${probeRun.error?.message || "none"}`,
+      probeRun.stderr, probeRun.stdout, state.stdout, state.stderr, journal.stdout, journal.stderr
+    ].filter(Boolean).map(value => String(value).slice(0, 4096)).join("\n"));
+  }
+  const probeOutput = probeRun.stdout;
   if (!probeOutput.includes("FORWARDER_ROOT_PROBE_OK")) {
     throw new Error("Forwarder Node/ESM root probe did not execute under its dedicated UID.");
   }
