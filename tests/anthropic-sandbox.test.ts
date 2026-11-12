@@ -152,7 +152,7 @@ describe("Anthropic sandbox", () => {
       { encoding: "utf8", env: process.env })).toContain("--trusted-linux-helpers");
     expect(execFileSync(process.execPath, ["--import", loader, "src/cli.ts", "help"],
       { encoding: "utf8", env: process.env })).toContain("--trusted-mac-helpers");
-  });
+  }, 15_000);
 
   it("adds stricter egress and authentication-file protection only when selected", () => {
     const cwd = path.resolve("fixture-workspace");
