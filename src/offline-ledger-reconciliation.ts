@@ -60,6 +60,7 @@ const donorLedgerFields = new Set([
   "version", "writerGeneration", "secrets", "requests", "agentIdentities", "audit",
   "approvalSettings", "approvalGrants", "approvalPolicyRules", "sensitiveMetadata"
 ]);
+const candidateLedgerFields = new Set([...appLedgerFields, ...donorLedgerFields]);
 const controlManifestFields = new Set([
   "version", "fingerprint", "updatedAt", "secrets", "approvalPolicyRules",
   "recoverySealed", "recoveryCheckpoint", "recoveryVaultId", "recoveryNamespace", "writerVersion"
@@ -123,6 +124,40 @@ export function assessOfflineLedgerReconciliation(input: OfflineReconciliationIn
       controlFingerprint: controlFingerprint(app)
     }
   };
+}
+
+// Keep this preflight separate from the encrypted-history migration.
+export function verifyOfflineReconciliationCandidateStructure(
+    input: OfflineReconciliationInput, candidateRaw: string): OfflineReconciliationAssessment {
+  const assessment = assessOfflineLedgerReconciliation(input);
+  const app = parseLedger(input.sealedLedgerRaw);
+  const donor = parseLedger(input.generationTwoLedgerRaw);
+  const candidate = parseLedger(candidateRaw);
+  assertKnownFields(candidate, candidateLedgerFields, "candidate ledger");
+  const format = inspectLedgerFormat(candidateRaw);
+  if (format.shape !== "mixed" || format.writerGeneration !== 2
+      || !format.hasEncryptedSensitiveMetadata || format.unknownConditionFields) {
+    throw new Error("The candidate is not the expected mixed ledger structure.");
+  }
+  if (controlFingerprint(candidate) !== assessment.summary.controlFingerprint) {
+    throw new Error("Candidate control authority differs from the sealed ledger.");
+  }
+  compareRecords(requiredArray(donor.agentIdentities, "agent identities"),
+    requiredArray(candidate.agentIdentities, "agent identities"), "id", []);
+  if (canonical(candidate.sensitiveMetadata) !== canonical(donor.sensitiveMetadata)) {
+    throw new Error("Candidate encrypted metadata differs from the generation-2 donor.");
+  }
+  assertSameIds(app.requests, candidate.requests);
+  assertSameIds(app.audit, candidate.audit);
+  return assessment;
+}
+
+function assertSameIds(expected: Record<string, unknown>[], actual: Record<string, unknown>[]): void {
+  const original = recordsByKey(expected, "id");
+  const candidate = recordsByKey(actual, "id");
+  if (original.size !== candidate.size || [...original.keys()].some((id) => !candidate.has(id))) {
+    throw new Error("Candidate history IDs differ from the sealed ledger.");
+  }
 }
 
 function assertKnownFields(record: Record<string, unknown>, fields: Set<string>, name: string): void {

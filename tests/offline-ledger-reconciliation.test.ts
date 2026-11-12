@@ -3,6 +3,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   assessOfflineLedgerReconciliation,
+  verifyOfflineReconciliationCandidateStructure,
   type OfflineReconciliationInput
 } from "../src/offline-ledger-reconciliation.js";
 
@@ -120,6 +121,16 @@ function editDonor(input: OfflineReconciliationInput, change: (value: any) => vo
   const donor = JSON.parse(input.generationTwoLedgerRaw);
   change(donor);
   return { ...input, generationTwoLedgerRaw: JSON.stringify(donor) };
+}
+
+function syntheticCandidate() {
+  const { app, donor, input } = fixture();
+  const candidate = {
+    ...structuredClone(app), writerGeneration: 2,
+    agentIdentities: structuredClone(donor.agentIdentities),
+    sensitiveMetadata: structuredClone(donor.sensitiveMetadata)
+  };
+  return { input, candidate };
 }
 
 describe("offline ledger reconciliation assessment", () => {
@@ -327,5 +338,64 @@ describe("offline ledger reconciliation assessment", () => {
       .toThrow("Invalid control manifest JSON.");
     expect(() => assessOfflineLedgerReconciliation({ ...input, generationTwoLedgerRaw: "private malformed ledger" }))
       .toThrow("Invalid ledger JSON.");
+  });
+});
+
+describe("offline reconciliation candidate structure", () => {
+  it("accepts a mixed synthetic candidate while keeping migration blocked", () => {
+    const { input, candidate } = syntheticCandidate();
+    const assessment = verifyOfflineReconciliationCandidateStructure(input, JSON.stringify(candidate));
+
+    expect(assessment.migrationBlocked).toBe(true);
+    expect(assessment.summary).toMatchObject({
+      donorIdentityRecords: 1, routes: 1, ruleFieldsOnlyInSeal: 2, requests: 1, audit: 1
+    });
+    expect(JSON.stringify(assessment)).not.toMatch(/Synthetic Claude|synthetic-ciphertext|example.test/);
+  });
+
+  it("rejects a candidate that drops or changes donor identities and encrypted metadata", () => {
+    const { input, candidate } = syntheticCandidate();
+    for (const change of [
+      (c: any) => { c.agentIdentities = []; },
+      (c: any) => { c.agentIdentities[0].customName = "Changed"; },
+      (c: any) => { c.agentIdentities.push({ ...c.agentIdentities[0] }); },
+      (c: any) => { delete c.sensitiveMetadata; },
+      (c: any) => { c.sensitiveMetadata.ciphertext = "changed"; },
+      (c: any) => { c.writerGeneration = 1; }
+    ]) {
+      const changed = structuredClone(candidate);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateStructure(input, JSON.stringify(changed))).toThrow();
+    }
+  });
+
+  it("rejects missing or changed sealed routes and policy conditions", () => {
+    const { input, candidate } = syntheticCandidate();
+    for (const change of [
+      (c: any) => { delete c.managedSshRoutes; },
+      (c: any) => { c.managedSshRoutes[0].route.port = 23; },
+      (c: any) => { delete c.approvalPolicyRules[0].conditions.envBindings; },
+      (c: any) => { c.approvalPolicyRules[0].conditions.commands = ["/usr/bin/false"]; }
+    ]) {
+      const changed = structuredClone(candidate);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateStructure(input, JSON.stringify(changed))).toThrow();
+    }
+  });
+
+  it("rejects missing, replaced, added, and duplicate request or audit IDs", () => {
+    const { input, candidate } = syntheticCandidate();
+    for (const change of [
+      (c: any) => { c.requests = []; },
+      (c: any) => { c.requests[0].id = "req_replaced"; },
+      (c: any) => { c.requests.push({ ...c.requests[0], id: "req_extra" }); },
+      (c: any) => { c.audit = []; },
+      (c: any) => { c.audit[0].id = "audit_replaced"; },
+      (c: any) => { c.audit.push({ ...c.audit[0] }); }
+    ]) {
+      const changed = structuredClone(candidate);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateStructure(input, JSON.stringify(changed))).toThrow();
+    }
   });
 });
