@@ -65,6 +65,11 @@ async function maybeEntries(dirname) {
   catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
 }
 
+async function maybeInfo(filename) {
+  try { return await lstat(filename); }
+  catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+}
+
 function properties(unit, names) {
   const result = run("systemctl", ["--system", "--all", "show", unit,
     ...names.flatMap(name => ["-p", name])]);
@@ -410,14 +415,14 @@ async function procIdentity(pid, agent, netns, executable) {
   ]);
   const uids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
   const gids = /^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
-  if (!uids || uids.slice(1).some(value => Number(value) !== agent.uid) ||
-      !gids || gids.slice(1).some(value => Number(value) !== agent.uid) ||
-      cgroup.split("\n").find(line => line.startsWith("0::"))?.slice(3) !==
-        `/system.slice/${agent.agentUnit}` || network !== netns ||
-      network === await readlink("/proc/self/ns/net") ||
-      liveExe.dev !== stagedExe.dev || liveExe.ino !== stagedExe.ino) {
-    throw new Error(`Codex process ${pid} escaped ${agent.sessionId}'s verified identity boundary.`);
-  }
+  const failed = [];
+  if (!uids || uids.slice(1).some(value => Number(value) !== agent.uid)) failed.push("UID");
+  if (!gids || gids.slice(1).some(value => Number(value) !== agent.uid)) failed.push("GID");
+  if (cgroup.split("\n").find(line => line.startsWith("0::"))?.slice(3) !==
+      `/system.slice/${agent.agentUnit}`) failed.push("cgroup");
+  if (network !== netns || network === await readlink("/proc/self/ns/net")) failed.push("network namespace");
+  if (liveExe.dev !== stagedExe.dev || liveExe.ino !== stagedExe.ino) failed.push("executable");
+  if (failed.length) throw new Error(`Codex process ${pid} failed ${agent.sessionId}'s ${failed.join(", ")} check.`);
 }
 
 try {
@@ -749,7 +754,6 @@ try {
       }
       await remember(marker);
     }
-    await procIdentity(agent.mainPid, agent, agent.netns, "/usr/bin/node");
     const ready = await until(async () => {
       const result = await maybeText(`${agent.root}/workspace/codex-result.json`);
       if (result) {
@@ -762,6 +766,7 @@ try {
     },
       `${agent.sessionId} attested forwarder`);
     if (!/^\d{1,5}\n$/.test(ready)) throw new Error("Native Codex forwarder did not bind loopback.");
+    await procIdentity(agent.mainPid, agent, agent.netns, "/usr/bin/node");
   }
   if (agents[0].uid === agents[1].uid || agents[0].netns === agents[1].netns) {
     throw new Error("Native Codex agents share a UID or private network namespace.");
@@ -893,7 +898,8 @@ try {
       for (const socket of ["/run/s-gw/agent-control.sock", "/run/s-gw/agent-prepare.sock"]) {
         await adoptGenerated(socket, "socket");
         if (!owned.has(socket)) continue;
-        const info = await lstat(socket);
+        const info = await maybeInfo(socket);
+        if (!info) continue;
         const prepare = socket.endsWith("agent-prepare.sock");
         if (info.gid !== (prepare ? 0 : brokerGid) ||
             (info.mode & 0o777) !== (prepare ? 0o600 : 0o660)) {
