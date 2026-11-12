@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rm, rmdir,
+import { chmod, copyFile, lstat, mkdir, readFile, readdir, realpath, rm, rmdir, stat,
   unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,7 @@ const brokerUnit = `s-gw-managed-mcp-${sessionId}.service`;
 const forwarderUnit = `s-gw-forwarder-${sessionId}.service`;
 const mcpUnit = `s-gw-managed-mcp-${sessionId}.socket`;
 const modelUnit = `s-gw-managed-model-${sessionId}.socket`;
+const probeUnit = `s-gw-forwarder-root-probe-${runId}.service`;
 const madeDirs = new Map();
 const madeFiles = new Map();
 const autoDirs = [
@@ -113,6 +114,20 @@ function properties(unit, fields) {
   return values;
 }
 
+function assertForwarderPortClosed() {
+  const probe = `import { connect } from "node:net"; ` +
+    `const socket = connect(43871, "127.0.0.1"); ` +
+    `socket.once("connect", () => process.exit(2)); ` +
+    `socket.once("error", error => { if (error.code !== "ECONNREFUSED") process.exit(3); ` +
+    `console.log("FORWARDER_PORT_CLOSED"); }); ` +
+    `socket.setTimeout(2000, () => process.exit(4));`;
+  const result = run("/usr/bin/nsenter", [`--net=${namespacePath}`, "--", process.execPath,
+    "--input-type=module", "--eval", probe]);
+  if (result.stdout.trim() !== "FORWARDER_PORT_CLOSED") {
+    throw new Error("Forwarder port 43871 did not refuse a local connection.");
+  }
+}
+
 function freeTriple() {
   for (let uid = 236000; uid < 236990; uid += 3) {
     const values = [uid, uid + 1, uid + 2];
@@ -151,6 +166,8 @@ const input = { control, record, config, brokerGid: brokerUid };
 const { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle } =
   await import(new URL("../dist/linux-agent-provision.js", import.meta.url));
 const { runLinuxManagedInstall } = await import(new URL("../dist/linux-managed-install.js", import.meta.url));
+const { discoverLinuxForwarderElfClosure } =
+  await import(new URL("../dist/linux-forwarder-elf.js", import.meta.url));
 const bundle = renderLinuxManagedUnitBundle(config, record, brokerUid, "prepare");
 let staged = false;
 let failure;
@@ -160,7 +177,8 @@ try {
   if (!version || Number(version) < 259) {
     throw new Error("Forwarder fixture needs Ubuntu 26 systemd 259 or newer.");
   }
-  for (const unit of [controlUnit, agentUnit, brokerUnit, forwarderUnit, mcpUnit, modelUnit]) {
+  for (const unit of [controlUnit, agentUnit, brokerUnit, forwarderUnit, mcpUnit, modelUnit,
+    probeUnit]) {
     if (properties(unit, ["LoadState"]).get("LoadState") !== "not-found") {
       throw new Error("Forwarder fixture found an existing unit: " + unit);
     }
@@ -211,7 +229,8 @@ try {
       rootParent.uid !== 0 || (rootParent.mode & 0o777) !== 0o700) {
     throw new Error("Forwarder fixture root is not traversable after chroot.");
   }
-  for (const relative of ["run", "run/s-gw", `run/s-gw/${path.basename(runtimeRoot)}`,
+  for (const relative of ["proc", "sys", "dev", "run", "run/s-gw",
+    `run/s-gw/${path.basename(runtimeRoot)}`,
     `run/s-gw/${path.basename(runtimeRoot)}/dist`]) {
     await mkdir(path.join(forwarderRoot, relative), { recursive: true, mode: 0o755 });
   }
@@ -219,12 +238,13 @@ try {
   await copyFile(forwarderEntry, `${forwarderRoot}${forwarderEntry}`);
   await writeFile(`${forwarderRoot}${runtimeRoot}/package.json`, '{"type":"module"}\n',
     { mode: 0o644, flag: "wx" });
-  const loader = /\[Requesting program interpreter: ([^\]\n]+)\]/.exec(
-    run("/usr/bin/readelf", ["-l", node]).stdout)?.[1];
-  if (!loader?.startsWith("/") || await maybe(`${forwarderRoot}${loader}`) ||
-      await readFile(`${forwarderRoot}${runtimeRoot}/package.json`, "utf8") !==
-        '{"type":"module"}\n') {
-    throw new Error("Forwarder fixture did not prove its sparse root is inert.");
+  const elf = await discoverLinuxForwarderElfClosure(node);
+  for (const file of elf.files) {
+    const inside = `${forwarderRoot}${file.targetPath}`;
+    if (await maybe(inside)) throw new Error("Forwarder fixture ELF target already exists: " + inside);
+    await mkdir(path.dirname(inside), { recursive: true, mode: 0o755 });
+    await copyFile(file.sourcePath, inside);
+    await chmod(inside, file.mode);
   }
   await ownedFile(envFile, "", 0o600);
   for (const [name, uid] of [[brokerName, brokerUid], [agentName, agentUid],
@@ -236,8 +256,76 @@ try {
     accounts.push(name);
   }
   await ownedFile(inputFile, JSON.stringify(input) + "\n", 0o600);
+  const loader = `${forwarderRoot}${elf.interpreter}`;
+  await unlink(loader);
+  let missingLoaderDenied = false;
+  try { await runLinuxManagedInstall(["stage", inputFile]); }
+  catch (error) { missingLoaderDenied = String(error).includes(loader); }
+  if (!missingLoaderDenied || await maybe(namespacePath) ||
+      properties(controlUnit, ["LoadState"]).get("LoadState") !== "not-found") {
+    throw new Error("Forwarder fixture did not reject its missing ELF loader before staging.");
+  }
+  const loaderFile = elf.files.find(file => file.targetPath === elf.interpreter);
+  if (!loaderFile) throw new Error("Forwarder fixture closure lost its ELF interpreter.");
+  await copyFile(loaderFile.sourcePath, loader);
+  await chmod(loader, loaderFile.mode);
+  const library = elf.files.find(file => file.targetPath !== elf.interpreter);
+  if (!library) throw new Error("Forwarder fixture has no dynamic library to check.");
+  const libraryInside = `${forwarderRoot}${library.targetPath}`;
+  await writeFile(libraryInside, "tampered library\n");
+  let tamperedLibraryDenied = false;
+  try { await runLinuxManagedInstall(["stage", inputFile]); }
+  catch (error) { tamperedLibraryDenied = /forwarder ELF closure differs/i.test(String(error)); }
+  if (!tamperedLibraryDenied || await maybe(namespacePath) ||
+      properties(controlUnit, ["LoadState"]).get("LoadState") !== "not-found") {
+    throw new Error("Forwarder fixture did not reject a changed ELF library before staging.");
+  }
+  await copyFile(library.sourcePath, libraryInside);
+  await chmod(libraryInside, library.mode);
+  const loaderConfigDir = `${forwarderRoot}/etc`;
+  await mkdir(loaderConfigDir, { mode: 0o755 });
+  await writeFile(`${loaderConfigDir}/ld.so.preload`, "/run/s-gw/unsafe.so\n", { mode: 0o644 });
+  let loaderConfigDenied = false;
+  try { await runLinuxManagedInstall(["stage", inputFile]); }
+  catch (error) { loaderConfigDenied = /loader configuration/i.test(String(error)); }
+  if (!loaderConfigDenied || await maybe(namespacePath) ||
+      properties(controlUnit, ["LoadState"]).get("LoadState") !== "not-found") {
+    throw new Error("Forwarder fixture did not reject loader configuration before staging.");
+  }
+  await unlink(`${loaderConfigDir}/ld.so.preload`);
+  await rmdir(loaderConfigDir);
+
   staged = true;
   await runLinuxManagedInstall(["stage", inputFile]);
+
+  const pinned = await stat(namespacePath, { bigint: true });
+  const probe = `import { readFileSync, statSync } from "node:fs";\n` +
+    `import { createServer } from "node:net";\n` +
+    `if (process.getuid() !== ${forwarderUid} || process.getgid() !== ${forwarderUid} || ` +
+    `process.getgroups().length !== 1 || process.getgroups()[0] !== ${forwarderUid} || ` +
+    `readFileSync("${runtimeRoot}/package.json", "utf8") !== '{"type":"module"}\\n') ` +
+    `throw new Error("wrong forwarder root or identity");\n` +
+    `const ns = statSync("/proc/self/ns/net", { bigint: true });\n` +
+    `if (ns.dev !== ${pinned.dev}n || ns.ino !== ${pinned.ino}n) ` +
+    `throw new Error("wrong forwarder namespace");\n` +
+    `const server = createServer(); server.listen(0, "127.0.0.1", () => { ` +
+    `server.close(() => console.log("FORWARDER_ROOT_PROBE_OK")); });\n`;
+  const probeOutput = run("/usr/bin/systemd-run", ["--system", "--wait", "--pipe", "--collect",
+    "--quiet", "--no-ask-password", `--unit=${probeUnit}`, "--property=Type=exec",
+    `--property=User=${forwarderUid}`, `--property=Group=${forwarderUid}`,
+    `--property=RootDirectory=${forwarderRoot}`, "--property=WorkingDirectory=/",
+    `--property=NetworkNamespacePath=${namespacePath}`, "--property=PrivateNetwork=yes",
+    "--property=PrivateIPC=yes", "--property=PrivateTmp=yes", "--property=MountFlags=private",
+    "--property=BindLogSockets=no", "--property=MountAPIVFS=yes",
+    "--property=ProtectHome=yes", "--property=ProtectSystem=strict",
+    "--property=PrivateDevices=yes", "--property=NoNewPrivileges=yes",
+    "--property=CapabilityBoundingSet=", "--property=AmbientCapabilities=",
+    "--property=RestrictNamespaces=yes", "--property=SystemCallArchitectures=native",
+    "--", node, "--input-type=module", "--eval", probe]).stdout;
+  if (!probeOutput.includes("FORWARDER_ROOT_PROBE_OK")) {
+    throw new Error("Forwarder Node/ESM root probe did not execute under its dedicated UID.");
+  }
+  assertForwarderPortClosed();
 
   const state = properties(forwarderUnit, ["Id", "LoadState", "ActiveState", "FragmentPath",
     "User", "Group", "RootDirectory", "NetworkNamespacePath", "PrivatePIDs", "MountFlags",
@@ -277,17 +365,25 @@ try {
       await readFile(record.brokerConfig, "utf8") !== bundle.brokerConfig) {
     throw new Error("Pending forwarder activation did not fail before mutation.");
   }
+  assertForwarderPortClosed();
   for (const unit of [agentUnit, brokerUnit, forwarderUnit, mcpUnit]) {
     if (properties(unit, ["ActiveState"]).get("ActiveState") !== "inactive") {
       throw new Error("Pending forwarder activation started a unit: " + unit);
     }
   }
-  console.log("Native MCP-only forwarder staged and read back; missing ELF loader and PENDING proof refuse activation.");
+  console.log("Native MCP-only forwarder root executed under its UID; staged unit read back and PENDING refused activation.");
 } catch (error) {
   failure = error;
 } finally {
   let cleanupError;
   try {
+    const probeState = properties(probeUnit, ["LoadState", "ActiveState"]);
+    if (probeState.get("LoadState") !== "not-found") {
+      if (probeState.get("ActiveState") !== "inactive") {
+        run("/usr/bin/systemctl", ["--system", "stop", probeUnit]);
+      }
+      run("/usr/bin/systemctl", ["--system", "reset-failed", probeUnit]);
+    }
     if (staged) {
       const controlState = properties(controlUnit, ["Id", "FragmentPath", "ActiveState"]);
       if (controlState.get("Id") === controlUnit &&
@@ -295,7 +391,7 @@ try {
           controlState.get("ActiveState") === "active") {
         run("/usr/bin/systemctl", ["--system", "stop", controlUnit]);
       }
-      for (const unit of [controlUnit, agentUnit, brokerUnit, forwarderUnit, mcpUnit]) {
+      for (const unit of [controlUnit, agentUnit, brokerUnit, forwarderUnit, mcpUnit, probeUnit]) {
         if (properties(unit, ["ActiveState"]).get("ActiveState") !== "inactive") {
           throw new Error("Forwarder fixture unit survived teardown: " + unit);
         }
@@ -344,7 +440,7 @@ try {
       }
     }
     if (staged) run("/usr/bin/systemctl", ["--system", "daemon-reload"]);
-    for (const unit of [controlUnit, brokerUnit, forwarderUnit, mcpUnit]) {
+    for (const unit of [controlUnit, brokerUnit, forwarderUnit, mcpUnit, probeUnit]) {
       if (properties(unit, ["LoadState"]).get("LoadState") !== "not-found") {
         throw new Error("Forwarder fixture unit remained installed: " + unit);
       }

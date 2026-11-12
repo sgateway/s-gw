@@ -7,6 +7,7 @@ import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSock
   brokerUnitInvocation, linuxManagedControlMaxFrame, unsafeStartupEnv,
   type LinuxManagedPlanRecord } from "./linux-agent-control.js";
 import { linuxAgentIdentityDir } from "./linux-agent-identity.js";
+import { discoverLinuxForwarderElfClosure, type LinuxForwarderElfClosure } from "./linux-forwarder-elf.js";
 import { linuxForwarderIdentityDir, linuxForwarderIdentityRecord } from "./linux-forwarder-identity.js";
 import { linuxAgentUnitName } from "./linux-agent-unit.js";
 import { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle,
@@ -20,6 +21,7 @@ interface FileState {
   uid: number;
   gid: number;
   mode: number;
+  specialBits?: number;
   nlink: number;
   size: number;
   dev: number;
@@ -42,6 +44,7 @@ export interface LinuxManagedInstallHost {
   read(filename: string): Promise<string>;
   list?(directory: string): Promise<string[]>;
   sha256?(filename: string): Promise<string>;
+  elfClosure?(nodePath: string): Promise<LinuxForwarderElfClosure>;
   ensureDirectory(filename: string, uid: number, gid: number, mode: number): Promise<boolean>;
   publish(filename: string, content: string, uid: number, gid: number, mode: number): Promise<SavedFile>;
   replace(filename: string, before: SavedFile, content: string,
@@ -268,6 +271,9 @@ async function checkForwarderRoot(host: LinuxManagedInstallHost,
   if (!forwarder) return;
   await checkedDirectory(host, forwarder.rootDirectory, 0, 0, 0o755);
   await checkedDirectory(host, `${forwarder.rootDirectory}/run/s-gw`, 0, 0, 0o755);
+  if (await host.file(`${forwarder.rootDirectory}/etc`)) {
+    throw new Error("Linux forwarder root cannot contain loader configuration.");
+  }
   const packageFile = `${forwarder.rootDirectory}${input.record.brokerRuntimeRoot}/package.json`;
   const packageState = await host.file(packageFile);
   await checkedFile(host, packageFile, 0, 0, 0o644);
@@ -281,10 +287,87 @@ async function checkForwarderRoot(host: LinuxManagedInstallHost,
     const inside = await checkedFile(host, `${forwarder.rootDirectory}${filename}`, 0, 0);
     const hostState = await host.file(hostFile.filename);
     const insideState = await host.file(inside.filename);
+    const access = filename === input.record.brokerNode ? 0o005 : 0o004;
     if (!hostState || !insideState || hostState.size !== insideState.size ||
+        hostState.specialBits !== 0 || insideState.specialBits !== 0 ||
+        (hostState.mode & access) !== access || (insideState.mode & access) !== access ||
         await host.sha256(hostFile.filename) !== await host.sha256(inside.filename)) {
       throw new Error("Linux forwarder root does not contain its trusted runtime.");
     }
+  }
+  if (!host.elfClosure || !host.list) {
+    throw new Error("Linux forwarder ELF closure cannot be verified.");
+  }
+  const closure = await host.elfClosure(input.record.brokerNode);
+  if (!closure || !Array.isArray(closure.files) || closure.files.length < 1 ||
+      closure.files.length > 64 || !closure.files.some(file =>
+        file.targetPath === closure.interpreter && (file.mode & 0o111) !== 0)) {
+    throw new Error("Linux forwarder ELF closure has no trusted interpreter.");
+  }
+  const targets = new Set<string>();
+  const directories = new Set<string>();
+  for (const file of closure.files) {
+    if (!file || typeof file.sourcePath !== "string" ||
+        typeof file.targetPath !== "string" || !path.isAbsolute(file.sourcePath) ||
+        path.resolve(file.sourcePath) !== file.sourcePath ||
+        !["/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/"].some(prefix =>
+          file.sourcePath.startsWith(prefix)) ||
+        !path.isAbsolute(file.targetPath) || path.resolve(file.targetPath) !== file.targetPath ||
+        !["/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/"].some(prefix =>
+          file.targetPath.startsWith(prefix)) ||
+        !/^[a-f0-9]{64}$/.test(file.sha256) ||
+        !Number.isInteger(file.mode) || (file.mode & 0o777) !== file.mode ||
+        (file.mode & 0o426) !== 0o404 ||
+        (file.targetPath === closure.interpreter && (file.mode & 0o001) === 0) ||
+        targets.has(file.targetPath)) {
+      throw new Error("Linux forwarder ELF closure has an unsafe library path.");
+    }
+    targets.add(file.targetPath);
+    let parent = path.dirname(file.targetPath);
+    while (parent !== "/") {
+      directories.add(parent);
+      parent = path.dirname(parent);
+    }
+    const source = await checkedFile(host, file.sourcePath, 0, 0, file.mode);
+    const inside = await checkedFile(host, `${forwarder.rootDirectory}${file.targetPath}`,
+      0, 0, file.mode);
+    const sourceState = await host.file(source.filename);
+    const insideState = await host.file(inside.filename);
+    if (!sourceState || !insideState || sourceState.size !== insideState.size ||
+        sourceState.specialBits !== 0 || insideState.specialBits !== 0 ||
+        await host.sha256(source.filename) !== file.sha256 ||
+        await host.sha256(inside.filename) !== file.sha256) {
+      throw new Error("Linux forwarder ELF closure differs from the trusted host runtime.");
+    }
+  }
+  const seen = new Set<string>();
+  let entries = 0;
+  async function scan(relative: string, depth: number): Promise<void> {
+    const filename = `${forwarder!.rootDirectory}${relative}`;
+    const item = await host.file(filename);
+    if (!item) return;
+    if (!directories.has(relative) || depth > 8 || ++entries > 256) {
+      throw new Error("Linux forwarder ELF closure contains an unexpected path.");
+    }
+    await checkedDirectory(host, filename, 0, 0, 0o755);
+    for (const name of await host.list!(filename)) {
+      if (!/^[A-Za-z0-9_.+-]+$/.test(name) || name === "." || name === "..") {
+        throw new Error("Linux forwarder ELF closure contains an invalid name.");
+      }
+      const child = `${relative}/${name}`;
+      const state = await host.file(`${forwarder!.rootDirectory}${child}`);
+      if (state?.kind === "directory") await scan(child, depth + 1);
+      else if (state?.kind === "file" && targets.has(child)) {
+        seen.add(child);
+        if (++entries > 256) throw new Error("Linux forwarder ELF closure is too large.");
+      } else {
+        throw new Error("Linux forwarder ELF closure contains an unexpected path.");
+      }
+    }
+  }
+  for (const base of ["/lib", "/lib64", "/usr/lib", "/usr/lib64"]) await scan(base, 0);
+  if (seen.size !== targets.size) {
+    throw new Error("Linux forwarder ELF closure is incomplete.");
   }
 }
 
@@ -340,7 +423,8 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
     "PrivateNetwork", "PrivateIPC", "PrivateTmp", "PrivatePIDs", "MountFlags", "BindLogSockets",
     "ProtectHome", "ProtectSystem",
     "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictNamespaces",
-    "SystemCallArchitectures", "KillMode", "BindReadOnlyPaths", "BindsTo", "After", "ExecStart"]));
+    "SystemCallArchitectures", "KillMode", "UnsetEnvironment", "BindReadOnlyPaths",
+    "BindsTo", "After", "ExecStart"]));
   const wanted = new Map([
     ["Id", name], ["LoadState", "loaded"], ["ActiveState", "inactive"],
     ["FragmentPath", forwarder.unitFile], ["DropInPaths", ""],
@@ -352,6 +436,7 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
     ["ProtectHome", "yes"], ["ProtectSystem", "strict"],
     ["NoNewPrivileges", "yes"], ["RestrictNamespaces", "yes"],
     ["SystemCallArchitectures", "native"], ["KillMode", "control-group"],
+    ["UnsetEnvironment", unsafeStartupEnv.join(" ")],
     ["BindReadOnlyPaths", `${input.record.plan.brokerSocket}:/run/s-gw/broker.sock ` +
       `/run/s-gw/forwarder-proofs/${input.record.plan.sessionId}.json:/run/s-gw/forwarder-attestation.json`]
   ]);
@@ -785,7 +870,8 @@ async function checkedSocketNode(host: LinuxManagedInstallHost,
 function nativeState(value: Stats): FileState {
   return { kind: value.isFile() ? "file" : value.isDirectory() ? "directory" :
     value.isSocket() ? "socket" : "other", uid: value.uid, gid: value.gid,
-    mode: value.mode & 0o777, nlink: value.nlink, size: value.size, dev: value.dev, ino: value.ino };
+    mode: value.mode & 0o777, specialBits: value.mode & 0o7000,
+    nlink: value.nlink, size: value.size, dev: value.dev, ino: value.ino };
 }
 
 async function nativeFile(filename: string): Promise<FileState | undefined> {
@@ -858,6 +944,7 @@ export const nativeLinuxInstallHost: LinuxManagedInstallHost = {
     input.once("error", reject);
     input.once("end", () => resolve(hash.digest("hex")));
   }),
+  elfClosure: discoverLinuxForwarderElfClosure,
   async ensureDirectory(filename, uid, gid, mode) {
     if (await nativeFile(filename)) return false;
     await mkdir(filename, { mode });

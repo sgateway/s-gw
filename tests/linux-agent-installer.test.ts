@@ -63,7 +63,8 @@ function approved(input: LinuxManagedInstallPlan, requestId = "req_approved"): R
 }
 
 interface FakeFile { kind: "file" | "directory" | "socket" | "other"; uid: number; gid: number;
-  mode: number; nlink: number; size: number; dev: number; ino: number; text?: string }
+  mode: number; specialBits: number; nlink: number; size: number; dev: number; ino: number;
+  text?: string }
 
 class Host implements LinuxManagedInstallHost {
   files = new Map<string, FakeFile>();
@@ -82,7 +83,7 @@ class Host implements LinuxManagedInstallHost {
   nextIno = 10;
   constructor(readonly input: LinuxManagedInstallPlan) {
     for (const dir of ["/", "/run", "/run/systemd", "/run/systemd/system", "/run/s-gw",
-      "/usr", "/usr/libexec", "/usr/libexec/s-gw", "/usr/libexec/s-gw/control",
+      "/usr", "/usr/lib", "/usr/libexec", "/usr/libexec/s-gw", "/usr/libexec/s-gw/control",
       "/usr/libexec/s-gw/dist", "/var", "/var/lib"]) {
       this.add(dir, "directory", "", 0, 0, 0o755);
     }
@@ -105,12 +106,21 @@ class Host implements LinuxManagedInstallHost {
         0, 0, 0o644);
       this.add("/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js",
         "file", "trusted runtime", 0, 0, 0o644);
+      for (const dir of ["/usr/lib/x86_64-linux-gnu", `${root}/lib`, `${root}/lib64`,
+        `${root}/lib/x86_64-linux-gnu`]) {
+        this.add(dir, "directory", "", 0, 0, 0o755);
+      }
+      this.add("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "file", "loader", 0, 0, 0o755);
+      this.add("/usr/lib/x86_64-linux-gnu/libc.so.6", "file", "libc", 0, 0, 0o755);
+      this.add(`${root}/lib64/ld-linux-x86-64.so.2`, "file", "loader", 0, 0, 0o755);
+      this.add(`${root}/lib/x86_64-linux-gnu/libc.so.6`, "file", "libc", 0, 0, 0o755);
       this.add(`${input.control.runtimeRoot}/s-gw-linux-netns`, "file", "helper", 0, 0, 0o755);
     }
   }
   add(filename: string, kind: FakeFile["kind"], text: string, uid: number, gid: number, mode: number) {
     const ino = ++this.nextIno;
-    this.files.set(filename, { kind, uid, gid, mode, nlink: 1, size: text.length,
+    this.files.set(filename, { kind, uid, gid, mode: mode & 0o777, specialBits: mode & 0o7000,
+      nlink: 1, size: text.length,
       dev: 1, ino, text });
     return { filename, dev: 1, ino };
   }
@@ -141,6 +151,16 @@ class Host implements LinuxManagedInstallHost {
   }
   async sha256(filename: string) {
     return createHash("sha256").update(await this.read(filename)).digest("hex");
+  }
+  async elfClosure(_nodePath: string) {
+    const files = [
+      { sourcePath: "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        targetPath: "/lib64/ld-linux-x86-64.so.2", mode: 0o755 },
+      { sourcePath: "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        targetPath: "/lib/x86_64-linux-gnu/libc.so.6", mode: 0o755 }
+    ];
+    return { interpreter: "/lib64/ld-linux-x86-64.so.2", files: await Promise.all(files.map(async file =>
+      ({ ...file, sha256: await this.sha256(file.sourcePath) }))) };
   }
   async ensureDirectory(filename: string, uid: number, gid: number, mode: number) {
     if (this.files.has(filename)) return false;
@@ -230,6 +250,7 @@ class Host implements LinuxManagedInstallHost {
       "ProtectHome=yes", "ProtectSystem=strict",
       "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=",
       "RestrictNamespaces=yes", "SystemCallArchitectures=native", "KillMode=control-group",
+      `UnsetEnvironment=${unsafeEnv}`,
       `BindReadOnlyPaths=${r.plan.brokerSocket}:/run/s-gw/broker.sock ` +
         `/run/s-gw/forwarder-proofs/${r.plan.sessionId}.json:/run/s-gw/forwarder-attestation.json`,
       `BindsTo=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
@@ -444,6 +465,78 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
     host.files.get(filename)!.text = '{"type":"commonjs"}\n';
     await expect(new LinuxManagedUnitInstaller(host).stage(input))
       .rejects.toThrow(/ES module metadata/);
+  });
+
+  it("refuses loader configuration inside the forwarder root", async () => {
+    const input = withForwarder();
+    for (const configName of ["ld.so.preload", "ld.so.cache"]) {
+      const host = new Host(input);
+      const root = input.record.mcpForwarder!.rootDirectory;
+      host.add(`${root}/etc`, "directory", "", 0, 0, 0o755);
+      host.add(`${root}/etc/${configName}`, "file", "/run/s-gw/unsafe.so\n", 0, 0, 0o644);
+      await expect(new LinuxManagedUnitInstaller(host).stage(input))
+        .rejects.toThrow(/loader configuration/);
+    }
+  });
+
+  it("requires the forwarder unit to clear loader environment overrides", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.forwarderProperties.set("UnsetEnvironment", "");
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/UnsetEnvironment/);
+  });
+
+  it("refuses a forwarder root with a missing ELF interpreter", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.files.delete(`${input.record.mcpForwarder!.rootDirectory}/lib64/ld-linux-x86-64.so.2`);
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/forwarder ELF closure|Untrusted Linux provisioner file/i);
+  });
+
+  it("refuses a forwarder root with a changed or writable dependency", async () => {
+    const input = withForwarder();
+    for (const change of ["content", "mode"]) {
+      const host = new Host(input);
+      const filename = `${input.record.mcpForwarder!.rootDirectory}/lib/x86_64-linux-gnu/libc.so.6`;
+      if (change === "content") host.files.get(filename)!.text = "changed libc";
+      else host.files.get(filename)!.mode = 0o777;
+      await expect(new LinuxManagedUnitInstaller(host).stage(input))
+        .rejects.toThrow(/forwarder ELF closure|Untrusted Linux provisioner file/i);
+    }
+  });
+
+  it("refuses special permission bits on forwarder runtime files", async () => {
+    const input = withForwarder();
+    const root = input.record.mcpForwarder!.rootDirectory;
+    for (const filename of [input.record.brokerNode,
+      `${root}/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js`,
+      "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      `${root}/lib64/ld-linux-x86-64.so.2`]) {
+      const host = new Host(input);
+      host.files.get(filename)!.specialBits = 0o4000;
+      await expect(new LinuxManagedUnitInstaller(host).stage(input))
+        .rejects.toThrow(/trusted runtime|forwarder ELF closure/);
+    }
+  });
+
+  it("refuses an unexpected library in the forwarder root", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.add(`${input.record.mcpForwarder!.rootDirectory}/lib/x86_64-linux-gnu/extra.so`,
+      "file", "unexpected", 0, 0, 0o644);
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/forwarder ELF closure/i);
+  });
+
+  it("refuses a writable directory in the forwarder library path", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.files.get(`${input.record.mcpForwarder!.rootDirectory}/lib/x86_64-linux-gnu`)!.mode =
+      0o777;
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/Untrusted Linux provisioner parent/i);
   });
 
   it("accepts systemd's recursive bind readback for the staged forwarder", async () => {
