@@ -86,6 +86,33 @@ describe("Windows broker launch control", () => {
     }
   });
 
+  it("uses current native probes and rejects a replaced stop signal", async () => {
+    const native = nativeChecks();
+    const session = registerWindowsAgentLaunch(
+      new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper), identity(), native, () => {});
+    native.dnsBoundaryReady = () => false;
+    await expect(session.pipes.openOnce(async () => Buffer.from("ok"))).rejects.toThrow("dnsBoundaryReady");
+    await session.confirmDrained();
+
+    const otherNative = nativeChecks();
+    const other = registerWindowsAgentLaunch(
+      new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper), identity(), otherNative, () => {});
+    otherNative.stopped = new AbortController().signal;
+    await expect(other.pipes.openOnce(async () => Buffer.from("ok"))).rejects.toThrow("stop signal changed");
+    await other.confirmDrained();
+
+    const duringNative = nativeChecks();
+    const during = registerWindowsAgentLaunch(
+      new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper), identity(), duringNative, () => {});
+    duringNative.dnsBoundaryReady = () => {
+      duringNative.stopped = new AbortController().signal;
+      return true;
+    };
+    await expect(during.pipes.openOnce(async () => Buffer.from("ok")))
+      .rejects.toThrow("during a native check");
+    await during.confirmDrained();
+  });
+
   it("keeps native pipe opening disabled after adapter registration", async () => {
     const registry = new WindowsAgentPipeRegistry(
       String.raw`C:\Program Files\s-gw\s-gw-windows-peer-identity.exe`, undefined, "a".repeat(64), async () => {});

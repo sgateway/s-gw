@@ -138,6 +138,22 @@ describe("Windows named-pipe session foundation", () => {
     await session.revokeAndDrain();
   });
 
+  it("does not dispatch after a native check revokes the launch", async () => {
+    const lease = launchLease();
+    let armed = false;
+    let checks = 0;
+    lease.assertLive = () => {
+      if (armed && ++checks === 3) lease.stoppedBy.abort();
+    };
+    const session = new WindowsAgentPipeRegistry("ignored-test-helper", fakeHelper(goodHelper).start)
+      .registerLaunched(identity(), lease);
+    const onRequest = vi.fn(async () => Buffer.from("ok"));
+    armed = true;
+    await expect(session.openOnce(onRequest)).rejects.toThrow("session ended");
+    expect(onRequest).not.toHaveBeenCalled();
+    await session.revokeAndDrain();
+  });
+
   it("rechecks native liveness inside a broker request before execution", async () => {
     const lease = launchLease();
     let live = true;

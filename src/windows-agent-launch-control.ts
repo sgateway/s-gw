@@ -16,7 +16,10 @@ export interface WindowsBrokerLaunchSession {
   confirmDrained(): Promise<void>;
 }
 
-function requireReady(name: string, probe: unknown, owner: WindowsRetainedAgentBoundary): void {
+type BoundaryProbe = Exclude<keyof WindowsRetainedAgentBoundary, "stopped">;
+
+function requireReady(name: BoundaryProbe, owner: WindowsRetainedAgentBoundary): void {
+  const probe = owner[name];
   if (typeof probe !== "function") throw new Error(`${name} is unavailable.`);
   const result: unknown = probe.call(owner);
   if (result === true) return;
@@ -32,18 +35,19 @@ export function registerWindowsAgentLaunch(registry: WindowsAgentPipeRegistry,
   if (!native || typeof reserveDurably !== "function") {
     throw new Error("Windows broker launch needs native checks and durable reservation.");
   }
-  const child = native.childHandleLive;
-  const job = native.jobHandleConfined;
-  const wfp = native.wfpSessionHealthy;
-  const dns = native.dnsBoundaryReady;
+  const stopped = native.stopped;
   const lease: WindowsAgentLaunchLease = {
-    stopped: native.stopped,
+    stopped,
     reserveDurably,
     assertLive: () => {
-      requireReady("childHandleLive", child, native);
-      requireReady("jobHandleConfined", job, native);
-      requireReady("wfpSessionHealthy", wfp, native);
-      requireReady("dnsBoundaryReady", dns, native);
+      if (native.stopped !== stopped) throw new Error("Windows launcher stop signal changed.");
+      requireReady("childHandleLive", native);
+      requireReady("jobHandleConfined", native);
+      requireReady("wfpSessionHealthy", native);
+      requireReady("dnsBoundaryReady", native);
+      if (native.stopped !== stopped || stopped.aborted) {
+        throw new Error("Windows launcher stopped or changed its stop signal during a native check.");
+      }
     }
   };
   const pipes = registry.registerLaunched(identity, lease);

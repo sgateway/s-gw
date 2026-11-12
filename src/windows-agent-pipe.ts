@@ -160,6 +160,9 @@ export class WindowsAgentPipeRegistry {
     if (!live.launch) return;
     try {
       this.assertLaunchLive(live.launch);
+      if (live.ended || live.launch.stopped.aborted) {
+        throw new Error("Windows agent session ended during a native check.");
+      }
     } catch (error) {
       live.ended = true;
       if (live.launch && live.stoppedListener) {
