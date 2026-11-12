@@ -3,7 +3,8 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { requestAgentIdentity } from "../src/agent-context.js";
-import { WindowsAgentPipeRegistry, type WindowsAgentPipeIdentity } from "../src/windows-agent-pipe.js";
+import { WindowsAgentPipeRegistry, type WindowsAgentLaunchLease,
+  type WindowsAgentPipeIdentity } from "../src/windows-agent-pipe.js";
 
 const oldTestMode = process.env.SGW_TEST_MODE;
 const nativeHelperPath = String.raw`C:\Program Files\s-gw\s-gw-windows-peer-identity.exe`;
@@ -36,6 +37,15 @@ function fakeHelper(script: string) {
       launches.push(args);
       return spawn(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
     }
+  };
+}
+
+function launchLease(stopped = new AbortController()): WindowsAgentLaunchLease & { stoppedBy: AbortController } {
+  return {
+    stopped: stopped.signal,
+    stoppedBy: stopped,
+    reserveDurably: () => {},
+    assertLive: () => {}
   };
 }
 
@@ -75,6 +85,78 @@ describe("Windows named-pipe session foundation", () => {
     expect(inspect).toHaveBeenCalledWith(nativeHelperPath, nativeHelperHash);
     expect(onRequest).not.toHaveBeenCalled();
     session.revoke();
+  });
+
+  it("keeps native opening disabled after a synthetic launcher registration", async () => {
+    const inspect = vi.fn(async () => {});
+    const registry = new WindowsAgentPipeRegistry(nativeHelperPath, undefined, nativeHelperHash, inspect);
+    const lease = launchLease();
+    const reserve = vi.spyOn(lease, "reserveDurably");
+    const session = registry.registerLaunched(identity(), lease);
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(Object.isFrozen(reserve.mock.calls[0][0])).toBe(true);
+    await expect(session.openOnce(async () => Buffer.from("ok")))
+      .rejects.toThrow("verified launcher and egress controls");
+    expect(inspect).toHaveBeenCalledOnce();
+    await session.revokeAndDrain();
+  });
+
+  it("burns a launch identity when durable reservation fails", () => {
+    const registry = new WindowsAgentPipeRegistry("ignored-test-helper", fakeHelper(goodHelper).start);
+    const lease = launchLease();
+    lease.reserveDurably = () => { throw new Error("durable identity store unavailable"); };
+    expect(() => registry.registerLaunched(identity(), lease)).toThrow("durable identity store unavailable");
+    expect(() => registry.registerLaunched(identity(), launchLease())).toThrow("already used");
+  });
+
+  it("rejects asynchronous native checks instead of treating them as attestation", () => {
+    const registry = new WindowsAgentPipeRegistry("ignored-test-helper", fakeHelper(goodHelper).start);
+    const asyncLive = launchLease();
+    asyncLive.assertLive = async () => {};
+    expect(() => registry.registerLaunched(identity(), asyncLive)).toThrow("must finish synchronously");
+
+    const asyncReserve = launchLease();
+    asyncReserve.reserveDurably = async () => {};
+    const next = identity({ appContainerSid: "S-1-15-2-555-666", sessionId: "windows-session-2",
+      jobName: String.raw`Local\s-gw-agent-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` });
+    expect(() => registry.registerLaunched(next, asyncReserve)).toThrow("must finish synchronously");
+  });
+
+  it("rejects a stopped or stale launcher before opening a pipe", async () => {
+    const registry = new WindowsAgentPipeRegistry("ignored-test-helper", fakeHelper(goodHelper).start);
+    const stopped = launchLease();
+    stopped.stoppedBy.abort();
+    expect(() => registry.registerLaunched(identity(), stopped)).toThrow("live AppContainer launcher lease");
+
+    const lease = launchLease();
+    let live = true;
+    lease.assertLive = () => { if (!live) throw new Error("native Job or WFP session is gone"); };
+    const session = registry.registerLaunched(identity(), lease);
+    live = false;
+    await expect(session.openOnce(async () => Buffer.from("ok")))
+      .rejects.toThrow("native Job or WFP session is gone");
+    await session.revokeAndDrain();
+  });
+
+  it("rechecks native liveness inside a broker request before execution", async () => {
+    const lease = launchLease();
+    let live = true;
+    lease.assertLive = () => { if (!live) throw new Error("native Job or WFP session is gone"); };
+    const session = new WindowsAgentPipeRegistry("ignored-test-helper", fakeHelper(goodHelper).start)
+      .registerLaunched(identity(), lease);
+    let release!: () => void;
+    const mayContinue = new Promise<void>(resolve => { release = resolve; });
+    const exchange = await session.openOnce(async (_request, _principal, _signal, agentSession) => {
+      agentSession.assertActive();
+      await mayContinue;
+      live = false;
+      agentSession.assertActive();
+      return Buffer.from("ok");
+    });
+    release();
+    await expect(exchange.completed).rejects.toThrow("launcher lost liveness");
+    await session.revokeAndDrain();
+    await expect(session.openOnce(async () => Buffer.from("ok"))).rejects.toThrow("session ended");
   });
 
   it("does not open a native pipe after the helper check fails or the session ends", async () => {
@@ -232,5 +314,74 @@ describe("Windows named-pipe session foundation", () => {
     session.revoke();
     expect(callbackSignal?.aborted).toBe(true);
     await expect(exchange.completed).rejects.toThrow("session ended");
+  });
+
+  it("holds native revocation until the helper exits and broker callback settles", async () => {
+    const lease = launchLease();
+    const helper = fakeHelper(goodHelper);
+    const session = new WindowsAgentPipeRegistry("ignored-test-helper", helper.start)
+      .registerLaunched(identity(), lease);
+    let started!: () => void;
+    let finish!: () => void;
+    const callbackStarted = new Promise<void>(resolve => { started = resolve; });
+    const releaseCallback = new Promise<void>(resolve => { finish = resolve; });
+    let callbackSignal: AbortSignal | undefined;
+    const exchange = await session.openOnce(async (_request, _principal, _signal, agentSession) => {
+      callbackSignal = agentSession.signal;
+      started();
+      await releaseCallback;
+      agentSession.assertActive();
+      return Buffer.from("ok");
+    });
+    const completed = expect(exchange.completed).rejects.toThrow("session ended");
+    await callbackStarted;
+    let drained = false;
+    const draining = session.revokeAndDrain().then(() => { drained = true; });
+    expect(callbackSignal?.aborted).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(drained).toBe(false);
+    finish();
+    await completed;
+    await draining;
+    expect(drained).toBe(true);
+  });
+
+  it("does not confirm native revocation while a killed helper remains open", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stdin: new PassThrough(), stderr: new PassThrough(),
+      kill: vi.fn(() => true)
+    });
+    const start = (): ChildProcessWithoutNullStreams => {
+      queueMicrotask(() => child.stdout.write("R"));
+      return child as unknown as ChildProcessWithoutNullStreams;
+    };
+    const session = new WindowsAgentPipeRegistry("ignored-test-helper", start)
+      .registerLaunched(identity(), launchLease());
+    const exchange = await session.openOnce(async () => Buffer.from("ok"));
+    const completed = expect(exchange.completed).rejects.toThrow("session ended");
+    let drained = false;
+    const draining = session.revokeAndDrain().then(() => { drained = true; });
+    await completed;
+    await Promise.resolve();
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(drained).toBe(false);
+    child.emit("close", null);
+    await draining;
+    expect(drained).toBe(true);
+  });
+
+  it("aborts a launched session when its native stop signal fires", async () => {
+    const lease = launchLease();
+    const helper = fakeHelper("process.stdout.write('R'); setInterval(() => {}, 1000);");
+    const onRequest = vi.fn(async () => Buffer.from("ok"));
+    const session = new WindowsAgentPipeRegistry("ignored-test-helper", helper.start)
+      .registerLaunched(identity(), lease);
+    const exchange = await session.openOnce(onRequest);
+    const completed = expect(exchange.completed).rejects.toThrow("session ended");
+    lease.stoppedBy.abort();
+    await completed;
+    await session.revokeAndDrain();
+    expect(onRequest).not.toHaveBeenCalled();
+    await expect(session.openOnce(onRequest)).rejects.toThrow("session ended");
   });
 });

@@ -29,13 +29,32 @@ export interface WindowsPipeExchange {
 }
 
 export type WindowsPipeRequestHandler = (request: Buffer, principal: VerifiedAgentPrincipal,
-  signal: AbortSignal) => Promise<Buffer>;
+  signal: AbortSignal, session: WindowsPipeAgentSession) => Promise<Buffer>;
+
+export interface WindowsPipeAgentSession {
+  readonly signal: AbortSignal;
+  assertActive(): void;
+}
+
+// This is a trusted in-process launcher hook, never agent IPC.
+export interface WindowsAgentLaunchLease {
+  readonly stopped: AbortSignal;
+  reserveDurably(identity: Readonly<WindowsAgentPipeIdentity>): void;
+  assertLive(): void;
+}
+
+export interface WindowsPipeRegistration {
+  openOnce(onRequest: WindowsPipeRequestHandler, timeoutMs?: number): Promise<WindowsPipeExchange>;
+  revoke(): void;
+  revokeAndDrain(): Promise<void>;
+}
 
 type HelperStart = (helperPath: string, args: string[]) => ChildProcessWithoutNullStreams;
 type HelperInspection = (helperPath: string, expectedSha256: string) => Promise<void>;
 
 interface RunningExchange {
   cancel(error: Error): void;
+  drained: Promise<void>;
 }
 
 interface LiveWindowsSession {
@@ -44,6 +63,8 @@ interface LiveWindowsSession {
   exchanges: Set<RunningExchange>;
   opening: number;
   ended: boolean;
+  launch?: WindowsAgentLaunchLease;
+  stoppedListener?: () => void;
 }
 
 export class WindowsAgentPipeRegistry {
@@ -68,36 +89,96 @@ export class WindowsAgentPipeRegistry {
     }
   }
 
-  register(identity: WindowsAgentPipeIdentity): {
-    openOnce(onRequest: WindowsPipeRequestHandler, timeoutMs?: number): Promise<WindowsPipeExchange>;
-    revoke(): void;
-  } {
-    validateIdentity(identity);
+  register(identity: WindowsAgentPipeIdentity): WindowsPipeRegistration {
+    return this.registerSession(identity);
+  }
+
+  registerLaunched(identity: WindowsAgentPipeIdentity, launch: WindowsAgentLaunchLease): WindowsPipeRegistration {
+    if (!identity.appContainerSid || !launch || typeof launch.assertLive !== "function" ||
+        typeof launch.reserveDurably !== "function" || !launch.stopped ||
+        typeof launch.stopped.addEventListener !== "function" ||
+        typeof launch.stopped.removeEventListener !== "function" ||
+        typeof launch.stopped.aborted !== "boolean" || launch.stopped.aborted) {
+      throw new Error("A Windows native pipe session needs a live AppContainer launcher lease.");
+    }
+    const attested = Object.freeze({ ...identity });
+    validateIdentity(attested);
+    this.consumeIdentity(attested);
+    this.assertLaunchLive(launch);
+    assertSyncResult(launch.reserveDurably(attested), "Windows durable identity reservation");
+    this.assertLaunchLive(launch);
+    if (launch.stopped.aborted) {
+      throw new Error("Windows agent launcher stopped during registration.");
+    }
+    return this.registerSession(attested, launch, true);
+  }
+
+  private consumeIdentity(identity: WindowsAgentPipeIdentity): void {
     const key = (identity.appContainerSid || identity.userSid).toLowerCase();
     if (this.usedIdentities.has(key) || this.usedSessionIds.has(identity.sessionId) ||
         this.usedJobNames.has(identity.jobName.toLowerCase())) {
       throw new Error("This Windows agent identity, session, or Job was already used by this broker.");
     }
-    const principal = principalForVerifiedPeer(`win32:sid:${key}`, identity.name, identity.sessionId);
-    const live: LiveWindowsSession = { identity: { ...identity }, principal, exchanges: new Set(), opening: 0,
-      ended: false };
     this.usedIdentities.add(key);
     this.usedSessionIds.add(identity.sessionId);
     this.usedJobNames.add(identity.jobName.toLowerCase());
-    return {
+  }
+
+  private registerSession(identity: WindowsAgentPipeIdentity, launch?: WindowsAgentLaunchLease,
+    consumed = false): WindowsPipeRegistration {
+    validateIdentity(identity);
+    if (!consumed) this.consumeIdentity(identity);
+    const key = (identity.appContainerSid || identity.userSid).toLowerCase();
+    const principal = principalForVerifiedPeer(`win32:sid:${key}`, identity.name, identity.sessionId);
+    const live: LiveWindowsSession = { identity: { ...identity }, principal, exchanges: new Set(), opening: 0,
+      ended: false, launch };
+    const session: WindowsPipeRegistration = {
       openOnce: (onRequest, timeoutMs = defaultExchangeTimeoutMs) => this.openOnce(live, onRequest, timeoutMs),
       revoke: () => {
         if (live.ended) return;
         live.ended = true;
+        if (launch && live.stoppedListener) launch.stopped.removeEventListener("abort", live.stoppedListener);
         for (const exchange of live.exchanges) exchange.cancel(new Error("Windows agent session ended."));
+      },
+      revokeAndDrain: async () => {
+        session.revoke();
+        await Promise.all([...live.exchanges].map(exchange => exchange.drained));
       }
     };
+    if (launch) {
+      live.stoppedListener = session.revoke;
+      launch.stopped.addEventListener("abort", session.revoke, { once: true });
+      if (launch.stopped.aborted) session.revoke();
+    }
+    return session;
+  }
+
+  private assertActive(live: LiveWindowsSession): void {
+    if (live.ended || live.launch?.stopped.aborted) {
+      throw new Error("Windows agent session ended.");
+    }
+    if (!live.launch) return;
+    try {
+      this.assertLaunchLive(live.launch);
+    } catch (error) {
+      live.ended = true;
+      if (live.launch && live.stoppedListener) {
+        live.launch.stopped.removeEventListener("abort", live.stoppedListener);
+      }
+      for (const exchange of live.exchanges) exchange.cancel(new Error("Windows agent launcher lost liveness."));
+      throw error;
+    }
+  }
+
+  private assertLaunchLive(launch: WindowsAgentLaunchLease): void {
+    assertSyncResult(launch.assertLive(), "Windows native liveness check");
   }
 
   private async openOnce(live: LiveWindowsSession,
     onRequest: WindowsPipeRequestHandler,
     timeoutMs: number): Promise<WindowsPipeExchange> {
-    if (live.ended || live.exchanges.size + live.opening >= maxExchangesPerSession) {
+    this.assertActive(live);
+    if (live.exchanges.size + live.opening >= maxExchangesPerSession) {
       throw new Error("Windows agent session is ended or has too many pending exchanges.");
     }
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 35 * 60_000) {
@@ -110,10 +191,10 @@ export class WindowsAgentPipeRegistry {
       identity.logonLuid, String(identity.windowsSessionId), identity.jobName];
     let child: ChildProcessWithoutNullStreams;
     try {
-      if (live.ended) throw new Error("Windows agent session ended.");
+      this.assertActive(live);
       if (this.startHelper === spawnNativeHelper) {
         await this.inspectHelper(this.helperPath, this.expectedHelperSha256!);
-        if (live.ended) throw new Error("Windows agent session ended.");
+        this.assertActive(live);
         throw new Error("Native Windows agent pipes require verified launcher and egress controls.");
       }
       child = this.startHelper(this.helperPath, args);
@@ -131,6 +212,10 @@ export class WindowsAgentPipeRegistry {
     let gotRequest = false;
     let sentResponse = false;
     let settled = false;
+    let childClosed = false;
+    let callbackDone = true;
+    let resolveDrained!: () => void;
+    const drained = new Promise<void>(resolve => { resolveDrained = resolve; });
     const controller = new AbortController();
     const cancel = (error: Error) => {
       if (settled) return;
@@ -141,7 +226,12 @@ export class WindowsAgentPipeRegistry {
       rejectReady(error);
       rejectDone(error);
     };
-    const exchange: RunningExchange = { cancel };
+    const exchange: RunningExchange = { cancel, drained };
+    const finishDrain = () => {
+      if (!childClosed || !callbackDone) return;
+      live.exchanges.delete(exchange);
+      resolveDrained();
+    };
     live.exchanges.add(exchange);
     void completed.catch(() => {});
     const deadline = setTimeout(() => cancel(new Error("Windows pipe exchange timed out.")), timeoutMs);
@@ -167,13 +257,21 @@ export class WindowsAgentPipeRegistry {
       }
       if (buffered.length < size + 5) return;
       gotRequest = true;
+      callbackDone = false;
       const request = Buffer.from(buffered.subarray(5));
       buffered = Buffer.alloc(0);
       void (async () => {
-        if (live.ended) throw new Error("Windows agent session ended.");
-        const response = await onRequest(request, live.principal, controller.signal);
+        this.assertActive(live);
+        const agentSession: WindowsPipeAgentSession = {
+          signal: controller.signal,
+          assertActive: () => {
+            controller.signal.throwIfAborted();
+            this.assertActive(live);
+          }
+        };
+        const response = await onRequest(request, live.principal, controller.signal, agentSession);
         controller.signal.throwIfAborted();
-        if (live.ended) throw new Error("Windows agent session ended.");
+        agentSession.assertActive();
         if (!Buffer.isBuffer(response) || response.length < 1 || response.length > maxMessageBytes) {
           throw new Error("Invalid Windows pipe response size.");
         }
@@ -183,17 +281,23 @@ export class WindowsAgentPipeRegistry {
         response.copy(frame, 5);
         sentResponse = true;
         child.stdin.end(frame);
-      })().catch(error => cancel(error instanceof Error ? error : new Error(String(error))));
+      })().catch(error => cancel(error instanceof Error ? error : new Error(String(error))))
+        .finally(() => { callbackDone = true; finishDrain(); });
     });
     child.stdout.once("error", error => cancel(error));
     child.stdin.once("error", error => cancel(error));
     child.once("error", error => cancel(error));
     child.once("close", code => {
-      live.exchanges.delete(exchange);
+      childClosed = true;
+      finishDrain();
       if (settled) return;
-      if (code !== 0 || !sawReady || !gotRequest || !sentResponse || live.ended) {
+      if (code !== 0 || !sawReady || !gotRequest || !sentResponse || live.ended ||
+          live.launch?.stopped.aborted) {
         cancel(new Error("Windows pipe helper ended before a verified exchange completed."));
         return;
+      }
+      if (live.launch) {
+        try { this.assertActive(live); } catch { return; }
       }
       settled = true;
       clearTimeout(deadline);
@@ -202,7 +306,7 @@ export class WindowsAgentPipeRegistry {
 
     try {
       await ready;
-      if (live.ended) throw new Error("Windows agent session ended.");
+      this.assertActive(live);
       return { pipeName, completed, close: () => cancel(new Error("Windows pipe exchange closed.")) };
     } catch (error) {
       cancel(error instanceof Error ? error : new Error(String(error)));
@@ -210,6 +314,14 @@ export class WindowsAgentPipeRegistry {
       throw error;
     }
   }
+}
+
+function assertSyncResult(result: unknown, operation: string): void {
+  if (result === undefined) return;
+  if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+    void Promise.resolve(result).catch(() => {});
+  }
+  throw new Error(`${operation} must finish synchronously.`);
 }
 
 function validateIdentity(identity: WindowsAgentPipeIdentity): void {
