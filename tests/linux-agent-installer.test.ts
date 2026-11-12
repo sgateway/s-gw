@@ -234,7 +234,8 @@ class Host implements LinuxManagedInstallHost {
         `/run/s-gw/forwarder-proofs/${r.plan.sessionId}.json:/run/s-gw/forwarder-attestation.json`,
       `BindsTo=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
       `After=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
-      `ExecStart={ path=${r.brokerNode} ; argv[]=${r.brokerNode} ${entry} ; ignore_errors=no ; }`];
+      `ExecStart={ path=${r.brokerNode} ; argv[]=${r.brokerNode} ${entry} ; ignore_errors=no ; ` +
+        "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"];
   }
   async unit(unit: string, _fields: string[]) {
     let lines: string[];
@@ -391,6 +392,41 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
     expect(failure?.message).toMatch(/Linux forwarder unit command changed: expected=.*actual=.*\/bin\/sh/);
     expect(failure!.message).not.toContain("x".repeat(513));
     expect(failure!.message.length).toBeLessThan(1500);
+  });
+
+  it("accepts systemd v259's inactive forwarder command readback", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    await expect(new LinuxManagedUnitInstaller(host).stage(input)).resolves.toBeUndefined();
+  });
+
+  const inactiveExecStart = "{ path=/usr/libexec/s-gw/node ; argv[]=/usr/libexec/s-gw/node " +
+    "/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js ; ignore_errors=no ; " +
+    "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
+  it.each([
+    ["a changed executable", inactiveExecStart.replace("path=/usr/libexec/s-gw/node", "path=/bin/sh")],
+    ["a changed argv", inactiveExecStart.replace("argv[]=/usr/libexec/s-gw/node", "argv[]=/bin/sh")],
+    ["an extra argument", inactiveExecStart.replace("forwarder.js ;", "forwarder.js --unsafe ;")],
+    ["ignore_errors enabled", inactiveExecStart.replace("ignore_errors=no", "ignore_errors=yes")],
+    ["an extra command", inactiveExecStart + " { path=/bin/sh ; argv[]=/bin/sh ; ignore_errors=no ; }"],
+    ["an unrecognized field", inactiveExecStart.replace("start_time=", "extra=1 ; start_time=")]
+  ])("rejects forwarder ExecStart with %s", async (_reason, changed) => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.forwarderProperties.set("ExecStart", changed);
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/Linux forwarder unit command changed/);
+  });
+
+  it("refuses a forwarder with stale execution metadata", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.forwarderProperties.set("ExecStart", inactiveExecStart.replace(
+      "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0",
+      "start_time=[Fri 2026-11-13 12:00:00 UTC] ; stop_time=[Fri 2026-11-13 12:00:01 UTC] ; " +
+      "pid=42 ; code=exited ; status=0"));
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/Linux forwarder unit command changed/);
   });
 
   it("refuses a forwarder root that its dedicated UID cannot traverse", async () => {

@@ -380,7 +380,8 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
     }
   }
   const command = `{ path=${input.record.brokerNode} ; argv[]=${input.record.brokerNode} ` +
-    `${forwarderEntry(input)} ; ignore_errors=no ; }`;
+    `${forwarderEntry(input)} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; ` +
+    "pid=0 ; code=(null) ; status=0/0 }";
   const actualCommand = values.get("ExecStart");
   if (actualCommand !== command) {
     throw new Error("Linux forwarder unit command changed: " +
