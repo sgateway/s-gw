@@ -11,6 +11,7 @@ export interface LinuxManagedUnitBundle {
   brokerUnit: string;
   mcpSocketUnit: string;
   modelSocketUnit?: string;
+  forwarderUnit?: string;
 }
 
 export interface LinuxControlUnitRuntime {
@@ -70,6 +71,32 @@ function managedSocketUnit(socketPath: string, group: number, descriptor: string
     `Service=${brokerUnit}\n`;
 }
 
+function managedForwarderUnit(record: LinuxManagedPlanRecord): string {
+  const forwarder = record.mcpForwarder!;
+  const sessionId = record.plan.sessionId;
+  const entry = path.join(path.dirname(record.brokerEntry), "linux-managed-mcp-forwarder.js");
+  const proof = `/run/s-gw/forwarder-proofs/${sessionId}.json`;
+  for (const value of [forwarder.rootDirectory, forwarder.networkNamespacePath,
+    record.plan.brokerSocket, proof, record.brokerNode, entry]) safeUnitLiteral(value);
+  return `[Unit]\nDescription=s-gw managed MCP forwarder\n` +
+    `BindsTo=s-gw-agent-control.service s-gw-agent-${sessionId}.service\n` +
+    `After=s-gw-agent-control.service s-gw-agent-${sessionId}.service\n` +
+    `[Service]\nType=exec\nUser=${forwarder.uid}\nGroup=${forwarder.gid}\n` +
+    `SupplementaryGroups=\nRootDirectory=${forwarder.rootDirectory}\nWorkingDirectory=/\n` +
+    `NetworkNamespacePath=${forwarder.networkNamespacePath}\nPrivateNetwork=yes\n` +
+    `PrivateIPC=yes\nPrivateTmp=yes\nMountFlags=private\nBindLogSockets=no\n` +
+    `TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777\n` +
+    `ProtectHome=yes\nProtectSystem=strict\nPrivateDevices=yes\n` +
+    `NoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\n` +
+    `RestrictNamespaces=yes\nRestrictSUIDSGID=yes\n` +
+    `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nSystemCallArchitectures=native\n` +
+    `KillMode=control-group\n` +
+    `BindReadOnlyPaths=${record.plan.brokerSocket}:/run/s-gw/broker.sock ` +
+    `${proof}:/run/s-gw/forwarder-attestation.json\n` +
+    `UnsetEnvironment=${unsafeStartupEnv.join(" ")}\n` +
+    `ExecStart=${record.brokerNode} ${entry}\nRestart=no\n`;
+}
+
 export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
   record: LinuxManagedPlanRecord, brokerGid: number,
   phase: "prepare" | "runtime"): LinuxManagedUnitBundle {
@@ -77,6 +104,9 @@ export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
     throw new Error("Invalid Linux managed provisioning phase.");
   }
   if (!record?.plan) throw new Error("Linux managed provisioning needs a root plan.");
+  if (record.mcpForwarder && record.plan.modelRelaySocket) {
+    throw new Error("Linux MCP-only forwarder staging has no model relay transport.");
+  }
   validateLinuxManagedPlanRecord(record, record.plan.sessionId, record.plan.brokerUid, brokerGid);
   if (!record.plan.identityGeneration || !record.plan.logicalAgentId) {
     throw new Error("Linux managed provisioning needs a durable identity.");
@@ -116,7 +146,7 @@ export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
         !/^[A-Za-z0-9_-]{1,256}$/.test(relay.requestId))) {
       throw new Error("Linux model relay runtime needs a sealed request ID.");
     }
-  } else if (config.relay || phase === "prepare") {
+  } else if (config.relay || (phase === "prepare" && !record.mcpForwarder)) {
     throw new Error("Linux preparation requires a managed model relay.");
   }
 
@@ -149,7 +179,9 @@ export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
     mcpSocketUnit: managedSocketUnit(record.plan.brokerSocket,
       record.mcpForwarder?.gid ?? record.plan.gid,
       `s-gw-agent-${sessionId}`, unit),
+    ...(record.mcpForwarder ? { forwarderUnit: managedForwarderUnit(record) } : {}),
     ...(record.plan.modelRelaySocket ? { modelSocketUnit: managedSocketUnit(
-      record.plan.modelRelaySocket, record.plan.gid, `s-gw-model-${sessionId}`, unit) } : {})
+      record.plan.modelRelaySocket, record.mcpForwarder?.gid ?? record.plan.gid,
+      `s-gw-model-${sessionId}`, unit) } : {})
   };
 }

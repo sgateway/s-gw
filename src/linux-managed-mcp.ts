@@ -42,6 +42,12 @@ export function validateLinuxManagedMcpConfig(value: LinuxManagedMcpConfig): voi
   if (Boolean(value.relay) !== Boolean(value.plan.modelRelaySocket)) {
     throw new Error("Managed model relay needs its own root-provisioned activated socket.");
   }
+  if (Boolean(value.mcpForwarder) !== Boolean(value.plan.managedForwarderNetworkNamespace)) {
+    throw new Error("Managed MCP forwarder configuration differs from its agent namespace plan.");
+  }
+  if (value.mcpForwarder && value.relay) {
+    throw new Error("Managed MCP forwarder staging does not provide a model relay.");
+  }
   if (value.mcpForwarder && (Object.keys(value.mcpForwarder).sort().join(",") !== "gid,uid" ||
       !Number.isSafeInteger(value.mcpForwarder.uid) || value.mcpForwarder.uid < 1 ||
       !Number.isSafeInteger(value.mcpForwarder.gid) || value.mcpForwarder.gid < 1 ||
@@ -200,7 +206,8 @@ export async function startLinuxManagedMcpSession(config: LinuxManagedMcpConfig,
       activatedFd: fds.mcp, requireLinuxMessageGate: true });
     if (config.relay) {
       relay = await startVerifiedModelRelayServer({ store, approval: approvals!,
-        socketPath: config.plan.modelRelaySocket!, socketGid: config.plan.gid,
+        socketPath: config.plan.modelRelaySocket!,
+        socketGid: config.mcpForwarder?.gid ?? config.plan.gid,
         activatedFd: (fds as { mcp: number; model: number }).model,
         requireLinuxMessageGate: true, requireStrictPayload: true });
     }

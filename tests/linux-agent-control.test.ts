@@ -98,6 +98,20 @@ describe.skipIf(process.platform === "win32")("Linux managed MCP control", () =>
     expect(() => validateLinuxManagedMcpConfig({ ...good, name: " " })).toThrow();
   });
 
+  it("requires the opt-in broker forwarder and agent namespace to be selected together", () => {
+    const managed = { ...plan(), restrictedSocketFamilies: true,
+      logicalAgentId: "managed-session", identityGeneration: "a".repeat(32),
+      managedForwarderNetworkNamespace: "/run/s-gw/netns/managed-session" };
+    const config = { name: "Managed agent", leaseDir: "/run/s-gw/managed-leases", plan: managed,
+      mcpForwarder: { uid: 230002, gid: 230002 } };
+    expect(() => validateLinuxManagedMcpConfig(config)).not.toThrow();
+    expect(() => validateLinuxManagedMcpConfig({ ...config, mcpForwarder: undefined }))
+      .toThrow(/differs from its agent namespace/);
+    expect(() => validateLinuxManagedMcpConfig({ ...config,
+      plan: { ...managed, managedForwarderNetworkNamespace: undefined } }))
+      .toThrow(/differs from its agent namespace/);
+  });
+
   it("requires a strict durable relay grant and matching second socket", () => {
     const managed = { ...plan(), logicalAgentId: "managed-session",
       identityGeneration: "a".repeat(32),

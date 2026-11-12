@@ -493,7 +493,7 @@ try {
   run("chmod", ["-R", "go-w", brokerPackage]);
   const controlFiles = ["linux-agent-control.js", "linux-agent-unit.js",
     "linux-peer-identity.js", "linux-agent-identity.js", "linux-managed-forwarder-attestation.js",
-    "linux-managed-forwarder-binding.js", "model-relay-action.js"];
+    "linux-managed-forwarder-binding.js", "linux-forwarder-identity.js", "model-relay-action.js"];
   for (const filename of controlFiles) {
     const staged = path.join(controlDir, filename);
     await copyRootFile(path.join(project, "dist", filename), staged, 0o644);

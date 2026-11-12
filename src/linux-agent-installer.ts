@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { constants, type Stats } from "node:fs";
-import { chmod, chown, link, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { constants, createReadStream, type Stats } from "node:fs";
+import { chmod, chown, link, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSocketUnit,
   brokerUnitInvocation, linuxManagedControlMaxFrame, unsafeStartupEnv,
   type LinuxManagedPlanRecord } from "./linux-agent-control.js";
 import { linuxAgentIdentityDir } from "./linux-agent-identity.js";
+import { linuxForwarderIdentityDir, linuxForwarderIdentityRecord } from "./linux-forwarder-identity.js";
 import { linuxAgentUnitName } from "./linux-agent-unit.js";
 import { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle,
   type LinuxControlUnitRuntime } from "./linux-agent-provision.js";
@@ -39,6 +40,8 @@ export interface LinuxManagedInstallHost {
   file(filename: string): Promise<FileState | undefined>;
   realpath(filename: string): Promise<string>;
   read(filename: string): Promise<string>;
+  list?(directory: string): Promise<string[]>;
+  sha256?(filename: string): Promise<string>;
   ensureDirectory(filename: string, uid: number, gid: number, mode: number): Promise<boolean>;
   publish(filename: string, content: string, uid: number, gid: number, mode: number): Promise<SavedFile>;
   replace(filename: string, before: SavedFile, content: string,
@@ -47,6 +50,7 @@ export interface LinuxManagedInstallHost {
   unit(unit: string, fields: string[]): Promise<string>;
   action(action: "daemon-reload" | "start" | "stop", unit?: string): Promise<void>;
   account(uid: number): Promise<{ gid: number; groups: number[] }>;
+  networkNamespace?(filename: string, helper: string, operation: "create" | "check"): Promise<void>;
 }
 
 export const linuxManagedInstallPayloadMaxBytes = 256 * 1024;
@@ -170,9 +174,19 @@ async function verifyInstalledFiles(host: LinuxManagedInstallHost,
     [record.brokerConfig, configText, input.brokerGid, 0o640],
     [`/run/s-gw/agent-plans/${record.plan.sessionId}.json`, bundle.planRecord, 0, 0o600],
     [record.brokerUnitFile, bundle.brokerUnit, 0, 0o644],
-    [record.mcpSocketUnitFile, bundle.mcpSocketUnit, 0, 0o644],
-    [record.modelRelaySocketUnitFile!, bundle.modelSocketUnit!, 0, 0o644]
+    [record.mcpSocketUnitFile, bundle.mcpSocketUnit, 0, 0o644]
   ];
+  if (record.modelRelaySocketUnitFile) {
+    expected.push([record.modelRelaySocketUnitFile, bundle.modelSocketUnit!, 0, 0o644]);
+  }
+  if (record.mcpForwarder) {
+    expected.push([record.mcpForwarder.unitFile, bundle.forwarderUnit!, 0, 0o644]);
+    expected.push([`/run/s-gw/forwarder-proofs/${record.plan.sessionId}.json`,
+      "PENDING\n", 0, 0o644]);
+    expected.push([`${record.mcpForwarder.rootDirectory}/run/s-gw/broker.sock`, "", 0, 0o600]);
+    expected.push([`${record.mcpForwarder.rootDirectory}/run/s-gw/forwarder-attestation.json`,
+      "", 0, 0o600]);
+  }
   for (const [filename, content, gid, mode] of expected) {
     await checkedFile(host, filename, 0, gid, mode);
     if (await host.read(filename) !== content) {
@@ -193,10 +207,13 @@ function validateInstallPlan(input: LinuxManagedInstallPlan): void {
       control.unitFile !== `/run/systemd/system/${controlName}` ||
       record.brokerUnitFile !== `/run/systemd/system/${record.brokerUnit}` ||
       record.mcpSocketUnitFile !== `/run/systemd/system/s-gw-managed-mcp-${sessionId}.socket` ||
-      record.modelRelaySocketUnitFile !== `/run/systemd/system/s-gw-managed-model-${sessionId}.socket` ||
+      (record.modelRelaySocketUnitFile !== undefined && record.modelRelaySocketUnitFile !==
+        `/run/systemd/system/s-gw-managed-model-${sessionId}.socket`) ||
       record.brokerConfig !== `/run/s-gw/${sessionId}.json` ||
       config.leaseDir !== "/run/s-gw/managed-leases" ||
-      record.plan.uid === control.brokerUid || record.plan.gid === brokerGid) {
+      record.plan.uid === control.brokerUid || record.plan.gid === brokerGid ||
+      (record.mcpForwarder && record.mcpForwarder.unitFile !==
+        `/run/systemd/system/s-gw-forwarder-${sessionId}.service`)) {
     throw new Error("Linux installer needs the dedicated root control and two-UID runtime layout.");
   }
 }
@@ -241,6 +258,134 @@ async function assertAccountIsolation(host: LinuxManagedInstallHost,
   }
 }
 
+function forwarderEntry(input: LinuxManagedInstallPlan): string {
+  return path.join(path.dirname(input.record.brokerEntry), "linux-managed-mcp-forwarder.js");
+}
+
+async function checkForwarderRoot(host: LinuxManagedInstallHost,
+  input: LinuxManagedInstallPlan): Promise<void> {
+  const forwarder = input.record.mcpForwarder;
+  if (!forwarder) return;
+  await checkedDirectory(host, forwarder.rootDirectory, 0, 0, 0o755);
+  await checkedDirectory(host, `${forwarder.rootDirectory}/run/s-gw`, 0, 0, 0o755);
+  const packageFile = `${forwarder.rootDirectory}${input.record.brokerRuntimeRoot}/package.json`;
+  const packageState = await host.file(packageFile);
+  await checkedFile(host, packageFile, 0, 0, 0o644);
+  if (!packageState || packageState.size > 128 ||
+      await host.read(packageFile) !== '{"type":"module"}\n') {
+    throw new Error("Linux forwarder root needs sealed ES module metadata.");
+  }
+  if (!host.sha256) throw new Error("Linux forwarder root needs a trusted runtime digest check.");
+  for (const filename of [input.record.brokerNode, forwarderEntry(input)]) {
+    const hostFile = await checkedFile(host, filename, 0, 0);
+    const inside = await checkedFile(host, `${forwarder.rootDirectory}${filename}`, 0, 0);
+    const hostState = await host.file(hostFile.filename);
+    const insideState = await host.file(inside.filename);
+    if (!hostState || !insideState || hostState.size !== insideState.size ||
+        await host.sha256(hostFile.filename) !== await host.sha256(inside.filename)) {
+      throw new Error("Linux forwarder root does not contain its trusted runtime.");
+    }
+  }
+}
+
+async function checkForwarderNamespace(host: LinuxManagedInstallHost,
+  input: LinuxManagedInstallPlan, operation: "create" | "check"): Promise<void> {
+  const forwarder = input.record.mcpForwarder;
+  if (!forwarder) return;
+  const helper = `${input.control.runtimeRoot}/s-gw-linux-netns`;
+  const item = await host.file(helper);
+  await checkedFile(host, helper, 0, 0);
+  if (!item || (item.mode & 0o111) === 0 || !host.networkNamespace) {
+    throw new Error("Linux forwarder needs its trusted namespace helper.");
+  }
+  if (operation === "create") {
+    if (await host.file(forwarder.networkNamespacePath)) {
+      throw new Error("Linux forwarder needs a fresh private network namespace.");
+    }
+    await host.networkNamespace(forwarder.networkNamespacePath, helper, "create");
+  }
+  await checkedFile(host, forwarder.networkNamespacePath, 0, 0);
+  await host.networkNamespace(forwarder.networkNamespacePath, helper, "check");
+}
+
+async function rejectAgentIdentityReuse(host: LinuxManagedInstallHost,
+  forwarder: NonNullable<LinuxManagedPlanRecord["mcpForwarder"]>): Promise<void> {
+  if (!host.list) throw new Error("Linux forwarder needs the durable agent identity inventory.");
+  for (const name of await host.list(linuxAgentIdentityDir)) {
+    if (!name.startsWith("generation-")) continue;
+    if (!/^generation-[a-f0-9]{32}\.json$/.test(name)) {
+      throw new Error("Linux agent identity registry has an invalid generation receipt.");
+    }
+    const filename = `${linuxAgentIdentityDir}/${name}`;
+    await checkedFile(host, filename, 0, 0, 0o600);
+    const value = JSON.parse(await host.read(filename)) as Record<string, unknown>;
+    if (!value || typeof value !== "object" ||
+        value.identityGeneration !== name.slice("generation-".length, -".json".length) ||
+        !Number.isSafeInteger(value.uid) || !Number.isSafeInteger(value.gid)) {
+      throw new Error("Linux agent identity history cannot be verified.");
+    }
+    if (value.uid === forwarder.uid || value.gid === forwarder.gid) {
+      throw new Error("Linux agent and forwarder identity histories overlap.");
+    }
+  }
+}
+
+async function readbackForwarder(host: LinuxManagedInstallHost,
+  input: LinuxManagedInstallPlan): Promise<void> {
+  const forwarder = input.record.mcpForwarder;
+  if (!forwarder) return;
+  const name = path.basename(forwarder.unitFile);
+  const values = parseProperties(await host.unit(name, ["Id", "LoadState", "ActiveState",
+    "FragmentPath", "DropInPaths", "User", "Group", "RootDirectory", "NetworkNamespacePath",
+    "PrivateNetwork", "PrivateIPC", "PrivateTmp", "PrivatePIDs", "MountFlags", "BindLogSockets",
+    "ProtectHome", "ProtectSystem",
+    "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictNamespaces",
+    "SystemCallArchitectures", "KillMode", "BindReadOnlyPaths", "BindsTo", "After", "ExecStart"]));
+  const wanted = new Map([
+    ["Id", name], ["LoadState", "loaded"], ["ActiveState", "inactive"],
+    ["FragmentPath", forwarder.unitFile], ["DropInPaths", ""],
+    ["User", String(forwarder.uid)], ["Group", String(forwarder.gid)],
+    ["RootDirectory", forwarder.rootDirectory],
+    ["NetworkNamespacePath", forwarder.networkNamespacePath],
+    ["PrivateNetwork", "yes"], ["PrivateIPC", "yes"], ["PrivateTmp", "yes"],
+    ["PrivatePIDs", "no"], ["MountFlags", "private"], ["BindLogSockets", "no"],
+    ["ProtectHome", "yes"], ["ProtectSystem", "strict"],
+    ["NoNewPrivileges", "yes"], ["RestrictNamespaces", "yes"],
+    ["SystemCallArchitectures", "native"], ["KillMode", "control-group"],
+    ["BindReadOnlyPaths", `${input.record.plan.brokerSocket}:/run/s-gw/broker.sock ` +
+      `/run/s-gw/forwarder-proofs/${input.record.plan.sessionId}.json:/run/s-gw/forwarder-attestation.json`]
+  ]);
+  for (const [key, expected] of wanted) {
+    const actual = values.get(key);
+    const validBind = key === "BindReadOnlyPaths" && actual?.split(" ").length === 2 &&
+      actual.split(" ").every((entry, index) => {
+        const source = expected.split(" ")[index];
+        return entry === source || entry === `${source}:rbind`;
+      });
+    if (actual !== expected && !validBind) {
+      throw new Error(`Linux forwarder unit property changed: ${key}`);
+    }
+  }
+  for (const key of ["CapabilityBoundingSet", "AmbientCapabilities"]) {
+    if (!["", "0"].includes(values.get(key) ?? "missing")) {
+      throw new Error(`Linux forwarder retained ${key}.`);
+    }
+  }
+  const expectedDeps = ["s-gw-agent-control.service",
+    `s-gw-agent-${input.record.plan.sessionId}.service`];
+  for (const key of ["BindsTo", "After"]) {
+    const deps = new Set((values.get(key) || "").split(/\s+/));
+    if (expectedDeps.some(unit => !deps.has(unit))) {
+      throw new Error(`Linux forwarder unit lost its ${key} dependency.`);
+    }
+  }
+  const command = `{ path=${input.record.brokerNode} ; argv[]=${input.record.brokerNode} ` +
+    `${forwarderEntry(input)} ; ignore_errors=no ; }`;
+  if (values.get("ExecStart") !== command) {
+    throw new Error("Linux forwarder unit command changed.");
+  }
+}
+
 async function assertInactive(host: LinuxManagedInstallHost, unit: string): Promise<void> {
   const properties = parseProperties(await host.unit(unit, ["Id", "LoadState", "ActiveState"]));
   if (properties.get("Id") !== unit || properties.get("ActiveState") !== "inactive") {
@@ -255,8 +400,7 @@ async function readbackSocket(host: LinuxManagedInstallHost, record: LinuxManage
   const values = parseProperties(output);
   if (values.get("LoadState") !== "loaded" || values.get("DropInPaths") ||
       values.get("SocketUser") !== "root" ||
-      values.get("SocketGroup") !== String(filename === record.mcpSocketUnitFile ?
-        record.mcpForwarder?.gid ?? record.plan.gid : record.plan.gid) ||
+      values.get("SocketGroup") !== String(record.mcpForwarder?.gid ?? record.plan.gid) ||
       !["0660", "660"].includes(values.get("SocketMode") || "") ||
       !["0711", "711"].includes(values.get("DirectoryMode") || "") ||
       values.get("PassCredentials") !== "yes" || values.get("Accept") !== "no" ||
@@ -368,17 +512,20 @@ export class LinuxManagedUnitInstaller {
     const plan = record.plan;
     const planFile = `/run/s-gw/agent-plans/${plan.sessionId}.json`;
     const mcpUnit = path.basename(record.mcpSocketUnitFile);
-    const modelUnit = path.basename(record.modelRelaySocketUnitFile!);
+    const modelUnit = record.modelRelaySocketUnitFile && path.basename(record.modelRelaySocketUnitFile);
+    const forwarderUnit = record.mcpForwarder && path.basename(record.mcpForwarder.unitFile);
     await assertAccountIsolation(host, input);
     for (const filename of [control.node, control.entry, control.preflight, record.brokerNode,
       record.brokerEntry, record.brokerPreflight]) {
       await checkedFile(host, filename, 0, 0);
     }
     await checkedFile(host, record.brokerEnvironmentFile, 0, 0, 0o600);
+    await checkForwarderRoot(host, input);
     if (record.brokerCa) await checkedFile(host, record.brokerCa, 0, 0);
     await assertInactive(host, mcpUnit);
-    await assertInactive(host, modelUnit);
+    if (modelUnit) await assertInactive(host, modelUnit);
     await assertInactive(host, record.brokerUnit);
+    if (forwarderUnit) await assertInactive(host, forwarderUnit);
     await assertInactive(host, linuxAgentUnitName(plan.sessionId));
     for (const filename of [controlSocket, prepareSocket]) {
       if (await host.file(filename)) {
@@ -392,6 +539,26 @@ export class LinuxManagedUnitInstaller {
     await ensureDirectory(host, config.leaseDir, plan.brokerUid, input.brokerGid, 0o700);
     await ensureDirectory(host, "/var/lib/s-gw", 0, 0, 0o700);
     await ensureDirectory(host, linuxAgentIdentityDir, 0, 0, 0o700);
+    if (await host.file(linuxForwarderIdentityDir)) {
+      await checkedDirectory(host, linuxForwarderIdentityDir, 0, 0, 0o700);
+      if (await host.file(`${linuxForwarderIdentityDir}/uid-${plan.uid}.json`) ||
+          await host.file(`${linuxForwarderIdentityDir}/gid-${plan.gid}.json`)) {
+        throw new Error("Linux agent and forwarder identity histories overlap.");
+      }
+    }
+    if (record.mcpForwarder) {
+      await ensureDirectory(host, linuxForwarderIdentityDir, 0, 0, 0o700);
+      await rejectAgentIdentityReuse(host, record.mcpForwarder);
+      const receipt = linuxForwarderIdentityRecord(record);
+      for (const filename of [`uid-${record.mcpForwarder.uid}.json`,
+        `gid-${record.mcpForwarder.gid}.json`, `session-${plan.sessionId}.json`]) {
+        await publishExpected(host, `${linuxForwarderIdentityDir}/${filename}`,
+          receipt, 0, 0, 0o600, []);
+      }
+      await ensureDirectory(host, "/run/s-gw/netns", 0, 0, 0o700);
+      await ensureDirectory(host, "/run/s-gw/forwarder-proofs", 0, 0, 0o711);
+      await checkForwarderNamespace(host, input, "create");
+    }
 
     const identity = `${JSON.stringify({ logicalAgentId: plan.logicalAgentId,
       identityGeneration: plan.identityGeneration, uid: plan.uid, gid: plan.gid })}\n`;
@@ -411,13 +578,28 @@ export class LinuxManagedUnitInstaller {
       await publishExpected(host, planFile, bundle.planRecord, 0, 0, 0o600, created);
       await publishExpected(host, record.brokerUnitFile, bundle.brokerUnit, 0, 0, 0o644, created);
       await publishExpected(host, record.mcpSocketUnitFile, bundle.mcpSocketUnit, 0, 0, 0o644, created);
-      await publishExpected(host, record.modelRelaySocketUnitFile!, bundle.modelSocketUnit!,
-        0, 0, 0o644, created);
+      if (record.modelRelaySocketUnitFile) {
+        await publishExpected(host, record.modelRelaySocketUnitFile, bundle.modelSocketUnit!,
+          0, 0, 0o644, created);
+      }
+      if (record.mcpForwarder) {
+        await publishExpected(host, record.mcpForwarder.unitFile, bundle.forwarderUnit!,
+          0, 0, 0o644, created);
+        await publishExpected(host, `/run/s-gw/forwarder-proofs/${plan.sessionId}.json`,
+          "PENDING\n", 0, 0, 0o644, created);
+        await publishExpected(host, `${record.mcpForwarder.rootDirectory}/run/s-gw/broker.sock`,
+          "", 0, 0, 0o600, created);
+        await publishExpected(host, `${record.mcpForwarder.rootDirectory}/run/s-gw/forwarder-attestation.json`,
+          "", 0, 0, 0o600, created);
+      }
       await verifyInstalledFiles(host, input, bundle.brokerConfig);
       await host.action("daemon-reload");
       await readbackBroker(host, input, false);
+      await readbackForwarder(host, input);
       await readbackSocket(host, record, record.mcpSocketUnitFile, "inactive");
-      await readbackSocket(host, record, record.modelRelaySocketUnitFile!, "inactive");
+      if (record.modelRelaySocketUnitFile) {
+        await readbackSocket(host, record, record.modelRelaySocketUnitFile, "inactive");
+      }
       await readbackControl(host, input, "inactive");
       startedControl = true;
       await host.action("start", controlName);
@@ -440,8 +622,9 @@ export class LinuxManagedUnitInstaller {
       }
       try {
         await assertInactive(host, mcpUnit);
-        await assertInactive(host, modelUnit);
+        if (modelUnit) await assertInactive(host, modelUnit);
         await assertInactive(host, record.brokerUnit);
+        if (forwarderUnit) await assertInactive(host, forwarderUnit);
         await assertInactive(host, linuxAgentUnitName(plan.sessionId));
         if (!cleanup.length) {
           for (const file of created.reverse()) await host.remove(file);
@@ -457,6 +640,9 @@ export class LinuxManagedUnitInstaller {
   async activate(input: LinuxManagedInstallPlan, requestId: string,
     getRequest: (id: string) => Promise<RequestRecord>): Promise<void> {
     validateInstallPlan(input);
+    if (input.record.mcpForwarder) {
+      throw new Error("MCP forwarder staging cannot activate without a model relay transport and root proof.");
+    }
     await this.host.assertRoot();
     return withInstallLock(this.host, () => this.activateLocked(input, requestId, getRequest));
   }
@@ -475,12 +661,19 @@ export class LinuxManagedUnitInstaller {
     const mcpUnit = path.basename(record.mcpSocketUnitFile);
     const modelUnit = path.basename(record.modelRelaySocketUnitFile!);
     const agentUnit = linuxAgentUnitName(record.plan.sessionId);
+    const forwarderUnit = record.mcpForwarder && path.basename(record.mcpForwarder.unitFile);
     await assertAccountIsolation(host, input);
     await readbackControl(host, input);
     await readbackBroker(host, input, false);
     await readbackSocket(host, record, record.mcpSocketUnitFile, "inactive");
     await readbackSocket(host, record, record.modelRelaySocketUnitFile!, "inactive");
     await assertInactive(host, agentUnit);
+    if (forwarderUnit) {
+      await assertInactive(host, forwarderUnit);
+      await checkForwarderRoot(host, input);
+      await checkForwarderNamespace(host, input, "check");
+      await readbackForwarder(host, input);
+    }
     const old = await checkedFile(host, record.brokerConfig, 0, input.brokerGid, 0o640);
     if (await host.read(record.brokerConfig) !== staged.brokerConfig) {
       throw new Error("Linux broker config changed after preparation.");
@@ -500,10 +693,12 @@ export class LinuxManagedUnitInstaller {
       started = true;
       await host.action("start", mcpUnit);
       await readbackSocket(host, record, record.mcpSocketUnitFile, "active");
-      await checkedSocketNode(host, record.plan.brokerSocket, record.plan.gid);
+      await checkedSocketNode(host, record.plan.brokerSocket,
+        record.mcpForwarder?.gid ?? record.plan.gid);
       await host.action("start", modelUnit);
       await readbackSocket(host, record, record.modelRelaySocketUnitFile!, "active");
-      await checkedSocketNode(host, record.plan.modelRelaySocket!, record.plan.gid);
+      await checkedSocketNode(host, record.plan.modelRelaySocket!,
+        record.mcpForwarder?.gid ?? record.plan.gid);
       await host.action("start", record.brokerUnit);
       await readbackBroker(host, input, true);
     } catch (error) {
@@ -532,6 +727,9 @@ export class LinuxManagedUnitInstaller {
 export function linuxManagedApprovalReaderArgs(input: LinuxManagedInstallPlan,
   requestId: string, unitName: string): string[] {
   validateInstallPlan(input);
+  if (input.record.mcpForwarder) {
+    throw new Error("MCP forwarder staging cannot request model relay approval.");
+  }
   if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId) ||
       !/^s-gw-approval-[a-f0-9]{32}$/.test(unitName)) {
     throw new Error("Linux approval reader needs a bounded request and fresh unit name.");
@@ -647,6 +845,14 @@ export const nativeLinuxInstallHost: LinuxManagedInstallHost = {
   file: nativeFile,
   realpath,
   read: filename => readFile(filename, "utf8"),
+  list: directory => readdir(directory),
+  sha256: filename => new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const input = createReadStream(filename);
+    input.on("data", chunk => hash.update(chunk));
+    input.once("error", reject);
+    input.once("end", () => resolve(hash.digest("hex")));
+  }),
   async ensureDirectory(filename, uid, gid, mode) {
     if (await nativeFile(filename)) return false;
     await mkdir(filename, { mode });
@@ -722,6 +928,9 @@ export const nativeLinuxInstallHost: LinuxManagedInstallHost = {
       throw new Error("Linux installer found an invalid account group.");
     }
     return { gid: Number(entry[3]), groups };
+  },
+  async networkNamespace(filename, helper, operation) {
+    await run(helper, [operation, filename]);
   }
 };
 

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import path from "node:path";
 import { buildModelRelayAction } from "../src/model-relay-action.js";
 import { LinuxManagedUnitInstaller, assertApprovedLinuxManagedRelay,
   linuxManagedInstallPayloadMaxBytes, linuxManagedApprovalReaderArgs, readRootLinuxManagedInstallPlan,
@@ -36,6 +38,20 @@ function setup(sessionId = "agent-one", uid = 230101, gid = 230102): LinuxManage
       brokerEnvironmentFile: "/run/s-gw/broker.env", brokerCa: null } };
 }
 
+function withForwarder(input = setup()): LinuxManagedInstallPlan {
+  const sessionId = input.record.plan.sessionId;
+  delete input.record.plan.modelRelaySocket;
+  delete input.record.modelRelaySocketUnitFile;
+  delete input.config.relay;
+  input.record.plan.managedForwarderNetworkNamespace = `/run/s-gw/netns/${sessionId}`;
+  input.config.mcpForwarder = { uid: 230104, gid: 230105 };
+  input.record.mcpForwarder = { ...input.config.mcpForwarder,
+    unitFile: `/run/systemd/system/s-gw-forwarder-${sessionId}.service`,
+    rootDirectory: `/var/lib/s-gw/forwarder-roots/${sessionId}`,
+    networkNamespacePath: `/run/s-gw/netns/${sessionId}` };
+  return input;
+}
+
 function approved(input: LinuxManagedInstallPlan, requestId = "req_approved"): RequestRecord {
   const now = new Date().toISOString();
   return { id: requestId, handle: input.config.relay!.grant.handle,
@@ -61,6 +77,8 @@ class Host implements LinuxManagedInstallHost {
   controlSocketMode = 0o660;
   controlReadbacks = 0;
   controlInvocationFlipAfter = Number.POSITIVE_INFINITY;
+  failNamespaceCheck = false;
+  forwarderProperties = new Map<string, string>();
   nextIno = 10;
   constructor(readonly input: LinuxManagedInstallPlan) {
     for (const dir of ["/", "/run", "/run/systemd", "/run/systemd/system", "/run/s-gw",
@@ -73,6 +91,22 @@ class Host implements LinuxManagedInstallHost {
       this.add(filename, "file", "trusted runtime", 0, 0, 0o755);
     }
     this.add(input.record.brokerEnvironmentFile, "file", "SGW_HOME=/trusted\n", 0, 0, 0o600);
+    if (input.record.mcpForwarder) {
+      const root = input.record.mcpForwarder.rootDirectory;
+      this.add("/var/lib/s-gw", "directory", "", 0, 0, 0o700);
+      this.add("/var/lib/s-gw/forwarder-roots", "directory", "", 0, 0, 0o700);
+      this.add(root, "directory", "", 0, 0, 0o755);
+      for (const dir of ["usr", "usr/libexec", "usr/libexec/s-gw", "usr/libexec/s-gw/dist",
+        "run", "run/s-gw"]) this.add(`${root}/${dir}`, "directory", "", 0, 0, 0o755);
+      this.add(`${root}${input.record.brokerNode}`, "file", "trusted runtime", 0, 0, 0o755);
+      this.add(`${root}/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js`,
+        "file", "trusted runtime", 0, 0, 0o644);
+      this.add(`${root}/usr/libexec/s-gw/package.json`, "file", '{"type":"module"}\n',
+        0, 0, 0o644);
+      this.add("/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js",
+        "file", "trusted runtime", 0, 0, 0o644);
+      this.add(`${input.control.runtimeRoot}/s-gw-linux-netns`, "file", "helper", 0, 0, 0o755);
+    }
   }
   add(filename: string, kind: FakeFile["kind"], text: string, uid: number, gid: number, mode: number) {
     const ino = ++this.nextIno;
@@ -101,6 +135,13 @@ class Host implements LinuxManagedInstallHost {
     if (!item || item.kind !== "file") throw new Error("No fixture file");
     return item.text || "";
   }
+  async list(filename: string) {
+    return [...this.files.keys()].filter(name => path.dirname(name) === filename)
+      .map(name => path.basename(name));
+  }
+  async sha256(filename: string) {
+    return createHash("sha256").update(await this.read(filename)).digest("hex");
+  }
   async ensureDirectory(filename: string, uid: number, gid: number, mode: number) {
     if (this.files.has(filename)) return false;
     this.add(filename, "directory", "", uid, gid, mode);
@@ -122,9 +163,18 @@ class Host implements LinuxManagedInstallHost {
     this.files.delete(file.filename);
   }
   async account(uid: number) {
+    if (uid === this.input.record.mcpForwarder?.uid) {
+      return { gid: this.input.record.mcpForwarder.gid,
+        groups: [this.input.record.mcpForwarder.gid] };
+    }
     return uid === this.input.record.plan.uid
       ? { gid: this.input.record.plan.gid, groups: [this.input.record.plan.gid] }
       : { gid: this.input.brokerGid, groups: [this.input.brokerGid] };
+  }
+  async networkNamespace(filename: string, _helper: string, operation: "create" | "check") {
+    if (operation === "create") this.add(filename, "file", "netns", 0, 0, 0o600);
+    if (operation === "check" && this.failNamespaceCheck) throw new Error("Namespace is no longer private");
+    if (!this.files.has(filename)) throw new Error("Fixture namespace is missing");
   }
   private socketUnit(unit: string, model: boolean): string[] {
     const { record } = this.input;
@@ -132,7 +182,8 @@ class Host implements LinuxManagedInstallHost {
     return ["Id=" + unit, `LoadState=${this.files.has(file) ? "loaded" : "not-found"}`,
       `ActiveState=${this.active.has(unit) ? "active" : "inactive"}`, `FragmentPath=${file}`,
       "DropInPaths=", `Triggers=${record.brokerUnit}`, "BindsTo=s-gw-agent-control.service",
-      "After=s-gw-agent-control.service", "SocketUser=root", `SocketGroup=${record.plan.gid}`,
+      "After=s-gw-agent-control.service", "SocketUser=root",
+      `SocketGroup=${record.mcpForwarder?.gid ?? record.plan.gid}`,
       "SocketMode=0660", "DirectoryMode=0711", "PassCredentials=yes", "Accept=no",
       "RemoveOnStop=no", `FileDescriptorName=s-gw-${model ? "model" : "agent"}-${record.plan.sessionId}`];
   }
@@ -166,6 +217,25 @@ class Host implements LinuxManagedInstallHost {
       `ExecStartPre={ path=${c.preflight} ; argv[]=${c.preflight} verify ${args} ; ignore_errors=no ; status=0 }`,
       `ExecStart={ path=${c.preflight} ; argv[]=${c.preflight} verify-exec ${args} -- --serve ${c.brokerUid} ${c.brokerGid} ; ignore_errors=no ; status=0 }`];
   }
+  private forwarderUnit(): string[] {
+    const r = this.input.record;
+    const f = r.mcpForwarder!;
+    const name = path.basename(f.unitFile);
+    const entry = "/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js";
+    return [`Id=${name}`, `LoadState=${this.files.has(f.unitFile) ? "loaded" : "not-found"}`,
+      `ActiveState=${this.active.has(name) ? "active" : "inactive"}`, `FragmentPath=${f.unitFile}`,
+      "DropInPaths=", `User=${f.uid}`, `Group=${f.gid}`, `RootDirectory=${f.rootDirectory}`,
+      `NetworkNamespacePath=${f.networkNamespacePath}`, "PrivateNetwork=yes", "PrivateIPC=yes",
+      "PrivateTmp=yes", "PrivatePIDs=no", "MountFlags=private", "BindLogSockets=no",
+      "ProtectHome=yes", "ProtectSystem=strict",
+      "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=",
+      "RestrictNamespaces=yes", "SystemCallArchitectures=native", "KillMode=control-group",
+      `BindReadOnlyPaths=${r.plan.brokerSocket}:/run/s-gw/broker.sock ` +
+        `/run/s-gw/forwarder-proofs/${r.plan.sessionId}.json:/run/s-gw/forwarder-attestation.json`,
+      `BindsTo=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
+      `After=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
+      `ExecStart={ path=${r.brokerNode} ; argv[]=${r.brokerNode} ${entry} ; ignore_errors=no ; }`];
+  }
   async unit(unit: string, _fields: string[]) {
     let lines: string[];
     if (unit === "s-gw-agent-control.service") {
@@ -176,6 +246,14 @@ class Host implements LinuxManagedInstallHost {
       });
     }
     else if (unit === this.input.record.brokerUnit) lines = this.brokerUnit();
+    else if (this.input.record.mcpForwarder &&
+      unit === path.basename(this.input.record.mcpForwarder.unitFile)) {
+      lines = this.forwarderUnit().map(line => {
+        const key = line.slice(0, line.indexOf("="));
+        const override = this.forwarderProperties.get(key);
+        return override === undefined ? line : `${key}=${override}`;
+      });
+    }
     else if (unit === `s-gw-managed-mcp-${this.input.record.plan.sessionId}.socket`) {
       lines = this.socketUnit(unit, false);
     } else if (unit === `s-gw-managed-model-${this.input.record.plan.sessionId}.socket`) {
@@ -193,7 +271,9 @@ class Host implements LinuxManagedInstallHost {
       if (unit.endsWith(".socket")) {
         const model = unit.includes("managed-model");
         const filename = model ? this.input.record.plan.modelRelaySocket! : this.input.record.plan.brokerSocket;
-        this.add(filename, "socket", "", 0, this.input.record.plan.gid, 0o660);
+        this.add(filename, "socket", "", 0,
+          this.input.record.mcpForwarder?.gid ?? this.input.record.plan.gid,
+          0o660);
       }
       if (this.failStart === unit) throw new Error(`Fixture start failed: ${unit}`);
     }
@@ -214,6 +294,119 @@ class Host implements LinuxManagedInstallHost {
 }
 
 describe.skipIf(process.platform === "win32")("Linux managed unit installer", () => {
+  it("stages an opt-in forwarder unit, pinned namespace and durable identity receipts", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    await new LinuxManagedUnitInstaller(host).stage(input);
+    const id = input.record.plan.sessionId;
+    expect(host.files.get(`/run/systemd/system/s-gw-forwarder-${id}.service`)?.text)
+      .toContain(`NetworkNamespacePath=/run/s-gw/netns/${id}\n`);
+    expect(host.files.get(`/run/s-gw/netns/${id}`)).toMatchObject({ uid: 0, gid: 0, mode: 0o600 });
+    expect(host.files.get("/var/lib/s-gw/forwarder-identities/uid-230104.json")?.text)
+      .toContain('"gid":230105');
+    expect(host.files.get("/var/lib/s-gw/forwarder-identities/gid-230105.json")?.text)
+      .toContain('"uid":230104');
+    expect(host.actions).not.toContain(`start:s-gw-forwarder-${id}.service`);
+  });
+
+  it("refuses reuse of a forwarder UID or GID from another session", async () => {
+    for (const marker of ["uid-230104.json", "gid-230105.json"]) {
+      const input = withForwarder();
+      const host = new Host(input);
+      host.add("/var/lib/s-gw/forwarder-identities", "directory", "", 0, 0, 0o700);
+      host.add(`/var/lib/s-gw/forwarder-identities/${marker}`, "file",
+        '{"sessionId":"older","uid":230104,"gid":230105}\n', 0, 0, 0o600);
+      await expect(new LinuxManagedUnitInstaller(host).stage(input))
+        .rejects.toThrow(/different content/);
+    }
+  });
+
+  it("rejects cross-role UID and GID reuse across two staged sessions", async () => {
+    const first = withForwarder(setup("first-session", 230101, 230102));
+    const firstHost = new Host(first);
+    await new LinuxManagedUnitInstaller(firstHost).stage(first);
+
+    for (const [uid, gid, session] of [
+      [230104, 230206, "later-agent-uid"],
+      [230206, 230105, "later-agent-gid"]
+    ] as const) {
+      const laterAgent = setup(session, uid, gid);
+      const agentHost = new Host(laterAgent);
+      for (const [name, item] of firstHost.files) {
+        if (name.startsWith("/var/lib/s-gw/forwarder-identities")) agentHost.files.set(name, item);
+      }
+      await expect(new LinuxManagedUnitInstaller(agentHost).stage(laterAgent))
+        .rejects.toThrow(/histories overlap/);
+    }
+
+    for (const [uid, gid, session] of [
+      [230101, 230205, "later-forwarder-uid"],
+      [230204, 230102, "later-forwarder-gid"]
+    ] as const) {
+      const laterForwarder = withForwarder(setup(session, 230201, 230202));
+      laterForwarder.config.mcpForwarder = { uid, gid };
+      laterForwarder.record.mcpForwarder = { ...laterForwarder.record.mcpForwarder!, uid, gid };
+      const forwarderHost = new Host(laterForwarder);
+      for (const [name, item] of firstHost.files) {
+        if (name.startsWith("/var/lib/s-gw/agent-identities")) {
+          forwarderHost.files.set(name, item);
+        }
+      }
+      await expect(new LinuxManagedUnitInstaller(forwarderHost).stage(laterForwarder))
+        .rejects.toThrow(/histories overlap/);
+    }
+  });
+
+  it("keeps the activated MCP socket in the forwarder group and refuses activation", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    const installer = new LinuxManagedUnitInstaller(host);
+    await installer.stage(input);
+    await expect(installer.activate(input, "req_approved", async () => approved(input)))
+      .rejects.toThrow(/forwarder.*cannot activate/i);
+    expect(host.files.get(input.record.plan.brokerSocket)).toBeUndefined();
+    expect(host.active.has("s-gw-forwarder-agent-one.service")).toBe(false);
+    const changed = withForwarder();
+    const otherHost = new Host(changed);
+    otherHost.failNamespaceCheck = true;
+    await expect(new LinuxManagedUnitInstaller(otherHost).stage(changed))
+      .rejects.toThrow(/namespace is no longer private/i);
+  });
+
+  it("refuses a forwarder unit that loses its private mount property", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.forwarderProperties.set("MountFlags", "shared");
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/MountFlags/);
+  });
+
+  it("refuses a forwarder root that its dedicated UID cannot traverse", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.files.get(input.record.mcpForwarder!.rootDirectory)!.mode = 0o700;
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/Untrusted Linux provisioner directory/);
+  });
+
+  it("requires ES module metadata inside the forwarder root", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    const filename = `${input.record.mcpForwarder!.rootDirectory}/usr/libexec/s-gw/package.json`;
+    host.files.get(filename)!.text = '{"type":"commonjs"}\n';
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/ES module metadata/);
+  });
+
+  it("accepts systemd's recursive bind readback for the staged forwarder", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    const id = input.record.plan.sessionId;
+    host.forwarderProperties.set("BindReadOnlyPaths",
+      `${input.record.plan.brokerSocket}:/run/s-gw/broker.sock:rbind ` +
+      `/run/s-gw/forwarder-proofs/${id}.json:/run/s-gw/forwarder-attestation.json:rbind`);
+    await expect(new LinuxManagedUnitInstaller(host).stage(input)).resolves.toBeUndefined();
+  });
   it("accepts the largest escaped model grant within the approval reader bound", () => {
     const input = setup();
     input.config.relay!.grant = {

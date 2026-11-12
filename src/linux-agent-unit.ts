@@ -13,6 +13,7 @@ export interface LinuxAgentUnitPlan {
   rootDirectory: string;
   brokerSocket: string;
   modelRelaySocket?: string;
+  managedForwarderNetworkNamespace?: string;
   executable: string;
   args: readonly string[];
   launchGate?: boolean;
@@ -99,6 +100,13 @@ export function validateLinuxAgentPlan(plan: LinuxAgentUnitPlan): void {
           !plan.sealedStdio || !plan.supervisedControlUnit || !plan.identityGeneration))) {
     throw new Error("Linux agent root and broker socket must use managed paths.");
   }
+  if (plan.managedForwarderNetworkNamespace !== undefined &&
+      (plan.managedForwarderNetworkNamespace !== `/run/s-gw/netns/${plan.sessionId}` ||
+        !plan.launchGate || !plan.activatedSocket || !plan.serializedLifecycle ||
+        !plan.sealedStdio || !plan.supervisedControlUnit || !plan.identityGeneration ||
+        !plan.restrictedSocketFamilies)) {
+    throw new Error("Managed Linux forwarder needs a sealed private network namespace plan.");
+  }
   if (!canonicalPath(plan.executable) || !plan.executable.startsWith("/usr/") ||
       (plan.launchGate !== undefined && typeof plan.launchGate !== "boolean") ||
       (plan.activatedSocket !== undefined && typeof plan.activatedSocket !== "boolean") ||
@@ -145,12 +153,15 @@ export function systemdRunArgs(plan: LinuxAgentUnitPlan, attemptId?: string): st
     "WorkingDirectory=/workspace",
     `ReadWritePaths=${plan.rootDirectory}/workspace`,
     `BindReadOnlyPaths=${bindReadOnlyPaths(plan)}`,
+    ...(plan.managedForwarderNetworkNamespace ? [
+      `NetworkNamespacePath=${plan.managedForwarderNetworkNamespace}`, "PrivatePIDs=yes",
+      "MountFlags=private", "BindLogSockets=no"] : []),
     ...(plan.isolatedSharedMemory ? [`TemporaryFileSystem=${privateSharedMemoryMount}`] : []),
     ...(plan.sealedStdio ? ["StandardInput=null", "StandardOutput=null", "StandardError=null"] : []),
     ...(plan.restrictedSocketFamilies ? ["RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
       "SystemCallArchitectures=native"] : []),
     ...(plan.supervisedControlUnit ? ["BindsTo=s-gw-agent-control.service", "After=s-gw-agent-control.service"] : []),
-    `Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
+    `Environment=${plan.managedForwarderNetworkNamespace ? "" : "SGW_BROKER_SOCKET=/run/s-gw/broker.sock"}${plan.modelRelaySocket && !plan.managedForwarderNetworkNamespace ?
       " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`
   ];
   return ["--system", "--no-ask-password", `--unit=${unit}`,
@@ -209,6 +220,7 @@ export function lifecyclePlanKey(plan: LinuxAgentUnitPlan): string {
     plan.supervisedControlUnit === true];
   if (plan.identityGeneration) fields.push(plan.logicalAgentId!, plan.identityGeneration);
   if (plan.modelRelaySocket) fields.push(plan.modelRelaySocket);
+  if (plan.managedForwarderNetworkNamespace) fields.push(plan.managedForwarderNetworkNamespace);
   if (plan.restrictedSocketFamilies) fields.push("restricted-socket-families");
   if (plan.requirePtracePolicy) fields.push("host-ptrace-policy");
   return JSON.stringify(fields);
@@ -272,6 +284,9 @@ function gateDirectory(plan: LinuxAgentUnitPlan): string {
 }
 
 function bindReadOnlyPaths(plan: LinuxAgentUnitPlan): string {
+  if (plan.managedForwarderNetworkNamespace) {
+    return `${gateDirectory(plan)}:${gateMount}`;
+  }
   const broker = `${plan.brokerSocket}:/run/s-gw/broker.sock`;
   const model = plan.modelRelaySocket ? ` ${plan.modelRelaySocket}:/run/s-gw/model.sock` : "";
   return plan.launchGate ? `${broker}${model} ${gateDirectory(plan)}:${gateMount}` : `${broker}${model}`;
@@ -324,7 +339,7 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
       attestedAddressFamilies(fields.get("RestrictAddressFamilies"))],
     ["SystemCallArchitectures", !plan.restrictedSocketFamilies || matches("SystemCallArchitectures", "native")],
     ["BindPaths", matches("BindPaths", "")],
-    ["Environment", matches("Environment", `SGW_BROKER_SOCKET=/run/s-gw/broker.sock${plan.modelRelaySocket ?
+    ["Environment", matches("Environment", `${plan.managedForwarderNetworkNamespace ? "" : "SGW_BROKER_SOCKET=/run/s-gw/broker.sock"}${plan.modelRelaySocket && !plan.managedForwarderNetworkNamespace ?
       " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`)],
     ["Restart", matches("Restart", "no")], ["KillMode", matches("KillMode", "control-group")],
     ["SendSIGKILL", enabled("SendSIGKILL")], ["Delegate", disabled("Delegate")],
@@ -340,7 +355,10 @@ export function parseSystemdAgentState(plan: LinuxAgentUnitPlan, output: string)
     ["ProtectControlGroups", enabled("ProtectControlGroups")],
     ["RestrictNamespaces", enabled("RestrictNamespaces")],
     ["RestrictSUIDSGID", enabled("RestrictSUIDSGID")],
-    ["NetworkNamespacePath", matches("NetworkNamespacePath", "")],
+    ["NetworkNamespacePath", matches("NetworkNamespacePath", plan.managedForwarderNetworkNamespace || "")],
+    ["PrivatePIDs", !plan.managedForwarderNetworkNamespace || enabled("PrivatePIDs")],
+    ["MountFlags", !plan.managedForwarderNetworkNamespace || matches("MountFlags", "private")],
+    ["BindLogSockets", !plan.managedForwarderNetworkNamespace || disabled("BindLogSockets")],
     ["BindsTo", !plan.supervisedControlUnit ||
       !!fields.get("BindsTo")?.split(/\s+/).includes("s-gw-agent-control.service")],
     ["After", !plan.supervisedControlUnit ||
@@ -489,6 +507,8 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
       "-p", "ProtectControlGroups", "-p", "RestrictNamespaces", "-p", "RestrictSUIDSGID",
       "-p", "BindsTo", "-p", "After",
       "-p", "NetworkNamespacePath", "-p", "IPCNamespacePath", "-p", "JoinsNamespaceOf",
+      "-p", "PrivatePIDs",
+      "-p", "MountFlags", "-p", "BindLogSockets",
       "-p", "ControlGroup", "-p", "MainPID", "-p", "InvocationID"]);
     if (lease && !linuxUnitOwnedByStartAttempt(plan, lease.attemptId, output)) {
       throw new Error("Linux agent unit changed after its leased start.");
@@ -553,20 +573,29 @@ export class SystemdRunAgentUnitManager implements LinuxAgentUnitManager {
         !brokerSocket.isSocket() || brokerSocket.uid !== (plan.activatedSocket ? 0 : plan.brokerUid)) {
       throw new Error("Linux agent forwarder boundary changed before release.");
     }
-    const attestation = await open(path.join(dir, "forwarder.tmp"),
+    if (plan.managedForwarderNetworkNamespace) {
+      const pinned = await stat(plan.managedForwarderNetworkNamespace, { bigint: true });
+      const live = await stat(`/proc/${current.mainPid}/ns/net`, { bigint: true });
+      if (pinned.dev !== live.dev || pinned.ino !== live.ino ||
+          brokerSocket.gid === plan.gid) {
+        throw new Error("Linux managed forwarder namespace or socket entitlement changed before release.");
+      }
+    } else {
+      const attestation = await open(path.join(dir, "forwarder.tmp"),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o444);
-    try {
-      await attestation.chmod(0o444);
-      await attestation.writeFile(JSON.stringify({ version: 1, sessionId: plan.sessionId,
-        uid: current.uid, gid: current.gid, brokerUid: plan.brokerUid,
-        brokerSocketOwnerUid: brokerSocket.uid,
-        ...(plan.modelRelaySocket ? { socketPath: "/run/s-gw/model.sock" } : {}),
-        cgroup: current.cgroup, networkNamespace, hostNetworkNamespace,
-        invocationId: current.invocationId, mainPid: current.mainPid,
-        brokerSocketDevice: String(brokerSocket.dev), brokerSocketInode: String(brokerSocket.ino) }) + "\n");
-      await attestation.sync();
-    } finally { await attestation.close(); }
-    await rename(path.join(dir, "forwarder.tmp"), path.join(dir, "forwarder-attestation.json"));
+      try {
+        await attestation.chmod(0o444);
+        await attestation.writeFile(JSON.stringify({ version: 1, sessionId: plan.sessionId,
+          uid: current.uid, gid: current.gid, brokerUid: plan.brokerUid,
+          brokerSocketOwnerUid: brokerSocket.uid,
+          ...(plan.modelRelaySocket ? { socketPath: "/run/s-gw/model.sock" } : {}),
+          cgroup: current.cgroup, networkNamespace, hostNetworkNamespace,
+          invocationId: current.invocationId, mainPid: current.mainPid,
+          brokerSocketDevice: String(brokerSocket.dev), brokerSocketInode: String(brokerSocket.ino) }) + "\n");
+        await attestation.sync();
+      } finally { await attestation.close(); }
+      await rename(path.join(dir, "forwarder.tmp"), path.join(dir, "forwarder-attestation.json"));
+    }
     const tmp = path.join(dir, "ready.tmp");
     const file = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o444);
     try {
@@ -924,9 +953,10 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
       (workspace.mode & 0o077) !== 0 || !executable.isFile() || executable.uid !== 0 ||
       (executable.mode & 0o022) !== 0 || (executable.mode & 0o111) === 0 ||
       !socket.isSocket() || socket.uid !== (plan.activatedSocket ? 0 : plan.brokerUid) ||
-      socket.gid !== plan.gid ||
+      (plan.managedForwarderNetworkNamespace ? socket.gid === plan.gid : socket.gid !== plan.gid) ||
       (plan.modelRelaySocket && (!modelSocket?.isSocket() || modelSocket.uid !== 0 ||
-        modelSocket.gid !== plan.gid || (modelSocket.mode & 0o777) !== 0o660)) ||
+        (plan.managedForwarderNetworkNamespace ? modelSocket.gid === plan.gid :
+          modelSocket.gid !== plan.gid) || (modelSocket.mode & 0o777) !== 0o660)) ||
       (plan.activatedSocket ? (socket.mode & 0o777) !== 0o660 :
         (socket.mode & 0o007) !== 0 || (socket.mode & 0o060) !== 0o060)) {
     throw new Error("Linux agent root, workspace, or broker socket is not privately staged.");
@@ -946,6 +976,22 @@ async function checkedHostPaths(plan: LinuxAgentUnitPlan): Promise<string> {
   const markers = [root.dev, root.ino, workspace.dev, workspace.ino, socket.dev, socket.ino,
     socketParent.dev, socketParent.ino, executable.dev, executable.ino];
   if (modelSocket) markers.push(modelSocket.dev, modelSocket.ino);
+  if (plan.managedForwarderNetworkNamespace) {
+    const namespace = await lstat(plan.managedForwarderNetworkNamespace);
+    if (!namespace.isFile() || namespace.uid !== 0 || (namespace.mode & 0o022) !== 0 ||
+        await realpath(plan.managedForwarderNetworkNamespace) !== plan.managedForwarderNetworkNamespace) {
+      throw new Error("Linux agent private network namespace is not root pinned.");
+    }
+    for (const name of ["broker.sock", "model.sock"]) {
+      try { await lstat(`${plan.rootDirectory}/run/s-gw/${name}`); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      throw new Error("Linux managed agent root exposes a direct broker socket path.");
+    }
+    markers.push(namespace.dev, namespace.ino);
+  }
   if (plan.launchGate) {
     const binary = await lstat(path.join(plan.rootDirectory, gateExecutable));
     const mount = await lstat(path.join(plan.rootDirectory, gateMount));
@@ -1066,13 +1112,15 @@ async function checkedExecutableParents(root: string, executable: string): Promi
 }
 
 async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUnitPlan): Promise<void> {
-  const [status, cgroup, procRoot, configuredRoot, net, hostNet, ipc, hostIpc, mounts, hostMounts] = await Promise.all([
+  const [status, cgroup, procRoot, configuredRoot, net, hostNet, ipc, hostIpc, mounts, hostMounts,
+    pidNamespace, hostPidNamespace] = await Promise.all([
     readFile(`/proc/${state.mainPid}/status`, "utf8"),
     readFile(`/proc/${state.mainPid}/cgroup`, "utf8"),
     stat(`/proc/${state.mainPid}/root`, { bigint: true }), stat(plan.rootDirectory, { bigint: true }),
     readlink(`/proc/${state.mainPid}/ns/net`), readlink("/proc/self/ns/net"),
     readlink(`/proc/${state.mainPid}/ns/ipc`), readlink("/proc/self/ns/ipc"),
-    readlink(`/proc/${state.mainPid}/ns/mnt`), readlink("/proc/self/ns/mnt")
+    readlink(`/proc/${state.mainPid}/ns/mnt`), readlink("/proc/self/ns/mnt"),
+    readlink(`/proc/${state.mainPid}/ns/pid`), readlink("/proc/self/ns/pid")
   ]);
   const uid = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
   const gid = /^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
@@ -1090,6 +1138,14 @@ async function assertMainProcess(state: LinuxAgentUnitState, plan: LinuxAgentUni
   if (!procRoot.isDirectory() || procRoot.dev !== configuredRoot.dev ||
       procRoot.ino !== configuredRoot.ino) failed.push("root directory");
   if (net === hostNet) failed.push("network namespace");
+  if (plan.managedForwarderNetworkNamespace) {
+    const [pinned, live] = await Promise.all([
+      stat(plan.managedForwarderNetworkNamespace, { bigint: true }),
+      stat(`/proc/${state.mainPid}/ns/net`, { bigint: true })
+    ]);
+    if (pinned.dev !== live.dev || pinned.ino !== live.ino) failed.push("pinned network namespace");
+    if (pidNamespace === hostPidNamespace) failed.push("PID namespace");
+  }
   if (ipc === hostIpc) failed.push("IPC namespace");
   if (mounts === hostMounts) failed.push("mount namespace");
   if (!noCapabilities) failed.push("capabilities");

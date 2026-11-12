@@ -23,7 +23,9 @@ function plan(): LinuxAgentUnitPlan {
 }
 
 function attestation(p: LinuxAgentUnitPlan): string {
-  const binds = `${p.brokerSocket}:/run/s-gw/broker.sock` +
+  const binds = p.managedForwarderNetworkNamespace
+    ? `/run/s-gw/launch-gates/${p.sessionId}:/run/s-gw/launch-gate`
+    : `${p.brokerSocket}:/run/s-gw/broker.sock` +
     (p.modelRelaySocket ? ` ${p.modelRelaySocket}:/run/s-gw/model.sock` : "") +
     (p.launchGate ? ` /run/s-gw/launch-gates/${p.sessionId}:/run/s-gw/launch-gate` : "");
   return [
@@ -38,7 +40,7 @@ function attestation(p: LinuxAgentUnitPlan): string {
     `StandardError=${p.sealedStdio ? "null" : "inherit"}`,
     `RestrictAddressFamilies=${p.restrictedSocketFamilies ? "AF_UNIX AF_INET AF_INET6" : ""}`,
     `SystemCallArchitectures=${p.restrictedSocketFamilies ? "native" : ""}`,
-    `Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock${p.modelRelaySocket ?
+    `Environment=${p.managedForwarderNetworkNamespace ? "" : "SGW_BROKER_SOCKET=/run/s-gw/broker.sock"}${p.modelRelaySocket && !p.managedForwarderNetworkNamespace ?
       " SGW_MODEL_RELAY_SOCKET=/run/s-gw/model.sock" : ""}`,
     "Restart=no", "KillMode=control-group", "SendSIGKILL=yes", "Delegate=no",
     `BindsTo=${p.supervisedControlUnit ? "s-gw-agent-control.service" : ""}`,
@@ -48,7 +50,11 @@ function attestation(p: LinuxAgentUnitPlan): string {
     "ProtectHome=yes", "PrivateDevices=yes", "NoNewPrivileges=yes",
     "CapabilityBoundingSet=", "AmbientCapabilities=", "ProtectKernelTunables=yes",
     "ProtectKernelModules=yes", "ProtectControlGroups=yes", "RestrictNamespaces=yes",
-    "RestrictSUIDSGID=yes", "NetworkNamespacePath=", "IPCNamespacePath=", "JoinsNamespaceOf=",
+    "RestrictSUIDSGID=yes", `NetworkNamespacePath=${p.managedForwarderNetworkNamespace || ""}`,
+    `PrivatePIDs=${p.managedForwarderNetworkNamespace ? "yes" : "no"}`,
+    `MountFlags=${p.managedForwarderNetworkNamespace ? "private" : ""}`,
+    `BindLogSockets=${p.managedForwarderNetworkNamespace ? "no" : "yes"}`,
+    "IPCNamespacePath=", "JoinsNamespaceOf=",
     `ControlGroup=/system.slice/${linuxAgentUnitName(p.sessionId)}`,
     "MainPID=1234", "InvocationID=0123456789abcdef0123456789abcdef"
   ].join("\n") + "\n";
@@ -120,6 +126,34 @@ describe.skipIf(process.platform === "win32")("Linux systemd agent unit plan", (
     expect(() => parseSystemdAgentState(managed, attestation(managed).replace(
       "BindsTo=s-gw-agent-control.service", "BindsTo="))).toThrow("did not attest");
     expect(() => validateLinuxAgentPlan({ ...managed, isolatedSharedMemory: false })).toThrow();
+  });
+
+  it("uses the pinned private namespace and omits broker sockets in forwarder mode", () => {
+    const p: LinuxAgentUnitPlan = { ...plan(), launchGate: true, activatedSocket: true,
+      isolatedSharedMemory: true, serializedLifecycle: true, sealedStdio: true,
+      supervisedControlUnit: true, restrictedSocketFamilies: true,
+      logicalAgentId: "session-123", identityGeneration: "a".repeat(32),
+      managedForwarderNetworkNamespace: "/run/s-gw/netns/session-123" };
+    const args = systemdRunArgs(p);
+    expect(args).toContain("--property=NetworkNamespacePath=/run/s-gw/netns/session-123");
+    expect(args).toContain("--property=PrivatePIDs=yes");
+    expect(args).toContain("--property=MountFlags=private");
+    expect(args).toContain("--property=BindLogSockets=no");
+    expect(args).toContain("--property=BindReadOnlyPaths=/run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate");
+    expect(args).not.toContain("--property=Environment=SGW_BROKER_SOCKET=/run/s-gw/broker.sock");
+    expect(parseSystemdAgentState(p, attestation(p)).mainPid).toBe(1234);
+    expect(() => parseSystemdAgentState(p, attestation(p).replace(
+      "BindReadOnlyPaths=/run/s-gw/launch-gates/session-123:/run/s-gw/launch-gate",
+      "BindReadOnlyPaths=/run/s-gw/agents/session-123/broker.sock:/run/s-gw/broker.sock")))
+      .toThrow("did not attest");
+    expect(() => parseSystemdAgentState(p, attestation(p).replace("PrivatePIDs=yes", "PrivatePIDs=no")))
+      .toThrow("did not attest");
+    expect(() => parseSystemdAgentState(p, attestation(p).replace("MountFlags=private", "MountFlags=shared")))
+      .toThrow("did not attest");
+    expect(() => parseSystemdAgentState(p, attestation(p).replace(
+      "NetworkNamespacePath=/run/s-gw/netns/session-123", "NetworkNamespacePath=")))
+      .toThrow("did not attest");
+    expect(() => validateLinuxAgentPlan({ ...p, managedForwarderNetworkNamespace: "/tmp/other" })).toThrow();
   });
 
   it("attests both mounted sockets and the model relay path before a gated launch", () => {

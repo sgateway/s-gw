@@ -117,7 +117,9 @@ describe.skipIf(process.platform === "win32")("Linux managed unit provisioning",
   });
 
   it("assigns an opt-in MCP listener to the root-registered forwarder group", () => {
-    const { config, record } = setup();
+    const { config, record } = setup(false);
+    record.plan.managedForwarderNetworkNamespace = "/run/s-gw/netns/example-agent";
+    config.plan.managedForwarderNetworkNamespace = record.plan.managedForwarderNetworkNamespace;
     config.mcpForwarder = { uid: 230104, gid: 230105 };
     record.mcpForwarder = { ...config.mcpForwarder,
       unitFile: "/run/systemd/system/s-gw-forwarder-example-agent.service",
@@ -125,10 +127,43 @@ describe.skipIf(process.platform === "win32")("Linux managed unit provisioning",
       networkNamespacePath: "/run/s-gw/netns/example-agent" };
     const files = renderLinuxManagedUnitBundle(config, record, 230103, "runtime");
     expect(files.mcpSocketUnit).toContain("SocketGroup=230105\n");
-    expect(files.modelSocketUnit).toContain("SocketGroup=230102\n");
+    expect(files.forwarderUnit).toContain("User=230104\nGroup=230105\n");
+    expect(files.forwarderUnit).toContain("RootDirectory=/var/lib/s-gw/forwarder-roots/example-agent\n");
+    expect(files.forwarderUnit).toContain("NetworkNamespacePath=/run/s-gw/netns/example-agent\n");
+    expect(files.forwarderUnit).toContain("BindReadOnlyPaths=/run/s-gw/agents/example-agent/broker.sock:/run/s-gw/broker.sock");
+    expect(files.forwarderUnit).toContain("/run/s-gw/forwarder-proofs/example-agent.json:/run/s-gw/forwarder-attestation.json");
+    expect(files.forwarderUnit).toContain("PrivateIPC=yes\nPrivateTmp=yes\n");
+    expect(files.forwarderUnit).toContain("MountFlags=private\nBindLogSockets=no\n");
+    expect(files.forwarderUnit).not.toContain("PrivatePIDs=yes");
+    expect(files.forwarderUnit).toContain("ExecStart=/usr/libexec/s-gw/node /usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js\n");
+    expect(files.modelSocketUnit).toBeUndefined();
+    expect(() => renderLinuxManagedUnitBundle(config, record, 230103, "prepare")).not.toThrow();
     expect(() => renderLinuxManagedUnitBundle({ ...config,
       mcpForwarder: { uid: 230104, gid: 230106 } }, record, 230103, "runtime"))
       .toThrow(/forwarder differs/);
+  });
+
+  it("rejects a forwarder record without the agent's matching private namespace", () => {
+    const { config, record } = setup(false);
+    config.mcpForwarder = { uid: 230104, gid: 230105 };
+    record.mcpForwarder = { ...config.mcpForwarder,
+      unitFile: "/run/systemd/system/s-gw-forwarder-example-agent.service",
+      rootDirectory: "/var/lib/s-gw/forwarder-roots/example-agent",
+      networkNamespacePath: "/run/s-gw/netns/example-agent" };
+    expect(() => renderLinuxManagedUnitBundle(config, record, 230103, "runtime"))
+      .toThrow(/Invalid root-provisioned/);
+  });
+
+  it("rejects a model relay alongside the MCP-only forwarder stage", () => {
+    const { config, record } = setup();
+    config.plan.managedForwarderNetworkNamespace = "/run/s-gw/netns/example-agent";
+    config.mcpForwarder = { uid: 230104, gid: 230105 };
+    record.mcpForwarder = { ...config.mcpForwarder,
+      unitFile: "/run/systemd/system/s-gw-forwarder-example-agent.service",
+      rootDirectory: "/var/lib/s-gw/forwarder-roots/example-agent",
+      networkNamespacePath: "/run/s-gw/netns/example-agent" };
+    expect(() => renderLinuxManagedUnitBundle(config, record, 230103, "prepare"))
+      .toThrow(/MCP-only|model relay/i);
   });
 
   it("rejects mismatched, untrusted, and loose relay plans", () => {
