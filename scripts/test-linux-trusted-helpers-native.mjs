@@ -55,6 +55,9 @@ try {
     await cp(path.join(repo, name), path.join(staged, name), { recursive: true, dereference: true });
   }
   await cp(path.join(repo, 'package.json'), path.join(staged, 'package.json'));
+  const ownershipFix = spawnSync('/usr/bin/chown', ['-R', '0:0', staged], { encoding: 'utf8' });
+  assert.equal(ownershipFix.error, undefined, ownershipFix.error?.message);
+  assert.equal(ownershipFix.status, 0, ownershipFix.stderr);
   const permissionFix = spawnSync('/usr/bin/chmod', ['-R', 'go-w', staged], { encoding: 'utf8' });
   assert.equal(permissionFix.status, 0, permissionFix.stderr);
   await chmod(staged, 0o755);
