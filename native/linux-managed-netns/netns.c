@@ -93,6 +93,12 @@ static int only_loopback_routes(void) {
         int fields = sscanf(line, "%32s %2s %32s %2s %32s %8s %8s %8s %8s %16s",
             destination, prefix, source, source_prefix, gateway, metric, refcount, used,
             flags, interface);
+        // Linux net/ipv6/route.c defines fib6_null_entry_template as an unreachable
+        // RTF_REJECT|RTF_NONEXTHOP route with metric ~0u.
+        int kernel_null = fields == 10 &&
+            strcmp(destination, "00000000000000000000000000000000") == 0 &&
+            strcmp(prefix, "00") == 0 && strcmp(metric, "ffffffff") == 0 &&
+            strcmp(flags, "00200200") == 0;
         if (fields != 10 || strcmp(interface, "lo") != 0 ||
             strcmp(source, "00000000000000000000000000000000") != 0 ||
             strcmp(source_prefix, "00") != 0 ||
@@ -100,7 +106,7 @@ static int only_loopback_routes(void) {
             !((strcmp(destination, "00000000000000000000000000000001") == 0 &&
                 strcmp(prefix, "80") == 0) ||
               (strcmp(destination, "ff000000000000000000000000000000") == 0 &&
-                strcmp(prefix, "08") == 0))) {
+                strcmp(prefix, "08") == 0) || kernel_null)) {
             fprintf(stderr, "Managed namespace rejected IPv6 route (%d fields): %s",
                 fields, line);
             if (!strchr(line, '\n')) fputc('\n', stderr);

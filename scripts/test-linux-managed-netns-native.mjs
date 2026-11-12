@@ -59,6 +59,19 @@ try {
     throw new Error("Namespace helper pinned the host network namespace.");
   }
   call(helper, ["check", filename]);
+  const ipv6Routes = call("/usr/bin/nsenter", [`--net=${filename}`, "--", "/bin/cat",
+    "/proc/net/ipv6_route"]).stdout;
+  const zeroAddress = "0".repeat(32);
+  let nullRoutes = 0;
+  for (const line of ipv6Routes.trim().split("\n")) {
+    const route = line.trim().split(/\s+/);
+    if (route.length === 10 && route[0] === zeroAddress && route[1] === "00" &&
+        route[2] === zeroAddress && route[3] === "00" && route[4] === zeroAddress &&
+        route[5] === "ffffffff" && route[8] === "00200200" && route[9] === "lo") {
+      nullRoutes++;
+    }
+  }
+  if (nullRoutes < 1) throw new Error("Expected the kernel IPv6 unreachable sentinel.");
   call(helper, ["create", filename], false);
   call(helper, ["check", `/run/s-gw/netns/../${name}`], false);
   const ip = ["/usr/sbin/ip", "/usr/bin/ip"].find(existsSync);
@@ -72,6 +85,12 @@ try {
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "add", "default", "dev", "lo"]);
   routeMustFail();
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "del", "default", "dev", "lo"]);
+  call(helper, ["check", filename]);
+  call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "-6", "route", "add",
+    "default", "dev", "lo", "metric", "100"]);
+  routeMustFail();
+  call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "-6", "route", "del",
+    "default", "dev", "lo", "metric", "100"]);
   call(helper, ["check", filename]);
   call("/usr/bin/nsenter", [`--net=${filename}`, "--", ip, "route", "add",
     "198.51.100.1/32", "dev", "lo"]);
