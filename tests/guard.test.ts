@@ -98,6 +98,22 @@ describe("guard mode", () => {
     expect(await store.listHandles()).toHaveLength(0);
   });
 
+  it.skipIf(process.platform === "win32")("warns when a Linux allowed host uses the unpinned sandbox proxy", async () => {
+    const store = new SecretStore(tmpHome);
+    await store.init();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("Missing process platform descriptor.");
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+      const prepared = await prepareGuardedRun(store, {
+        agent: "codex", command: process.execPath, env: { PATH: "/usr/bin:/bin" },
+        sandbox: "anthropic", sandboxOptions: { strictEgress: true, allowHosts: ["allowed.test"] },
+        persist: false
+      });
+      expect(prepared.plan.warnings).toContain("Linux's default sandbox proxy can connect an allowed hostname to a private resolved address. Use --pin-public-proxy for public-only destinations.");
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
   it("scans credential-like npm environment values by default", async () => {
     const store = new SecretStore(tmpHome);
     await store.init();
