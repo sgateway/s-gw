@@ -90,7 +90,7 @@ static int read_release(char *buf, size_t size) {
   if (fd < 0) return -1;
   struct stat info;
   if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != SGW_GATE_OWNER_UID ||
-      (info.st_mode & 022) != 0 || info.st_nlink != 1) {
+      (info.st_mode & 022) != 0 || info.st_nlink > 1) {
     close(fd);
     return -1;
   }
@@ -101,9 +101,19 @@ static int read_release(char *buf, size_t size) {
   }
   char extra;
   ssize_t tail = read(fd, &extra, 1);
+  if (tail != 0) {
+    close(fd);
+    return -1;
+  }
+  struct stat final_info;
+  if (fstat(fd, &final_info) != 0 || final_info.st_nlink > 1) {
+    close(fd);
+    return -1;
+  }
   close(fd);
-  if (tail != 0) return -1;
   buf[count] = '\0';
+  // Release may unlink the opened WAIT inode; an unlinked GO is never enough to launch.
+  if (info.st_nlink == 0 || final_info.st_nlink == 0) return strcmp(buf, "WAIT\n") == 0 ? 1 : -1;
   return 0;
 }
 
@@ -125,15 +135,16 @@ int main(int argc, char **argv) {
 
   for (;;) {
     char marker[96];
-    if (read_release(marker, sizeof(marker)) != 0) return 70;
-    if (strcmp(marker, expected) == 0) {
+    int release_status = read_release(marker, sizeof(marker));
+    if (release_status < 0) return 70;
+    if (release_status == 0 && strcmp(marker, expected) == 0) {
 #ifdef __linux__
       if (close_inherited_fds() != 0) return 70;
 #endif
       execv(argv[2], argv + 2);
       return 71;
     }
-    if (strcmp(marker, "WAIT\n") != 0) return 72;
+    if (release_status == 0 && strcmp(marker, "WAIT\n") != 0) return 72;
 
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 70;

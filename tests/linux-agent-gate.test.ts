@@ -16,14 +16,40 @@ afterEach(async () => {
   tmp = "";
 });
 
-async function compiledGate(forceFdFallback = false): Promise<{ binary: string; marker: string }> {
+async function compiledGate(forceFdFallback = false, swapOn?: "fstat" | "read"): Promise<{ binary: string; marker: string }> {
   tmp = await mkdtemp(path.join(os.tmpdir(), "sgw-linux-gate-"));
   const marker = path.join(tmp, "release");
   const binary = path.join(tmp, "gate");
+  const swapSource = path.join(tmp, "swap-marker.c");
+  const swapFunction = swapOn === "fstat"
+    ? `int gate_test_fstat(int fd, struct stat *info) {
+  if (swap_marker() != 0) return -1;
+  return fstat(fd, info);
+}`
+    : `ssize_t gate_test_read(int fd, void *buf, size_t size) {
+  if (swap_marker() != 0) return -1;
+  return read(fd, buf, size);
+}`;
+  if (swapOn) await writeFile(swapSource, `#undef ${swapOn}
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int swap_marker(void) {
+  static int swapped = 0;
+  if (swapped) return 0;
+  swapped = 1;
+  return rename(getenv("SGW_GATE_TEST_REPLACEMENT"), SGW_GATE_RELEASE_FILE);
+}
+
+${swapFunction}
+`);
   const result = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror",
     `-DSGW_GATE_RELEASE_FILE="${marker}"`, `-DSGW_GATE_OWNER_UID=${process.getuid?.() ?? 0}`,
     "-DGATE_WAIT_SECONDS=1", ...(forceFdFallback ? ["-DSGW_GATE_FORCE_FD_FALLBACK=1"] : []),
-    source, "-o", binary], { encoding: "utf8" });
+    ...(swapOn ? [`-D${swapOn}=gate_test_${swapOn}`] : []), source,
+    ...(swapOn ? [swapSource] : []), "-o", binary], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || "Could not compile Linux launch gate test binary.");
   return { binary, marker };
 }
@@ -42,6 +68,66 @@ function runGate(binary: string, args: string[], inheritedFd?: number) {
 }
 
 describe.skipIf(process.platform === "win32")("native Linux launch gate protocol", () => {
+  it("retries a WAIT inode unlinked between open and fstat", async () => {
+    const { binary, marker } = await compiledGate(false, "fstat");
+    await writeFile(marker, "WAIT\n", { mode: 0o444 });
+    await chmod(marker, 0o444);
+    const ready = path.join(tmp, "ready.tmp");
+    const script = `set -e; printf 'GO %s %s\\n' "$INVOCATION_ID" "$$" > "$SGW_GATE_TEST_REPLACEMENT"; ` +
+      `chmod 444 "$SGW_GATE_TEST_REPLACEMENT"; exec "$SGW_GATE_TEST_BINARY" -- /usr/bin/true`;
+    const child = spawn("/bin/sh", ["-c", script], { env: {
+      INVOCATION_ID: invocation, SGW_GATE_TEST_REPLACEMENT: ready, SGW_GATE_TEST_BINARY: binary
+    } });
+    const finished = new Promise<number>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", code => resolve(code ?? -1));
+    });
+    const exitCode = await finished;
+    expect(await readFile(marker, "utf8")).toBe(`GO ${invocation} ${child.pid}\n`);
+    await expect(readFile(ready)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(exitCode).toBe(0);
+  });
+
+  it("rejects an unlinked GO inode even when its invocation and PID match", async () => {
+    const { binary, marker } = await compiledGate(false, "fstat");
+    const ready = path.join(tmp, "ready.tmp");
+    const script = `set -e; printf 'GO %s %s\\n' "$INVOCATION_ID" "$$" > "$SGW_GATE_TEST_MARKER"; ` +
+      `chmod 444 "$SGW_GATE_TEST_MARKER"; ` +
+      `printf 'GO %s %s\\n' "$INVOCATION_ID" "$$" > "$SGW_GATE_TEST_REPLACEMENT"; ` +
+      `chmod 444 "$SGW_GATE_TEST_REPLACEMENT"; exec "$SGW_GATE_TEST_BINARY" -- /usr/bin/true`;
+    const child = spawn("/bin/sh", ["-c", script], { env: {
+      INVOCATION_ID: invocation, SGW_GATE_TEST_MARKER: marker,
+      SGW_GATE_TEST_REPLACEMENT: ready, SGW_GATE_TEST_BINARY: binary
+    } });
+    const finished = new Promise<number>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", code => resolve(code ?? -1));
+    });
+    expect(await finished).toBe(70);
+    await expect(readFile(ready)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects GO unlinked after its first fstat but before read", async () => {
+    const { binary, marker } = await compiledGate(false, "read");
+    const ready = path.join(tmp, "ready.tmp");
+    const script = `set -e; printf 'GO %s %s\\n' "$INVOCATION_ID" "$$" > "$SGW_GATE_TEST_MARKER"; ` +
+      `chmod 444 "$SGW_GATE_TEST_MARKER"; ` +
+      `printf 'WAIT\\n' > "$SGW_GATE_TEST_REPLACEMENT"; ` +
+      `chmod 444 "$SGW_GATE_TEST_REPLACEMENT"; exec "$SGW_GATE_TEST_BINARY" -- /usr/bin/true`;
+    const child = spawn("/bin/sh", ["-c", script], { env: {
+      INVOCATION_ID: invocation, SGW_GATE_TEST_MARKER: marker,
+      SGW_GATE_TEST_REPLACEMENT: ready, SGW_GATE_TEST_BINARY: binary
+    } });
+    const finished = new Promise<number>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", code => resolve(code ?? -1));
+    });
+    const exitCode = await finished;
+    expect(await readFile(marker, "utf8")).toBe("WAIT\n");
+    await expect(readFile(ready)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(exitCode).toBe(70);
+  });
+
   it("keeps the target stopped until the exact invocation and PID are released", async () => {
     const { binary, marker } = await compiledGate();
     await writeFile(marker, "WAIT\n", { mode: 0o444 });
