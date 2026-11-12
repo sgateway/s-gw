@@ -53,29 +53,47 @@ static int only_loopback_routes(void) {
     char gateway[33], mask[9], source[33], source_prefix[3];
     char metric[9], refcount[9], used[9], flags[9];
     FILE *ipv4 = fopen("/proc/net/route", "r");
-    if (!ipv4 || !fgets(line, sizeof(line), ipv4)) {
-        if (ipv4) fclose(ipv4);
+    if (!ipv4) {
+        perror("Managed namespace IPv4 route inventory open");
+        return 0;
+    }
+    if (!fgets(line, sizeof(line), ipv4)) {
+        fputs("Managed namespace IPv4 route inventory has no header.\n", stderr);
+        fclose(ipv4);
         return 0;
     }
     while (fgets(line, sizeof(line), ipv4)) {
-        if (sscanf(line, "%16s %8s %8s %8s %8s %8s %8s %8s",
-            interface, destination, gateway, flags, refcount, used, metric, mask) != 8 ||
+        int fields = sscanf(line, "%16s %8s %8s %8s %8s %8s %8s %8s",
+            interface, destination, gateway, flags, refcount, used, metric, mask);
+        if (fields != 8 ||
             strcmp(interface, "lo") != 0 || strcmp(gateway, "00000000") != 0 ||
             !((strcmp(destination, "0000007F") == 0 && strcmp(mask, "000000FF") == 0) ||
               (strcmp(destination, "0100007F") == 0 && strcmp(mask, "FFFFFFFF") == 0))) {
+            fprintf(stderr, "Managed namespace rejected IPv4 route (%d fields): %s",
+                fields, line);
+            if (!strchr(line, '\n')) fputc('\n', stderr);
             fclose(ipv4);
             return 0;
         }
     }
-    if (ferror(ipv4)) { fclose(ipv4); return 0; }
+    if (ferror(ipv4)) {
+        perror("Managed namespace IPv4 route inventory read");
+        fclose(ipv4);
+        return 0;
+    }
     fclose(ipv4);
 
     FILE *ipv6 = fopen("/proc/net/ipv6_route", "r");
-    if (!ipv6) return errno == ENOENT;
+    if (!ipv6) {
+        if (errno == ENOENT) return 1;
+        perror("Managed namespace IPv6 route inventory open");
+        return 0;
+    }
     while (fgets(line, sizeof(line), ipv6)) {
-        if (sscanf(line, "%32s %2s %32s %2s %32s %8s %8s %8s %8s %16s",
+        int fields = sscanf(line, "%32s %2s %32s %2s %32s %8s %8s %8s %8s %16s",
             destination, prefix, source, source_prefix, gateway, metric, refcount, used,
-            flags, interface) != 10 || strcmp(interface, "lo") != 0 ||
+            flags, interface);
+        if (fields != 10 || strcmp(interface, "lo") != 0 ||
             strcmp(source, "00000000000000000000000000000000") != 0 ||
             strcmp(source_prefix, "00") != 0 ||
             strcmp(gateway, "00000000000000000000000000000000") != 0 ||
@@ -83,11 +101,15 @@ static int only_loopback_routes(void) {
                 strcmp(prefix, "80") == 0) ||
               (strcmp(destination, "ff000000000000000000000000000000") == 0 &&
                 strcmp(prefix, "08") == 0))) {
+            fprintf(stderr, "Managed namespace rejected IPv6 route (%d fields): %s",
+                fields, line);
+            if (!strchr(line, '\n')) fputc('\n', stderr);
             fclose(ipv6);
             return 0;
         }
     }
     int okay = !ferror(ipv6);
+    if (!okay) perror("Managed namespace IPv6 route inventory read");
     fclose(ipv6);
     return okay;
 }
