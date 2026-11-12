@@ -82,6 +82,22 @@ async function waitForBufferedBytes(expected: number, owner?: string) {
   throw new Error(`Relay buffered ${modelRelayBufferUsage(owner)} bytes; expected ${expected}.`);
 }
 
+async function rawRequest(port: number, requestLine: string, host: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1");
+    let response = "";
+    socket.setTimeout(3000, () => { reject(new Error("Model relay did not close the request.")); socket.destroy(); });
+    socket.on("data", chunk => { response += chunk.toString(); });
+    socket.once("error", error => {
+      if ((error as NodeJS.ErrnoException).code !== "ECONNRESET") reject(error);
+    });
+    socket.once("close", () => resolve(response));
+    socket.once("connect", () => {
+      socket.write(`${requestLine}\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
+    });
+  });
+}
+
 describe("model relay transport", () => {
   it("refuses special-use DNS answers, including IPv4-mapped addresses", () => {
     for (const address of ["127.0.0.1", "198.18.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.1",
@@ -587,6 +603,31 @@ describe("model relay transport", () => {
     const connect = await fetch(fixture.url + "/v1/messages", { method: "PUT", body: "{}" });
     expect(connect.status).toBe(404);
     expect(fixture.outbound).toEqual([]);
+  });
+
+  it("cannot proxy to an operator listener through an absolute target, CONNECT, or Host", async () => {
+    let operatorHits = 0;
+    const operator = createHttpServer((_req, res) => { operatorHits++; res.end("operator response"); });
+    await new Promise<void>(resolve => operator.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = operator.address();
+      if (!address || typeof address === "string") throw new Error("Operator fixture port missing.");
+      const target = `127.0.0.1:${address.port}`;
+      const fixture = await startFixture("anthropic", (_req, res) => res.end("model response"));
+      const relayPort = Number(new URL(fixture.url).port);
+
+      const absolute = await rawRequest(relayPort, `GET http://${target}/api/state HTTP/1.1`, target);
+      expect(absolute).toContain("404 Not Found");
+      const tunneled = await rawRequest(relayPort, `CONNECT ${target} HTTP/1.1`, target);
+      expect(tunneled).not.toContain("200 Connection established");
+      const model = await rawRequest(relayPort, "GET /v1/models HTTP/1.1", target);
+      expect(model).toContain("model response");
+      expect(fixture.outbound).toEqual(["https://api.anthropic.com/v1/models"]);
+      expect(operatorHits).toBe(0);
+    } finally {
+      operator.closeAllConnections();
+      await new Promise<void>(resolve => operator.close(() => resolve()));
+    }
   });
 
   it("supports fixed Anthropic token count and model discovery routes", async () => {
