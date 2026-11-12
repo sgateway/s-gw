@@ -529,9 +529,9 @@ export class SecretStore {
     const passphrase = requirePassphrase();
     const fingerprint = fingerprintSecret(input.value, passphrase);
     const service = input.service || defaultSecretKeychainService();
-    const operation = await this.mutate((store) => {
+    const { operation, resumed } = await this.mutate((store) => {
       const pending = (store.credentialOps || []).find((item) => item.record.fingerprint === fingerprint);
-      if (pending) return pending;
+      if (pending) return { operation: pending, resumed: true };
       if (store.secrets.some((secret) => secret.fingerprint === fingerprint)) {
         throw new Error("Staged credential-store add currently requires a new credential.");
       }
@@ -562,7 +562,7 @@ export class SecretStore {
       };
       const prepared: CredentialOperation = { id, kind: "keychain-add", phase: "prepared", record, createdAt: now };
       store.credentialOps = [...(store.credentialOps || []), prepared];
-      return prepared;
+      return { operation: prepared, resumed: false };
     });
 
     const intended = {
@@ -591,25 +591,54 @@ export class SecretStore {
       throw new Error(`Pending credential-store add ${operation.id} has a different service or staging account.`);
     }
 
-    try {
-      setMacKeychainItem(ref, input.value);
-      if (fingerprintSecret(getMacKeychainItem(ref), passphrase) !== fingerprint) {
-        throw new Error("Credential-store readback did not match the submitted value.");
+    if (!resumed || !this.stagedValueMatches(ref, fingerprint, passphrase)) {
+      try {
+        setMacKeychainItem(ref, input.value);
+      } catch {
+        throw new Error(`Credential-store add ${operation.id} is pending because its staged value was not verified. Retry with the same value.`);
       }
-    } catch {
-      throw new Error(`Credential-store add ${operation.id} is pending because its staged value was not verified. Retry with the same value.`);
+      if (!this.stagedValueMatches(ref, fingerprint, passphrase)) {
+        throw new Error(`Credential-store add ${operation.id} is pending because its staged value was not verified. Retry with the same value.`);
+      }
     }
 
+    return this.commitPreparedCredentialOperation(operation);
+  }
+
+  async recoverPendingCredentialOperation(id: string): Promise<SecretRecord> {
+    const store = await this.read();
+    const operation = (store.credentialOps || []).find((item) => item.id === id);
+    if (!operation) throw new Error(`Unknown pending credential operation: ${id}`);
+
+    const ref = keychainRefFromRecord(operation.record);
+    if (ref.account !== `${operation.record.handle}:stage:${operation.id}`) {
+      throw new Error(`Pending credential-store add ${id} has a different staging account.`);
+    }
+    if (!this.stagedValueMatches(ref, operation.record.fingerprint, requirePassphrase())) {
+      throw new Error(`Credential-store add ${id} is pending because its staged value was not verified. Retry with the same value.`);
+    }
+    return this.commitPreparedCredentialOperation(operation);
+  }
+
+  private stagedValueMatches(ref: MacKeychainItemRef, fingerprint: string, passphrase: string): boolean {
+    try {
+      return fingerprintSecret(getMacKeychainItem(ref), passphrase) === fingerprint;
+    } catch {
+      return false;
+    }
+  }
+
+  private async commitPreparedCredentialOperation(operation: CredentialOperation): Promise<SecretRecord> {
     return this.mutate((store) => {
       const pending = (store.credentialOps || []).find((item) => item.id === operation.id);
       if (!pending) {
         const committed = store.secrets.find((secret) => secret.handle === operation.record.handle);
-        if (committed?.fingerprint === fingerprint &&
+        if (committed?.fingerprint === operation.record.fingerprint &&
             JSON.stringify(committed.encrypted) === JSON.stringify(operation.record.encrypted)) return committed;
         throw new Error(`Credential-store add ${operation.id} changed before commit; inspect the pending operation.`);
       }
       if (JSON.stringify(pending) !== JSON.stringify(operation) ||
-          store.secrets.some((secret) => secret.handle === pending.record.handle || secret.fingerprint === fingerprint)) {
+          store.secrets.some((secret) => secret.handle === pending.record.handle || secret.fingerprint === operation.record.fingerprint)) {
         throw new Error(`Credential-store add ${operation.id} changed before commit; inspect the pending operation.`);
       }
       store.secrets.push(pending.record);

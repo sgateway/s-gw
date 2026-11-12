@@ -69,6 +69,7 @@ if (command === "set") {
   }
   db[key] = fs.readFileSync(0, "utf8");
   fs.writeFileSync(dbPath, JSON.stringify(db), { mode: 0o600 });
+  if (process.env.SGW_TEST_SET_LOG) fs.appendFileSync(process.env.SGW_TEST_SET_LOG, account + "\\n");
   process.exit(0);
 }
 if (command === "get") {
@@ -190,7 +191,7 @@ describe.skipIf(process.platform !== "darwin").sequential("staged credential-sto
     }
   }, 30_000);
 
-  it("keeps a failed readback pending across sealed recovery and retries the same staging account", async () => {
+  it("recovers a prepared add by readback after sealed ledger recovery without another provider write", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sgw-staged-retry-"));
     const home = path.join(root, "home");
     const helper = path.join(root, "keychain-helper");
@@ -198,7 +199,7 @@ describe.skipIf(process.platform !== "darwin").sequential("staged credential-sto
     const names = [
       "SGW_HOME", "SGW_RECOVERY_HOME", "SGW_TEST_MODE", "SGW_KEYCHAIN_HELPER",
       "SGW_TEST_KEYCHAIN_DB", "SGW_MASTER_PASSPHRASE", "SGW_DISABLE_KEYCHAIN",
-      "SGW_DISABLE_ONEPASSWORD_BACKUP", "SGW_TEST_WRONG_READ"
+      "SGW_DISABLE_ONEPASSWORD_BACKUP", "SGW_TEST_WRONG_READ", "SGW_TEST_SET_LOG"
     ] as const;
     const old = Object.fromEntries(names.map((name) => [name, process.env[name]]));
     Object.assign(process.env, {
@@ -210,7 +211,8 @@ describe.skipIf(process.platform !== "darwin").sequential("staged credential-sto
       SGW_MASTER_PASSPHRASE: "synthetic master passphrase",
       SGW_DISABLE_KEYCHAIN: "1",
       SGW_DISABLE_ONEPASSWORD_BACKUP: "1",
-      SGW_TEST_WRONG_READ: "1"
+      SGW_TEST_WRONG_READ: "1",
+      SGW_TEST_SET_LOG: path.join(root, "sets.log")
     });
     const input = { name: "synthetic staged item", type: "api-token" as const, value: "synthetic-staged-value-123456789" };
     try {
@@ -227,14 +229,69 @@ describe.skipIf(process.platform !== "darwin").sequential("staged credential-sto
       await rm(store.storePath);
       const recovered = new SecretStore(home);
       expect(await recovered.listPendingCredentialOperations()).toEqual([pending]);
+      await expect(recovered.recoverPendingCredentialOperation(pending.id)).rejects.toThrow(/is pending because its staged value was not verified/);
+      expect(await recovered.listHandles()).toHaveLength(0);
       delete process.env.SGW_TEST_WRONG_READ;
-      const record = await recovered.addKeychainSecretStaged(input);
+      const providerCopy = await readFile(process.env.SGW_TEST_KEYCHAIN_DB!, "utf8");
+      await rm(process.env.SGW_TEST_KEYCHAIN_DB!);
+      await expect(recovered.recoverPendingCredentialOperation(pending.id)).rejects.toThrow(/is pending because its staged value was not verified/);
+      expect(await recovered.listPendingCredentialOperations()).toEqual([pending]);
+      await writeFile(process.env.SGW_TEST_KEYCHAIN_DB!, providerCopy, { mode: 0o600 });
+      const record = await recovered.recoverPendingCredentialOperation(pending.id);
       expect(record.handle).toBe(pending.handle);
       expect(await recovered.listPendingCredentialOperations()).toEqual([]);
       expect(await recovered.listHandles()).toEqual([expect.objectContaining({ handle: pending.handle })]);
       const db = JSON.parse(await readFile(process.env.SGW_TEST_KEYCHAIN_DB!, "utf8"));
       expect(Object.keys(db)).toHaveLength(1);
       expect(Object.keys(db)[0]).toContain(pending.id);
+      expect((await readFile(process.env.SGW_TEST_SET_LOG!, "utf8")).trim().split("\n")).toEqual([
+        expect.stringContaining(pending.id)
+      ]);
+    } finally {
+      for (const name of names) {
+        if (old[name] === undefined) delete process.env[name];
+        else process.env[name] = old[name];
+      }
+      await rm(root, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("retries a prepared add without rewriting a value already present in the provider", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sgw-staged-readback-"));
+    const home = path.join(root, "home");
+    const helper = path.join(root, "keychain-helper");
+    await fakeKeychainHelper(helper);
+    const names = [
+      "SGW_HOME", "SGW_RECOVERY_HOME", "SGW_TEST_MODE", "SGW_KEYCHAIN_HELPER",
+      "SGW_TEST_KEYCHAIN_DB", "SGW_MASTER_PASSPHRASE", "SGW_DISABLE_KEYCHAIN",
+      "SGW_DISABLE_ONEPASSWORD_BACKUP", "SGW_TEST_WRONG_READ", "SGW_TEST_SET_LOG"
+    ] as const;
+    const old = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    Object.assign(process.env, {
+      SGW_HOME: home,
+      SGW_RECOVERY_HOME: `${home}-recovery`,
+      SGW_TEST_MODE: "1",
+      SGW_KEYCHAIN_HELPER: helper,
+      SGW_TEST_KEYCHAIN_DB: path.join(root, "provider.json"),
+      SGW_MASTER_PASSPHRASE: "synthetic master passphrase",
+      SGW_DISABLE_KEYCHAIN: "1",
+      SGW_DISABLE_ONEPASSWORD_BACKUP: "1",
+      SGW_TEST_WRONG_READ: "1",
+      SGW_TEST_SET_LOG: path.join(root, "sets.log")
+    });
+    const input = { name: "synthetic staged item", type: "api-token" as const, value: "synthetic-staged-value-123456789" };
+    try {
+      const store = new SecretStore(home);
+      await expect(store.addKeychainSecretStaged(input)).rejects.toThrow(/is pending because its staged value was not verified/);
+      const [pending] = await store.listPendingCredentialOperations();
+      delete process.env.SGW_TEST_WRONG_READ;
+      const record = await store.addKeychainSecretStaged(input);
+      expect(record.handle).toBe(pending.handle);
+      expect(await store.listPendingCredentialOperations()).toEqual([]);
+      expect((await readFile(process.env.SGW_TEST_SET_LOG!, "utf8")).trim().split("\n")).toEqual([
+        expect.stringContaining(pending.id)
+      ]);
     } finally {
       for (const name of names) {
         if (old[name] === undefined) delete process.env[name];
