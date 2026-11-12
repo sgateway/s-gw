@@ -11,7 +11,7 @@ if (!project || !work || !bridge || !/^[0-9]+$/.test(expectedUid) ||
   throw new Error("The managed bridge agent has the wrong fixture identity.");
 }
 
-const sdkRoot = path.join(project, "node_modules/@modelcontextprotocol/sdk/dist/esm/client");
+const sdkRoot = path.join(work, "node_modules/@modelcontextprotocol/sdk/dist/esm/client");
 const { Client } = await import(pathToFileURL(path.join(sdkRoot, "index.js")).href);
 const { StdioClientTransport } = await import(pathToFileURL(path.join(sdkRoot, "stdio.js")).href);
 const output = path.join(work, "agent-output");

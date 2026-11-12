@@ -146,7 +146,7 @@ function createIdentity(uid, name) {
     throw new Error(`Fixture account name is already in use: ${name}`);
   }
   run("groupadd", ["-g", String(uid), name]);
-  groups.push(name);
+  groups.push({ uid, name });
   run("useradd", ["-u", String(uid), "-g", String(uid), "-M", "-s", "/usr/sbin/nologin", name]);
   accounts.push({ uid, name });
 }
@@ -290,8 +290,15 @@ async function cleanup() {
       run("userdel", [name]);
     } catch (error) { errors.push(error); }
   }
-  for (const name of groups.toReversed()) {
-    try { run("groupdel", [name]); }
+  for (const { uid, name } of groups.toReversed()) {
+    try {
+      const found = run("getent", ["group", name], true);
+      if (found.status === 2) continue;
+      if (found.status !== 0 || found.stdout.split(":")[2] !== String(uid)) {
+        throw new Error(`Fixture group identity changed before cleanup: ${name}`);
+      }
+      run("groupdel", [name]);
+    }
     catch (error) { errors.push(error); }
   }
   for (const filename of [proofPath, brokerPath, work && path.join(work, "old-broker.sock")]) {
@@ -324,6 +331,10 @@ try {
   if (!existsSync(path.join(project, "dist/linux-managed-mcp-forwarder.js"))) {
     throw new Error("Build the Linux managed forwarder before the hosted bridge fixture.");
   }
+  const sdkModules = path.join(project, "node_modules");
+  if (!existsSync(path.join(sdkModules, "@modelcontextprotocol/sdk/dist/esm/client/index.js"))) {
+    throw new Error("Install the MCP SDK before the hosted bridge fixture.");
+  }
   if (await statMaybe(proofPath) || await statMaybe(brokerPath)) {
     throw new Error("The hosted bridge fixture found an existing global forwarder proof or broker socket.");
   }
@@ -349,6 +360,7 @@ try {
   const output = path.join(work, "agent-output");
   await mkdir(output, { mode: 0o700 });
   await chown(output, agentUid, agentUid);
+  await mkdir(path.join(work, "node_modules"), { mode: 0o755 });
   const bridge = path.join(work, "bridge");
   run("cc", ["-static", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
     path.join(project, "native/linux-managed-mcp-stdio/bridge.c"), "-o", bridge]);
@@ -373,6 +385,7 @@ try {
 
   startUnit(agentUnit, [...systemdOptions(agentUnit, agentName),
     "--property=PrivateNetwork=yes", "--property=ReadWritePaths=" + output,
+    "--property=BindReadOnlyPaths=" + sdkModules + ":" + path.join(work, "node_modules"),
     process.execPath, agentScript, project, work, bridge, String(agentUid)]);
   await outputMarker("ready");
   const agentPid = liveUnit(agentUnit, agentName);
