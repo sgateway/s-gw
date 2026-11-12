@@ -110,7 +110,7 @@ const agentUnit = "s-gw-agent-" + sessionId + ".service";
 const brokerUnit = "s-gw-managed-mcp-" + sessionId + ".service";
 const mcpUnit = "s-gw-managed-mcp-" + sessionId + ".socket";
 const modelUnit = "s-gw-managed-model-" + sessionId + ".socket";
-const operatorEntry = path.join(project, "scripts/linux-managed-mcp-operator.mjs");
+const operatorEntry = path.join(brokerPackage, "scripts/linux-managed-mcp-operator.mjs");
 const plan = { sessionId, uid: agentUid, gid: agentUid, brokerUid,
   rootDirectory: rootDir, brokerSocket: path.join(socketDir, "broker.sock"),
   modelRelaySocket: path.join(socketDir, "model.sock"),
@@ -315,6 +315,8 @@ try {
   run("cp", ["-R", path.join(project, "tools/desktop-packager"),
     path.join(brokerPackage, "tools")]);
   await copyFile(path.join(project, "package.json"), path.join(brokerPackage, "package.json"));
+  await mkdir(path.dirname(operatorEntry), { mode: 0o755 });
+  await copyFile(path.join(project, "scripts/linux-managed-mcp-operator.mjs"), operatorEntry);
   for (const filename of ["linux-agent-control.js", "linux-agent-unit.js",
     "linux-peer-identity.js", "linux-agent-identity.js", "model-relay-action.js"]) {
     await copyFile(path.join(project, "dist", filename), path.join(controlDir, filename));
@@ -648,7 +650,24 @@ try {
     await removeFile(envFile);
     for (const filename of [rootDir, storeHome, recoveryHome, installed]) await removeTree(filename);
     for (const name of accounts.reverse()) run("userdel", [name]);
-    for (const name of groups.reverse()) run("groupdel", [name]);
+    for (const name of groups.reverse()) {
+      const expectedGid = name === brokerName ? brokerUid : agentUid;
+      const before = run("getent", ["group", name], true);
+      if (before.error || (before.status !== 0 && before.status !== 2)) {
+        throw new Error("Could not inspect installer fixture group: " + name);
+      }
+      if (before.status === 0) {
+        const fields = before.stdout.trimEnd().split(":");
+        if (fields.length !== 4 || fields[0] !== name || Number(fields[2]) !== expectedGid) {
+          throw new Error("Installer fixture group changed before teardown: " + name);
+        }
+        run("groupdel", [name]);
+      }
+      const after = run("getent", ["group", name], true);
+      if (after.error || after.status !== 2) {
+        throw new Error("Installer fixture group survived teardown: " + name);
+      }
+    }
     for (const filename of madeDirs.reverse()) {
       if (!await statMaybe(filename)) continue;
       if (!owned.has(filename)) continue;
