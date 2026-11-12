@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { readFileSync, statfsSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,11 +21,17 @@ if (!Number.isSafeInteger(uid) || uid <= 0 || !Number.isSafeInteger(gid) || gid 
 }
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
-const free = statfsSync('/opt', { bigint: true });
-if (free.bavail * free.bsize < 5n * 1024n ** 3n) {
-  throw new Error('Trusted helper acceptance needs at least 5 GiB free on /opt before staging about 251 MiB.');
+const stageParent = '/usr/local/share';
+for (const dir of ['/', '/usr', '/usr/local', stageParent]) {
+  const info = lstatSync(dir);
+  assert(info.isDirectory() && info.uid === 0 && (info.mode & 0o022) === 0 &&
+    (info.mode & 0o005) === 0o005, `Trusted helper staging parent is not agent-readable and root-owned: ${dir}`);
 }
-const staged = await mkdtemp('/opt/sgw-trusted-helper-e2e-');
+const free = statfsSync(stageParent, { bigint: true });
+if (free.bavail * free.bsize < 5n * 1024n ** 3n) {
+  throw new Error('Trusted helper acceptance needs at least 5 GiB free on /usr/local/share before staging about 251 MiB.');
+}
+const staged = await mkdtemp(path.join(stageParent, 'sgw-trusted-helper-e2e-'));
 let agentRoot;
 const envKeys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'SGW_TEST_MODE', 'SGW_TEST_HOME_ROOT',
   'SGW_HOME', 'SGW_RECOVERY_HOME', 'SGW_MASTER_PASSPHRASE', 'SGW_DISABLE_KEYCHAIN',
