@@ -228,7 +228,8 @@ static int socket_at(int fd, const char *location, int listening) {
     return 0;
 }
 
-static int signed_code_matches(CFDictionaryRef attributes, const char *requirement_text) {
+static int signed_code_matches(CFDictionaryRef attributes, const char *requirement_text,
+                               const char *expected_path) {
     if (!attributes || !requirement_text || !requirement_text[0]) return 0;
     CFStringRef text = CFStringCreateWithCString(NULL, requirement_text, kCFStringEncodingUTF8);
     if (!text) return 0;
@@ -237,6 +238,15 @@ static int signed_code_matches(CFDictionaryRef attributes, const char *requireme
     int valid = SecRequirementCreateWithString(text, kSecCSDefaultFlags, &requirement) == errSecSuccess &&
         SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &code) == errSecSuccess &&
         SecCodeCheckValidity(code, kSecCSDefaultFlags, requirement) == errSecSuccess;
+    if (valid && expected_path) {
+        CFURLRef code_url = NULL;
+        char actual[PATH_MAX], actual_real[PATH_MAX], expected_real[PATH_MAX];
+        valid = SecCodeCopyPath(code, kSecCSDefaultFlags, &code_url) == errSecSuccess &&
+            code_url && CFURLGetFileSystemRepresentation(code_url, true,
+                (UInt8 *)actual, sizeof(actual)) && realpath(actual, actual_real) &&
+            realpath(expected_path, expected_real) && !strcmp(actual_real, expected_real);
+        if (code_url) CFRelease(code_url);
+    }
     if (code) CFRelease(code);
     if (requirement) CFRelease(requirement);
     CFRelease(text);
@@ -252,13 +262,14 @@ static int self_signed(void) {
     CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 1,
                                                       &kCFTypeDictionaryKeyCallBacks,
                                                       &kCFTypeDictionaryValueCallBacks);
-    int valid = signed_code_matches(attributes, SGW_POLICY_SERVICE_REQUIREMENT);
+    int valid = signed_code_matches(attributes, SGW_POLICY_SERVICE_REQUIREMENT, NULL);
     if (attributes) CFRelease(attributes);
     CFRelease(number);
     return valid;
 }
 
-static int signed_peer(int fd, uid_t expected_uid, const char *requirement_text) {
+static int signed_peer(int fd, uid_t expected_uid, const char *requirement_text,
+                       const char *expected_path) {
     uid_t uid;
     gid_t gid;
     audit_token_t token;
@@ -273,7 +284,7 @@ static int signed_peer(int fd, uid_t expected_uid, const char *requirement_text)
     CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 1,
                                                       &kCFTypeDictionaryKeyCallBacks,
                                                       &kCFTypeDictionaryValueCallBacks);
-    int valid = signed_code_matches(attributes, requirement_text);
+    int valid = signed_code_matches(attributes, requirement_text, expected_path);
     if (attributes) CFRelease(attributes);
     CFRelease(audit);
     return valid;
@@ -426,7 +437,7 @@ static int serve(int broker, int listener, int provider, uid_t broker_uid) {
             if (fd < 0) break;
             int slot = runners[0].fd < 0 ? 0 : runners[1].fd < 0 ? 1 : -1;
             int no_sigpipe = 1;
-            if (slot < 0 || !signed_peer(fd, 0, SGW_POLICY_RUNNER_REQUIREMENT) ||
+            if (slot < 0 || !signed_peer(fd, 0, SGW_POLICY_RUNNER_REQUIREMENT, NULL) ||
                 setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe))) close(fd);
             else runners[slot] = (struct runner_connection){ .fd = fd, .peer_uid = 0 };
         } else if (fds[1].revents) break;
@@ -455,8 +466,8 @@ int main(void) {
         checked_socket(PROVIDER_SOCKET, 0, 0600) ||
         socket_at(3, BROKER_CONTROL_SOCKET, 0) || socket_at(4, POLICY_SOCKET, 1) ||
         socket_at(5, PROVIDER_SOCKET, 0) ||
-        !signed_peer(3, broker_node.st_uid, SGW_POLICY_BROKER_REQUIREMENT) ||
-        !signed_peer(5, 0, SGW_POLICY_PROVIDER_REQUIREMENT)) {
+        !signed_peer(3, broker_node.st_uid, SGW_POLICY_BROKER_REQUIREMENT, NULL) ||
+        !signed_peer(5, 0, SGW_POLICY_PROVIDER_REQUIREMENT, SGW_POLICY_PROVIDER_PATH)) {
         fputs("s-gw root policy service has no trusted broker, socket, or signing requirement.\n", stderr);
         return 1;
     }

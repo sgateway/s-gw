@@ -2,6 +2,7 @@
 #include "policy-service.c"
 #undef main
 
+#include <signal.h>
 #include <sys/wait.h>
 
 static int entitlement_cases(void) {
@@ -75,9 +76,71 @@ static int exchange_cases(const struct sgw_policy_state *state) {
     return accepted_closed == 0 || proof.provider_alive ? 29 : 0;
 }
 
+static int peer_connect_case(const char *socket_path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 30;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    if (strlen(socket_path) >= sizeof(address.sun_path)) {
+        close(fd);
+        return 31;
+    }
+    strcpy(address.sun_path, socket_path);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address))) {
+        close(fd);
+        return 32;
+    }
+    char ignored;
+    recv(fd, &ignored, 1, 0);
+    close(fd);
+    return 0;
+}
+
+static int live_path_case(const char *self_path, const char *expected_path) {
+    char directory[] = "/tmp/sgw-policy-peer-XXXXXX";
+    if (!mkdtemp(directory)) return 33;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    char socket_path[sizeof(address.sun_path)];
+    int path_len = snprintf(socket_path, sizeof(socket_path), "%s/peer.sock", directory);
+    if (path_len < 0 || path_len >= (int)sizeof(socket_path)) {
+        rmdir(directory);
+        return 34;
+    }
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    strcpy(address.sun_path, socket_path);
+    if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) ||
+        listen(listener, 1)) {
+        if (listener >= 0) close(listener);
+        unlink(socket_path);
+        rmdir(directory);
+        return 35;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(listener);
+        execl(self_path, self_path, "--connect", socket_path, NULL);
+        _exit(36);
+    }
+    struct pollfd ready = { .fd = listener, .events = POLLIN };
+    int peer = child > 0 && poll(&ready, 1, 3000) == 1 && (ready.revents & POLLIN) ?
+        accept(listener, NULL, NULL) : -1;
+    int matched = peer >= 0 && signed_peer(peer, getuid(),
+        "identifier \"com.sgw.test-service\"", expected_path);
+    if (peer >= 0) close(peer);
+    if (peer < 0 && child > 0) kill(child, SIGKILL);
+    close(listener);
+    int child_status = 0;
+    int waited = child > 0 ? waitpid(child, &child_status, 0) : -1;
+    unlink(socket_path);
+    rmdir(directory);
+    if (waited != child || !WIFEXITED(child_status) || WEXITSTATUS(child_status)) return 37;
+    return matched ? 0 : 38;
+}
+
 int main(int argc, char **argv) {
     int entitlement_result = entitlement_cases();
     if (entitlement_result) return entitlement_result;
+    if (argc == 3 && !strcmp(argv[1], "--live-path")) return live_path_case(argv[0], argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--connect")) return peer_connect_case(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--tree"))
         return provider_bundle_contents_safe(argv[2], getuid()) ? 0 : 18;
     if (argc == 2) {
@@ -98,7 +161,7 @@ int main(int argc, char **argv) {
     if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 2;
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) return 3;
-    if (signed_peer(sockets[0], getuid(), "")) return 6;
+    if (signed_peer(sockets[0], getuid(), "", NULL)) return 6;
     struct runner_connection runner = { .fd = sockets[0], .peer_uid = 0 };
     if (reply_check(&runner, -1, &state, "CHECK-V1 231000 alpha\n")) return 4;
     char result[128] = {0};

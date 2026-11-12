@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -83,6 +83,37 @@ describe.skipIf(!macWithCompiler)("macOS root policy source", () => {
       expect(verify.status, verify.stderr).toBe(0);
       const adHoc = spawnSync(verifier, [candidate], { encoding: "utf8" });
       expect(adHoc.status, adHoc.stderr).toBe(0);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it("binds a signed live .systemextension peer to its pinned bundle path", () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), "sgw-policy-peer-path-"));
+    try {
+      const bundle = path.join(tmp, "Provider.systemextension");
+      const copied = path.join(tmp, "Copied.systemextension");
+      const verifier = path.join(bundle, "Contents", "MacOS", "test-service");
+      const copiedVerifier = path.join(copied, "Contents", "MacOS", "test-service");
+      mkdirSync(path.dirname(verifier), { recursive: true });
+      writeFileSync(path.join(bundle, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.sgw.test-service</string>
+<key>CFBundleExecutable</key><string>test-service</string>
+<key>CFBundlePackageType</key><string>XPC!</string>
+<key>CFBundleVersion</key><string>1</string>
+</dict></plist>\n`);
+      const build = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
+        path.join(sources, "policy-core.c"), path.join(sources, "test-service.c"),
+        "-framework", "Security", "-framework", "CoreFoundation", "-lbsm", "-o", verifier],
+      { encoding: "utf8" });
+      expect(build.status, build.stderr).toBe(0);
+      const sign = spawnSync("codesign", ["--force", "--sign", "-", "--identifier",
+        "com.sgw.test-service", bundle], { encoding: "utf8" });
+      expect(sign.status, sign.stderr).toBe(0);
+      cpSync(bundle, copied, { recursive: true });
+      const matching = spawnSync(verifier, ["--live-path", bundle], { encoding: "utf8" });
+      expect(matching.status, matching.stderr).toBe(0);
+      expect(spawnSync(copiedVerifier, ["--live-path", copied], { encoding: "utf8" }).status).toBe(0);
+      expect(spawnSync(verifier, ["--live-path", copied], { encoding: "utf8" }).status).not.toBe(0);
     } finally { rmSync(tmp, { recursive: true, force: true }); }
   });
 
