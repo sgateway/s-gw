@@ -50,6 +50,8 @@ jobs:
       - run: npm run check:rust
       - run: npm run check
       - run: npm run build
+      - name: Verify integrated Anthropic Unix-socket denial
+        run: node scripts/test-anthropic-seccomp-integrated-linux.mjs
       - name: Verify native Linux agent socket and launch gate
         run: |
           test "$(id -u)" -ne 0
@@ -90,9 +92,9 @@ jobs:
           SGW_ALLOW_NO_CGROUP: "1"
 
   seccomp-newer-host:
-    name: Anthropic seccomp availability probe (Ubuntu 26.04)
+    name: Anthropic seccomp integrated launch (Ubuntu 26.04)
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -102,8 +104,20 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
-      - run: bash scripts/probe-anthropic-seccomp-linux.sh
+          sudo apt-get install -y bubblewrap socat ripgrep
+      - run: npm run build
+      - name: Check helper and integrated s-gw launch independently
+        run: |
+          echo '::group::Ad hoc helper probe'
+          helper_status=0
+          bash scripts/probe-anthropic-seccomp-linux.sh || helper_status=$?
+          echo '::endgroup::'
+          echo '::group::Integrated s-gw Anthropic launch'
+          integrated_status=0
+          node scripts/test-anthropic-seccomp-integrated-linux.mjs || integrated_status=$?
+          echo '::endgroup::'
+          printf 'Ad hoc helper probe exit: %s\nIntegrated s-gw launch exit: %s\n' "$helper_status" "$integrated_status"
+          if [ "$helper_status" -ne 0 ] || [ "$integrated_status" -ne 0 ]; then exit 1; fi
 
   macos-native:
     name: macOS native surfaces
