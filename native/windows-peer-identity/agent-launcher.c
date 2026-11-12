@@ -181,15 +181,46 @@ static void drain_job(HANDLE job) {
     }
 }
 
+static void request_job_stop(HANDLE job) {
+    if (!job) return;
+    for (;;) {
+        if (TerminateJobObject(job, 1)) return;
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION usage = { 0 };
+        if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+            &usage, sizeof(usage), NULL) && usage.ActiveProcesses == 0) return;
+        Sleep(50);
+    }
+}
+
+static void drain_process(HANDLE process) {
+    if (!process) return;
+    // Job accounting alone is not enough if membership became uncertain.
+    for (;;) {
+        DWORD waited = WaitForSingleObject(process, 50);
+        if (waited == WAIT_OBJECT_0) return;
+        TerminateProcess(process, 1);
+        if (waited == WAIT_FAILED) Sleep(50);
+    }
+}
+
 static void revoke_until_confirmed(const SGW_WINDOWS_AGENT_HOOKS *hooks, void *context,
     const SGW_WINDOWS_AGENT_IDENTITY *identity) {
     while (hooks->revoke_session(context, identity) != ERROR_SUCCESS) Sleep(50);
 }
 
+static void begin_revoke_until_confirmed(const SGW_WINDOWS_AGENT_HOOKS *hooks, void *context,
+    const SGW_WINDOWS_AGENT_IDENTITY *identity, HANDLE job) {
+    while (hooks->begin_revoke(context, identity) != ERROR_SUCCESS) {
+        request_job_stop(job);
+        Sleep(50);
+    }
+}
+
 DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
     void *context, DWORD *child_exit_code) {
     if (!stop_event || stop_event == INVALID_HANDLE_VALUE || !hooks ||
-        !hooks->prepare || !hooks->register_session || !hooks->revoke_session ||
+        !hooks->prepare || !hooks->register_session || !hooks->begin_revoke ||
+        !hooks->revoke_session ||
         !child_exit_code || WaitForSingleObject(stop_event, 0) != WAIT_TIMEOUT)
         return ERROR_INVALID_PARAMETER;
 
@@ -337,7 +368,14 @@ done:
         TerminateProcess(process.hProcess, 1);
         WaitForSingleObject(process.hProcess, INFINITE);
     }
+    if (registration_attempted) {
+        // A known boundary failure takes priority over the normal broker-first teardown.
+        if (result == ERROR_NETWORK_ACCESS_DENIED || !sgw_wfp_healthy(&wfp))
+            request_job_stop(job);
+        begin_revoke_until_confirmed(hooks, context, &identity, job);
+    }
     drain_job(job);
+    drain_process(process.hProcess);
     if (registration_attempted) revoke_until_confirmed(hooks, context, &identity);
     if (process.hThread) CloseHandle(process.hThread);
     if (process.hProcess) CloseHandle(process.hProcess);

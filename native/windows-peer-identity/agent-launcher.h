@@ -29,6 +29,10 @@ typedef struct {
     DWORD (*prepare)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity,
         SGW_WINDOWS_AGENT_COMMAND *command);
     DWORD (*register_session)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity);
+    // In-process and nonblocking: synchronously deny new broker work and abort active requests.
+    // Do not wait for helpers or the child here.
+    DWORD (*begin_revoke)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity);
+    // Confirm that helpers and broker callbacks have settled before WFP is released.
     DWORD (*revoke_session)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity);
 } SGW_WINDOWS_AGENT_HOOKS;
 
