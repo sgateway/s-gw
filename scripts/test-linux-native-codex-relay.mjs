@@ -369,7 +369,8 @@ async function adoptAgentNodes(agent) {
 async function trustedFile(filename) {
   const info = await lstat(filename);
   if (!info.isFile() || info.uid !== 0 || info.nlink !== 1 || (info.mode & 0o022)) {
-    throw new Error(`Native Codex fixture file is not root controlled: ${filename}`);
+    throw new Error(`Native Codex fixture file is not root controlled: ${filename} ` +
+      `(uid=${info.uid}, mode=${(info.mode & 0o777).toString(8)}, links=${info.nlink})`);
   }
   let parent = path.dirname(filename);
   while (true) {
@@ -469,8 +470,10 @@ try {
   const controlFiles = ["linux-agent-control.js", "linux-agent-unit.js",
     "linux-peer-identity.js", "linux-agent-identity.js", "model-relay-action.js"];
   for (const filename of controlFiles) {
-    await copyFile(path.join(project, "dist", filename), path.join(controlDir, filename));
-    await trustedFile(path.join(controlDir, filename));
+    const staged = path.join(controlDir, filename);
+    await copyFile(path.join(project, "dist", filename), staged);
+    await chmod(staged, 0o644);
+    await trustedFile(staged);
   }
   await writeFile(path.join(controlDir, "package.json"), '{"type":"module"}\n', { mode: 0o644 });
   await copyFile(process.execPath, rootNode);
@@ -514,6 +517,8 @@ try {
       path.join(agent.root, "usr/libexec/s-gw/agent-local-model-forwarder.js"));
     await copyFile(path.join(project, "scripts/linux-native-codex-agent.mjs"),
       path.join(agent.root, "usr/libexec/s-gw/native-codex-agent.mjs"));
+    await chmod(path.join(agent.root, "usr/libexec/s-gw/agent-local-model-forwarder.js"), 0o644);
+    await chmod(path.join(agent.root, "usr/libexec/s-gw/native-codex-agent.mjs"), 0o644);
     await writeFile(path.join(agent.root, "usr/libexec/s-gw/package.json"),
       '{"type":"module"}\n', { mode: 0o644 });
     await writeFile(path.join(agent.root, "etc/passwd"),
