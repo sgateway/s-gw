@@ -117,12 +117,12 @@ else
 fi
 
 if [ "$standalone_result" -eq 1 ]; then
-  echo "::warning title=Anthropic seccomp availability::Standalone helper is blocked before payload by host policy; the product's inside-bwrap path was checked separately."
+  echo "::warning title=Anthropic seccomp availability::Standalone helper is blocked before payload by host policy; the separate inside-bwrap probe was checked too."
 elif [ "$standalone_result" -ne 0 ]; then
   echo "Standalone helper failed after payload start or for an unclassified reason." >&2
   exit 1
 fi
 if [ "$inside_result" -ne 0 ]; then
-  echo "The product's inside-bwrap helper did not prove a filtered payload launch." >&2
+  echo "The separate inside-bwrap probe did not prove a filtered payload launch." >&2
   exit 1
 fi
