@@ -6,6 +6,7 @@ if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -eq 0 ]; then
   exit 1
 fi
 
+node scripts/stage-anthropic-runtime.mjs
 version=$(node -p "require('./node_modules/@anthropic-ai/sandbox-runtime/package.json').version")
 if [ "$version" != 0.0.50 ]; then
   echo "Expected the pinned sandbox-runtime 0.0.50, found $version." >&2
@@ -28,6 +29,8 @@ printf 'Kernel: %s\nRuntime: %s\n' "$(uname -r)" "$version"
 /usr/bin/bwrap --version
 printf 'Host AppArmor: '
 cat /proc/self/attr/current
+printf 'Host setgroups: '
+cat /proc/self/setgroups
 grep -E '^(CapBnd|CapEff|NoNewPrivs|Seccomp):' /proc/self/status
 for key in apparmor_restrict_unprivileged_userns apparmor_restrict_unprivileged_unconfined unprivileged_userns_clone; do
   if [ -r "/proc/sys/kernel/$key" ]; then
@@ -51,7 +54,7 @@ known_policy_denial() {
 
 outer_sentinel="$probe_dir/outer.started"
 # shellcheck disable=SC2016
-if outer_output=$(env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bwrap "${bwrap_args[@]}" /bin/sh -c 'printf started > "$1"; printf "Bwrap child AppArmor: "; cat /proc/self/attr/current; grep -E "^(CapBnd|CapEff|NoNewPrivs|Seccomp):" /proc/self/status' sh "$outer_sentinel" 2>&1); then
+if outer_output=$(env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bwrap "${bwrap_args[@]}" /bin/sh -c 'printf started > "$1"; printf "Bwrap child AppArmor: "; cat /proc/self/attr/current; printf "Bwrap child setgroups: "; cat /proc/self/setgroups; grep -E "^(CapBnd|CapEff|NoNewPrivs|Seccomp):" /proc/self/status' sh "$outer_sentinel" 2>&1); then
   printf '%s\n' "$outer_output"
   if [ ! -f "$outer_sentinel" ]; then
     echo "Outer bubblewrap reported success without starting its payload." >&2
@@ -64,8 +67,8 @@ else
     echo "Outer bubblewrap failed for an unclassified reason or after starting its payload." >&2
     exit 1
   fi
-  echo "Outer bubblewrap: blocked before payload by host policy (fail closed)"
-  echo "::warning title=Anthropic seccomp availability::Outer bubblewrap is unavailable on this host; filtered launch was not verified."
+  echo "Outer bubblewrap is blocked before payload by host policy; filtered launch is unavailable." >&2
+  exit 1
 fi
 
 socket_probe=$'import sys\nwith open(sys.argv[1], "x") as marker:\n    marker.write("started")\nprint("SGW_PAYLOAD_STARTED", flush=True)\nimport errno, socket\ntry:\n    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nexcept OSError as error:\n    if error.errno != errno.EPERM:\n        raise\n    print("SGW_AF_UNIX_DENIED")\nelse:\n    sock.close()\n    raise SystemExit("SGW_AF_UNIX_ALLOWED")'
@@ -95,9 +98,8 @@ probe() {
     return 1
   fi
   if known_policy_denial "$output"; then
-    echo "$label: blocked before payload by host policy (fail closed)"
-    echo "::warning title=Anthropic seccomp availability::$label is unavailable on this host; the payload did not run."
-    return 0
+    echo "$label: blocked before payload by host policy; filtered launch is unavailable." >&2
+    return 1
   fi
   echo "$label failed for an unclassified reason." >&2
   return 1

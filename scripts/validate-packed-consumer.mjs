@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { bundledPackages, stageAnthropicRuntime } from "./stage-anthropic-runtime.mjs";
+import { bundledPackages, seccompHelpers, stageAnthropicRuntime } from "./stage-anthropic-runtime.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeName = "@anthropic-ai/sandbox-runtime";
@@ -57,6 +58,14 @@ export function validatePackedConsumer(tarballFile) {
     if (existsSync(join(installed, "node_modules", runtimeName, "node_modules", "zod"))) {
       throw new Error("The packed Anthropic runtime installed a nested Zod copy.");
     }
+    for (const [arch, hashes] of seccompHelpers) {
+      for (const prefix of ["vendor", "dist/vendor"]) {
+        const binary = join(installed, "node_modules", runtimeName, prefix, "seccomp", arch, "apply-seccomp");
+        if (sha256(binary) !== hashes.patched) {
+          throw new Error(`The packed Anthropic ${arch} seccomp helper is not patched.`);
+        }
+      }
+    }
 
     const tree = JSON.parse(runNpm(["ls", runtimeName, "zod", "--all", "--json"], consumer, env, workDir, "npm-ls"));
     checkZodVersions(tree);
@@ -77,6 +86,12 @@ export function validatePackedConsumer(tarballFile) {
 export function validateBundledFiles(files) {
   const bundled = new Set();
   const paths = new Set(files.map((entry) => entry.path));
+  for (const name of ["LICENSE", "README.md", "apply-seccomp.c", "unix-block-bpf.h",
+    "x64/apply-seccomp", "arm64/apply-seccomp"]) {
+    if (!paths.has(`vendor/anthropic-seccomp/${name}`)) {
+      throw new Error(`npm package is missing the Anthropic seccomp source or helper: ${name}`);
+    }
+  }
   for (const filePath of paths) {
     if (!filePath.startsWith("node_modules/")) continue;
     const match = /^node_modules\/((?:@[^/]+\/)?[^/]+)\//.exec(filePath);
@@ -94,6 +109,10 @@ export function validateBundledFiles(files) {
       throw new Error(`npm package is missing bundled dependency: ${name}`);
     }
   }
+}
+
+function sha256(file) {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
 }
 
 function runNpm(args, cwd, env, logs, name, allowed = [0]) {

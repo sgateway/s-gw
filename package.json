@@ -32,6 +32,7 @@
     "NOTICE",
     "TRADEMARKS.md",
     "server.json",
+    "vendor/anthropic-seccomp",
     ".codex-plugin",
     ".mcp.json",
     "skills",
