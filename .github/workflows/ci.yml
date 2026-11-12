@@ -28,7 +28,8 @@ jobs:
 
   quality:
     name: TypeScript, tests, and package
-    runs-on: ubuntu-latest
+    # Anthropic's seccomp helper fails closed on newer userns/AppArmor policies; keep Unix socket filtering.
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
       SGW_E2E_CHROME: /usr/bin/google-chrome
@@ -61,6 +62,32 @@ jobs:
       - run: npm run audit:release
       - run: npm run package:dry-run
       - run: npm run test:packed-consumer
+
+  quality-newer-host:
+    name: Core tests on newer Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SGW_E2E_CHROME: /usr/bin/google-chrome
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Install Linux sandbox dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap socat ripgrep
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm run check
+      - run: npm run build
+      - run: npm test -- --no-file-parallelism --exclude tests/anthropic-sandbox.test.ts --exclude tests/ssh-auth-sandbox.test.ts
+        env:
+          SGW_ALLOW_NO_CGROUP: "1"
 
   macos-native:
     name: macOS native surfaces
@@ -495,6 +522,11 @@ jobs:
         run: |
           node_path="$(command -v node)"
           sudo systemd-run --wait --pipe --collect --unit=sgw-sandbox-e2e --property=Delegate=yes             /bin/bash -c 'chown -R "$1:$(id -gn "$1")" /sys/fs/cgroup/system.slice/sgw-sandbox-e2e.service; cd "$2"; exec runuser -u "$1" -- /usr/bin/env "PATH=$4" "$3" scripts/test-anthropic-e2e.mjs --require-cgroup'             bash "$(id -un)" "$PWD" "$node_path" "$PATH"
+      - name: Verify native Linux managed unit installer
+        run: |
+          test "$(id -u)" -ne 0
+          node_path="$(command -v node)"
+          sudo CI=true "$node_path" scripts/test-linux-managed-installer-native.mjs --root
       - name: Verify two native Linux agent identities with a staged listener
         run: |
           test "$(id -u)" -ne 0

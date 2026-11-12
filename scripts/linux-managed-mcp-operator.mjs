@@ -54,6 +54,14 @@ if (mode === "seed" && args.length === 1) {
   const count = (await store.listRequests()).filter(item =>
     item.agentSessionId === sessionId && item.action.kind === "model_relay").length;
   process.stdout.write(`${count}\n`);
+} else if (mode === "relay-request" && args.length === 1) {
+  const [requestId] = args;
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(requestId)) throw new Error("Invalid native model request ID.");
+  const request = await store.getRequest(requestId);
+  if (!request || request.id !== requestId || request.action.kind !== "model_relay") {
+    throw new Error("Native model relay request was not found.");
+  }
+  process.stdout.write(`${JSON.stringify(request)}\n`);
 } else if (mode === "approve-relay" && args.length === 1) {
   const [requestId] = args;
   const request = await store.getRequest(requestId);
@@ -138,5 +146,5 @@ if (mode === "seed" && args.length === 1) {
   }
   process.stdout.write(`${request.id}\n`);
 } else {
-  throw new Error("Usage: linux-managed-mcp-operator seed <port> | approve <session> <uid> <name> <handle> <url> [generation]");
+  throw new Error("Usage: linux-managed-mcp-operator seed <port> | seed-relay | relay-request <id> | approve-relay <id> | approve <session> <uid> <name> <handle> <url> [generation]");
 }

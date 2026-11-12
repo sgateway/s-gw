@@ -386,6 +386,21 @@ static int save(const char *filename, const char *value) {
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "--installer-idle") == 0) {
+        alarm(5);
+        int broker = unix_connect("/run/s-gw/broker.sock");
+        int model = unix_connect("/run/s-gw/model.sock");
+        alarm(0);
+        if (broker < 0 || model < 0) {
+            if (broker >= 0) close(broker);
+            if (model >= 0) close(model);
+            return 70;
+        }
+        close(broker);
+        close(model);
+        if (save("/workspace/installer-ready", "ready\n") != 0) return 70;
+        for (;;) pause();
+    }
     if (argc == 2 && strcmp(argv[1], "--rights-positive") == 0) {
         return rights_selftest() ? 0 : 1;
     }
