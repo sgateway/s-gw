@@ -168,6 +168,9 @@ const { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle } =
 const { runLinuxManagedInstall } = await import(new URL("../dist/linux-managed-install.js", import.meta.url));
 const { discoverLinuxForwarderElfClosure } =
   await import(new URL("../dist/linux-forwarder-elf.js", import.meta.url));
+const { linuxForwarderEntry, linuxForwarderNode, linuxForwarderPackage,
+  linuxForwarderRuntimeDir } =
+  await import(new URL("../dist/linux-forwarder-runtime.js", import.meta.url));
 const bundle = renderLinuxManagedUnitBundle(config, record, brokerUid, "prepare");
 let staged = false;
 let failure;
@@ -230,13 +233,12 @@ try {
     throw new Error("Forwarder fixture root is not traversable after chroot.");
   }
   for (const relative of ["proc", "sys", "dev", "run", "run/s-gw",
-    `run/s-gw/${path.basename(runtimeRoot)}`,
-    `run/s-gw/${path.basename(runtimeRoot)}/dist`]) {
+    "opt", "opt/s-gw", linuxForwarderRuntimeDir.slice(1)]) {
     await mkdir(path.join(forwarderRoot, relative), { recursive: true, mode: 0o755 });
   }
-  await copyFile(node, `${forwarderRoot}${node}`);
-  await copyFile(forwarderEntry, `${forwarderRoot}${forwarderEntry}`);
-  await writeFile(`${forwarderRoot}${runtimeRoot}/package.json`, '{"type":"module"}\n',
+  await copyFile(node, `${forwarderRoot}${linuxForwarderNode}`);
+  await copyFile(forwarderEntry, `${forwarderRoot}${linuxForwarderEntry}`);
+  await writeFile(`${forwarderRoot}${linuxForwarderPackage}`, '{"type":"module"}\n',
     { mode: 0o644, flag: "wx" });
   const elf = await discoverLinuxForwarderElfClosure(node);
   for (const file of elf.files) {
@@ -301,9 +303,11 @@ try {
   const pinned = await stat(namespacePath, { bigint: true });
   const probe = `import { readFileSync, statSync } from "node:fs";\n` +
     `import { createServer } from "node:net";\n` +
+    `import { checkManagedMcpForwarderBoundary } from "file://${linuxForwarderEntry}";\n` +
     `if (process.getuid() !== ${forwarderUid} || process.getgid() !== ${forwarderUid} || ` +
     `process.getgroups().length !== 1 || process.getgroups()[0] !== ${forwarderUid} || ` +
-    `readFileSync("${runtimeRoot}/package.json", "utf8") !== '{"type":"module"}\\n') ` +
+    `typeof checkManagedMcpForwarderBoundary !== "function" || ` +
+    `readFileSync("${linuxForwarderPackage}", "utf8") !== '{"type":"module"}\\n') ` +
     `throw new Error("wrong forwarder root or identity");\n` +
     `const ns = statSync("/proc/self/ns/net", { bigint: true });\n` +
     `if (ns.dev !== ${pinned.dev}n || ns.ino !== ${pinned.ino}n) ` +
@@ -321,7 +325,7 @@ try {
     "--property=PrivateDevices=yes", "--property=NoNewPrivileges=yes",
     "--property=CapabilityBoundingSet=", "--property=AmbientCapabilities=",
     "--property=RestrictNamespaces=yes", "--property=SystemCallArchitectures=native",
-    "--", node, "--input-type=module", "--eval", probe], true);
+    "--", linuxForwarderNode, "--input-type=module", "--eval", probe], true);
   if (probeRun.error || probeRun.status !== 0) {
     const state = run("/usr/bin/systemctl", ["--system", "--no-pager", "show", probeUnit,
       "-p", "LoadState", "-p", "ActiveState", "-p", "Result", "-p", "ExecMainCode",
@@ -340,14 +344,16 @@ try {
   assertForwarderPortClosed();
 
   const state = properties(forwarderUnit, ["Id", "LoadState", "ActiveState", "FragmentPath",
-    "User", "Group", "RootDirectory", "NetworkNamespacePath", "PrivatePIDs", "MountFlags",
+    "User", "Group", "RootDirectory", "NetworkNamespacePath", "PrivatePIDs", "MountAPIVFS",
+    "MountFlags",
     "BindLogSockets", "BindReadOnlyPaths"]);
   if (state.get("Id") !== forwarderUnit || state.get("LoadState") !== "loaded" ||
       state.get("ActiveState") !== "inactive" || state.get("FragmentPath") !== forwarder.unitFile ||
       state.get("User") !== String(forwarderUid) || state.get("Group") !== String(forwarderUid) ||
       state.get("RootDirectory") !== forwarderRoot ||
       state.get("NetworkNamespacePath") !== namespacePath ||
-      state.get("PrivatePIDs") !== "no" || state.get("MountFlags") !== "private" ||
+      state.get("PrivatePIDs") !== "no" || state.get("MountAPIVFS") !== "yes" ||
+      state.get("MountFlags") !== "private" ||
       state.get("BindLogSockets") !== "no") {
     throw new Error("Installed forwarder unit lost its staged identity or isolation.");
   }

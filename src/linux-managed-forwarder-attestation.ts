@@ -7,11 +7,13 @@ import type { LinuxManagedPlanRecord } from "./linux-agent-control.js";
 import type { LinuxAgentUnitPlan, LinuxAgentUnitState } from "./linux-agent-unit.js";
 import { bindLinuxManagedForwarderSession, type LinuxBrokerSocketEvidence,
   type LinuxUnitProcessEvidence, type RootAttestedForwarderBinding } from "./linux-managed-forwarder-binding.js";
+import { linuxForwarderEntry, linuxForwarderNode } from "./linux-forwarder-runtime.js";
 import type { PeerSession } from "./peer-identity.js";
 
 const run = promisify(execFile);
 const unitFields = ["Id", "LoadState", "ActiveState", "FragmentPath", "DropInPaths", "User", "Group",
   "SupplementaryGroups", "RootDirectory", "NetworkNamespacePath", "PrivateIPC", "PrivateTmp",
+  "MountAPIVFS",
   "ProtectHome", "ProtectSystem", "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities",
   "RestrictNamespaces", "SystemCallArchitectures", "KillMode", "BindsTo", "After", "ExecStart",
   "ControlGroup", "MainPID", "InvocationID"];
@@ -67,13 +69,14 @@ function properties(output: string): Map<string, string> {
 function assertUnit(record: LinuxManagedPlanRecord, values: Map<string, string>): LinuxAgentUnitState {
   const forwarder = record.mcpForwarder!;
   const name = path.basename(forwarder.unitFile);
-  const entry = path.join(path.dirname(record.brokerEntry), "linux-managed-mcp-forwarder.js");
   const exec = values.get("ExecStart") || "";
-  const command = `{ path=${record.brokerNode} ; argv[]=${record.brokerNode} ${entry} ; ignore_errors=no ; }`;
+  const command = `{ path=${linuxForwarderNode} ; argv[]=${linuxForwarderNode} ` +
+    `${linuxForwarderEntry} ; ignore_errors=no ; }`;
   const unit = [`Id=${name}`, "LoadState=loaded", "ActiveState=active",
     `FragmentPath=${forwarder.unitFile}`, "DropInPaths=", `User=${forwarder.uid}`,
     `Group=${forwarder.gid}`, "SupplementaryGroups=", `RootDirectory=${forwarder.rootDirectory}`,
     `NetworkNamespacePath=${forwarder.networkNamespacePath}`, "PrivateIPC=yes", "PrivateTmp=yes",
+    "MountAPIVFS=yes",
     "ProtectHome=yes", "ProtectSystem=strict", "NoNewPrivileges=yes", "CapabilityBoundingSet=0",
     "AmbientCapabilities=0", "RestrictNamespaces=yes", "SystemCallArchitectures=native",
     "KillMode=control-group"];
@@ -192,6 +195,8 @@ export async function collectRootManagedForwarderSession(record: LinuxManagedPla
   await rootOwnedFile(host, forwarder.unitFile);
   await rootOwnedFile(host, entry);
   await rootOwnedFile(host, record.brokerNode);
+  await rootOwnedFile(host, `${forwarder.rootDirectory}${linuxForwarderNode}`);
+  await rootOwnedFile(host, `${forwarder.rootDirectory}${linuxForwarderEntry}`);
   await rootOwnedFile(host, forwarder.networkNamespacePath);
   const unit = assertUnit(record, properties(await host.unit(path.basename(forwarder.unitFile), unitFields)));
   const [agentProcess, forwarderProcess, brokerSocket, mountedBrokerSocket,

@@ -48,12 +48,12 @@ function fixture() {
     `FragmentPath=${record.mcpForwarder!.unitFile}`, "DropInPaths=", "User=32001", "Group=32001",
     "SupplementaryGroups=", `RootDirectory=${record.mcpForwarder!.rootDirectory}`,
     `NetworkNamespacePath=${record.mcpForwarder!.networkNamespacePath}`, "PrivateIPC=yes",
-    "PrivateTmp=yes", "ProtectHome=yes", "ProtectSystem=strict", "NoNewPrivileges=yes",
+    "PrivateTmp=yes", "MountAPIVFS=yes", "ProtectHome=yes", "ProtectSystem=strict", "NoNewPrivileges=yes",
     "CapabilityBoundingSet=0", "AmbientCapabilities=0", "RestrictNamespaces=yes",
     "SystemCallArchitectures=native", "KillMode=control-group",
     `BindsTo=s-gw-agent-control.service ${agentUnit.unit}`,
     `After=s-gw-agent-control.service ${agentUnit.unit}`,
-    "ExecStart={ path=/opt/s-gw/node ; argv[]=/opt/s-gw/node /opt/s-gw/dist/linux-managed-mcp-forwarder.js ; ignore_errors=no ; }",
+    "ExecStart={ path=/opt/s-gw/forwarder/node ; argv[]=/opt/s-gw/forwarder/node /opt/s-gw/forwarder/linux-managed-mcp-forwarder.js ; ignore_errors=no ; }",
     `ControlGroup=/system.slice/s-gw-forwarder-${sessionId}.service`, "MainPID=202",
     `InvocationID=${forwarderInvocation}`
   ].join("\n") + "\n";
@@ -77,6 +77,10 @@ function fixture() {
     [record.mcpForwarder!.unitFile, file("file", 0, 0, 0o100644)],
     ["/opt/s-gw/dist/linux-managed-mcp-forwarder.js", file("file", 0, 0, 0o100644)],
     [record.brokerNode, file("file", 0, 0, 0o100755)],
+    [`${record.mcpForwarder!.rootDirectory}/opt/s-gw/forwarder/node`,
+      file("file", 0, 0, 0o100755)],
+    [`${record.mcpForwarder!.rootDirectory}/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js`,
+      file("file", 0, 0, 0o100644)],
     [record.plan.brokerSocket, file("socket", 0, 32001, 0o140660, 10, 20)],
     ["/proc/202/root/run/s-gw/broker.sock", file("socket", 0, 32001, 0o140660, 10, 20)],
     ["/proc/202/root", file("directory", 0, 0, 0o40755, 4, 40)],
@@ -86,10 +90,12 @@ function fixture() {
   ]);
   for (const name of [record.mcpForwarder!.unitFile,
     "/opt/s-gw/dist/linux-managed-mcp-forwarder.js", record.brokerNode,
+    `${record.mcpForwarder!.rootDirectory}/opt/s-gw/forwarder/node`,
+    `${record.mcpForwarder!.rootDirectory}/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js`,
     record.mcpForwarder!.networkNamespacePath]) {
     let parent = name.slice(0, name.lastIndexOf("/")) || "/";
-    while (!files.has(parent)) {
-      files.set(parent, file("directory", 0, 0, 0o40755));
+    while (true) {
+      if (!files.has(parent)) files.set(parent, file("directory", 0, 0, 0o40755));
       if (parent === "/") break;
       parent = parent.slice(0, parent.lastIndexOf("/")) || "/";
     }
@@ -145,6 +151,10 @@ describe("product Linux MCP forwarder attestation", () => {
     unit.host.unit = async () => unit.unitText.replace("DropInPaths=", "DropInPaths=/tmp/override.conf");
     await expect(collectRootManagedForwarderSession(unit.record, unit.agentUnit, "Claude", unit.host))
       .rejects.toThrow(/unit differs/);
+    const apivfs = fixture();
+    apivfs.host.unit = async () => apivfs.unitText.replace("MountAPIVFS=yes", "MountAPIVFS=no");
+    await expect(collectRootManagedForwarderSession(apivfs.record, apivfs.agentUnit,
+      "Claude", apivfs.host)).rejects.toThrow(/unit differs/);
   });
 
   it("cannot register when the agent mount and FD gate has no trusted proof", async () => {

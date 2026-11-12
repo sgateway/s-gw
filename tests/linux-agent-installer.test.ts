@@ -97,12 +97,12 @@ class Host implements LinuxManagedInstallHost {
       this.add("/var/lib/s-gw", "directory", "", 0, 0, 0o700);
       this.add("/var/lib/s-gw/forwarder-roots", "directory", "", 0, 0, 0o700);
       this.add(root, "directory", "", 0, 0, 0o755);
-      for (const dir of ["usr", "usr/libexec", "usr/libexec/s-gw", "usr/libexec/s-gw/dist",
-        "run", "run/s-gw"]) this.add(`${root}/${dir}`, "directory", "", 0, 0, 0o755);
-      this.add(`${root}${input.record.brokerNode}`, "file", "trusted runtime", 0, 0, 0o755);
-      this.add(`${root}/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js`,
+      for (const dir of ["opt", "opt/s-gw", "opt/s-gw/forwarder", "run", "run/s-gw"])
+        this.add(`${root}/${dir}`, "directory", "", 0, 0, 0o755);
+      this.add(`${root}/opt/s-gw/forwarder/node`, "file", "trusted runtime", 0, 0, 0o755);
+      this.add(`${root}/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js`,
         "file", "trusted runtime", 0, 0, 0o644);
-      this.add(`${root}/usr/libexec/s-gw/package.json`, "file", '{"type":"module"}\n',
+      this.add(`${root}/opt/s-gw/forwarder/package.json`, "file", '{"type":"module"}\n',
         0, 0, 0o644);
       this.add("/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js",
         "file", "trusted runtime", 0, 0, 0o644);
@@ -241,12 +241,13 @@ class Host implements LinuxManagedInstallHost {
     const r = this.input.record;
     const f = r.mcpForwarder!;
     const name = path.basename(f.unitFile);
-    const entry = "/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js";
+    const entry = "/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js";
     return [`Id=${name}`, `LoadState=${this.files.has(f.unitFile) ? "loaded" : "not-found"}`,
       `ActiveState=${this.active.has(name) ? "active" : "inactive"}`, `FragmentPath=${f.unitFile}`,
       "DropInPaths=", `User=${f.uid}`, `Group=${f.gid}`, `RootDirectory=${f.rootDirectory}`,
       `NetworkNamespacePath=${f.networkNamespacePath}`, "PrivateNetwork=yes", "PrivateIPC=yes",
-      "PrivateTmp=yes", "PrivatePIDs=no", "MountFlags=private", "BindLogSockets=no",
+      "PrivateTmp=yes", "PrivatePIDs=no", "MountAPIVFS=yes", "MountFlags=private",
+      "BindLogSockets=no",
       "ProtectHome=yes", "ProtectSystem=strict",
       "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=",
       "RestrictNamespaces=yes", "SystemCallArchitectures=native", "KillMode=control-group",
@@ -255,7 +256,7 @@ class Host implements LinuxManagedInstallHost {
         `/run/s-gw/forwarder-proofs/${r.plan.sessionId}.json:/run/s-gw/forwarder-attestation.json`,
       `BindsTo=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
       `After=s-gw-agent-control.service s-gw-agent-${r.plan.sessionId}.service`,
-      `ExecStart={ path=${r.brokerNode} ; argv[]=${r.brokerNode} ${entry} ; ignore_errors=no ; ` +
+      `ExecStart={ path=/opt/s-gw/forwarder/node ; argv[]=/opt/s-gw/forwarder/node ${entry} ; ignore_errors=no ; ` +
         "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"];
   }
   async unit(unit: string, _fields: string[]) {
@@ -403,6 +404,14 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
       .rejects.toThrow(/MountFlags/);
   });
 
+  it("refuses a forwarder unit without its private API filesystems", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    host.forwarderProperties.set("MountAPIVFS", "no");
+    await expect(new LinuxManagedUnitInstaller(host).stage(input))
+      .rejects.toThrow(/MountAPIVFS/);
+  });
+
   it("reports the bounded systemd command readback on a forwarder mismatch", async () => {
     const input = withForwarder();
     const host = new Host(input);
@@ -421,12 +430,12 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
     await expect(new LinuxManagedUnitInstaller(host).stage(input)).resolves.toBeUndefined();
   });
 
-  const inactiveExecStart = "{ path=/usr/libexec/s-gw/node ; argv[]=/usr/libexec/s-gw/node " +
-    "/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js ; ignore_errors=no ; " +
+  const inactiveExecStart = "{ path=/opt/s-gw/forwarder/node ; argv[]=/opt/s-gw/forwarder/node " +
+    "/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js ; ignore_errors=no ; " +
     "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
   it.each([
-    ["a changed executable", inactiveExecStart.replace("path=/usr/libexec/s-gw/node", "path=/bin/sh")],
-    ["a changed argv", inactiveExecStart.replace("argv[]=/usr/libexec/s-gw/node", "argv[]=/bin/sh")],
+    ["a changed executable", inactiveExecStart.replace("path=/opt/s-gw/forwarder/node", "path=/bin/sh")],
+    ["a changed argv", inactiveExecStart.replace("argv[]=/opt/s-gw/forwarder/node", "argv[]=/bin/sh")],
     ["an extra argument", inactiveExecStart.replace("forwarder.js ;", "forwarder.js --unsafe ;")],
     ["ignore_errors enabled", inactiveExecStart.replace("ignore_errors=no", "ignore_errors=yes")],
     ["an extra command", inactiveExecStart + " { path=/bin/sh ; argv[]=/bin/sh ; ignore_errors=no ; }"],
@@ -461,10 +470,22 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
   it("requires ES module metadata inside the forwarder root", async () => {
     const input = withForwarder();
     const host = new Host(input);
-    const filename = `${input.record.mcpForwarder!.rootDirectory}/usr/libexec/s-gw/package.json`;
+    const filename = `${input.record.mcpForwarder!.rootDirectory}/opt/s-gw/forwarder/package.json`;
     host.files.get(filename)!.text = '{"type":"commonjs"}\n';
     await expect(new LinuxManagedUnitInstaller(host).stage(input))
       .rejects.toThrow(/ES module metadata/);
+  });
+
+  it("refuses changed chroot-visible forwarder executable files", async () => {
+    const input = withForwarder();
+    const root = input.record.mcpForwarder!.rootDirectory;
+    for (const relative of ["/opt/s-gw/forwarder/node",
+      "/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js"]) {
+      const host = new Host(input);
+      host.files.get(`${root}${relative}`)!.text = "changed runtime";
+      await expect(new LinuxManagedUnitInstaller(host).stage(input))
+        .rejects.toThrow(/trusted runtime/);
+    }
   });
 
   it("refuses loader configuration inside the forwarder root", async () => {
@@ -511,7 +532,7 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
     const input = withForwarder();
     const root = input.record.mcpForwarder!.rootDirectory;
     for (const filename of [input.record.brokerNode,
-      `${root}/usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js`,
+      `${root}/opt/s-gw/forwarder/linux-managed-mcp-forwarder.js`,
       "/usr/lib/x86_64-linux-gnu/libc.so.6",
       `${root}/lib64/ld-linux-x86-64.so.2`]) {
       const host = new Host(input);

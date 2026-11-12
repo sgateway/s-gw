@@ -8,6 +8,8 @@ import { assertControlUnitPreflight, assertManagedMcpSocketUnit, assertModelSock
   type LinuxManagedPlanRecord } from "./linux-agent-control.js";
 import { linuxAgentIdentityDir } from "./linux-agent-identity.js";
 import { discoverLinuxForwarderElfClosure, type LinuxForwarderElfClosure } from "./linux-forwarder-elf.js";
+import { linuxForwarderEntry, linuxForwarderNode, linuxForwarderPackage,
+  linuxForwarderRuntimeDir } from "./linux-forwarder-runtime.js";
 import { linuxForwarderIdentityDir, linuxForwarderIdentityRecord } from "./linux-forwarder-identity.js";
 import { linuxAgentUnitName } from "./linux-agent-unit.js";
 import { renderLinuxAgentControlUnit, renderLinuxManagedUnitBundle,
@@ -271,10 +273,13 @@ async function checkForwarderRoot(host: LinuxManagedInstallHost,
   if (!forwarder) return;
   await checkedDirectory(host, forwarder.rootDirectory, 0, 0, 0o755);
   await checkedDirectory(host, `${forwarder.rootDirectory}/run/s-gw`, 0, 0, 0o755);
+  for (const relative of ["/opt", "/opt/s-gw", linuxForwarderRuntimeDir]) {
+    await checkedDirectory(host, `${forwarder.rootDirectory}${relative}`, 0, 0, 0o755);
+  }
   if (await host.file(`${forwarder.rootDirectory}/etc`)) {
     throw new Error("Linux forwarder root cannot contain loader configuration.");
   }
-  const packageFile = `${forwarder.rootDirectory}${input.record.brokerRuntimeRoot}/package.json`;
+  const packageFile = `${forwarder.rootDirectory}${linuxForwarderPackage}`;
   const packageState = await host.file(packageFile);
   await checkedFile(host, packageFile, 0, 0, 0o644);
   if (!packageState || packageState.size > 128 ||
@@ -282,9 +287,12 @@ async function checkForwarderRoot(host: LinuxManagedInstallHost,
     throw new Error("Linux forwarder root needs sealed ES module metadata.");
   }
   if (!host.sha256) throw new Error("Linux forwarder root needs a trusted runtime digest check.");
-  for (const filename of [input.record.brokerNode, forwarderEntry(input)]) {
+  for (const [filename, chrootPath] of [
+    [input.record.brokerNode, linuxForwarderNode],
+    [forwarderEntry(input), linuxForwarderEntry]
+  ]) {
     const hostFile = await checkedFile(host, filename, 0, 0);
-    const inside = await checkedFile(host, `${forwarder.rootDirectory}${filename}`, 0, 0);
+    const inside = await checkedFile(host, `${forwarder.rootDirectory}${chrootPath}`, 0, 0);
     const hostState = await host.file(hostFile.filename);
     const insideState = await host.file(inside.filename);
     const access = filename === input.record.brokerNode ? 0o005 : 0o004;
@@ -420,7 +428,8 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
   const name = path.basename(forwarder.unitFile);
   const values = parseProperties(await host.unit(name, ["Id", "LoadState", "ActiveState",
     "FragmentPath", "DropInPaths", "User", "Group", "RootDirectory", "NetworkNamespacePath",
-    "PrivateNetwork", "PrivateIPC", "PrivateTmp", "PrivatePIDs", "MountFlags", "BindLogSockets",
+    "PrivateNetwork", "PrivateIPC", "PrivateTmp", "PrivatePIDs", "MountAPIVFS",
+    "MountFlags", "BindLogSockets",
     "ProtectHome", "ProtectSystem",
     "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictNamespaces",
     "SystemCallArchitectures", "KillMode", "UnsetEnvironment", "BindReadOnlyPaths",
@@ -432,7 +441,8 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
     ["RootDirectory", forwarder.rootDirectory],
     ["NetworkNamespacePath", forwarder.networkNamespacePath],
     ["PrivateNetwork", "yes"], ["PrivateIPC", "yes"], ["PrivateTmp", "yes"],
-    ["PrivatePIDs", "no"], ["MountFlags", "private"], ["BindLogSockets", "no"],
+    ["PrivatePIDs", "no"], ["MountAPIVFS", "yes"], ["MountFlags", "private"],
+    ["BindLogSockets", "no"],
     ["ProtectHome", "yes"], ["ProtectSystem", "strict"],
     ["NoNewPrivileges", "yes"], ["RestrictNamespaces", "yes"],
     ["SystemCallArchitectures", "native"], ["KillMode", "control-group"],
@@ -464,8 +474,8 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
       throw new Error(`Linux forwarder unit lost its ${key} dependency.`);
     }
   }
-  const command = `{ path=${input.record.brokerNode} ; argv[]=${input.record.brokerNode} ` +
-    `${forwarderEntry(input)} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; ` +
+  const command = `{ path=${linuxForwarderNode} ; argv[]=${linuxForwarderNode} ` +
+    `${linuxForwarderEntry} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; ` +
     "pid=0 ; code=(null) ; status=0/0 }";
   const actualCommand = values.get("ExecStart");
   if (actualCommand !== command) {

@@ -133,9 +133,10 @@ describe.skipIf(process.platform === "win32")("Linux managed unit provisioning",
     expect(files.forwarderUnit).toContain("BindReadOnlyPaths=/run/s-gw/agents/example-agent/broker.sock:/run/s-gw/broker.sock");
     expect(files.forwarderUnit).toContain("/run/s-gw/forwarder-proofs/example-agent.json:/run/s-gw/forwarder-attestation.json");
     expect(files.forwarderUnit).toContain("PrivateIPC=yes\nPrivateTmp=yes\n");
+    expect(files.forwarderUnit).toContain("MountAPIVFS=yes\n");
     expect(files.forwarderUnit).toContain("MountFlags=private\nBindLogSockets=no\n");
     expect(files.forwarderUnit).not.toContain("PrivatePIDs=yes");
-    expect(files.forwarderUnit).toContain("ExecStart=/usr/libexec/s-gw/node /usr/libexec/s-gw/dist/linux-managed-mcp-forwarder.js\n");
+    expect(files.forwarderUnit).toContain("ExecStart=/opt/s-gw/forwarder/node /opt/s-gw/forwarder/linux-managed-mcp-forwarder.js\n");
     expect(files.modelSocketUnit).toBeUndefined();
     expect(() => renderLinuxManagedUnitBundle(config, record, 230103, "prepare")).not.toThrow();
     expect(() => renderLinuxManagedUnitBundle({ ...config,

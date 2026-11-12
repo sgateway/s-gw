@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { unsafeStartupEnv, validateLinuxManagedPlanRecord,
   type LinuxManagedPlanRecord } from "./linux-agent-control.js";
 import type { LinuxManagedMcpConfig } from "./linux-managed-mcp.js";
+import { linuxForwarderEntry, linuxForwarderNode } from "./linux-forwarder-runtime.js";
 import { normalizeModelRelayGrant } from "./model-relay-action.js";
 
 export interface LinuxManagedUnitBundle {
@@ -74,15 +75,15 @@ function managedSocketUnit(socketPath: string, group: number, descriptor: string
 function managedForwarderUnit(record: LinuxManagedPlanRecord): string {
   const forwarder = record.mcpForwarder!;
   const sessionId = record.plan.sessionId;
-  const entry = path.join(path.dirname(record.brokerEntry), "linux-managed-mcp-forwarder.js");
   const proof = `/run/s-gw/forwarder-proofs/${sessionId}.json`;
   for (const value of [forwarder.rootDirectory, forwarder.networkNamespacePath,
-    record.plan.brokerSocket, proof, record.brokerNode, entry]) safeUnitLiteral(value);
+    record.plan.brokerSocket, proof, linuxForwarderNode, linuxForwarderEntry]) safeUnitLiteral(value);
   return `[Unit]\nDescription=s-gw managed MCP forwarder\n` +
     `BindsTo=s-gw-agent-control.service s-gw-agent-${sessionId}.service\n` +
     `After=s-gw-agent-control.service s-gw-agent-${sessionId}.service\n` +
     `[Service]\nType=exec\nUser=${forwarder.uid}\nGroup=${forwarder.gid}\n` +
     `SupplementaryGroups=\nRootDirectory=${forwarder.rootDirectory}\nWorkingDirectory=/\n` +
+    `MountAPIVFS=yes\n` +
     `NetworkNamespacePath=${forwarder.networkNamespacePath}\nPrivateNetwork=yes\n` +
     `PrivateIPC=yes\nPrivateTmp=yes\nMountFlags=private\nBindLogSockets=no\n` +
     `TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777\n` +
@@ -94,7 +95,7 @@ function managedForwarderUnit(record: LinuxManagedPlanRecord): string {
     `BindReadOnlyPaths=${record.plan.brokerSocket}:/run/s-gw/broker.sock ` +
     `${proof}:/run/s-gw/forwarder-attestation.json\n` +
     `UnsetEnvironment=${unsafeStartupEnv.join(" ")}\n` +
-    `ExecStart=${record.brokerNode} ${entry}\nRestart=no\n`;
+    `ExecStart=${linuxForwarderNode} ${linuxForwarderEntry}\nRestart=no\n`;
 }
 
 export function renderLinuxManagedUnitBundle(config: LinuxManagedMcpConfig,
