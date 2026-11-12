@@ -1221,7 +1221,9 @@ async function assertNoUidProcesses(uid: number): Promise<void> {
     let status: string;
     try { status = await readFile(`/proc/${entry}/status`, "utf8"); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      const code = (error as NodeJS.ErrnoException).code;
+      // A task can exit after the /proc listing and return either error.
+      if (code === "ENOENT" || code === "ESRCH") continue;
       throw error;
     }
     const ids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m.exec(status);
