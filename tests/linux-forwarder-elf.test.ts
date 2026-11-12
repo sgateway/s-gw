@@ -139,6 +139,27 @@ describe.skipIf(process.platform === "win32")("Linux forwarder ELF closure", () 
       .toBe(true);
   });
 
+  it("accepts executable glibc libc only when it names Node's interpreter", async () => {
+    add("/lib/libc.so.6", "file", "libc bytes");
+    fake.readelf.set("/run/s-gw/node", elf(["libc.so.6"], "/lib/ld-linux.so"));
+    fake.readelf.set("/lib/libc.so.6", elf([], "/lib/ld-linux.so"));
+    fake.cache = `  libc.so.6 (libc6,${matchingAbi}) => /lib/libc.so.6\n`;
+    const result = await discoverLinuxForwarderElfClosure("/run/s-gw/node");
+    expect(result.files.map(file => file.targetPath)).toEqual([
+      "/lib/ld-linux.so", "/lib/libc.so.6"
+    ]);
+
+    fake.readelf.set("/lib/libc.so.6", elf([], "/lib/different-loader.so"));
+    await expect(discoverLinuxForwarderElfClosure("/run/s-gw/node"))
+      .rejects.toThrow(/interpreter mismatch.*libc.so.6/);
+  });
+
+  it("rejects PT_INTERP on another shared object even when it names Node's loader", async () => {
+    fake.readelf.set("/lib/libfoo.so.1.2", elf([], "/lib/ld-linux.so"));
+    await expect(discoverLinuxForwarderElfClosure("/run/s-gw/node"))
+      .rejects.toThrow(/interpreter mismatch.*libfoo.so.1/);
+  });
+
   it("rejects non-root discovery before inspecting the runtime", async () => {
     vi.mocked(process.geteuid).mockReturnValue(501);
     await expect(discoverLinuxForwarderElfClosure("/run/s-gw/node"))

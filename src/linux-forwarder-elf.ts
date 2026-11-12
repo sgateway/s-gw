@@ -222,8 +222,9 @@ export async function discoverLinuxForwarderElfClosure(nodePath: string):
   const node = await trustedFile(nodePath, "node");
   const nodeInfo = inspectElf(node.filename);
   requireArch(nodeInfo);
-  const interpreter = nodeInfo.interpreter;
-  if (!interpreter) throw new Error("Linux Node runtime has no ELF interpreter.");
+  const requestedInterpreter = nodeInfo.interpreter;
+  if (!requestedInterpreter) throw new Error("Linux Node runtime has no ELF interpreter.");
+  const interpreter: string = requestedInterpreter;
   absolutePath(interpreter);
   if (!systemPath(interpreter)) throw new Error("Linux ELF interpreter is outside system libraries.");
   const cache = libraryCache();
@@ -235,7 +236,14 @@ export async function discoverLinuxForwarderElfClosure(nodePath: string):
 
   async function addFile(targetPath: string, source: TrustedFile, info: ElfInfo): Promise<void> {
     requireArch(info);
-    if (info.interpreter) throw new Error("Linux ELF library has its own interpreter.");
+    // Executable glibc libc.so.6 can carry PT_INTERP; it must name Node's loader.
+    if (info.interpreter && (path.posix.basename(targetPath) !== "libc.so.6" ||
+        info.interpreter !== interpreter)) {
+      throw new Error(`Linux ELF library interpreter mismatch for ` +
+        `${JSON.stringify(path.posix.basename(targetPath).slice(0, 128))}: expected ` +
+        `${JSON.stringify(interpreter.slice(0, 128))}, got ` +
+        `${JSON.stringify(info.interpreter.slice(0, 128))}.`);
+    }
     const old = targets.get(targetPath);
     if (old && old !== source.filename) throw new Error("Linux ELF target resolves ambiguously.");
     if (old) return;
