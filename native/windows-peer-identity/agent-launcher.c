@@ -102,6 +102,36 @@ static BOOL job_is_confined(HANDLE job, HANDLE process) {
         !(flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK));
 }
 
+struct SGW_WINDOWS_AGENT_BOUNDARY {
+    HANDLE child;
+    HANDLE job;
+    HANDLE stop_event;
+    const SGW_WFP_BOUNDARY *wfp;
+    const SGW_WINDOWS_AGENT_IDENTITY *identity;
+    const SGW_WINDOWS_AGENT_BOUNDARY_HOOKS *hooks;
+    void *context;
+    volatile LONG active;
+};
+
+static BOOL boundary_controls_healthy(const SGW_WINDOWS_AGENT_BOUNDARY *boundary) {
+    return boundary->hooks->dns_boundary_ready(boundary->context, boundary->identity) == TRUE &&
+        job_is_confined(boundary->job, boundary->child) &&
+        sgw_wfp_healthy(boundary->wfp);
+}
+
+BOOL sgw_windows_agent_boundary_healthy(const SGW_WINDOWS_AGENT_BOUNDARY *boundary) {
+    if (!boundary || InterlockedCompareExchange((volatile LONG *)&boundary->active, 0, 0) != 1 ||
+        !boundary->child || !boundary->job || !boundary->stop_event ||
+        boundary->stop_event == INVALID_HANDLE_VALUE || !boundary->wfp || !boundary->hooks ||
+        !boundary->hooks->dns_boundary_ready || !boundary->identity ||
+        WaitForSingleObject(boundary->stop_event, 0) != WAIT_TIMEOUT ||
+        WaitForSingleObject(boundary->child, 0) != WAIT_TIMEOUT ||
+        !boundary_controls_healthy(boundary) ||
+        WaitForSingleObject(boundary->child, 0) != WAIT_TIMEOUT) return FALSE;
+    return InterlockedCompareExchange((volatile LONG *)&boundary->active, 0, 0) == 1 &&
+        WaitForSingleObject(boundary->stop_event, 0) == WAIT_TIMEOUT;
+}
+
 static DWORD child_identity(HANDLE process, PSID broker_sid, PSID package_sid,
     SGW_WINDOWS_AGENT_IDENTITY *identity) {
     HANDLE token = NULL;
@@ -216,11 +246,13 @@ static void begin_revoke_until_confirmed(const SGW_WINDOWS_AGENT_HOOKS *hooks, v
     }
 }
 
-DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
-    void *context, DWORD *child_exit_code) {
+static DWORD run_agent(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
+    const SGW_WINDOWS_AGENT_BOUNDARY_HOOKS *boundary_hooks, void *context,
+    DWORD *child_exit_code) {
     if (!stop_event || stop_event == INVALID_HANDLE_VALUE || !hooks ||
-        !hooks->prepare || !hooks->register_session || !hooks->begin_revoke ||
-        !hooks->revoke_session ||
+        !hooks->prepare || !hooks->begin_revoke || !hooks->revoke_session ||
+        (boundary_hooks ? (!boundary_hooks->register_session ||
+            !boundary_hooks->dns_boundary_ready) : !hooks->register_session) ||
         !child_exit_code || WaitForSingleObject(stop_event, 0) != WAIT_TIMEOUT)
         return ERROR_INVALID_PARAMETER;
 
@@ -240,6 +272,7 @@ DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *ho
     LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
     HANDLE job = NULL;
     PROCESS_INFORMATION process = { 0 };
+    SGW_WINDOWS_AGENT_BOUNDARY boundary = { 0 };
     BOOL profile_created = FALSE, registration_attempted = FALSE, attrs_initialized = FALSE;
     DWORD result = broker_identity(&identity, &broker_sid);
     if (result) goto done;
@@ -335,10 +368,29 @@ DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *ho
     if (WaitForSingleObject(stop_event, 0) != WAIT_TIMEOUT) {
         result = ERROR_OPERATION_ABORTED; goto done;
     }
+    if (boundary_hooks) {
+        boundary.child = process.hProcess;
+        boundary.job = job;
+        boundary.stop_event = stop_event;
+        boundary.wfp = &wfp;
+        boundary.identity = &identity;
+        boundary.hooks = boundary_hooks;
+        boundary.context = context;
+        InterlockedExchange(&boundary.active, 1);
+        if (!sgw_windows_agent_boundary_healthy(&boundary)) {
+            result = ERROR_NETWORK_ACCESS_DENIED; goto done;
+        }
+    }
     registration_attempted = TRUE;
-    result = hooks->register_session(context, &identity);
+    result = boundary_hooks
+        ? boundary_hooks->register_session(context, &identity, &boundary)
+        : hooks->register_session(context, &identity);
     if (result) goto done;
-    if (!sgw_wfp_healthy(&wfp) || !job_is_confined(job, process.hProcess)) {
+    if (WaitForSingleObject(stop_event, 0) != WAIT_TIMEOUT) {
+        result = ERROR_OPERATION_ABORTED; goto done;
+    }
+    if (boundary_hooks ? !sgw_windows_agent_boundary_healthy(&boundary)
+        : (!sgw_wfp_healthy(&wfp) || !job_is_confined(job, process.hProcess))) {
         result = ERROR_NETWORK_ACCESS_DENIED; goto done;
     }
     if (WaitForSingleObject(stop_event, 0) != WAIT_TIMEOUT) {
@@ -349,12 +401,23 @@ DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *ho
     }
     HANDLE watched[2] = { process.hProcess, stop_event };
     for (;;) {
-        if (!sgw_wfp_healthy(&wfp) || !job_is_confined(job, process.hProcess)) {
+        DWORD child_waited = WaitForSingleObject(process.hProcess, 0);
+        if (child_waited == WAIT_OBJECT_0) {
+            result = (boundary_hooks ? boundary_controls_healthy(&boundary)
+                : (sgw_wfp_healthy(&wfp) && job_is_confined(job, process.hProcess))) &&
+                GetExitCodeProcess(process.hProcess, child_exit_code)
+                ? ERROR_SUCCESS : ERROR_NETWORK_ACCESS_DENIED;
+            break;
+        }
+        if (child_waited != WAIT_TIMEOUT) { result = GetLastError(); break; }
+        if (boundary_hooks ? !boundary_controls_healthy(&boundary)
+            : (!sgw_wfp_healthy(&wfp) || !job_is_confined(job, process.hProcess))) {
             result = ERROR_NETWORK_ACCESS_DENIED; break;
         }
         DWORD waited = WaitForMultipleObjects(2, watched, FALSE, 100);
         if (waited == WAIT_OBJECT_0) {
-            result = sgw_wfp_healthy(&wfp) && job_is_confined(job, process.hProcess) &&
+            result = (boundary_hooks ? boundary_controls_healthy(&boundary)
+                : (sgw_wfp_healthy(&wfp) && job_is_confined(job, process.hProcess))) &&
                 GetExitCodeProcess(process.hProcess, child_exit_code)
                 ? ERROR_SUCCESS : ERROR_NETWORK_ACCESS_DENIED;
             break;
@@ -364,6 +427,7 @@ DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *ho
     }
 
 done:
+    InterlockedExchange(&boundary.active, 0);
     if (process.hProcess && !job) {
         TerminateProcess(process.hProcess, 1);
         WaitForSingleObject(process.hProcess, INFINITE);
@@ -393,4 +457,16 @@ done:
         if (result == ERROR_SUCCESS && deleted != S_OK) result = (DWORD)deleted;
     }
     return result;
+}
+
+DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
+    void *context, DWORD *child_exit_code) {
+    return run_agent(stop_event, hooks, NULL, context, child_exit_code);
+}
+
+DWORD sgw_windows_agent_run_bound(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
+    const SGW_WINDOWS_AGENT_BOUNDARY_HOOKS *boundary_hooks, void *context,
+    DWORD *child_exit_code) {
+    if (!boundary_hooks) return ERROR_INVALID_PARAMETER;
+    return run_agent(stop_event, hooks, boundary_hooks, context, child_exit_code);
 }

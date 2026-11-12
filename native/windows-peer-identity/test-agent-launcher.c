@@ -14,6 +14,11 @@ typedef struct {
     int drained_at_revoke;
     int child_stopped_at_revoke;
     int begin_count_at_revoke;
+    int dns_ready;
+    int dns_checks;
+    int boundary_checked;
+    int stopped_boundary_rejected;
+    int killed_during_dns;
     HANDLE stop_event;
 } TEST_CONTEXT;
 
@@ -101,8 +106,36 @@ static DWORD register_session(void *opaque, const SGW_WINDOWS_AGENT_IDENTITY *id
         !identity->logon_luid[0] || !identity->session_id[0]) return ERROR_INVALID_DATA;
     if (!launched_child_live(identity)) return ERROR_INVALID_DATA;
     if (context->mode == 1) return ERROR_ACCESS_DENIED;
-    if (context->mode >= 2) SetEvent(context->stop_event);
+    if (context->mode == 2 || context->mode == 3) SetEvent(context->stop_event);
     return ERROR_SUCCESS;
+}
+
+static BOOL dns_boundary_ready(void *opaque, const SGW_WINDOWS_AGENT_IDENTITY *identity) {
+    TEST_CONTEXT *context = opaque;
+    if (!identity->package_sid[0]) return FALSE;
+    context->dns_checks++;
+    if (context->mode == 7 && context->dns_checks == 1) SetEvent(context->stop_event);
+    if (context->mode == 8 && context->dns_checks == 1) {
+        HANDLE child = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, identity->process_id);
+        if (!child) return FALSE;
+        context->killed_during_dns = TerminateProcess(child, 1) &&
+            WaitForSingleObject(child, 5000) == WAIT_OBJECT_0;
+        CloseHandle(child);
+        if (!context->killed_during_dns) return FALSE;
+    }
+    return context->dns_ready ? TRUE : FALSE;
+}
+
+static DWORD register_bound(void *opaque, const SGW_WINDOWS_AGENT_IDENTITY *identity,
+    const SGW_WINDOWS_AGENT_BOUNDARY *boundary) {
+    TEST_CONTEXT *context = opaque;
+    context->boundary_checked = sgw_windows_agent_boundary_healthy(boundary);
+    if (!context->boundary_checked) return ERROR_NETWORK_ACCESS_DENIED;
+    DWORD result = register_session(opaque, identity);
+    if (context->mode == 5 && result == ERROR_SUCCESS) context->dns_ready = 0;
+    if ((context->mode == 2 || context->mode == 3) && result == ERROR_SUCCESS)
+        context->stopped_boundary_rejected = !sgw_windows_agent_boundary_healthy(boundary);
+    return result;
 }
 
 static DWORD begin_revoke(void *opaque, const SGW_WINDOWS_AGENT_IDENTITY *identity) {
@@ -131,36 +164,60 @@ static DWORD revoke_session(void *opaque, const SGW_WINDOWS_AGENT_IDENTITY *iden
 int wmain(int argc, wchar_t **argv) {
     if (argc != 2) return 2;
     SGW_WINDOWS_AGENT_HOOKS hooks = { prepare, register_session, begin_revoke, revoke_session };
+    SGW_WINDOWS_AGENT_BOUNDARY_HOOKS boundary_hooks = { register_bound, dns_boundary_ready };
     HANDLE stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!stop) return 2;
     DWORD result = ERROR_SUCCESS, child_exit = STILL_ACTIVE;
-    for (int mode = 0; mode < 4; mode++) {
+    SGW_WINDOWS_AGENT_BOUNDARY_HOOKS missing_dns = { register_bound, NULL };
+    TEST_CONTEXT rejected = { 0 };
+    if (sgw_windows_agent_run_bound(stop, &hooks, &missing_dns, &rejected,
+        &child_exit) != ERROR_INVALID_PARAMETER || rejected.registered) {
+        CloseHandle(stop);
+        return 1;
+    }
+    for (int mode = 0; mode < 9; mode++) {
         TEST_CONTEXT context = { 0 };
         context.source = argv[1];
         context.mode = mode;
+        context.dns_ready = mode != 4;
         context.stop_event = stop;
         ResetEvent(stop);
-        result = sgw_windows_agent_run(stop, &hooks, &context, &child_exit);
-        int expected_begins = mode == 3 ? 2 : 1;
-        if (context.registered != 1 || context.began != expected_begins ||
-            context.revoked != 1 || !context.drained_at_revoke ||
-            !context.child_stopped_at_revoke ||
-            context.begin_count_at_revoke != expected_begins ||
+        result = mode == 0
+            ? sgw_windows_agent_run(stop, &hooks, &context, &child_exit)
+            : sgw_windows_agent_run_bound(stop, &hooks, &boundary_hooks, &context, &child_exit);
+        int expected_begins = (mode == 4 || mode == 7 || mode == 8) ? 0 : mode == 3 ? 2 : 1;
+        if (context.registered != ((mode == 4 || mode == 7 || mode == 8) ? 0 : 1) ||
+            context.began != expected_begins ||
+            context.revoked != ((mode == 4 || mode == 7 || mode == 8) ? 0 : 1) ||
+            (mode != 4 && mode != 7 && mode != 8 &&
+                (!context.drained_at_revoke || !context.child_stopped_at_revoke ||
+                context.begin_count_at_revoke != expected_begins)) ||
+            (mode == 0 && (context.dns_checks || context.boundary_checked)) ||
+            (mode != 0 && (!context.dns_checks ||
+                context.boundary_checked != (mode != 4 && mode != 7 && mode != 8))) ||
+            (context.stopped_boundary_rejected != (mode == 2 || mode == 3)) ||
+            (context.killed_during_dns != (mode == 8)) ||
             (mode == 0 && (result || child_exit || !context.marker_at_revoke)) ||
+            (mode == 6 && (result || child_exit || !context.marker_at_revoke)) ||
             (mode == 1 && (result != ERROR_ACCESS_DENIED || context.marker_at_revoke)) ||
-            (mode >= 2 && (result != ERROR_OPERATION_ABORTED || context.marker_at_revoke)) ||
-            (mode != 0 && !context.live_on_first_begin) ||
+            ((mode == 2 || mode == 3) &&
+                (result != ERROR_OPERATION_ABORTED || context.marker_at_revoke)) ||
+            ((mode == 4 || mode == 5 || mode == 7 || mode == 8) &&
+                (result != ERROR_NETWORK_ACCESS_DENIED || context.marker_at_revoke)) ||
+            ((mode == 1 || mode == 2 || mode == 3) && !context.live_on_first_begin) ||
+            (mode == 6 && context.live_on_first_begin) ||
             (mode == 3 && !context.stopped_on_retry)) {
-            fprintf(stderr, "Launcher mode %d failed: result=%lu exit=%lu register=%d begin=%d revoke=%d marker=%d live=%d retry_stopped=%d drained=%d child_stopped=%d\n",
+            fprintf(stderr, "Launcher mode %d failed: result=%lu exit=%lu register=%d begin=%d revoke=%d marker=%d live=%d retry_stopped=%d drained=%d child_stopped=%d dns=%d boundary=%d stop_rejected=%d killed=%d\n",
                 mode, (unsigned long)result, (unsigned long)child_exit, context.registered,
                 context.began, context.revoked, context.marker_at_revoke,
                 context.live_on_first_begin, context.stopped_on_retry, context.drained_at_revoke,
-                context.child_stopped_at_revoke);
+                context.child_stopped_at_revoke, context.dns_checks, context.boundary_checked,
+                context.stopped_boundary_rejected, context.killed_during_dns);
             CloseHandle(stop);
             return 1;
         }
     }
     CloseHandle(stop);
-    puts("LAUNCHER-SUSPEND-REGISTER-REVOKE-PASSED");
+    puts("LAUNCHER-SUSPEND-REGISTER-REVOKE-BOUNDARY-PASSED");
     return 0;
 }

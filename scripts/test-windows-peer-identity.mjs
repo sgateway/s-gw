@@ -554,7 +554,7 @@ try {
         { encoding: "utf8", windowsHide: true, timeout: 60_000 });
       assert.equal(launched.status, 0,
         launched.stderr || launched.error?.message || "The broker-owned launcher fixture failed.");
-      assert.match(launched.stdout, /LAUNCHER-SUSPEND-REGISTER-REVOKE-PASSED/);
+      assert.match(launched.stdout, /LAUNCHER-SUSPEND-REGISTER-REVOKE-BOUNDARY-PASSED/);
       dnsCapture = await startDnsCapture();
       await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
         { intruderProfile: profiles[1], sameProfileOutOfJob: true });

@@ -36,6 +36,27 @@ typedef struct {
     DWORD (*revoke_session)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity);
 } SGW_WINDOWS_AGENT_HOOKS;
 
+typedef struct SGW_WINDOWS_AGENT_BOUNDARY SGW_WINDOWS_AGENT_BOUNDARY;
+
+typedef struct {
+    // Called only by the broker while the child is suspended. The boundary pointer
+    // stays valid until revoke_session has confirmed callback drain.
+    DWORD (*register_session)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity,
+        const SGW_WINDOWS_AGENT_BOUNDARY *boundary);
+    // The broker must verify DNS isolation from host policy, not an agent report.
+    BOOL (*dns_boundary_ready)(void *context, const SGW_WINDOWS_AGENT_IDENTITY *identity);
+} SGW_WINDOWS_AGENT_BOUNDARY_HOOKS;
+
+// This reads the launcher's retained child, Job and WFP handles, then calls the
+// broker's synchronous DNS guard. An identity, PID or Job name alone is not proof.
+BOOL sgw_windows_agent_boundary_healthy(const SGW_WINDOWS_AGENT_BOUNDARY *boundary);
+
+// Source-only opt-in handoff for an in-process broker bridge. The boundary may
+// be probed during registration and while the session runs, but not after drain.
+DWORD sgw_windows_agent_run_bound(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
+    const SGW_WINDOWS_AGENT_BOUNDARY_HOOKS *boundary_hooks, void *context,
+    DWORD *child_exit_code);
+
 // The caller must be the broker. It owns stop_event and must keep its registration
 // callback live until this function returns. No agent-controlled IPC calls this API.
 DWORD sgw_windows_agent_run(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
