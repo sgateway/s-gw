@@ -105,16 +105,39 @@ async function assertHeldFd(pid, mode) {
   }
 }
 
+function assertOwnedUnit(owned, state, requireCgroup) {
+  if (state.get("LoadState") === "not-found") return;
+  const group = state.get("ControlGroup");
+  const expectedGroup = owned.cgroup.slice("/sys/fs/cgroup".length);
+  const emptyAfterStop = !requireCgroup && group === "" &&
+    ["inactive", "failed"].includes(state.get("ActiveState"));
+  if (state.get("Id") !== owned.unit || state.get("Description") !== owned.description ||
+      state.get("User") !== String(uid) || state.get("Group") !== String(uid) ||
+      state.get("RootDirectory") !== root ||
+      (group !== expectedGroup && !emptyAfterStop)) {
+    throw new Error("Census fixture unit ownership changed before teardown.");
+  }
+}
+
+async function unitDrained(owned) {
+  const state = properties(owned.unit);
+  assertOwnedUnit(owned, state, false);
+  if (state.get("ActiveState") !== "inactive" && state.get("LoadState") !== "not-found")
+    return false;
+  if (owned.pid && await lstat(`/proc/${owned.pid}`).then(() => true, error => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  })) return false;
+  let events;
+  try { events = await readFile(`${owned.cgroup}/cgroup.events`, "utf8"); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  return !events || /^populated 0$/m.test(events);
+}
+
 async function stopUnit(owned) {
   const before = properties(owned.unit);
   const loaded = before.get("LoadState") !== "not-found";
-  if (loaded && (before.get("Id") !== owned.unit ||
-      before.get("Description") !== owned.description ||
-      before.get("User") !== String(uid) || before.get("Group") !== String(uid) ||
-      before.get("RootDirectory") !== root ||
-      before.get("ControlGroup") !== owned.cgroup.slice("/sys/fs/cgroup".length))) {
-    throw new Error("Census fixture unit ownership changed before teardown.");
-  }
+  assertOwnedUnit(owned, before, true);
   const currentPid = Number(before.get("MainPID"));
   if (Number.isSafeInteger(currentPid) && currentPid > 0) owned.pid = currentPid;
   const errors = [];
@@ -126,27 +149,31 @@ async function stopUnit(owned) {
       try { call("/usr/bin/systemctl", ["--system", "stop", owned.unit]); }
       catch (error) { errors.push(`stop: ${error.message}`); }
     }
-    try { call("/usr/bin/systemctl", ["--system", "reset-failed", owned.unit]); }
-    catch (error) { errors.push(`reset: ${error.message}`); }
+    try {
+      const afterStop = properties(owned.unit);
+      if (afterStop.get("LoadState") !== "not-found") {
+        assertOwnedUnit(owned, afterStop, false);
+        if (!["inactive", "failed"].includes(afterStop.get("ActiveState"))) {
+          throw new Error("unit is still active");
+        }
+        try { call("/usr/bin/systemctl", ["--system", "reset-failed", owned.unit]); }
+        catch (error) {
+          const afterReset = properties(owned.unit);
+          if (afterReset.get("LoadState") !== "not-found") {
+            assertOwnedUnit(owned, afterReset, false);
+            throw error;
+          }
+        }
+      }
+    } catch (error) { errors.push(`reset: ${error.message}`); }
   }
   try {
-    await waitFor(async () => {
-      const state = properties(owned.unit);
-      if (state.get("ActiveState") !== "inactive" && state.get("LoadState") !== "not-found")
-        return false;
-      if (owned.pid && await lstat(`/proc/${owned.pid}`).then(() => true, error => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-      })) return false;
-      let events;
-      try { events = await readFile(`${owned.cgroup}/cgroup.events`, "utf8"); }
-      catch (error) { if (error.code !== "ENOENT") throw error; }
-      return !events || /^populated 0$/m.test(events);
-    }, `unit teardown ${owned.unit}`);
+    await waitFor(() => unitDrained(owned), `unit teardown ${owned.unit}`);
   } catch (error) { errors.push(`drain: ${error.message}`); }
   if (errors.length) {
     throw new Error(`Census fixture teardown failed: ${errors.join("; ").slice(0, 4096)}`);
   }
+  owned.drained = true;
 }
 
 async function assertNoUidProcesses() {
@@ -165,10 +192,25 @@ async function assertNoUidProcesses() {
   }
 }
 
+function removeCreatedGroup() {
+  const group = call("/usr/bin/getent", ["group", username], true);
+  if (group.error || group.signal || ![0, 2].includes(group.status)) {
+    throw new Error("Census fixture group lookup failed during cleanup.");
+  }
+  if (group.status === 2) return;
+  const fields = group.stdout.trimEnd().split(":");
+  if (fields.length !== 4 || fields[0] !== username ||
+      fields[2] !== String(uid) || fields[3] !== "") {
+    throw new Error("Census fixture group changed before cleanup.");
+  }
+  call("/usr/sbin/groupdel", [username]);
+}
+
 async function withUnit(mode, inspect) {
   const unit = `s-gw-agent-census-${id}-${mode}.service`;
   const description = `s-gw-agent-census-fixture:${id}:${mode}`;
-  const owned = { unit, description, cgroup: `/sys/fs/cgroup/system.slice/${unit}`, pid: 0 };
+  const owned = { unit, description, cgroup: `/sys/fs/cgroup/system.slice/${unit}`,
+    pid: 0, drained: false };
   await writeFile(ready, "");
   units.push(owned);
   const result = call("/usr/bin/systemd-run", ["--system", "--no-ask-password", "--quiet",
@@ -188,6 +230,7 @@ async function withUnit(mode, inspect) {
     throw new Error(`Census fixture unit failed to start: ${String(result.stderr || result.stdout ||
       result.error?.message || result.status).slice(0, 4096)}`);
   }
+  let failure;
   try {
     await waitFor(async () => (await readFile(ready, "utf8")) === "READY\n", "gate readiness");
     const state = properties(unit);
@@ -210,9 +253,17 @@ async function withUnit(mode, inspect) {
     await waitFor(async () => /^frozen 1$/m.test(await readFile(`${owned.cgroup}/cgroup.events`, "utf8")),
       "cgroup freeze");
     await inspect(pid, owned.cgroup);
-  } finally {
-    await stopUnit(owned);
+  } catch (error) { failure = error; }
+  let teardownError;
+  try { await stopUnit(owned); }
+  catch (error) { teardownError = error; }
+  if (failure && teardownError) {
+    throw new AggregateError([failure, teardownError],
+      `Census fixture check failed: ${String(failure).slice(0, 2048)}; ` +
+      `teardown failed: ${String(teardownError).slice(0, 2048)}`);
   }
+  if (failure) throw failure;
+  if (teardownError) throw teardownError;
 }
 
 let failure;
@@ -263,7 +314,10 @@ try {
     if (server) await new Promise(resolve => server.close(resolve));
     const teardownErrors = [];
     for (const owned of units.reverse()) {
-      try { await stopUnit(owned); }
+      try {
+        if (owned.drained) await waitFor(() => unitDrained(owned), `unit teardown ${owned.unit}`);
+        else await stopUnit(owned);
+      }
       catch (error) { teardownErrors.push(error.message); }
     }
     if (teardownErrors.length) {
@@ -278,10 +332,15 @@ try {
       await rm(base, { recursive: true });
     }
     if (userCreated) call("/usr/sbin/userdel", [username]);
-    if (groupCreated) call("/usr/sbin/groupdel", [username]);
+    if (groupCreated) removeCreatedGroup();
   } catch (error) { cleanupError = error; }
+  if (cleanupError && failure) {
+    throw new AggregateError([failure, cleanupError],
+      `Census fixture check failed: ${String(failure).slice(0, 2048)}; ` +
+      `cleanup failed: ${String(cleanupError).slice(0, 2048)}`);
+  }
   if (cleanupError) throw new Error(`Census fixture cleanup failed: ${cleanupError.message}`, {
-    cause: failure || cleanupError
+    cause: cleanupError
   });
 }
 if (failure) throw failure;
