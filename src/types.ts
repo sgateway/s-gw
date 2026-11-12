@@ -195,6 +195,7 @@ export interface ModelRelaySpec {
   routes: string[];
   ttlMs: number;
   payloadProfile?: "strict";
+  toolBoundary?: "client-only";
   maxRequests?: number;
   maxInputBytes?: number;
   maxOutputTokens?: number;

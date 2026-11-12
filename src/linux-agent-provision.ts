@@ -49,7 +49,7 @@ export function renderLinuxAgentControlUnit(runtime: LinuxControlUnitRuntime): s
     `${runtime.brokerUid} ${runtime.brokerGid}\nRestart=no\n`;
 }
 
-const grantKeys = new Set(["handle", "provider", "routes", "ttlMs", "payloadProfile",
+const grantKeys = new Set(["handle", "provider", "routes", "ttlMs", "payloadProfile", "toolBoundary",
   "maxRequests", "maxInputBytes", "maxOutputTokens", "allowedModels", "workspaceId",
   "organizationId", "projectId", "anthropicVersion", "allowedBetaValues"]);
 

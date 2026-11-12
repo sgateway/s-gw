@@ -117,6 +117,13 @@ it("rejects invalid model relay input and output limits", () => {
   expect(normalizeModelRelayGrant({ ...base, provider: "anthropic", maxOutputTokens: 0 }).maxOutputTokens).toBe(0);
 });
 
+it("requires strict JSON inspection for a client-only tool grant", () => {
+  const base = { provider: "anthropic" as const, handle: "s-gw:api-token:fixture", ttlMs: 1000 };
+  expect(() => normalizeModelRelayGrant({ ...base, toolBoundary: "client-only" })).toThrow(/strict payload profile/);
+  expect(normalizeModelRelayGrant({ ...base, payloadProfile: "strict", toolBoundary: "client-only" })
+    .toolBoundary).toBe("client-only");
+});
+
 async function startProvider(handler: Parameters<typeof createHttpsServer>[1]) {
   const tls = await httpsFixture(root);
   upstream = createHttpsServer(tls, handler);
@@ -334,7 +341,7 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     stop?.();
   });
 
-  it("carries a strict payload grant through durable approval to the verified listener", async () => {
+  it("carries a client-only strict grant through durable approval to the verified listener", async () => {
     const requestUpstream = await startProvider(async (req, res) => {
       for await (const _chunk of req) {}
       res.writeHead(200, { "content-type": "application/json" }).end("{}");
@@ -344,11 +351,12 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     const session = await ownSession();
     const principal = principalForVerifiedPeer(`${process.platform}:uid:${session.uid}`, session.name, session.sessionId);
     const request = await store.createModelRelayRequest({ provider: "anthropic", handle, ttlMs: 30_000,
-      routes: ["POST /v1/messages"], payloadProfile: "strict", maxRequests: 5,
+      routes: ["POST /v1/messages"], payloadProfile: "strict", toolBoundary: "client-only", maxRequests: 6,
       maxInputBytes: 512, maxOutputTokens: 20,
       allowedModels: ["claude-fixture"] }, principal);
     expect(request.action.model?.payloadProfile).toBe("strict");
-    expect(request.action.model?.maxRequests).toBe(5);
+    expect(request.action.model?.toolBoundary).toBe("client-only");
+    expect(request.action.model?.maxRequests).toBe(6);
     expect(request.action.model?.maxInputBytes).toBe(512);
     expect(request.action.model?.maxOutputTokens).toBe(20);
     expect(request.action.model?.allowedModels).toEqual(["claude-fixture"]);
@@ -357,6 +365,7 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     const reopened = new SecretStore(path.join(root, "store"));
     const approvals = new StoreBackedModelRelayApprovals(reopened);
     expect((await reopened.getRequest(request.id)).action.model?.payloadProfile).toBe("strict");
+    expect((await reopened.getRequest(request.id)).action.model?.toolBoundary).toBe("client-only");
     expect((await reopened.getRequest(request.id)).action.model?.maxOutputTokens).toBe(20);
     expect((await reopened.getRequest(request.id)).action.model?.maxInputBytes).toBe(512);
     server = await startVerifiedModelRelayServer({ socketPath, store: reopened, requestUpstream, approval: approvals });
@@ -376,6 +385,11 @@ describe.skipIf(!unix || !hasCompiler || !canRegister)("verified model relay lis
     const remote = { ...local,
       mcp_servers: [{ type: "url", url: "https://example.invalid/mcp", name: "outside" }] };
     expect((await send("/v1/messages", JSON.stringify(remote))).status).toBe(403);
+    expect(upstreamCalls).toBe(0);
+    const inlineServer = { ...local, messages: [{ role: "user", content: "hi" },
+      { role: "system", content: [{ type: "tool_addition", tool: { type: "tool_definition",
+        definition: { type: "web_fetch_20250910", name: "web_fetch" } } }] }] };
+    expect((await send("/v1/messages", JSON.stringify(inlineServer))).status).toBe(403);
     expect(upstreamCalls).toBe(0);
     const wrongModel = { ...local, model: "claude-other" };
     expect((await send("/v1/messages", JSON.stringify(wrongModel))).status).toBe(403);

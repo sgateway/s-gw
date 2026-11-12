@@ -160,7 +160,7 @@ it.skipIf(!enabled)("runs native Claude Code through a durable strict broker mod
     const principal = principalForVerifiedPeer(principalIdForPeerSession(session), session.name, session.sessionId);
     const request = await store.createModelRelayRequest({ provider: "anthropic", handle, ttlMs: 30_000,
       routes: ["POST /v1/messages", "POST /v1/messages/count_tokens", "GET /v1/models"],
-      payloadProfile: "strict", allowedModels: ["claude-test"], maxInputBytes: 16_384,
+      payloadProfile: "strict", toolBoundary: "client-only", allowedModels: ["claude-test"], maxInputBytes: 16_384,
       maxOutputTokens: 32_000, maxRequests: 3, allowedBetaValues: [betaHeader!] }, principal);
     expect(request.state).toBe("pending");
     await store.approveRequest(request.id, { mode: "per-transaction" });

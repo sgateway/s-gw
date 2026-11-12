@@ -35,7 +35,8 @@ async function startFixture(
   payloadProfile?: "strict",
   allowedModels?: readonly string[],
   maxOutputTokens?: number,
-  maxInputBytes?: number
+  maxInputBytes?: number,
+  toolBoundary?: "client-only"
 ) {
   home = await mkdtemp(path.join(os.tmpdir(), "sgw-model-relay-"));
   const tls = await httpsFixture(home);
@@ -58,6 +59,7 @@ async function startFixture(
       allowedBetaValues,
       bufferOwner,
       payloadProfile,
+      toolBoundary,
       allowedModels,
       maxOutputTokens,
       maxInputBytes,
@@ -223,10 +225,14 @@ describe("model relay transport", () => {
     expect((await send(JSON.stringify(allowed))).status).toBe(200);
     const withoutStore = { model: "gpt-fixture", input: "hi" };
     expect((await send(JSON.stringify(withoutStore))).status).toBe(200);
+    const legacyNested = { model: "gpt-fixture", input: [{ role: "developer", type: "additional_tools",
+      tools: [{ type: "web_search" }] }] };
+    expect((await send(JSON.stringify(legacyNested))).status).toBe(200);
     expect(received).toEqual([
-      JSON.stringify({ ...allowed, store: false }), JSON.stringify({ ...withoutStore, store: false })
+      JSON.stringify({ ...allowed, store: false }), JSON.stringify({ ...withoutStore, store: false }),
+      JSON.stringify({ ...legacyNested, store: false })
     ]);
-    expect(fixture.outbound).toEqual(["https://api.openai.com/v1/responses", "https://api.openai.com/v1/responses"]);
+    expect(fixture.outbound).toEqual(Array(3).fill("https://api.openai.com/v1/responses"));
   });
 
   it("blocks remote MCP and URL media in strict Anthropic grants", async () => {
@@ -257,8 +263,170 @@ describe("model relay transport", () => {
       expect(fixture.outbound).toEqual([]);
     }
     expect((await send(JSON.stringify(base))).status).toBe(200);
-    expect(received).toEqual([JSON.stringify(base)]);
-    expect(fixture.outbound).toEqual(["https://api.anthropic.com/v1/messages"]);
+    const legacyInline = { ...base, messages: [{ role: "user", content: "hi" },
+      { role: "system", content: [{ type: "tool_addition", tool: { type: "tool_definition",
+        definition: { type: "web_fetch_20250910", name: "web_fetch" } } }] }] };
+    expect((await send(JSON.stringify(legacyInline))).status).toBe(200);
+    expect(received).toEqual([JSON.stringify(base), JSON.stringify(legacyInline)]);
+    expect(fixture.outbound).toEqual(Array(2).fill("https://api.anthropic.com/v1/messages"));
+  });
+
+  it("blocks OpenAI additional tools in a client-only grant before upstream", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("openai", async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received.push(Buffer.concat(chunks).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, "strict", undefined, undefined, undefined, "client-only");
+    const send = (payload: object) => fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload)
+    });
+    const base = { model: "gpt-fixture", input: "hi" };
+    for (const tools of [
+      [{ type: "mcp", server_label: "outside", server_url: "https://example.invalid/mcp", require_approval: "never" }],
+      [{ type: "web_search" }]
+    ]) {
+      const response = await send({ ...base, input: [{ role: "developer", type: "additional_tools", tools }] });
+      expect(response.status).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    expect((await send({ ...base, tools: [{ type: "function", name: "local_calculation",
+      parameters: { type: "object" }, server_url: "https://example.invalid/mcp" }] })).status).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+    for (const tools of [
+      [{ type: "function", name: "local_calculation", parameters: { type: "object" },
+        allowed_callers: ["programmatic"] }],
+      [{ type: "custom", name: "local_text", format: { type: "text" },
+        allowed_callers: ["direct", "programmatic"] }]
+    ]) {
+      expect((await send({ ...base, tools })).status).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    const clientTools = { ...base, tools: [
+      { type: "function", name: "local_calculation", description: "Compute locally",
+        parameters: { type: "object" }, output_schema: { type: "object" }, strict: true,
+        allowed_callers: ["direct"], async: false, defer_loading: false },
+      { type: "custom", name: "local_text", format: { type: "text" }, allowed_callers: ["direct"],
+        async: false, defer_loading: false }
+    ] };
+    expect((await send(clientTools)).status).toBe(200);
+    expect(received).toEqual([JSON.stringify({ ...clientTools, store: false })]);
+  });
+
+  it("rejects provider tool selectors in a client-only OpenAI grant", async () => {
+    const fixture = await startFixture("openai", async (req, res) => {
+      for await (const _chunk of req) {}
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, "strict", undefined, undefined, undefined, "client-only");
+    const send = (tool_choice: unknown) => fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        model: "gpt-fixture", input: "hi", tools: [
+          { type: "function", name: "local_calculation", parameters: { type: "object" } },
+          { type: "custom", name: "local_text", format: { type: "text" } }
+        ], tool_choice
+      })
+    });
+    for (const choice of [
+      { type: "web_search" },
+      { type: "mcp", server_label: "outside", name: "fetch" },
+      { type: "function", name: "undeclared" },
+      { name: "undeclared" },
+      { type: "allowed_tools", mode: "auto", tools: [{ name: "undeclared" }] },
+      { type: "allowed_tools", mode: "auto", tools: [{ type: "web_search" }] }
+    ]) {
+      expect((await send(choice)).status, JSON.stringify(choice)).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    for (const choice of ["auto", { type: "function", name: "local_calculation" },
+      { type: "custom", name: "local_text" },
+      { type: "allowed_tools", mode: "required", tools: [{ type: "custom", name: "local_text" }] }]) {
+      expect((await send(choice)).status, JSON.stringify(choice)).toBe(200);
+    }
+    expect(fixture.outbound).toHaveLength(4);
+  });
+
+  it("fails closed when a client-only transport authority lacks strict JSON inspection", async () => {
+    const fixture = await startFixture("openai", async (req, res) => {
+      for await (const _chunk of req) {}
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, [], undefined, key, undefined, undefined, undefined, undefined, "client-only");
+    const response = await fetch(fixture.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-fixture", input: "hi" })
+    });
+    expect(response.status).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+  });
+
+  it("blocks Anthropic inline server tools but keeps client definitions and references", async () => {
+    const received: string[] = [];
+    const fixture = await startFixture("anthropic", async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received.push(Buffer.concat(chunks).toString());
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    }, undefined, ["inline-tools-2026-09-15"], undefined, key, "strict", undefined, undefined, undefined, "client-only");
+    const send = (payload: object) => fetch(fixture.url + "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-beta": "inline-tools-2026-09-15" },
+      body: JSON.stringify(payload)
+    });
+    const base = { model: "claude-fixture", max_tokens: 10,
+      tools: [{ name: "local_search", input_schema: { type: "object" },
+        allowed_callers: ["direct"], input_examples: [{}], eager_input_streaming: false }] };
+    const inline = (tool: object) => ({ ...base, messages: [
+      { role: "user", content: "hi" },
+      { role: "system", content: [{ type: "tool_addition", tool }] }
+    ] });
+    const blocked = [
+      { type: "tool_definition", definition: { type: "web_fetch_20250910", name: "web_fetch" } },
+      { type: "tool_definition", definition: { type: "mcp_toolset", mcp_server_name: "outside" } },
+      { type: "mcp_tool_reference", server_name: "outside", name: "fetch" },
+      { type: "mcp_toolset_reference", server_name: "outside" },
+      { type: "tool_reference", name: "undeclared" },
+      { type: "tool_definition", definition: { name: "hosted_caller", input_schema: { type: "object" },
+        allowed_callers: ["code_execution_20260120"] } },
+      { type: "tool_definition", definition: { name: "ambiguous", input_schema: { type: "object" },
+        mcp_server_name: "outside" } },
+      { type: "unrecognized", name: "local_search" }
+    ];
+    for (const tool of blocked) {
+      expect((await send(inline(tool))).status, JSON.stringify(tool)).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    for (const type of ["tool_addition", "tool_removal"]) {
+      const block = { type, tool: { type: "tool_reference", name: "local_search" },
+        mcp_server_name: "outside" };
+      expect((await send({ ...base, messages: [{ role: "user", content: "hi" },
+        { role: "system", content: [block] }] })).status).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    expect((await send({ ...base, tools: [{ ...base.tools[0], mcp_server_name: "outside" }],
+      messages: [{ role: "user", content: "hi" }] })).status).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+    expect((await send({ ...base, tools: [{ ...base.tools[0],
+      allowed_callers: ["code_execution_20260120"] }],
+      messages: [{ role: "user", content: "hi" }] })).status).toBe(403);
+    expect(fixture.outbound).toEqual([]);
+    const choiceRequest = (tool_choice: object) => ({ ...base,
+      messages: [{ role: "user", content: "hi" }], tool_choice });
+    for (const choice of [{ type: "tool", name: "web_fetch" }, { type: "unknown", name: "local_search" }]) {
+      expect((await send(choiceRequest(choice))).status).toBe(403);
+      expect(fixture.outbound).toEqual([]);
+    }
+    const clientDefinition = { type: "tool_definition", definition: {
+      name: "inline_calculation", input_schema: { type: "object" }
+    } };
+    const clientReference = { type: "tool_reference", name: "local_search" };
+    expect((await send(inline(clientDefinition))).status).toBe(200);
+    expect((await send(inline(clientReference))).status).toBe(200);
+    const removal = { ...base, messages: [{ role: "user", content: "hi" },
+      { role: "system", content: [{ type: "tool_removal", tool: clientReference }] }] };
+    expect((await send(removal)).status).toBe(200);
+    const localChoice = choiceRequest({ type: "tool", name: "local_search" });
+    expect((await send(localChoice)).status).toBe(200);
+    expect(received).toEqual([JSON.stringify(inline(clientDefinition)), JSON.stringify(inline(clientReference)),
+      JSON.stringify(removal), JSON.stringify(localChoice)]);
   });
 
   it("keeps ordinary grants byte-for-byte compatible when strict profile is absent", async () => {

@@ -117,7 +117,7 @@ export interface RequestRecord {
     owned?: boolean;
     http?: { url: string; method: string; headers: Record<string, string>; body?: string; auth: { kind: string; username?: string; name?: string } };
     model?: { provider: "anthropic" | "openai"; routes: string[]; ttlMs: number; payloadProfile?: "strict";
-      maxRequests?: number; maxInputBytes?: number; maxOutputTokens?: number; allowedModels?: string[];
+      toolBoundary?: "client-only"; maxRequests?: number; maxInputBytes?: number; maxOutputTokens?: number; allowedModels?: string[];
       workspaceId?: string; organizationId?: string; projectId?: string;
       anthropicVersion?: string; allowedBetaValues?: string[] };
     command: string;

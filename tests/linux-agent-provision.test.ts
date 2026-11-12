@@ -90,6 +90,13 @@ describe.skipIf(process.platform === "win32")("Linux managed unit provisioning",
     expect(files.brokerUnit).toContain("UnsetEnvironment=NODE_OPTIONS NODE_PATH");
   });
 
+  it("preserves an opt-in client-only relay grant in the sealed broker config", () => {
+    const { config, record } = setup();
+    config.relay!.grant.toolBoundary = "client-only";
+    const files = renderLinuxManagedUnitBundle(config, record, 230103, "runtime");
+    expect(JSON.parse(files.brokerConfig).relay.grant.toolBoundary).toBe("client-only");
+  });
+
   it("renders an unsealed preparation bundle without activating either socket", () => {
     const { config, record } = setup();
     config.relay!.requestId = undefined;

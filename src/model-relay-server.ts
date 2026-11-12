@@ -243,6 +243,7 @@ export async function startVerifiedModelRelayServer(options: ModelRelayServerOpt
         anthropicVersion: active.grant.anthropicVersion,
         allowedBetaValues: active.grant.allowedBetaValues,
         payloadProfile: active.grant.payloadProfile,
+        toolBoundary: active.grant.toolBoundary,
         allowedModels: active.grant.allowedModels,
         maxInputBytes: active.grant.maxInputBytes,
         maxOutputTokens: active.grant.maxOutputTokens,

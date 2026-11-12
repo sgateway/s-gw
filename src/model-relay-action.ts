@@ -32,6 +32,10 @@ function normalizeModelRelaySpec(input: Omit<ModelRelayGrant, "handle">): ModelR
   if (input.payloadProfile !== undefined && input.payloadProfile !== "strict") {
     throw new Error("Invalid model relay payload profile.");
   }
+  if (input.toolBoundary !== undefined &&
+      (input.toolBoundary !== "client-only" || input.payloadProfile !== "strict")) {
+    throw new Error("Client-only model tools require a strict payload profile.");
+  }
   if (input.maxRequests !== undefined &&
       (!Number.isSafeInteger(input.maxRequests) || input.maxRequests < 1 || input.maxRequests > 10_000)) {
     throw new Error("Invalid model relay request count limit.");
@@ -88,6 +92,7 @@ function normalizeModelRelaySpec(input: Omit<ModelRelayGrant, "handle">): ModelR
     routes,
     ttlMs: input.ttlMs,
     ...(input.payloadProfile ? { payloadProfile: input.payloadProfile } : {}),
+    ...(input.toolBoundary ? { toolBoundary: input.toolBoundary } : {}),
     ...(input.maxRequests !== undefined ? { maxRequests: input.maxRequests } : {}),
     ...(input.maxInputBytes !== undefined ? { maxInputBytes: input.maxInputBytes } : {}),
     ...(input.maxOutputTokens !== undefined ? { maxOutputTokens: input.maxOutputTokens } : {}),

@@ -133,7 +133,7 @@ it.skipIf(!existsSync(codex) || !hasCompiler || !canRegister)(
       if (process.platform === "linux") session.linuxCgroup = linuxCgroup;
       const principal = principalForVerifiedPeer(principalIdForPeerSession(session), session.name, session.sessionId);
       const request = await store.createModelRelayRequest({ provider: "openai", handle, ttlMs: 30_000,
-        routes: ["POST /v1/responses"], payloadProfile: "strict" }, principal);
+        routes: ["POST /v1/responses"], payloadProfile: "strict", toolBoundary: "client-only" }, principal);
       await store.approveRequest(request.id, { mode: "per-transaction" });
       const approvals = new StoreBackedModelRelayApprovals(store);
       relay = await startVerifiedModelRelayServer({ socketPath, store, approval: approvals, requestUpstream });

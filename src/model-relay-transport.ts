@@ -16,6 +16,7 @@ export interface ModelRelayAuthority {
   anthropicVersion?: string;
   allowedBetaValues?: readonly string[];
   payloadProfile?: "strict";
+  toolBoundary?: "client-only";
   allowedModels?: readonly string[];
   maxInputBytes?: number;
   maxOutputTokens?: number;
@@ -160,8 +161,21 @@ function objectValue(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function directOnlyCallers(value: unknown): boolean {
+  return value === undefined || Array.isArray(value) && value.length === 1 && value[0] === "direct";
+}
+
+function anthropicClientTool(value: unknown): value is Record<string, unknown> {
+  if (!objectValue(value) || (value.type !== undefined && value.type !== "custom") ||
+      typeof value.name !== "string" || !value.name.trim() || !objectValue(value.input_schema) ||
+      !directOnlyCallers(value.allowed_callers)) return false;
+  return Object.keys(value).every(key => ["type", "name", "description", "input_schema",
+    "cache_control", "defer_loading", "strict", "allowed_callers", "input_examples",
+    "eager_input_streaming"].includes(key));
+}
+
 function checkedModelBody(provider: ModelProvider, route: URL, body: Buffer, strict: boolean,
-  allowedModels?: readonly string[], maxOutputTokens?: number): Buffer {
+  allowedModels?: readonly string[], maxOutputTokens?: number, toolBoundary?: "client-only"): Buffer {
   let parsed: unknown;
   try { parsed = JSON.parse(body.toString("utf8")); }
   catch { throw new RelayError(400, "Model requests with payload restrictions must contain JSON."); }
@@ -203,6 +217,63 @@ function checkedModelBody(provider: ModelProvider, route: URL, body: Buffer, str
     }
   }
 
+  const clientTools = new Map<string, string>();
+  if (toolBoundary === "client-only") {
+    for (const tool of (parsed.tools || []) as unknown[]) {
+      if (!objectValue(tool) || typeof tool.name !== "string" || !tool.name.trim() ||
+          clientTools.has(tool.name)) {
+        throw new RelayError(403, "Client tool definitions are invalid.");
+      }
+      if (provider === "anthropic") {
+        if (!anthropicClientTool(tool)) throw new RelayError(403, "Client tool definitions are invalid.");
+        clientTools.set(tool.name, "custom");
+      } else {
+        const allowed = tool.type === "function"
+          ? ["type", "name", "description", "parameters", "strict", "allowed_callers",
+            "async", "defer_loading", "output_schema"]
+          : ["type", "name", "allowed_callers", "async", "defer_loading", "description", "format"];
+        if (!directOnlyCallers(tool.allowed_callers) || Object.keys(tool).some(key => !allowed.includes(key))) {
+          throw new RelayError(403, "Client tool definitions are invalid.");
+        }
+        clientTools.set(tool.name, tool.type as string);
+      }
+    }
+    if (provider === "openai" && parsed.tool_choice !== undefined) {
+      const choice = parsed.tool_choice;
+      if (typeof choice === "string") {
+        if (!["none", "auto", "required"].includes(choice)) {
+          throw new RelayError(403, "Model tool choice is outside this grant.");
+        }
+      } else if (objectValue(choice)) {
+        const selected = choice.type === "allowed_tools" ? choice.tools : [choice];
+        if (choice.type === "allowed_tools" &&
+            (choice.mode !== "auto" && choice.mode !== "required" ||
+              Object.keys(choice).some(key => key !== "type" && key !== "mode" && key !== "tools"))) {
+          throw new RelayError(403, "Model tool choice is outside this grant.");
+        }
+        if (!Array.isArray(selected) || !selected.length || selected.some(tool =>
+          !objectValue(tool) || (tool.type !== "function" && tool.type !== "custom") ||
+          typeof tool.name !== "string" ||
+          clientTools.get(tool.name) !== tool.type ||
+          Object.keys(tool).some(key => key !== "type" && key !== "name"))) {
+          throw new RelayError(403, "Model tool choice is outside this grant.");
+        }
+      } else throw new RelayError(403, "Model tool choice is outside this grant.");
+    }
+    if (provider === "anthropic" && parsed.tool_choice !== undefined) {
+      const choice = parsed.tool_choice;
+      if (!objectValue(choice) || !["auto", "any", "none", "tool"].includes(choice.type as string) ||
+          (choice.type === "tool" && (typeof choice.name !== "string" ||
+            clientTools.get(choice.name) !== "custom")) ||
+          Object.keys(choice).some(key => key !== "type" &&
+            !(choice.type === "tool" && key === "name") &&
+            !(choice.type !== "none" && key === "disable_parallel_tool_use" &&
+              typeof choice.disable_parallel_tool_use === "boolean"))) {
+        throw new RelayError(403, "Model tool choice is outside this grant.");
+      }
+    }
+  }
+
   const queue: unknown[] = [parsed];
   let visited = 0;
   while (queue.length) {
@@ -215,6 +286,32 @@ function checkedModelBody(provider: ModelProvider, route: URL, body: Buffer, str
     }
     const item = value as Record<string, unknown>;
     if (strict) {
+      if (toolBoundary === "client-only") {
+        if (provider === "openai" && item.type === "additional_tools") {
+          throw new RelayError(403, "Additional model tools are outside this grant.");
+        }
+        if (provider === "anthropic" && (item.type === "tool_addition" || item.type === "tool_removal")) {
+          if (Object.keys(item).some(key => key !== "type" && key !== "tool" && key !== "cache_control")) {
+            throw new RelayError(403, "Inline model tool block is invalid.");
+          }
+          const tool = item.tool;
+          if (!objectValue(tool)) throw new RelayError(403, "Inline model tool is invalid.");
+          if (tool.type === "tool_reference") {
+            if (typeof tool.name !== "string" || clientTools.get(tool.name) !== "custom" ||
+                Object.keys(tool).some(key => key !== "type" && key !== "name")) {
+              throw new RelayError(403, "Inline model tool reference is outside this grant.");
+            }
+          } else if (item.type === "tool_addition" && tool.type === "tool_definition") {
+            const definition = tool.definition;
+            if (!anthropicClientTool(definition) ||
+                Object.keys(tool).some(key => key !== "type" && key !== "definition")) {
+              throw new RelayError(403, "Inline model tool definition is outside this grant.");
+            }
+          } else {
+            throw new RelayError(403, "Inline model tool is outside this grant.");
+          }
+        }
+      }
       if (item.type === "item_reference" || ["file_id", "file_ids", "container_id", "comparison_response_id"].some(name => name in item)) {
         throw new RelayError(403, "Provider resource references are outside this grant.");
       }
@@ -421,13 +518,17 @@ export async function relayModelRequest(
   try {
     if (!authority.credential || authority.credential.length > 16_384) throw new RelayError(403, "Model relay credential is unavailable.");
     validateHeaderValue("authorization", authority.credential);
+    if (authority.toolBoundary !== undefined &&
+        (authority.toolBoundary !== "client-only" || authority.payloadProfile !== "strict")) {
+      throw new RelayError(403, "Client-only model tools require a strict payload profile.");
+    }
     const route = modelRoute(authority.provider, req.method, req.url);
     await check();
     abort.signal.throwIfAborted();
     buffered = await requestBody(req, abort.signal, authority.bufferOwner, authority.maxInputBytes);
     if (req.method !== "GET" && (authority.payloadProfile === "strict" || authority.allowedModels || authority.maxOutputTokens !== undefined)) {
       buffered.data = checkedModelBody(authority.provider, route, buffered.data!,
-        authority.payloadProfile === "strict", authority.allowedModels, authority.maxOutputTokens);
+        authority.payloadProfile === "strict", authority.allowedModels, authority.maxOutputTokens, authority.toolBoundary);
     }
     if (authority.maxInputBytes !== undefined && buffered.data!.length > authority.maxInputBytes) {
       throw new RelayError(413, "Model request exceeds approved input-body limit.");

@@ -3159,12 +3159,18 @@ function ApprovalSheet({
                 <div>Allowed routes: {Array.isArray(request.action.model.routes) ? request.action.model.routes.join(", ") : "Unavailable"}</div>
                 <div>Lifetime after launch: {Math.ceil(request.action.model.ttlMs / 60_000)} minute(s)</div>
                 <div>Payload profile: {request.action.model.payloadProfile === "strict" ? "Strict" : "Unrestricted JSON"}</div>
+                {request.action.model.payloadProfile === "strict" ? (
+                  <div>Client-only tool boundary: {request.action.model.toolBoundary === "client-only" ? "Enabled" : "Not enabled"}</div>
+                ) : null}
                 {request.action.model.maxRequests !== undefined ? <div>Maximum requests: {request.action.model.maxRequests}</div> : null}
                 {request.action.model.maxInputBytes !== undefined ? <div>Maximum input bytes per request: {request.action.model.maxInputBytes}</div> : null}
                 {request.action.model.maxOutputTokens !== undefined ? <div>Maximum output tokens per request: {request.action.model.maxOutputTokens}</div> : null}
                 {request.action.model.allowedModels ? <div>Allowed models: {request.action.model.allowedModels.join(", ")}</div> : null}
                 {request.action.model.payloadProfile === "strict" ? (
-                  <div className="text-xs text-muted-foreground">Blocks background work, provider-run tools, remote MCP servers, recognized URL inputs, and provider resource references. OpenAI responses use store: false. Prompt text and other provider behavior are not inspected.</div>
+                  <div className="text-xs text-muted-foreground">Checks top-level provider tools, remote MCP servers, recognized URL inputs, provider resource references, and background work. OpenAI responses use store: false. Nested provider tools require the client-only boundary.</div>
+                ) : null}
+                {request.action.model.toolBoundary === "client-only" ? (
+                  <div className="text-xs text-muted-foreground">Rejects OpenAI additional tools and provider tool selectors, and Anthropic inline server tools or MCP references. Direct client tools and references to validated top-level client tools remain available. Prompt text and future provider fields are not inspected.</div>
                 ) : null}
                 {request.action.model.workspaceId ? <div>Workspace: {request.action.model.workspaceId}</div> : null}
                 {request.action.model.organizationId ? <div>Organization: {request.action.model.organizationId}</div> : null}
