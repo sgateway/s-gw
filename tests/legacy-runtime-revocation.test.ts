@@ -43,11 +43,12 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
   it("stops a TypeScript environment command when a deny is added", async () => {
     const { store, handle, requestId, ready } = await envRequest();
     const running = executeApprovedRequest(store, requestId, { engine: "typescript", strictLegacyRevocation: true });
+    const rejected = expect(running).rejects.toThrow(/denied by the current policy/i);
     await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
     const revokedAt = Date.now();
     await denyHandle(store, handle, "env_command");
 
-    await expect(running).rejects.toThrow(/denied by the current policy/i);
+    await rejected;
     expect(Date.now() - revokedAt).toBeLessThan(2_500);
     expect((await store.getRequest(requestId)).state).toBe("failed");
   }, 15_000);
@@ -55,11 +56,12 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
   it("stops a TypeScript environment command when its handle is deleted", async () => {
     const { store, handle, requestId, ready } = await envRequest();
     const running = executeApprovedRequest(store, requestId, { engine: "typescript", strictLegacyRevocation: true });
+    const rejected = expect(running).rejects.toThrow(/authorization is no longer active/i);
     await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
     const revokedAt = Date.now();
     await store.deleteSecret(handle);
 
-    await expect(running).rejects.toThrow(/authorization is no longer active/i);
+    await rejected;
     expect(Date.now() - revokedAt).toBeLessThan(2_500);
     expect((await store.getRequest(requestId)).state).toBe("failed");
   }, 15_000);
@@ -89,11 +91,12 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
     const running = executeReusablePermit(store, admission.permit, {
       caller, engine: "typescript", strictLegacyRevocation: true
     });
+    const rejected = expect(running).rejects.toThrow(/authorization changed|denied/i);
     await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
     const revokedAt = Date.now();
     await denyHandle(store, record.handle, "env_command");
 
-    await expect(running).rejects.toThrow(/authorization changed|denied/i);
+    await rejected;
     expect(Date.now() - revokedAt).toBeLessThan(2_500);
   }, 15_000);
 
@@ -118,12 +121,14 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
       const running = executeApprovedRequest(store, requestId, {
         engine: "rust", coreBinary: core, strictLegacyRevocation: true
       });
+      const rejected = expect(running).rejects.toThrow(cause === "deny"
+        ? /denied by the current policy/i : /authorization is no longer active/i);
       await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
       const revokedAt = Date.now();
       if (cause === "deny") await denyHandle(store, handle, "env_command");
       else await store.deleteSecret(handle);
 
-      await expect(running).rejects.toThrow(cause === "deny" ? /denied by the current policy/i : /authorization is no longer active/i);
+      await rejected;
       expect(Date.now() - revokedAt).toBeLessThan(2_500);
       await new Promise(resolve => setTimeout(resolve, 1_400));
       expect(existsSync(late)).toBe(false);
@@ -138,12 +143,14 @@ describe.sequential("opt-in legacy in-flight revocation", () => {
       expect((await executeApprovedRequest(store, first.id)).exitCode).toBe(0);
       const second = await sshRequest(store, handle, "slow");
       const running = executeApprovedRequest(store, second.id, { strictLegacyRevocation: true });
+      const rejected = expect(running).rejects.toThrow(cause === "deny"
+        ? /denied by the current policy/i : /authorization is no longer active/i);
       await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 5_000 });
       const revokedAt = Date.now();
       if (cause === "deny") await denyHandle(store, handle, "ssh_session");
       else await store.deleteSecret(handle);
 
-      await expect(running).rejects.toThrow(cause === "deny" ? /denied by the current policy/i : /authorization is no longer active/i);
+      await rejected;
       expect(Date.now() - revokedAt).toBeLessThan(2_500);
       const calls = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line) as string[]);
       expect(calls.filter(args => args.includes("-M"))).toHaveLength(1);
