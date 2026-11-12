@@ -257,6 +257,12 @@ async function withUnit(mode, inspect) {
       throw new Error("Census fixture cgroup path changed.");
     }
     owned.pid = pid;
+    // READY is written before the helper closes its temporary writer.
+    const readyFd = mode === "clean" ? 3 : mode === "extra" ? 4 : 5;
+    await waitFor(async () => {
+      try { await readlink(`/proc/${pid}/fd/${readyFd}`); return false; }
+      catch (error) { if (error.code === "ENOENT") return true; throw error; }
+    }, "gate readiness descriptor close");
     await writeFile(`${owned.cgroup}/cgroup.freeze`, "1\n");
     await waitFor(async () => /^frozen 1$/m.test(await readFile(`${owned.cgroup}/cgroup.events`, "utf8")),
       "cgroup freeze");
