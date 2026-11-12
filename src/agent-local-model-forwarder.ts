@@ -91,7 +91,8 @@ async function rootOwnedPath(filePath: string, kind: "file" | "socket"): Promise
   while (true) {
     const info = await lstat(current);
     if (!info.isDirectory() || info.uid !== 0 || (info.mode & 0o022) !== 0) {
-      throw new Error("Linux forwarder path is not controlled by the launcher.");
+      throw new Error(`Linux forwarder path is not controlled by the launcher: ${current} ` +
+        `(uid=${info.uid}, mode=${(info.mode & 0o777).toString(8)}).`);
     }
     const next = path.dirname(current);
     if (next === current) break;
