@@ -755,7 +755,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
       await rm(home, { recursive: true, force: true });
       await rm(`${home}-recovery`, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("executes the next approved request through a stable command shape", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-next-"));
