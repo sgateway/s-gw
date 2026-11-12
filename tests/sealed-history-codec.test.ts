@@ -148,6 +148,40 @@ describe("sealed history v3 codec", () => {
     expect(() => openSealedHistory(sealed, randomBytes(32), anchor)).toThrow();
   });
 
+  it("rejects reordered request and audit rows under the same trusted anchor", () => {
+    const secondRequest = request();
+    secondRequest.id = "req_second";
+    const secondEvent = event();
+    secondEvent.id = "audit_second";
+    const rows = {
+      requests: [
+        { revision: 1, record: request() }, { revision: 1, record: secondRequest }
+      ],
+      audit: [
+        { revision: 1, record: event() }, { revision: 1, record: secondEvent }
+      ]
+    };
+    const sealed = sealHistory(rows, key);
+    const anchor = revisions(rows);
+
+    const reorderedRequests = structuredClone(sealed);
+    reorderedRequests.requests.reverse();
+    expect(() => openSealedHistory(reorderedRequests, key, anchor)).toThrow();
+
+    const reorderedAudit = structuredClone(sealed);
+    reorderedAudit.audit.reverse();
+    expect(() => openSealedHistory(reorderedAudit, key, anchor)).toThrow();
+
+    const missingRequest = structuredClone(sealed);
+    missingRequest.requests.pop();
+    expect(() => openSealedHistory(missingRequest, key, anchor)).toThrow("revision anchor mismatch");
+
+    const missingAudit = structuredClone(sealed);
+    missingAudit.audit.pop();
+    expect(() => openSealedHistory(missingAudit, key, anchor)).toThrow("revision anchor mismatch");
+    expect(openSealedHistory(sealed, key, anchor)).toEqual(rows);
+  });
+
   it("fails closed on a torn write and detects replay using a trusted revision anchor", () => {
     const first = sealHistory(fixture(), key);
     const nextRows = fixture();

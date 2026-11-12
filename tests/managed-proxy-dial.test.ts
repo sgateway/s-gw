@@ -79,9 +79,12 @@ describe("managed proxy dial", () => {
 
   it("bounds lookup and connection waits and closes a late socket", async () => {
     const connect = vi.fn(async () => fakeSocket());
+    let finishLookup!: (answers: { address: string; family: number }[]) => void;
     await expect(dialManagedProxyHost("allowed.test", 443, {
-      lookup: () => new Promise(() => {}), connect, lookupTimeoutMs: 10
+      lookup: () => new Promise(resolve => { finishLookup = resolve; }), connect, lookupTimeoutMs: 10
     })).rejects.toThrow("lookup timed out");
+    finishLookup([{ address: "8.8.8.8", family: 4 }]);
+    await new Promise(resolve => setImmediate(resolve));
     expect(connect).not.toHaveBeenCalled();
 
     let finish: ((socket: Socket) => void) | undefined;
@@ -96,6 +99,148 @@ describe("managed proxy dial", () => {
     const socket = fakeSocket();
     finish!(socket);
     await vi.waitFor(() => expect(socket.destroyed).toBe(true));
+  });
+
+  it("does not start a lookup or connection after caller cancellation", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const lookup = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]);
+    const connect = vi.fn(async () => fakeSocket());
+    await expect(dialManagedProxyHost("allowed.test", 443, {
+      signal: controller.signal, lookup, connect
+    })).rejects.toThrow("aborted");
+    expect(lookup).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("does not connect if the caller cancels during DNS", async () => {
+    const controller = new AbortController();
+    let finish!: (answers: { address: string; family: number }[]) => void;
+    const lookup = () => new Promise<{ address: string; family: number }[]>(resolve => { finish = resolve; });
+    const sockets: Socket[] = [];
+    const connect = vi.fn(async () => {
+      const socket = fakeSocket();
+      sockets.push(socket);
+      return socket;
+    });
+    const pending = dialManagedProxyHost("allowed.test", 443, { signal: controller.signal, lookup, connect });
+    try {
+      await vi.waitFor(() => expect(finish).toBeDefined());
+      controller.abort();
+      finish([{ address: "8.8.8.8", family: 4 }]);
+      await expect(pending).rejects.toThrow("aborted");
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      if (finish) finish([{ address: "8.8.8.8", family: 4 }]);
+      for (const socket of sockets) socket.destroy();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("notifies a cooperative resolver when the caller cancels", async () => {
+    const controller = new AbortController();
+    let resolverSignal: AbortSignal | undefined;
+    const pending = dialManagedProxyHost("allowed.test", 443, {
+      signal: controller.signal,
+      lookup: (_host, signal) => new Promise((_resolve, reject) => {
+        resolverSignal = signal;
+        signal.addEventListener("abort", () => reject(new Error("resolver stopped")), { once: true });
+      })
+    });
+    await vi.waitFor(() => expect(resolverSignal).toBeDefined());
+    controller.abort();
+    await expect(pending).rejects.toThrow("aborted");
+    expect(resolverSignal?.aborted).toBe(true);
+  });
+
+  it("closes a connector's late socket after caller cancellation", async () => {
+    const controller = new AbortController();
+    let finish!: (socket: Socket) => void;
+    const late = fakeSocket();
+    const pending = dialManagedProxyHost("8.8.8.8", 443, {
+      signal: controller.signal,
+      connect: () => new Promise<Socket>(resolve => { finish = resolve; })
+    });
+    try {
+      await vi.waitFor(() => expect(finish).toBeDefined());
+      controller.abort();
+      finish(late);
+      await expect(pending).rejects.toThrow("aborted");
+      await vi.waitFor(() => expect(late.destroyed).toBe(true));
+    } finally {
+      controller.abort();
+      if (finish) finish(late);
+      late.destroy();
+      await Promise.allSettled([pending]);
+    }
+  });
+
+  it("holds DNS capacity until cancelled or timed-out lookups settle", async () => {
+    const controllers = Array.from({ length: 16 }, () => new AbortController());
+    const finish: Array<(answers: { address: string; family: number }[]) => void> = [];
+    const lookup = () => new Promise<{ address: string; family: number }[]>(resolve => { finish.push(resolve); });
+    const connect = vi.fn(async () => fakeSocket());
+    const pending = controllers.map((controller, index) => dialManagedProxyHost("allowed.test", 443, {
+      signal: controller.signal, lookup, connect, lookupTimeoutMs: index < 8 ? 1_000 : 30
+    }).catch(error => error));
+    try {
+      await vi.waitFor(() => expect(finish).toHaveLength(16));
+      await expect(dialManagedProxyHost("allowed.test", 443, {
+        lookup, connect, lookupTimeoutMs: 20
+      })).rejects.toThrow("lookup capacity");
+      for (const controller of controllers.slice(0, 8)) controller.abort();
+      const outcomes = await Promise.all(pending);
+      expect(outcomes.slice(0, 8).every(error => error.message === "Managed proxy dial aborted.")).toBe(true);
+      expect(outcomes.slice(8).every(error => error.message === "Managed proxy lookup timed out.")).toBe(true);
+      await expect(dialManagedProxyHost("allowed.test", 443, {
+        lookup, connect, lookupTimeoutMs: 20
+      })).rejects.toThrow("lookup capacity");
+    } finally {
+      for (const controller of controllers) controller.abort();
+      for (const resolve of finish) resolve([{ address: "8.8.8.8", family: 4 }]);
+      await Promise.allSettled(pending);
+    }
+    expect(connect).not.toHaveBeenCalled();
+    const socket = fakeSocket();
+    const result = await dialManagedProxyHost("allowed.test", 443, {
+      lookup: async () => [{ address: "8.8.8.8", family: 4 }], connect: async () => socket
+    });
+    expect(result.socket).toBe(socket);
+    socket.destroy();
+  });
+
+  it("holds connection capacity until cancelled connectors settle", async () => {
+    const controllers = Array.from({ length: 32 }, () => new AbortController());
+    const finish: Array<(socket: Socket) => void> = [];
+    const connect = () => new Promise<Socket>(resolve => { finish.push(resolve); });
+    const pending = controllers.map(controller => dialManagedProxyHost("8.8.8.8", 443, {
+      signal: controller.signal, connect, connectTimeoutMs: 1_000
+    }).catch(error => error));
+    const sockets: Socket[] = [];
+    try {
+      await vi.waitFor(() => expect(finish).toHaveLength(32));
+      await expect(dialManagedProxyHost("8.8.8.8", 443, {
+        connect, connectTimeoutMs: 20
+      })).rejects.toThrow("connection capacity");
+      for (const controller of controllers) controller.abort();
+      await expect(dialManagedProxyHost("8.8.8.8", 443, {
+        connect, connectTimeoutMs: 20
+      })).rejects.toThrow("connection capacity");
+    } finally {
+      for (const controller of controllers) controller.abort();
+      for (const resolve of finish) {
+        const socket = fakeSocket();
+        sockets.push(socket);
+        resolve(socket);
+      }
+      await Promise.allSettled(pending);
+      for (const socket of sockets) socket.destroy();
+    }
+    const socket = fakeSocket();
+    const result = await dialManagedProxyHost("8.8.8.8", 443, { connect: async () => socket });
+    expect(result.socket).toBe(socket);
+    socket.destroy();
   });
 
   it("rejects malformed answers and propagates connection failure", async () => {

@@ -69,7 +69,7 @@ export function sealHistory(rows: HistoryRows, key: Uint8Array): SealedHistoryV3
     checkId(seen, record.id);
     const meta = { id: record.id, updatedAt: record.updatedAt, state: record.state,
       revision: item.revision };
-    requests.push({ ...meta, box: encryptRow("request", meta, record, aesKey) });
+    requests.push({ ...meta, box: encryptRow("request", meta, requests.length, record, aesKey) });
   }
   for (const value of input.audit) {
     const item = objectWithFields(value, ["revision", "record"]);
@@ -77,7 +77,7 @@ export function sealHistory(rows: HistoryRows, key: Uint8Array): SealedHistoryV3
     const record = checkAudit(item.record);
     checkId(seen, record.id);
     const meta = { id: record.id, ts: record.ts, revision: item.revision };
-    audit.push({ ...meta, box: encryptRow("audit", meta, record, aesKey) });
+    audit.push({ ...meta, box: encryptRow("audit", meta, audit.length, record, aesKey) });
   }
   return { version: 3, requests, audit };
 }
@@ -105,7 +105,7 @@ export function openSealedHistory(raw: unknown, key: Uint8Array,
     checkExpectedRevision(expectedRevisions, row.id, row.revision);
     const meta = { id: row.id, updatedAt: row.updatedAt, state: row.state,
       revision: row.revision };
-    const record = checkRequest(decryptRow("request", meta, row.box, aesKey));
+    const record = checkRequest(decryptRow("request", meta, requests.length, row.box, aesKey));
     if (record.id !== row.id || record.updatedAt !== row.updatedAt || record.state !== row.state) {
       throw new Error("Sealed request metadata mismatch.");
     }
@@ -119,7 +119,7 @@ export function openSealedHistory(raw: unknown, key: Uint8Array,
     checkId(seen, row.id);
     checkExpectedRevision(expectedRevisions, row.id, row.revision);
     const meta = { id: row.id, ts: row.ts, revision: row.revision };
-    const record = checkAudit(decryptRow("audit", meta, row.box, aesKey));
+    const record = checkAudit(decryptRow("audit", meta, audit.length, row.box, aesKey));
     if (record.id !== row.id || record.ts !== row.ts) {
       throw new Error("Sealed audit metadata mismatch.");
     }
@@ -131,10 +131,10 @@ export function openSealedHistory(raw: unknown, key: Uint8Array,
   return { requests, audit };
 }
 
-function encryptRow(kind: HistoryKind, meta: object, record: object, key: Buffer): HistoryBox {
+function encryptRow(kind: HistoryKind, meta: object, position: number, record: object, key: Buffer): HistoryBox {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
-  cipher.setAAD(aad(kind, meta));
+  cipher.setAAD(aad(kind, meta, position));
   const ciphertext = Buffer.concat([cipher.update(JSON.stringify(record), "utf8"), cipher.final()]);
   return {
     alg: "aes-256-gcm", iv: iv.toString("base64"),
@@ -143,21 +143,21 @@ function encryptRow(kind: HistoryKind, meta: object, record: object, key: Buffer
   };
 }
 
-function decryptRow(kind: HistoryKind, meta: object, value: unknown, key: Buffer): unknown {
+function decryptRow(kind: HistoryKind, meta: object, position: number, value: unknown, key: Buffer): unknown {
   const box = objectWithFields(value, ["alg", "iv", "authTag", "ciphertext"]);
   if (box.alg !== "aes-256-gcm") throw new Error("Unsupported history cipher.");
   const iv = decodeBase64(box.iv, 12);
   const tag = decodeBase64(box.authTag, 16);
   const ciphertext = decodeBase64(box.ciphertext);
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAAD(aad(kind, meta));
+  decipher.setAAD(aad(kind, meta, position));
   decipher.setAuthTag(tag);
   const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return JSON.parse(plain.toString("utf8")) as unknown;
 }
 
-function aad(kind: HistoryKind, meta: object): Buffer {
-  return Buffer.from(JSON.stringify(["s-gw-history-v3", kind, meta]), "utf8");
+function aad(kind: HistoryKind, meta: object, position: number): Buffer {
+  return Buffer.from(JSON.stringify(["s-gw-history-v3", kind, position, meta]), "utf8");
 }
 
 function checkedKey(key: Uint8Array): Buffer {

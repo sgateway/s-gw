@@ -7,7 +7,8 @@ type LookupAnswer = { address: string; family: number };
 type Address = { address: string; family: IpFamily };
 
 export interface ManagedProxyDialOptions {
-  lookup?: (host: string) => Promise<readonly LookupAnswer[]>;
+  signal?: AbortSignal;
+  lookup?: (host: string, signal: AbortSignal) => Promise<readonly LookupAnswer[]>;
   connect?: (address: string, port: number, family: IpFamily, signal: AbortSignal) => Promise<Socket>;
   lookupTimeoutMs?: number;
   connectTimeoutMs?: number;
@@ -21,6 +22,10 @@ export interface ManagedProxyConnection {
 }
 
 const extraSpecialUse = new BlockList();
+const capacity = {
+  lookup: { active: 0, max: 16 },
+  connection: { active: 0, max: 32 }
+};
 for (const subnet of ["192.0.0.0", "192.31.196.0", "192.52.193.0", "192.175.48.0"]) {
   extraSpecialUse.addSubnet(subnet, 24);
 }
@@ -57,20 +62,44 @@ function dialHost(host: string): { requestedHost: string; lookupHost: string; li
   return { requestedHost: host, lookupHost, literal: 0 };
 }
 
-async function withDeadline<T>(work: Promise<T>, ms: number, label: string, onTimeout?: () => void): Promise<T> {
+function limitedWork<T>(kind: "lookup" | "connection", work: () => Promise<T>): Promise<T> {
+  const limit = capacity[kind];
+  if (limit.active >= limit.max) throw new Error(`Managed proxy ${kind} capacity exceeded.`);
+  limit.active++;
+  const pending = Promise.resolve().then(work);
+  // A cancelled dial may leave its underlying DNS or connector work running.
+  void pending.then(() => { limit.active--; }, () => { limit.active--; });
+  return pending;
+}
+
+async function withDeadline<T>(work: Promise<T>, ms: number, label: string, signal?: AbortSignal, onStop?: () => void): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  const stop = (reject: (error: Error) => void, error: Error) => {
+    if (stopped) return;
+    stopped = true;
+    onStop?.();
+    reject(error);
+  };
+  let onAbort: (() => void) | undefined;
   const expired = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      onTimeout?.();
-      reject(new Error(`Managed proxy ${label} timed out.`));
+      stop(reject, new Error(`Managed proxy ${label} timed out.`));
     }, ms);
+    onAbort = () => stop(reject, new Error("Managed proxy dial aborted."));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
   try { return await Promise.race([work, expired]); }
-  finally { clearTimeout(timer); }
+  finally {
+    clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function connectNumeric(address: string, port: number, family: IpFamily, signal: AbortSignal): Promise<Socket> {
   return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(new Error("Managed proxy dial aborted.")); return; }
     const socket = netConnect({ host: address, port, family });
     const done = (error?: Error) => {
       socket.off("connect", onConnect);
@@ -90,6 +119,7 @@ function connectNumeric(address: string, port: number, family: IpFamily, signal:
 }
 
 export async function dialManagedProxyHost(host: string, port: number, options: ManagedProxyDialOptions = {}): Promise<ManagedProxyConnection> {
+  if (options.signal?.aborted) throw new Error("Managed proxy dial aborted.");
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("Invalid managed proxy port.");
   const target = dialHost(host);
   const lookupLimit = timeoutMs(options.lookupTimeoutMs, "lookup");
@@ -97,14 +127,21 @@ export async function dialManagedProxyHost(host: string, port: number, options: 
   let addresses: readonly LookupAnswer[];
   if (target.literal) addresses = [{ address: target.lookupHost, family: target.literal }];
   else {
-    const resolver = options.lookup ?? (name => lookup(name, { all: true }));
+    const resolver = options.lookup ?? ((name: string) => lookup(name, { all: true }));
+    const cancelLookup = new AbortController();
     try {
-      addresses = await withDeadline(Promise.resolve().then(() => resolver(target.lookupHost)), lookupLimit, "lookup");
+      const pending = limitedWork("lookup", () => {
+        if (cancelLookup.signal.aborted) throw new Error("Managed proxy dial aborted.");
+        return resolver(target.lookupHost, cancelLookup.signal);
+      });
+      addresses = await withDeadline(pending, lookupLimit, "lookup", options.signal, () => cancelLookup.abort());
     } catch (error) {
-      if (error instanceof Error && error.message === "Managed proxy lookup timed out.") throw error;
+      if (error instanceof Error && ["Managed proxy lookup timed out.", "Managed proxy dial aborted.",
+        "Managed proxy lookup capacity exceeded."].includes(error.message)) throw error;
       throw new Error("Managed proxy lookup failed.", { cause: error });
     }
   }
+  if (options.signal?.aborted) throw new Error("Managed proxy dial aborted.");
   if (!Array.isArray(addresses) || !addresses.length || addresses.some(item => !item)) {
     throw new Error("Managed proxy host resolves to a restricted address.");
   }
@@ -117,15 +154,21 @@ export async function dialManagedProxyHost(host: string, port: number, options: 
   const chosen = vetted[0];
   const cancel = new AbortController();
   const connector = options.connect ?? connectNumeric;
-  const pending = Promise.resolve().then(() => connector(chosen.address, port, chosen.family, cancel.signal));
+  if (options.signal?.aborted) throw new Error("Managed proxy dial aborted.");
+  const pending = limitedWork("connection", () => {
+    if (cancel.signal.aborted || options.signal?.aborted) throw new Error("Managed proxy dial aborted.");
+    return connector(chosen.address, port, chosen.family, cancel.signal);
+  });
   try {
-    const socket = await withDeadline(pending, connectLimit, "connection", () => cancel.abort());
+    const socket = await withDeadline(pending, connectLimit, "connection", options.signal, () => cancel.abort());
+    if (options.signal?.aborted) { socket.destroy(); throw new Error("Managed proxy dial aborted."); }
     return { requestedHost: target.requestedHost, address: chosen.address, family: chosen.family, socket };
   } catch (error) {
     cancel.abort();
     // An injected connector may finish after the deadline; do not leave its socket open.
     void pending.then(socket => socket.destroy(), () => {});
-    if (error instanceof Error && error.message === "Managed proxy connection timed out.") throw error;
+    if (error instanceof Error && ["Managed proxy connection timed out.", "Managed proxy dial aborted.",
+      "Managed proxy connection capacity exceeded."].includes(error.message)) throw error;
     throw new Error("Managed proxy connection failed.", { cause: error });
   }
 }
