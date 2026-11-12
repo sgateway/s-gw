@@ -552,13 +552,25 @@ const proxy = new URL(process.env.SGW_SANDBOX_PROXY_URL);
 const viaProxy = await new Promise(resolve => {
   const req = request({ hostname: proxy.hostname, port: Number(proxy.port), method: 'CONNECT',
     path: '127.0.0.1:' + fixture.localPort });
-  req.once('connect', (response, socket) => {
+  let connected = false;
+  req.once('connect', (response, socket, head) => {
+    connected = true;
     if (response.statusCode !== 200) { socket.destroy(); resolve(false); return; }
-    socket.once('data', chunk => { socket.destroy(); resolve(chunk.toString() === 'synthetic localhost fixture'); });
+    const greeting = 'synthetic localhost fixture';
+    let received = head.toString();
+    const finish = () => { socket.destroy(); resolve(received === greeting); };
+    if (received.length >= greeting.length) { finish(); return; }
+    socket.on('data', chunk => {
+      received += chunk.toString();
+      if (received.length >= greeting.length) finish();
+    });
     socket.once('error', () => resolve(false));
+    socket.once('close', () => resolve(false));
     socket.setTimeout(2000, () => { socket.destroy(); resolve(false); });
   });
   req.once('error', () => resolve(false));
+  req.once('close', () => { if (!connected) resolve(false); });
+  req.setTimeout(2000, () => { req.destroy(); resolve(false); });
   req.end();
 });
 writeFileSync('session-isolation-result.json', JSON.stringify({ siblingRead, ownMcp, direct, viaProxy }));
