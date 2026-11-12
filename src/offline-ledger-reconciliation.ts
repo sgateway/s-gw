@@ -54,7 +54,7 @@ const terminalStates = new Set(["denied", "executed", "failed"]);
 const requestStates = new Set([...terminalStates, "pending", "approved", "executing"]);
 const appLedgerFields = new Set([
   "version", "secrets", "requests", "audit", "approvalSettings", "approvalGrants",
-  "approvalPolicyRules", "managedSshRoutes", "credentialOps"
+  "approvalPolicyRules", "managedSshRoutes", "credentialOps", "consoleAccess"
 ]);
 const donorLedgerFields = new Set([
   "version", "writerGeneration", "secrets", "requests", "agentIdentities", "audit",
@@ -161,6 +161,10 @@ function assertSealedControl(input: OfflineReconciliationInput, app: Ledger, che
   const head = parseObject(input.recoveryHeadRaw, "recovery head");
   assertKnownFields(manifest, controlManifestFields, "control manifest");
   assertKnownFields(head, recoveryHeadFields, "recovery head");
+  if ((app.consoleAccess !== undefined && app.consoleAccess !== "protected")
+      || (checkpoint.consoleAccess !== undefined && checkpoint.consoleAccess !== "protected")) {
+    throw new Error("Invalid console access policy in sealed app ledger.");
+  }
   const fingerprint = controlFingerprint(app);
   const checkpointHash = controlFingerprint(checkpoint);
   const checkpointName = /^checkpoint-\d{13}-[A-Za-z0-9_-]+-([a-f0-9]{64})\.json$/
@@ -168,7 +172,8 @@ function assertSealedControl(input: OfflineReconciliationInput, app: Ledger, che
   // A later writer may change the fingerprint or checkpoint format.
   if (!checkpointName || manifest.version !== 1 || manifest.recoverySealed !== true
       || typeof manifest.updatedAt !== "string"
-      || manifest.writerVersion !== "0.1.22"
+      || (manifest.writerVersion !== "0.1.22" && manifest.writerVersion !== "0.1.23")
+      || (manifest.writerVersion === "0.1.22" && app.consoleAccess === "protected")
       || manifest.fingerprint !== fingerprint || checkpointHash !== fingerprint
       || checkpointName[1] !== fingerprint || manifest.recoveryCheckpoint !== input.checkpointName
       || manifest.secrets !== app.secrets.length
@@ -297,6 +302,7 @@ function controlFingerprint(ledger: Ledger): string {
   const control = {
     version: ledger.version,
     secrets,
+    ...(ledger.consoleAccess === "protected" ? { consoleAccess: ledger.consoleAccess } : {}),
     approvalSettings: ledger.approvalSettings,
     approvalGrants: grants,
     approvalPolicyRules: rules,

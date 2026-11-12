@@ -85,11 +85,13 @@ function seal(app: {
   approvalGrants: Record<string, unknown>[];
   approvalPolicyRules: Record<string, unknown>[];
   managedSshRoutes: Record<string, unknown>[];
+  consoleAccess?: "protected";
   credentialOps?: Record<string, unknown>[];
-}, donor: object): OfflineReconciliationInput {
+}, donor: object, writerVersion = "0.1.22"): OfflineReconciliationInput {
   const secrets = app.secrets.map(({ updatedAt: _updatedAt, ...secret }) => secret);
   const controls = {
     version: 1, secrets, approvalSettings: app.approvalSettings,
+    ...(app.consoleAccess === "protected" ? { consoleAccess: app.consoleAccess } : {}),
     approvalGrants: app.approvalGrants, approvalPolicyRules: app.approvalPolicyRules,
     managedSshRoutes: app.managedSshRoutes,
     ...(app.credentialOps?.length ? { credentialOps: app.credentialOps } : {})
@@ -102,7 +104,7 @@ function seal(app: {
       version: 1, fingerprint, updatedAt: timestamp, secrets: app.secrets.length,
       approvalPolicyRules: app.approvalPolicyRules.length, recoverySealed: true,
       recoveryCheckpoint: checkpointName, recoveryNamespace: sha(path.resolve(home)).slice(0, 24),
-      recoveryVaultId: sha(path.resolve(recoveryHome)), writerVersion: "0.1.22"
+      recoveryVaultId: sha(path.resolve(recoveryHome)), writerVersion
     }),
     checkpointName,
     checkpointRaw: JSON.stringify({ ...app, requests: [], audit: [] }),
@@ -158,7 +160,7 @@ describe("offline ledger reconciliation assessment", () => {
     expect(() => assessOfflineLedgerReconciliation({ ...input, pendingControlRaw: "{}" }))
       .toThrow("pending control-plane write");
     const futureManifest = JSON.parse(input.controlManifestRaw);
-    futureManifest.writerVersion = "0.1.23";
+    futureManifest.writerVersion = "0.1.24";
     expect(() => assessOfflineLedgerReconciliation({ ...input, controlManifestRaw: JSON.stringify(futureManifest) }))
       .toThrow("sealed app control plane");
     const checkpoint = JSON.parse(input.checkpointRaw);
@@ -168,6 +170,32 @@ describe("offline ledger reconciliation assessment", () => {
     expect(() => assessOfflineLedgerReconciliation({ ...input,
       originalHome: path.join(home, "..", ".s-gw"),
       originalRecoveryHome: path.join(recoveryHome, "..", ".s-gw-recovery") })).not.toThrow();
+  });
+
+  it("validates a protected 0.1.23 app seal and rejects console policy drift", () => {
+    const { app, donor } = fixture();
+    const protectedApp = { ...app, consoleAccess: "protected" as const };
+    const input = seal(protectedApp, donor, "0.1.23");
+    const assessment = assessOfflineLedgerReconciliation(input);
+    expect(assessment.migrationBlocked).toBe(true);
+    expect(assessment.summary.controlFingerprint).toBe(JSON.parse(input.controlManifestRaw).fingerprint);
+
+    const checkpoint = JSON.parse(input.checkpointRaw);
+    delete checkpoint.consoleAccess;
+    expect(() => assessOfflineLedgerReconciliation({ ...input, checkpointRaw: JSON.stringify(checkpoint) }))
+      .toThrow("sealed app control plane");
+
+    const changedApp = JSON.parse(input.sealedLedgerRaw);
+    delete changedApp.consoleAccess;
+    expect(() => assessOfflineLedgerReconciliation({ ...input, sealedLedgerRaw: JSON.stringify(changedApp) }))
+      .toThrow("sealed app control plane");
+
+    const invalidApp = { ...changedApp, consoleAccess: "ordinary" };
+    expect(() => assessOfflineLedgerReconciliation({ ...input, sealedLedgerRaw: JSON.stringify(invalidApp) }))
+      .toThrow("Invalid console access policy");
+
+    expect(() => assessOfflineLedgerReconciliation(seal(protectedApp, donor, "0.1.22")))
+      .toThrow("sealed app control plane");
   });
 
   it("rejects generation-2 secret, grant, setting, rule, and shared-condition drift", () => {
