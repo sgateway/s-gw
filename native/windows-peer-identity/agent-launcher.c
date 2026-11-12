@@ -132,6 +132,20 @@ BOOL sgw_windows_agent_boundary_healthy(const SGW_WINDOWS_AGENT_BOUNDARY *bounda
         WaitForSingleObject(boundary->stop_event, 0) == WAIT_TIMEOUT;
 }
 
+DWORD sgw_windows_agent_boundary_child_pid(const SGW_WINDOWS_AGENT_BOUNDARY *boundary) {
+    if (!boundary || InterlockedCompareExchange((volatile LONG *)&boundary->active, 0, 0) != 1 ||
+        !boundary->child || boundary->child == INVALID_HANDLE_VALUE ||
+        !boundary->stop_event || boundary->stop_event == INVALID_HANDLE_VALUE ||
+        WaitForSingleObject(boundary->stop_event, 0) != WAIT_TIMEOUT ||
+        WaitForSingleObject(boundary->child, 0) != WAIT_TIMEOUT) return 0;
+
+    DWORD pid = GetProcessId(boundary->child);
+    if (!pid || WaitForSingleObject(boundary->child, 0) != WAIT_TIMEOUT ||
+        WaitForSingleObject(boundary->stop_event, 0) != WAIT_TIMEOUT ||
+        InterlockedCompareExchange((volatile LONG *)&boundary->active, 0, 0) != 1) return 0;
+    return pid;
+}
+
 static DWORD child_identity(HANDLE process, PSID broker_sid, PSID package_sid,
     SGW_WINDOWS_AGENT_IDENTITY *identity) {
     HANDLE token = NULL;

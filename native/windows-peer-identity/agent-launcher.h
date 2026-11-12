@@ -51,6 +51,10 @@ typedef struct {
 // broker's synchronous DNS guard. An identity, PID or Job name alone is not proof.
 BOOL sgw_windows_agent_boundary_healthy(const SGW_WINDOWS_AGENT_BOUNDARY *boundary);
 
+// Returns zero unless the retained child handle still names a live process in
+// an active launch. The callback's recorded process_id is not used here.
+DWORD sgw_windows_agent_boundary_child_pid(const SGW_WINDOWS_AGENT_BOUNDARY *boundary);
+
 // Source-only opt-in handoff for an in-process broker bridge. The boundary may
 // be probed during registration and while the session runs, but not after drain.
 DWORD sgw_windows_agent_run_bound(HANDLE stop_event, const SGW_WINDOWS_AGENT_HOOKS *hooks,
