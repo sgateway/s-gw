@@ -381,7 +381,7 @@ describeBrowser("React local console (real headless Chrome)", () => {
     expect(await cdp.eval<boolean>(`Boolean(document.querySelector('[data-approve="${request.id}"]')?.disabled)`)).toBe(false);
 
     await store.updateManagedSshRoute(route.id, { host: "127.0.0.2" });
-    await cdp.eval("window.location.reload()");
+    await cdp.send("Page.navigate", { url: new URL("approvals", running.url).toString() });
     await waitFor(() => cdp!.eval<boolean>("document.querySelectorAll('tbody tr').length > 0"), "stale managed SSH row");
     await cdp.eval("document.querySelector('tbody tr').dispatchEvent(new MouseEvent('click', { bubbles: true }))");
     await waitFor(() => cdp!.eval<boolean>("Boolean(document.querySelector('[data-managed-ssh-route]'))"), "stale managed SSH review");
