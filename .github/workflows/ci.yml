@@ -171,6 +171,24 @@ jobs:
           node_path="$(command -v node)"
           sudo CI=true "$node_path" scripts/test-linux-managed-forwarder-installer-native.mjs --root
 
+  agent-census-newer-host:
+    name: Frozen agent mount and FD census (Ubuntu 26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libc6-dev
+      - run: python3 native/linux-agent-isolation/test-agent-census.py
+      - name: Inspect frozen disposable systemd unit
+        run: |
+          test "$(id -u)" -ne 0
+          systemctl --version | sed -n '1p'
+          node_path="$(command -v node)"
+          sudo CI=true "$node_path" scripts/test-linux-agent-census-native.mjs --root
+
   filter-only-newer-host:
     name: Filter-only seccomp payload (Ubuntu 26.04)
     runs-on: ubuntu-26.04
