@@ -3,8 +3,9 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   assessOfflineLedgerReconciliation,
+  verifyOfflineReconciliationCandidateDetails,
   verifyOfflineReconciliationCandidateStructure,
-  type OfflineReconciliationInput
+  type OfflineReconciliationInput, type OfflineDecryptedDonorEvidence
 } from "../src/offline-ledger-reconciliation.js";
 
 const syntheticRoot = path.join(path.parse(process.cwd()).root, "synthetic");
@@ -89,11 +90,12 @@ function seal(app: {
   consoleAccess?: "protected";
   credentialOps?: Record<string, unknown>[];
 }, donor: object, writerVersion = "0.1.22"): OfflineReconciliationInput {
-  const secrets = app.secrets.map(({ updatedAt: _updatedAt, ...secret }) => secret);
+  const secrets = app.secrets.map(({ updatedAt: _updatedAt, cache: _cache, ...secret }) => secret);
+  const grants = app.approvalGrants.map(({ lastRequestId: _lastRequestId, updatedAt: _updatedAt, ...grant }) => grant);
   const controls = {
     version: 1, secrets, approvalSettings: app.approvalSettings,
     ...(app.consoleAccess === "protected" ? { consoleAccess: app.consoleAccess } : {}),
-    approvalGrants: app.approvalGrants, approvalPolicyRules: app.approvalPolicyRules,
+    approvalGrants: grants, approvalPolicyRules: app.approvalPolicyRules,
     managedSshRoutes: app.managedSshRoutes,
     ...(app.credentialOps?.length ? { credentialOps: app.credentialOps } : {})
   };
@@ -131,6 +133,21 @@ function syntheticCandidate() {
     sensitiveMetadata: structuredClone(donor.sensitiveMetadata)
   };
   return { input, candidate };
+}
+
+function detailEvidence(input: OfflineReconciliationInput): OfflineDecryptedDonorEvidence {
+  const app = JSON.parse(input.sealedLedgerRaw);
+  const donor = JSON.parse(input.generationTwoLedgerRaw);
+  return {
+    decryptedDonorMetadataRaw: JSON.stringify({
+      requests: { req_one: { reason: "synthetic current reason", args: ["synthetic argument"] } },
+      audit: { audit_one: "synthetic audit" }
+    }),
+    generationTwoLedgerSha256: sha(input.generationTwoLedgerRaw),
+    donorMetadataBoxSha256: sha(JSON.stringify(canonical(donor.sensitiveMetadata))),
+    sealedAppLedgerSha256: sha(input.sealedLedgerRaw),
+    sealedAppHistorySha256: sha(JSON.stringify(canonical({ requests: app.requests, audit: app.audit })))
+  };
 }
 
 describe("offline ledger reconciliation assessment", () => {
@@ -397,5 +414,290 @@ describe("offline reconciliation candidate structure", () => {
       change(changed);
       expect(() => verifyOfflineReconciliationCandidateStructure(input, JSON.stringify(changed))).toThrow();
     }
+  });
+});
+
+describe("offline reconciliation candidate details", () => {
+  it("compares decrypted donor detail and keeps migration blocked", () => {
+    const { input, candidate } = syntheticCandidate();
+    const evidence = detailEvidence(input);
+    const assessment = verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), evidence);
+
+    expect(assessment.migrationBlocked).toBe(true);
+    expect(JSON.stringify(assessment)).not.toMatch(/synthetic current reason|synthetic argument|synthetic audit/);
+  });
+
+  it("preserves every app-only history row and all its details", () => {
+    const { app, donor } = fixture();
+    app.requests.push({ ...app.requests[0], id: "req_new", reason: "new private reason" });
+    app.audit.push({ ...app.audit[0], id: "audit_new", message: "new private audit" });
+    const input = seal(app, donor);
+    const candidate = { ...structuredClone(app), writerGeneration: 2,
+      agentIdentities: structuredClone(donor.agentIdentities),
+      sensitiveMetadata: structuredClone(donor.sensitiveMetadata) };
+    const evidence = detailEvidence(input);
+    expect(verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), evidence)
+      .summary.appOnlyRequests).toBe(1);
+
+    for (const change of [
+      (c: any) => { c.requests[1].reason = "changed"; },
+      (c: any) => { c.requests[1].action.args = []; },
+      (c: any) => { c.audit[1].message = "changed"; },
+      (c: any) => { c.requests.reverse(); },
+      (c: any) => { c.audit.reverse(); }
+    ]) {
+      const changed = structuredClone(candidate);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(changed), evidence))
+        .toThrow("Candidate request or audit detail");
+    }
+  });
+
+  it("rejects same-ID candidate content changes hidden by the structural check", () => {
+    const { input, candidate } = syntheticCandidate();
+    const evidence = detailEvidence(input);
+    for (const change of [
+      (c: any) => { c.requests[0].reason = "changed"; },
+      (c: any) => { c.requests[0].action.args = ["changed"]; },
+      (c: any) => { c.requests[0].action.http = { url: "https://other.test" }; },
+      (c: any) => { c.requests[0].state = "executed"; },
+      (c: any) => { c.requests[0].resultSummary = { stdout: "changed" }; },
+      (c: any) => { c.audit[0].message = "changed"; },
+      (c: any) => { c.audit[0].requestId = "req_other"; }
+    ]) {
+      const changed = structuredClone(candidate);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(changed), evidence))
+        .toThrow("Candidate request or audit detail");
+    }
+  });
+
+  it("keeps exact app-owned cache, grant, and optional fields", () => {
+    const { app, donor } = fixture();
+    (app.secrets[0] as any).cache = { backend: "onepassword", fingerprint: "synthetic-cache" };
+    const grantFields = {
+      actionKey: "env_command:synthetic", agentScope: "same-agent", agentName: "Synthetic Claude",
+      principalId: "principal_one", agentSessionId: "session_one", loginSessionId: "login_one",
+      createdAt: timestamp, updatedAt: timestamp, expiresAt: "2027-01-01T00:00:00.000Z",
+      lastRequestId: "req_one"
+    };
+    Object.assign(app.approvalGrants[0], grantFields);
+    Object.assign(donor.approvalGrants[0], grantFields);
+    const input = seal(app, donor);
+    const candidate = { ...structuredClone(app), writerGeneration: 2,
+      agentIdentities: structuredClone(donor.agentIdentities),
+      sensitiveMetadata: structuredClone(donor.sensitiveMetadata) };
+    const evidence = detailEvidence(input);
+    const candidateRaw = JSON.stringify(candidate);
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, candidateRaw, evidence)).not.toThrow();
+
+    for (const change of [
+      (c: any) => { c.secrets[0].cache.fingerprint = "changed"; },
+      (c: any) => { delete c.secrets[0].cache; },
+      (c: any) => { c.secrets[0].updatedAt = "2026-10-22T00:00:00.000Z"; },
+      (c: any) => { c.approvalGrants[0].lastRequestId = "req_other"; },
+      (c: any) => { c.approvalGrants[0].updatedAt = "2026-10-22T00:00:00.000Z"; },
+      (c: any) => { c.credentialOps = []; }
+    ]) {
+      const changed = structuredClone(candidate);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateStructure(input, JSON.stringify(changed))).not.toThrow();
+      expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(changed), evidence))
+        .toThrow("Candidate app-owned fields differ");
+    }
+
+    for (const field of Object.keys(app.approvalGrants[0])) {
+      const changed = structuredClone(candidate) as any;
+      changed.approvalGrants[0][field] = "changed";
+      expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(changed), evidence))
+        .toThrow();
+    }
+  });
+
+  it("rejects decrypted request and audit conflicts or missing envelope rows", () => {
+    const { input, candidate } = syntheticCandidate();
+    const evidence = detailEvidence(input);
+    for (const change of [
+      (d: any) => { d.requests.req_one.reason = "different private reason"; },
+      (d: any) => { d.requests.req_one.args = ["different private arg"]; },
+      (d: any) => { d.audit.audit_one = "different private audit"; },
+      (d: any) => { delete d.requests.req_one; },
+      (d: any) => { d.requests.req_extra = { reason: "extra", args: [] }; },
+      (d: any) => { delete d.audit.audit_one; },
+      (d: any) => { d.audit.audit_extra = "extra"; },
+      (d: any) => { d.requests.req_one.futureDetail = "unknown"; }
+    ]) {
+      const details = JSON.parse(evidence.decryptedDonorMetadataRaw);
+      change(details);
+      expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+        ...evidence, decryptedDonorMetadataRaw: JSON.stringify(details)
+      })).toThrow();
+    }
+  });
+
+  it("checks legacy sealed fields and newer fields left outside that envelope", () => {
+    const { app, donor } = fixture();
+    app.requests[0].action = {
+      kind: "ssh_session", command: "ssh", args: ["private argument"],
+      workingDir: "/private/work", ssh: {
+        target: "synthetic@example.test", port: 22,
+        transfer: { direction: "upload", sourcePath: "/private/source", destinationPath: "/private/dest" }
+      }
+    };
+    (app.requests[0] as any).error = "private failure";
+    (app.requests[0] as any).resultSummary = { stdout: "private stdout", stderr: "private stderr" };
+    donor.requests[0] = structuredClone(app.requests[0]);
+    donor.requests[0].reason = "";
+    delete (donor.requests[0] as any).error;
+    donor.requests[0].action.args = [];
+    delete (donor.requests[0].action as any).workingDir;
+    (donor.requests[0].action as any).ssh.target = "";
+    (donor.requests[0] as any).resultSummary.stdout = "";
+    (donor.requests[0] as any).resultSummary.stderr = "";
+    const input = seal(app, donor);
+    const candidate = { ...structuredClone(app), writerGeneration: 2,
+      agentIdentities: structuredClone(donor.agentIdentities),
+      sensitiveMetadata: structuredClone(donor.sensitiveMetadata) };
+    const details = {
+      requests: { req_one: { reason: app.requests[0].reason, args: app.requests[0].action.args,
+        error: "private failure", workingDir: "/private/work", sshTarget: "synthetic@example.test",
+        stdout: "private stdout", stderr: "private stderr" } },
+      audit: { audit_one: app.audit[0].message }
+    };
+    const evidence = { ...detailEvidence(input), decryptedDonorMetadataRaw: JSON.stringify(details) };
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), evidence))
+      .not.toThrow();
+
+    for (const change of [
+      (d: any) => { d.requests.req_one.workingDir = "/other"; },
+      (d: any) => { d.requests.req_one.sshTarget = "other@example.test"; },
+      (d: any) => { d.requests.req_one.stdout = "other output"; },
+      (d: any) => { delete d.requests.req_one.stderr; },
+      (d: any) => { d.requests.req_one.error = "other failure"; }
+    ]) {
+      const changed = structuredClone(details);
+      change(changed);
+      expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+        ...evidence, decryptedDonorMetadataRaw: JSON.stringify(changed)
+      })).toThrow();
+    }
+    const changedDonor = structuredClone(donor);
+    (changedDonor.requests[0].action as any).ssh.transfer.sourcePath = "/other/source";
+    const changedInput = seal(app, changedDonor);
+    expect(() => verifyOfflineReconciliationCandidateDetails(changedInput, JSON.stringify(candidate), {
+      ...evidence, generationTwoLedgerSha256: sha(changedInput.generationTwoLedgerRaw)
+    })).toThrow("request detail conflicts");
+  });
+
+  it("accepts a later closed app request but rejects conflicting lifecycle and origin", () => {
+    const { input, candidate } = syntheticCandidate();
+    const donor = JSON.parse(input.generationTwoLedgerRaw);
+    donor.requests[0].state = "executing";
+    donor.requests[0].updatedAt = "2026-10-20T00:00:00.000Z";
+    const older = { ...input, generationTwoLedgerRaw: JSON.stringify(donor) };
+    const evidence = detailEvidence(older);
+    expect(() => verifyOfflineReconciliationCandidateDetails(older, JSON.stringify(candidate), evidence))
+      .not.toThrow();
+
+    for (const change of [
+      (d: any) => { d.requests[0].updatedAt = "2026-10-22T00:00:00.000Z"; },
+      (d: any) => { d.requests[0].action.injectEnv = "OTHER_TOKEN"; },
+      (d: any) => { d.requests[0].approvalSource = "policy"; },
+      (d: any) => { d.requests[0].state = "executed"; }
+    ]) {
+      const changed = structuredClone(donor);
+      change(changed);
+      const changedInput = { ...input, generationTwoLedgerRaw: JSON.stringify(changed) };
+      expect(() => verifyOfflineReconciliationCandidateDetails(changedInput, JSON.stringify(candidate),
+        detailEvidence(changedInput))).toThrow();
+    }
+  });
+
+  it("rejects donor rows that were not redacted as the envelope format requires", () => {
+    const { input, candidate } = syntheticCandidate();
+    for (const change of [
+      (d: any) => { d.requests[0].reason = "private reason outside the box"; },
+      (d: any) => { d.requests[0].action.args = ["private arg outside the box"]; },
+      (d: any) => { d.audit[0].message = "private audit outside the box"; }
+    ]) {
+      const donor = JSON.parse(input.generationTwoLedgerRaw);
+      change(donor);
+      const changedInput = { ...input, generationTwoLedgerRaw: JSON.stringify(donor) };
+      expect(() => verifyOfflineReconciliationCandidateDetails(changedInput, JSON.stringify(candidate),
+        detailEvidence(changedInput))).toThrow();
+    }
+  });
+
+  it("requires independent anchors and rejects ambiguous JSON without echoing details", () => {
+    const { input, candidate } = syntheticCandidate();
+    const evidence = detailEvidence(input);
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+      ...evidence, generationTwoLedgerSha256: "0".repeat(64)
+    })).toThrow("generation-2 ledger anchor");
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+      ...evidence, donorMetadataBoxSha256: "0".repeat(64)
+    })).toThrow("metadata box anchor");
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+      ...evidence, sealedAppLedgerSha256: "0".repeat(64)
+    })).toThrow("sealed-app ledger anchor");
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+      ...evidence, sealedAppHistorySha256: "0".repeat(64)
+    })).toThrow("history anchor");
+    const duplicateEnvelope = evidence.decryptedDonorMetadataRaw.replace(
+      '"req_one":', '"req_one":{"reason":"hidden private reason","args":[]},"req_one":');
+    expect(() => verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+      ...evidence, decryptedDonorMetadataRaw: duplicateEnvelope
+    })).toThrow("duplicate key");
+    const duplicateApp = input.sealedLedgerRaw.replace('"requests":', '"requests":[],"requests":');
+    expect(() => verifyOfflineReconciliationCandidateDetails({ ...input, sealedLedgerRaw: duplicateApp },
+      JSON.stringify(candidate), evidence)).toThrow("duplicate key");
+    const nonFiniteNumber = input.sealedLedgerRaw.replace('"durationMs":900000', '"durationMs":1e309');
+    expect(() => verifyOfflineReconciliationCandidateDetails({ ...input, sealedLedgerRaw: nonFiniteNumber },
+      JSON.stringify(candidate), evidence)).toThrow("invalid number");
+    let error: Error | undefined;
+    try {
+      verifyOfflineReconciliationCandidateDetails(input, JSON.stringify(candidate), {
+        ...evidence, decryptedDonorMetadataRaw: "private malformed metadata"
+      });
+    } catch (caught) {
+      error = caught as Error;
+    }
+    expect(error?.message).toMatch(/Invalid offline reconciliation JSON/);
+    expect(error?.message).not.toContain("private malformed metadata");
+  });
+
+  it("rejects donor identity tampering even when box and app-history hashes still match", () => {
+    const { input, candidate } = syntheticCandidate();
+    const evidence = detailEvidence(input);
+    const donor = JSON.parse(input.generationTwoLedgerRaw);
+    donor.agentIdentities[0].customName = "changed identity";
+    const changedInput = { ...input, generationTwoLedgerRaw: JSON.stringify(donor) };
+    const changedCandidate = structuredClone(candidate);
+    changedCandidate.agentIdentities[0].customName = "changed identity";
+    const changedEvidence = detailEvidence(changedInput);
+    expect(changedEvidence.donorMetadataBoxSha256).toBe(evidence.donorMetadataBoxSha256);
+    expect(changedEvidence.sealedAppHistorySha256).toBe(evidence.sealedAppHistorySha256);
+    expect(() => verifyOfflineReconciliationCandidateStructure(changedInput, JSON.stringify(changedCandidate)))
+      .not.toThrow();
+    expect(() => verifyOfflineReconciliationCandidateDetails(changedInput,
+      JSON.stringify(changedCandidate), evidence)).toThrow("generation-2 ledger anchor");
+  });
+
+  it("rejects coordinated app and candidate bookkeeping changes outside the control fingerprint", () => {
+    const { input, candidate } = syntheticCandidate();
+    const evidence = detailEvidence(input);
+    const app = JSON.parse(input.sealedLedgerRaw);
+    app.secrets[0].cache = { backend: "onepassword", fingerprint: "changed cache" };
+    app.approvalGrants[0].lastRequestId = "req_other";
+    const changedInput = { ...input, sealedLedgerRaw: JSON.stringify(app) };
+    const changedCandidate = structuredClone(candidate) as any;
+    changedCandidate.secrets = app.secrets;
+    changedCandidate.approvalGrants = app.approvalGrants;
+    const changedEvidence = detailEvidence(changedInput);
+    expect(changedEvidence.sealedAppHistorySha256).toBe(evidence.sealedAppHistorySha256);
+    expect(() => verifyOfflineReconciliationCandidateStructure(changedInput, JSON.stringify(changedCandidate)))
+      .not.toThrow();
+    expect(() => verifyOfflineReconciliationCandidateDetails(changedInput,
+      JSON.stringify(changedCandidate), evidence)).toThrow("sealed-app ledger anchor");
   });
 });

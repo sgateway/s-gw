@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { parseTree, type Node as JsonNode, type ParseError } from "jsonc-parser";
 import { inspectLedgerFormat } from "./ledger-format-inspection.js";
 
 interface Ledger extends Record<string, unknown> {
@@ -47,6 +48,19 @@ export interface OfflineReconciliationAssessment {
   migrationBlocked: true;
   blockingReasons: string[];
   summary: OfflineReconciliationSummary;
+}
+
+export interface OfflineDecryptedDonorEvidence {
+  /** Authenticated decryption of the exact generation-2 sensitiveMetadata box, supplied by the caller. */
+  decryptedDonorMetadataRaw: string;
+  /** SHA-256 of the exact generation-2 ledger bytes from the trusted paired snapshot. */
+  generationTwoLedgerSha256: string;
+  /** SHA-256 of the canonical encrypted box passed to the trusted decryptor. */
+  donorMetadataBoxSha256: string;
+  /** SHA-256 of the exact sealed-app ledger bytes from the trusted paired snapshot. */
+  sealedAppLedgerSha256: string;
+  /** Independently captured SHA-256 of canonical { requests, audit } from the sealed app snapshot. */
+  sealedAppHistorySha256: string;
 }
 
 const appOnlyRuleFields = new Set(["envBindings", "resolvedCommands", "principalIds", "actionKeys"]);
@@ -152,11 +166,198 @@ export function verifyOfflineReconciliationCandidateStructure(
   return assessment;
 }
 
-function assertSameIds(expected: Record<string, unknown>[], actual: Record<string, unknown>[]): void {
+/** Checks supplied history. The caller authenticates box decryption and full-donor/app snapshot anchors. */
+export function verifyOfflineReconciliationCandidateDetails(input: OfflineReconciliationInput,
+    candidateRaw: string, evidence: OfflineDecryptedDonorEvidence): OfflineReconciliationAssessment {
+  for (const raw of [input.sealedLedgerRaw, input.controlManifestRaw, input.checkpointRaw,
+    input.recoveryHeadRaw, input.generationTwoLedgerRaw, candidateRaw, evidence.decryptedDonorMetadataRaw]) {
+    assertNoDuplicateJsonKeys(raw);
+  }
+  const assessment = verifyOfflineReconciliationCandidateStructure(input, candidateRaw);
+  const app = parseLedger(input.sealedLedgerRaw);
+  const donor = parseLedger(input.generationTwoLedgerRaw);
+  const candidate = parseLedger(candidateRaw);
+  if (evidence.generationTwoLedgerSha256 !== digest(input.generationTwoLedgerRaw)) {
+    throw new Error("Trusted generation-2 ledger anchor differs from the donor snapshot.");
+  }
+  if (evidence.donorMetadataBoxSha256 !== digest(canonical(donor.sensitiveMetadata))) {
+    throw new Error("Trusted generation-2 metadata box anchor differs from the donor.");
+  }
+  if (evidence.sealedAppLedgerSha256 !== digest(input.sealedLedgerRaw)) {
+    throw new Error("Trusted sealed-app ledger anchor differs from the snapshot.");
+  }
+  if (evidence.sealedAppHistorySha256 !== digest(canonical({ requests: app.requests, audit: app.audit }))) {
+    throw new Error("Trusted sealed-app history anchor differs from the snapshot.");
+  }
+
+  const details = parseDonorDetails(evidence.decryptedDonorMetadataRaw);
+  const appRequests = recordsByKey(app.requests, "id");
+  const appAudit = recordsByKey(app.audit, "id");
+  const donorRequests = recordsByKey(donor.requests, "id");
+  const donorAudit = recordsByKey(donor.audit, "id");
+  assertSameIds(donor.requests, [...details.requests.keys()].map((id) => ({ id })),
+    "Generation-2 request envelope IDs differ from donor history.");
+  assertSameIds(donor.audit, [...details.audit.keys()].map((id) => ({ id })),
+    "Generation-2 audit envelope IDs differ from donor history.");
+
+  for (const [id, donorRow] of donorRequests) {
+    const appRow = appRequests.get(id);
+    const detail = details.requests.get(id);
+    if (!appRow || !detail) throw new Error("Generation-2 request detail IDs differ from history.");
+    assertSharedRequestDetail(appRow, donorRow, detail);
+  }
+  for (const [id, donorRow] of donorAudit) {
+    const appRow = appAudit.get(id);
+    const message = details.audit.get(id);
+    if (!appRow || message === undefined || donorRow.message !== ""
+        || canonical({ ...donorRow, message }) !== canonical(appRow)) {
+      throw new Error("Generation-2 audit detail conflicts with sealed app history.");
+    }
+  }
+  if (canonical(candidate.requests) !== canonical(app.requests)
+      || canonical(candidate.audit) !== canonical(app.audit)) {
+    throw new Error("Candidate request or audit detail differs from the sealed app history.");
+  }
+  if (canonical(without(candidate, ["writerGeneration", "agentIdentities", "sensitiveMetadata"]))
+      !== canonical(app)) {
+    throw new Error("Candidate app-owned fields differ from the sealed app ledger.");
+  }
+  return assessment;
+}
+
+interface DonorRequestDetail extends Record<string, unknown> {
+  reason: string;
+  args: string[];
+  error?: string;
+  workingDir?: string;
+  sshTarget?: string;
+  stdout?: string;
+  stderr?: string;
+}
+
+function parseDonorDetails(raw: string): {
+    requests: Map<string, DonorRequestDetail>; audit: Map<string, string> } {
+  const envelope = parseObject(raw, "generation-2 decrypted metadata");
+  if (Object.keys(envelope).length !== 2 || !Object.hasOwn(envelope, "requests")
+      || !Object.hasOwn(envelope, "audit")) {
+    throw new Error("Invalid generation-2 decrypted metadata.");
+  }
+  const requestValues = asObject(envelope.requests);
+  const auditValues = asObject(envelope.audit);
+  if (!requestValues || !auditValues) throw new Error("Invalid generation-2 decrypted metadata.");
+
+  const requests = new Map<string, DonorRequestDetail>();
+  for (const [id, value] of Object.entries(requestValues)) {
+    const detail = asObject(value);
+    if (!id || !detail || typeof detail.reason !== "string" || !Array.isArray(detail.args)
+        || detail.args.some((arg) => typeof arg !== "string")
+        || Object.keys(detail).some((field) => ![
+          "reason", "args", "error", "workingDir", "sshTarget", "stdout", "stderr"
+        ].includes(field))) {
+      throw new Error("Invalid generation-2 request detail.");
+    }
+    for (const field of ["error", "workingDir", "sshTarget", "stdout", "stderr"]) {
+      if (detail[field] !== undefined && typeof detail[field] !== "string") {
+        throw new Error("Invalid generation-2 request detail.");
+      }
+    }
+    requests.set(id, detail as DonorRequestDetail);
+  }
+  const audit = new Map<string, string>();
+  for (const [id, message] of Object.entries(auditValues)) {
+    if (!id || typeof message !== "string") throw new Error("Invalid generation-2 audit detail.");
+    audit.set(id, message);
+  }
+  return { requests, audit };
+}
+
+function assertSharedRequestDetail(appRow: Record<string, unknown>, donorRow: Record<string, unknown>,
+    detail: DonorRequestDetail): void {
+  const action = asObject(donorRow.action);
+  const ssh = asObject(action?.ssh);
+  const result = asObject(donorRow.resultSummary);
+  if (!action || !Array.isArray(action.args) || action.args.length
+      || (action.ssh !== undefined && !ssh)
+      || (donorRow.resultSummary !== undefined && !result)) {
+    throw new Error("Invalid generation-2 redacted request row or detail.");
+  }
+  if (donorRow.reason !== "" || Object.hasOwn(donorRow, "error")
+      || Object.hasOwn(action, "workingDir") || (ssh && ssh.target !== "")
+      || (result && (result.stdout !== "" || result.stderr !== ""))) {
+    throw new Error("Invalid generation-2 redacted request row or detail.");
+  }
+  if ((ssh && detail.sshTarget === undefined) || (!ssh && detail.sshTarget !== undefined)
+      || (result && (detail.stdout === undefined || detail.stderr === undefined))
+      || (!result && (detail.stdout !== undefined || detail.stderr !== undefined))) {
+    throw new Error("Invalid generation-2 redacted request row or detail.");
+  }
+
+  const restored = structuredClone(donorRow);
+  const restoredAction = restored.action as Record<string, unknown>;
+  restored.reason = detail.reason;
+  restoredAction.args = detail.args;
+  if (detail.error !== undefined) restored.error = detail.error;
+  if (detail.workingDir !== undefined) restoredAction.workingDir = detail.workingDir;
+  if (ssh) (restoredAction.ssh as Record<string, unknown>).target = detail.sshTarget;
+  if (result) {
+    const output = restored.resultSummary as Record<string, unknown>;
+    output.stdout = detail.stdout;
+    output.stderr = detail.stderr;
+  }
+
+  if (terminalStates.has(donorRow.state as string)) {
+    if (canonical(restored) !== canonical(appRow)) {
+      throw new Error("Generation-2 request detail conflicts with sealed app history.");
+    }
+    return;
+  }
+  const allowedEndStates = donorRow.state === "executing"
+    ? new Set(["executed", "failed"]) : terminalStates;
+  const donorTime = typeof donorRow.updatedAt === "string" ? Date.parse(donorRow.updatedAt) : NaN;
+  const appTime = typeof appRow.updatedAt === "string" ? Date.parse(appRow.updatedAt) : NaN;
+  const changingFields = ["state", "updatedAt", "approvedAt", "approvalSource", "approvalGrantId",
+    "approvalPolicyRuleId", "deniedAt", "executedAt", "resultSummary", "error"];
+  if (!allowedEndStates.has(appRow.state as string) || !Number.isFinite(donorTime)
+      || !Number.isFinite(appTime) || appTime < donorTime
+      || canonical(without(restored, changingFields)) !== canonical(without(appRow, changingFields))) {
+    throw new Error("Generation-2 request provenance conflicts with sealed app history.");
+  }
+  for (const field of changingFields.slice(2)) {
+    if (Object.hasOwn(restored, field) && canonical(restored[field]) !== canonical(appRow[field])) {
+      throw new Error("Generation-2 request lifecycle conflicts with sealed app history.");
+    }
+  }
+}
+
+function assertNoDuplicateJsonKeys(raw: string): void {
+  const errors: ParseError[] = [];
+  const tree = parseTree(raw, errors, { disallowComments: true });
+  if (!tree || errors.length) throw new Error("Invalid offline reconciliation JSON.");
+  function check(node: JsonNode): void {
+    if (node.type === "number" && !Number.isFinite(node.value)) {
+      throw new Error("Offline reconciliation JSON has an invalid number.");
+    }
+    if (node.type === "object") {
+      const keys = new Set<string>();
+      for (const property of node.children || []) {
+        const key = property.children?.[0]?.value;
+        if (typeof key !== "string" || keys.has(key)) {
+          throw new Error("Offline reconciliation JSON has a duplicate key.");
+        }
+        keys.add(key);
+      }
+    }
+    for (const child of node.children || []) check(child);
+  }
+  check(tree);
+}
+
+function assertSameIds(expected: Record<string, unknown>[], actual: Record<string, unknown>[],
+    error = "Candidate history IDs differ from the sealed ledger."): void {
   const original = recordsByKey(expected, "id");
   const candidate = recordsByKey(actual, "id");
   if (original.size !== candidate.size || [...original.keys()].some((id) => !candidate.has(id))) {
-    throw new Error("Candidate history IDs differ from the sealed ledger.");
+    throw new Error(error);
   }
 }
 
