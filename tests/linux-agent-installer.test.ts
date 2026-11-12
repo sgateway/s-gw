@@ -381,6 +381,18 @@ describe.skipIf(process.platform === "win32")("Linux managed unit installer", ()
       .rejects.toThrow(/MountFlags/);
   });
 
+  it("reports the bounded systemd command readback on a forwarder mismatch", async () => {
+    const input = withForwarder();
+    const host = new Host(input);
+    const actual = `{ path=/bin/sh ; argv[]=/bin/sh ${"x".repeat(2048)} ; ignore_errors=no ; }`;
+    host.forwarderProperties.set("ExecStart", actual);
+    const failure = await new LinuxManagedUnitInstaller(host).stage(input)
+      .then(() => null, error => error as Error);
+    expect(failure?.message).toMatch(/Linux forwarder unit command changed: expected=.*actual=.*\/bin\/sh/);
+    expect(failure!.message).not.toContain("x".repeat(513));
+    expect(failure!.message.length).toBeLessThan(1500);
+  });
+
   it("refuses a forwarder root that its dedicated UID cannot traverse", async () => {
     const input = withForwarder();
     const host = new Host(input);

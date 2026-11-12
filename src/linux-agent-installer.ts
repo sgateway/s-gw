@@ -381,8 +381,12 @@ async function readbackForwarder(host: LinuxManagedInstallHost,
   }
   const command = `{ path=${input.record.brokerNode} ; argv[]=${input.record.brokerNode} ` +
     `${forwarderEntry(input)} ; ignore_errors=no ; }`;
-  if (values.get("ExecStart") !== command) {
-    throw new Error("Linux forwarder unit command changed.");
+  const actualCommand = values.get("ExecStart");
+  if (actualCommand !== command) {
+    throw new Error("Linux forwarder unit command changed: " +
+      `expected=${JSON.stringify(command.slice(0, 512))} (length=${command.length}) ` +
+      `actual=${JSON.stringify(actualCommand?.slice(0, 512) ?? null)} ` +
+      `(length=${actualCommand?.length ?? 0}).`);
   }
 }
 
