@@ -522,6 +522,11 @@ try {
     await chown(path.join(agent.root, "workspace/codex"), agent.uid, agent.uid);
     await copyRootFile(codexBinary, path.join(agent.root, "usr/bin/codex"), 0o755);
     await stageNode(agent.root, agent.uid);
+    const launchGate = path.join(agent.root, "usr/libexec/s-gw/agent-launch-gate");
+    run("cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+      path.join(project, "native/linux-agent-gate/launch-gate.c"), "-o", launchGate]);
+    await chown(launchGate, 0, 0);
+    await chmod(launchGate, 0o755);
     await copyRootFile(path.join(project, "dist/agent-local-model-forwarder.js"),
       path.join(agent.root, "usr/libexec/s-gw/agent-local-model-forwarder.js"), 0o644);
     await copyRootFile(path.join(project, "scripts/linux-native-codex-agent.mjs"),
@@ -539,7 +544,7 @@ try {
     }).stdout.trim() !== `codex-cli ${version}`) {
       throw new Error("Pinned Codex archive reported an unexpected CLI version.");
     }
-    for (const file of ["usr/bin/codex", "usr/bin/node",
+    for (const file of ["usr/bin/codex", "usr/bin/node", "usr/libexec/s-gw/agent-launch-gate",
       "usr/libexec/s-gw/agent-local-model-forwarder.js",
       "usr/libexec/s-gw/native-codex-agent.mjs"]) {
       await trustedFile(path.join(agent.root, file));
