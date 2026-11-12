@@ -34,6 +34,21 @@
 #define MAX_DEPTH 32
 #define MAX_ROOT_PATH 2048
 
+struct mount_expectation {
+    const char *point;
+    const char *root;
+    const char *device;
+    const char *options;
+    const char *type;
+    const char *source;
+    const char *super_options;
+};
+
+static int mount_complete(const struct mount_expectation *mount) {
+    return mount->point && mount->root && mount->device && mount->options &&
+        mount->type && mount->source && mount->super_options;
+}
+
 static int decimal(const char *value, unsigned long long *number) {
     if (!value || !*value) return 0;
     for (const char *p = value; *p; p++) {
@@ -45,6 +60,17 @@ static int decimal(const char *value, unsigned long long *number) {
     if (errno || !end || *end) return 0;
     *number = result;
     return 1;
+}
+
+static int mount_device_ok(const char *value) {
+    if (!value || strnlen(value, 64) >= 64) return 0;
+    char copy[64];
+    strcpy(copy, value);
+    char *colon = strchr(copy, ':');
+    if (!colon) return 0;
+    *colon++ = '\0';
+    unsigned long long major, minor;
+    return decimal(copy, &major) && decimal(colon, &minor);
 }
 
 static int clean_path(const char *path) {
@@ -86,7 +112,7 @@ static int decode_mount_path(const char *input, char *output, size_t capacity) {
     return clean_path(output);
 }
 
-static int mount_line_ok(const char *line, const char **allowed, size_t count,
+static int mount_line_ok(const char *line, const struct mount_expectation *expected, size_t count,
                          unsigned char *seen) {
     if (!line || strnlen(line, MAX_LINE + 1) > MAX_LINE) return 0;
     char copy[MAX_LINE + 1];
@@ -102,7 +128,7 @@ static int mount_line_ok(const char *line, const char **allowed, size_t count,
     if (n < 10) return 0;
     unsigned long long number;
     if (!decimal(tokens[0], &number) || !decimal(tokens[1], &number) ||
-        tokens[3][0] != '/' || !strchr(tokens[2], ':')) return 0;
+        tokens[3][0] != '/' || !mount_device_ok(tokens[2])) return 0;
 
     size_t separator = 6;
     while (separator < n && strcmp(tokens[separator], "-") != 0) separator++;
@@ -113,11 +139,17 @@ static int mount_line_ok(const char *line, const char **allowed, size_t count,
     if (!*tokens[5] || !*tokens[separator + 1] ||
         !*tokens[separator + 2] || !*tokens[separator + 3]) return 0;
 
-    char mountpoint[MAX_ROOT_PATH + 1];
-    if (!decode_mount_path(tokens[4], mountpoint, sizeof(mountpoint))) return 0;
+    char mountpoint[MAX_ROOT_PATH + 1], mount_root[MAX_ROOT_PATH + 1];
+    if (!decode_mount_path(tokens[3], mount_root, sizeof(mount_root)) ||
+        !decode_mount_path(tokens[4], mountpoint, sizeof(mountpoint))) return 0;
     for (size_t i = 0; i < count; i++) {
-        if (strcmp(mountpoint, allowed[i]) != 0) continue;
-        if (seen[i]) return 0;
+        if (strcmp(mountpoint, expected[i].point) != 0) continue;
+        if (seen[i] || strcmp(mount_root, expected[i].root) != 0 ||
+            strcmp(tokens[2], expected[i].device) != 0 ||
+            strcmp(tokens[5], expected[i].options) != 0 ||
+            strcmp(tokens[separator + 1], expected[i].type) != 0 ||
+            strcmp(tokens[separator + 2], expected[i].source) != 0 ||
+            strcmp(tokens[separator + 3], expected[i].super_options) != 0) return 0;
         seen[i] = 1;
         return 1;
     }
@@ -499,7 +531,7 @@ static int namespace_and_root_ok(pid_t pid, const char *root_path) {
         same_object(&agent_cwd, &expected_root);
 }
 
-static int mountinfo_ok(pid_t pid, const char **mounts, size_t mount_count) {
+static int mountinfo_ok(pid_t pid, const struct mount_expectation *mounts, size_t mount_count) {
     char path[80], line[MAX_LINE + 1];
     int n = snprintf(path, sizeof(path), "/proc/%ld/mountinfo", (long)pid);
     if (n < 0 || (size_t)n >= sizeof(path)) return 0;
@@ -570,7 +602,7 @@ static int task_and_fd_ok(pid_t pid, dev_t null_rdev) {
 
 static int verify(pid_t pid, unsigned long long dedicated_uid,
                   const char *group_path, const char *root_path,
-                  const char **mounts, size_t mount_count) {
+                  const struct mount_expectation *mounts, size_t mount_count) {
 #ifndef SYS_pidfd_open
     (void)pid; (void)dedicated_uid; (void)group_path; (void)root_path;
     (void)mounts; (void)mount_count;
@@ -640,7 +672,7 @@ int main(int argc, char **argv) {
     pid_t pid = 0;
     unsigned long long dedicated_uid = 0;
     const char *group = NULL, *root = NULL;
-    const char *mounts[MAX_MOUNTS];
+    struct mount_expectation mounts[MAX_MOUNTS] = { 0 };
     size_t mount_count = 0;
     for (int i = 1; i < argc; i++) {
         if (++i >= argc) return 2;
@@ -661,14 +693,34 @@ int main(int argc, char **argv) {
         } else if (strcmp(flag, "--mount") == 0 && mount_count < MAX_MOUNTS) {
             if (!clean_path(value)) return 2;
             for (size_t j = 0; j < mount_count; j++) {
-                if (strcmp(mounts[j], value) == 0) return 2;
+                if (strcmp(mounts[j].point, value) == 0) return 2;
             }
-            mounts[mount_count++] = value;
+            if (mount_count && !mount_complete(&mounts[mount_count - 1])) return 2;
+            mounts[mount_count++].point = value;
+        } else if (strcmp(flag, "--mount-root") == 0 && mount_count &&
+                   !mounts[mount_count - 1].root && clean_path(value)) {
+            mounts[mount_count - 1].root = value;
+        } else if (strcmp(flag, "--mount-device") == 0 && mount_count &&
+                   !mounts[mount_count - 1].device && mount_device_ok(value)) {
+            mounts[mount_count - 1].device = value;
+        } else if (strcmp(flag, "--mount-options") == 0 && mount_count &&
+                   !mounts[mount_count - 1].options && *value) {
+            mounts[mount_count - 1].options = value;
+        } else if (strcmp(flag, "--mount-type") == 0 && mount_count &&
+                   !mounts[mount_count - 1].type && *value) {
+            mounts[mount_count - 1].type = value;
+        } else if (strcmp(flag, "--mount-source") == 0 && mount_count &&
+                   !mounts[mount_count - 1].source && *value) {
+            mounts[mount_count - 1].source = value;
+        } else if (strcmp(flag, "--mount-super-options") == 0 && mount_count &&
+                   !mounts[mount_count - 1].super_options && *value) {
+            mounts[mount_count - 1].super_options = value;
         } else {
             return 2;
         }
     }
-    if (!pid || !dedicated_uid || !group || !root || !mount_count) return 2;
+    if (!pid || !dedicated_uid || !group || !root || !mount_count ||
+        !mount_complete(&mounts[mount_count - 1])) return 2;
     if (getuid() != 0 || geteuid() != 0) {
         fputs("Root required for agent census.\n", stderr);
         return 1;

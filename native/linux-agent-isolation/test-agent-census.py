@@ -16,7 +16,11 @@ HARNESS = r'''
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     if (strcmp(argv[1], "mount") == 0) {
-        const char *allowed[] = { "/" };
+        const struct mount_expectation allowed[] = {{
+            .point = "/", .root = "/var/lib/s-gw-census-test/root",
+            .device = "0:32", .options = "ro,relatime", .type = "ext4",
+            .source = "/dev/sda", .super_options = "ro"
+        }};
         unsigned char seen[1] = { 0 };
         return mount_line_ok(argv[2], allowed, 1, seen) && seen[0] ? 0 : 1;
     }
@@ -77,22 +81,37 @@ class CensusParserTests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stderr.decode())
 
     def test_private_root_mount(self):
-        self.check("mount", "36 25 0:32 / / rw,relatime - ext4 /dev/sda rw", 0)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime - ext4 /dev/sda ro", 0)
 
     def test_shared_mount_rejected(self):
-        self.check("mount", "36 25 0:32 / / rw shared:5 - ext4 /dev/sda rw", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime shared:5 - ext4 /dev/sda ro", 1)
 
     def test_master_mount_rejected(self):
-        self.check("mount", "36 25 0:32 / / rw master:5 - ext4 /dev/sda rw", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime master:5 - ext4 /dev/sda ro", 1)
 
     def test_propagate_from_mount_rejected(self):
-        self.check("mount", "36 25 0:32 / / rw propagate_from:5 - ext4 /dev/sda rw", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime propagate_from:5 - ext4 /dev/sda ro", 1)
 
     def test_extra_mount_rejected(self):
         self.check("mount", "37 25 0:33 / /run/broker rw - tmpfs tmpfs rw", 1)
 
     def test_malformed_mount_rejected(self):
-        self.check("mount", "36 25 0:32 / / rw - ext4", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime - ext4", 1)
+
+    def test_other_mount_root_rejected(self):
+        self.check("mount", "36 25 0:32 /var/lib/other/root / ro,relatime - ext4 /dev/sda ro", 1)
+
+    def test_other_backing_rejected(self):
+        self.check("mount", "36 25 0:33 /var/lib/s-gw-census-test/root / ro,relatime - ext4 /dev/sda ro", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime - btrfs /dev/sda ro", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime - ext4 /dev/sdb ro", 1)
+
+    def test_writable_mount_rejected(self):
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / rw,relatime - ext4 /dev/sda ro", 1)
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,relatime - ext4 /dev/sda rw", 1)
+
+    def test_other_options_rejected(self):
+        self.check("mount", "36 25 0:32 /var/lib/s-gw-census-test/root / ro,nosuid - ext4 /dev/sda ro", 1)
 
     def test_proc_stat_handles_spaces_and_parentheses(self):
         fields = ["S"] + ["1"] * 18 + ["1234"] + ["0"] * 30

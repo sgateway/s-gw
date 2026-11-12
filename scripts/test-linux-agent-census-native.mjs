@@ -27,6 +27,7 @@ let server;
 let groupCreated = false;
 let userCreated = false;
 let startUncertain = false;
+let rootMount;
 
 function call(command, args, allowFailure = false) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: 15_000,
@@ -75,9 +76,50 @@ async function freeUid() {
   throw new Error("No dedicated census fixture UID is free.");
 }
 
-async function checkCensus(pid, cgroup, shouldPass) {
+function decodeMountPath(value) {
+  if (/\\(?![0-7]{3})/.test(value)) throw new Error("Malformed host mount path.");
+  return value.replace(/\\([0-7]{3})/g, (_, code) => String.fromCharCode(parseInt(code, 8)));
+}
+
+async function hostMountFor(target) {
+  const mountinfo = await readFile("/proc/self/mountinfo", "utf8");
+  let selected;
+  for (const line of mountinfo.trimEnd().split("\n")) {
+    const fields = line.split(" ");
+    const separator = fields.indexOf("-");
+    if (separator < 6 || separator + 4 !== fields.length || !/^\d+:\d+$/.test(fields[2])) {
+      throw new Error("Malformed host mountinfo.");
+    }
+    const mountpoint = decodeMountPath(fields[4]);
+    if (target !== mountpoint && !target.startsWith(`${mountpoint === "/" ? "" : mountpoint}/`))
+      continue;
+    if (selected && mountpoint.length < selected.mountpoint.length) continue;
+    if (selected && mountpoint.length === selected.mountpoint.length) {
+      throw new Error("Ambiguous host mount for census root.");
+    }
+    selected = {
+      mountpoint, root: decodeMountPath(fields[3]), device: fields[2],
+      options: fields[5], type: fields[separator + 1], source: fields[separator + 2],
+      superOptions: fields[separator + 3]
+    };
+  }
+  if (!selected || !selected.root.startsWith("/")) {
+    throw new Error("No host mount for census root.");
+  }
+  const relative = target.slice(selected.mountpoint.length).replace(/^\//, "");
+  return {
+    root: relative ? path.posix.resolve(selected.root, relative) : selected.root,
+    device: selected.device, options: selected.options, type: selected.type,
+    source: selected.source, superOptions: selected.superOptions
+  };
+}
+
+async function checkCensus(pid, cgroup, shouldPass, mount = rootMount) {
   const args = ["--pid", String(pid), "--uid", String(uid), "--cgroup", cgroup,
-    "--root", root, "--mount", "/"];
+    "--root", root, "--mount", "/", "--mount-root", mount.root,
+    "--mount-device", mount.device, "--mount-options", mount.options,
+    "--mount-type", mount.type, "--mount-source", mount.source,
+    "--mount-super-options", mount.superOptions];
   const result = call(census, args, true);
   if (result.error || result.signal || (shouldPass ? result.status !== 0 : result.status !== 1)) {
     const mountinfo = await readFile(`/proc/${pid}/mountinfo`, "utf8").catch(() => "unavailable");
@@ -291,6 +333,7 @@ try {
   await mkdir(base, { mode: 0o755 });
   baseInode = await lstat(base);
   await mkdir(root, { mode: 0o755 });
+  rootMount = await hostMountFor(root);
   call("/usr/bin/cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
     path.join(project, "native/linux-agent-isolation/agent-census.c"), "-o", census]);
   call("/usr/bin/cc", ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
@@ -299,6 +342,12 @@ try {
   await chown(ready, uid, uid);
   await withUnit("clean", async (pid, cgroup) => {
     await checkCensus(pid, cgroup, true);
+    await checkCensus(pid, cgroup, false, { ...rootMount, source: "not-the-host-backing" });
+    const readOnlyOptions = rootMount.options.replace(/(^|,)rw(?=,|$)/, "$1ro");
+    if (readOnlyOptions === rootMount.options) {
+      throw new Error("Census fixture root was not mounted read-write as expected.");
+    }
+    await checkCensus(pid, cgroup, false, { ...rootMount, options: readOnlyOptions });
     server = createServer();
     await new Promise((resolve, reject) => {
       server.once("error", reject);
@@ -319,7 +368,7 @@ try {
     await assertHeldFd(pid, "socket");
     await checkCensus(pid, cgroup, false);
   });
-  console.log("Native agent census accepted a frozen clean gate and refused socket aliases and extra FDs.");
+  console.log("Native agent census accepted the frozen mount and refused mismatched mount metadata, socket aliases, and extra FDs.");
 } catch (error) {
   failure = error;
 } finally {
