@@ -90,7 +90,10 @@ async function rootOwnedPath(filePath: string, kind: "file" | "socket"): Promise
   let current = path.dirname(filePath);
   while (true) {
     const info = await lstat(current);
-    if (!info.isDirectory() || info.uid !== 0 || (info.mode & 0o022) !== 0) {
+    // systemd may mount /run as sticky tmpfs; agents cannot replace its root-owned s-gw child.
+    const stickyRun = current === "/run" && (info.mode & 0o7777) === 0o1777;
+    if (!info.isDirectory() || info.uid !== 0 ||
+        ((info.mode & 0o022) !== 0 && !stickyRun)) {
       throw new Error(`Linux forwarder path is not controlled by the launcher: ${current} ` +
         `(uid=${info.uid}, mode=${(info.mode & 0o7777).toString(8)}).`);
     }
