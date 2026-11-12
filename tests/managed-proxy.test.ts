@@ -270,6 +270,42 @@ describe("public-pinned managed proxy", () => {
     await expect(proxyGet(proxy.httpPort, "http://allowed.test/")).rejects.toThrow();
   });
 
+  it("counts an outbound connection while its dial is pending", async () => {
+    const upstream = createTcpServer(socket => socket.pipe(socket));
+    const port = await listeningPort(upstream);
+    let releaseDial: (() => void) | undefined;
+    const proxy = await start({ allowedDomains: ["allowed.test"], brokerPort: 62000,
+      lookup: async () => publicAnswer, maxLiveSockets: 2,
+      connect: () => new Promise<Socket>((resolve, reject) => {
+        const socket = netConnect({ host: "127.0.0.1", port });
+        socket.once("connect", () => { releaseDial = () => resolve(socket); });
+        socket.once("error", reject);
+      }) });
+    const first = netConnect({ host: "127.0.0.1", port: proxy.socksPort });
+    let second: Socket | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => { first.once("connect", resolve); first.once("error", reject); });
+      first.write(Buffer.from([5, 1, 0]));
+      expect([...await readBytes(first, 2)]).toEqual([5, 0]);
+      const name = Buffer.from("allowed.test");
+      first.write(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name, Buffer.from([1, 187])]));
+      await vi.waitFor(() => expect(releaseDial).toBeTypeOf("function"));
+
+      second = netConnect({ host: "127.0.0.1", port: proxy.socksPort });
+      second.on("error", () => {});
+      await vi.waitFor(() => expect(second?.destroyed).toBe(true), { timeout: 2000 });
+
+      releaseDial?.();
+      expect((await readBytes(first, 10))[1]).toBe(0);
+    } finally {
+      first.destroy();
+      second?.destroy();
+      releaseDial?.();
+      await proxy.close();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  });
+
   it.skipIf(!["darwin", "linux"].includes(process.platform))("passes both external ports into the real SRT wrapper", async () => {
     const proxy = await start({ allowedDomains: ["allowed.test"], brokerPort: 62000 });
     const config = anthropicSandboxConfig(process.cwd(), "/tmp/sgw-managed-proxy-test", { strictEgress: true, allowHosts: ["allowed.test"] });

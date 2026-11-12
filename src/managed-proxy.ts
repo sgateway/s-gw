@@ -117,11 +117,12 @@ export async function startManagedProxyServers(options: ManagedProxyOptions): Pr
   const sockets = new Set<Socket>();
   const stopping = new AbortController();
   let closed = false;
+  let pendingDials = 0;
 
   const track = (socket: Socket): boolean => {
     if (sockets.has(socket)) return true;
     socket.on("error", () => {});
-    if (closed || sockets.size >= maxSockets) { socket.destroy(); return false; }
+    if (closed || sockets.size + pendingDials >= maxSockets) { socket.destroy(); return false; }
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     socket.setTimeout(5 * 60_000, () => socket.destroy());
@@ -160,9 +161,17 @@ export async function startManagedProxyServers(options: ManagedProxyOptions): Pr
     signal.addEventListener("abort", onAbort, { once: true });
   });
   const dial = async (host: string, port: number, signal: AbortSignal): Promise<Socket> => {
-    const socket = host === "127.0.0.1" && port === options.brokerPort
-      ? await openBroker(signal)
-      : (await dialManagedProxyHost(host, port, { signal, lookup: options.lookup, connect: options.connect })).socket;
+    if (host === "127.0.0.1" && port === options.brokerPort) return openBroker(signal);
+    if (closed || sockets.size + pendingDials >= maxSockets) {
+      throw new Error("Managed proxy socket capacity exceeded.");
+    }
+    pendingDials++;
+    let socket: Socket;
+    try {
+      socket = (await dialManagedProxyHost(host, port, { signal, lookup: options.lookup, connect: options.connect })).socket;
+    } finally {
+      pendingDials--;
+    }
     if (!track(socket)) throw new Error("Managed proxy socket capacity exceeded.");
     return socket;
   };
