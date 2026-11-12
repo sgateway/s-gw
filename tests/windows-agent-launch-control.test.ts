@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { registerWindowsAgentLaunch } from "../src/windows-agent-launch-control.js";
+import { registerWindowsAgentLaunch, registerWindowsNativeAgentLaunch,
+  type WindowsNativeLauncherIdentity } from "../src/windows-agent-launch-control.js";
 import { WindowsAgentPipeRegistry, type WindowsAgentPipeIdentity } from "../src/windows-agent-pipe.js";
 
 const oldTestMode = process.env.SGW_TEST_MODE;
@@ -34,6 +35,30 @@ function nativeChecks() {
   };
 }
 
+function nativeIdentity(changes: Partial<WindowsNativeLauncherIdentity> = {}): WindowsNativeLauncherIdentity {
+  return {
+    session_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    profile_name: "sgwagent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    broker_sid: "S-1-5-21-100-200-300-1001",
+    user_sid: "S-1-5-21-100-200-300-1001",
+    package_sid: "S-1-15-2-111-222-333-444",
+    job_name: String.raw`Local\s-gw-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+    logon_luid: "00000000000003e7",
+    windows_session_id: 3,
+    process_id: 1234,
+    ...changes
+  };
+}
+
+function nativeBridge(changes: Partial<WindowsNativeLauncherIdentity> = {}) {
+  const record = nativeIdentity(changes);
+  return {
+    ...nativeChecks(),
+    launchIdentity: () => record,
+    childProcessId: () => 1234
+  };
+}
+
 function waitingHelper(): ChildProcessWithoutNullStreams {
   const script = `
     const body = Buffer.from('native request');
@@ -47,6 +72,84 @@ function waitingHelper(): ChildProcessWithoutNullStreams {
 }
 
 describe("Windows broker launch control", () => {
+  it("passes the C launcher's package identity to peer verification", async () => {
+    let helperArgs: string[] = [];
+    const registry = new WindowsAgentPipeRegistry("synthetic-helper", (_path, args) => {
+      helperArgs = args;
+      return waitingHelper();
+    });
+    let reserved: WindowsAgentPipeIdentity | undefined;
+    const bridge = nativeBridge();
+    const session = registerWindowsNativeAgentLaunch(registry, bridge, "Native Windows agent",
+      record => { reserved = record; });
+    let sawRequest!: () => void;
+    const requested = new Promise<void>(resolve => { sawRequest = resolve; });
+    let principalId: string | undefined;
+    try {
+      const exchange = await session.pipes.openOnce(async (_request, principal) => {
+        principalId = principal.id;
+        sawRequest();
+        return Buffer.from("ok");
+      });
+      await requested;
+      expect(principalId).toBe("win32:sid:s-1-15-2-111-222-333-444");
+      expect(helperArgs).toEqual([
+        exchange.pipeName, "S-1-5-21-100-200-300-1001", "S-1-5-21-100-200-300-1001",
+        "S-1-15-2-111-222-333-444", "00000000000003e7", "3",
+        String.raw`Local\s-gw-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
+      ]);
+      expect(reserved).toMatchObject({ sessionId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        appContainerSid: "S-1-15-2-111-222-333-444", name: "Native Windows agent" });
+    } finally {
+      await session.confirmDrained();
+    }
+  });
+
+  it("rejects a C identity that disagrees with its profile, Job, user or retained child", () => {
+    const invalid = [
+      [nativeBridge({ profile_name: "sgwagent_other" }), "profile"],
+      [nativeBridge({ job_name: String.raw`Local\s-gw-agent-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` }), "Job"],
+      [nativeBridge({ user_sid: "S-1-5-21-100-200-300-1002" }), "user SID"],
+      [nativeBridge({ process_id: 4321 }), "child process ID"],
+      [nativeBridge({ session_id: "windows-session-1" }), "session ID"]
+    ] as const;
+    for (const [bridge, reason] of invalid) {
+      let reservations = 0;
+      const registry = new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper);
+      expect(() => registerWindowsNativeAgentLaunch(registry, bridge, "Native Windows agent",
+        () => { reservations++; })).toThrow(reason);
+      expect(reservations).toBe(0);
+    }
+  });
+
+  it("rechecks the retained child process ID before broker work", async () => {
+    const bridge = nativeBridge();
+    const session = registerWindowsNativeAgentLaunch(
+      new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper), bridge,
+      "Native Windows agent", () => {});
+    bridge.childProcessId = () => 4321;
+    try {
+      await expect(session.pipes.openOnce(async () => Buffer.from("ok")))
+        .rejects.toThrow("childHandleLive");
+    } finally {
+      await session.confirmDrained();
+    }
+  });
+
+  it("refuses asynchronous identity or retained-handle readings", () => {
+    const asyncIdentity = nativeBridge();
+    asyncIdentity.launchIdentity = (async () => nativeIdentity()) as unknown as typeof asyncIdentity.launchIdentity;
+    expect(() => registerWindowsNativeAgentLaunch(
+      new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper), asyncIdentity,
+      "Native Windows agent", () => {})).toThrow("identity must finish synchronously");
+
+    const asyncProcessId = nativeBridge();
+    asyncProcessId.childProcessId = (async () => 1234) as unknown as typeof asyncProcessId.childProcessId;
+    expect(() => registerWindowsNativeAgentLaunch(
+      new WindowsAgentPipeRegistry("synthetic-helper", waitingHelper), asyncProcessId,
+      "Native Windows agent", () => {})).toThrow("child process ID must finish synchronously");
+  });
+
   it("refuses registration unless every retained boundary check is ready", () => {
     const names = ["childHandleLive", "jobHandleConfined", "wfpSessionHealthy", "dnsBoundaryReady"] as const;
     const reserved = new Set<string>();
@@ -116,7 +219,8 @@ describe("Windows broker launch control", () => {
   it("keeps native pipe opening disabled after adapter registration", async () => {
     const registry = new WindowsAgentPipeRegistry(
       String.raw`C:\Program Files\s-gw\s-gw-windows-peer-identity.exe`, undefined, "a".repeat(64), async () => {});
-    const session = registerWindowsAgentLaunch(registry, identity(), nativeChecks(), () => {});
+    const session = registerWindowsNativeAgentLaunch(registry, nativeBridge(),
+      "Native Windows agent", () => {});
     try {
       await expect(session.pipes.openOnce(async () => Buffer.from("ok")))
         .rejects.toThrow("verified launcher and egress controls");
