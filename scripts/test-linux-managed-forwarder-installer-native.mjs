@@ -209,7 +209,7 @@ try {
   for (const name of ["linux-agent-control.js", "linux-agent-unit.js", "linux-peer-identity.js",
     "linux-agent-identity.js", "linux-forwarder-identity.js",
     "linux-managed-forwarder-attestation.js", "linux-managed-forwarder-binding.js",
-    "model-relay-action.js"]) {
+    "linux-forwarder-runtime.js", "model-relay-action.js"]) {
     await copyFile(path.join(project, "dist", name), path.join(controlDir, name));
   }
   await writeFile(path.join(controlDir, "package.json"), '{"type":"module"}\n', { mode: 0o644 });
