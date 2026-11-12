@@ -1385,6 +1385,11 @@ export function installedConsoleRequiresOperatorProof(plistPath = launchAgentPat
   return args.includes("--operator-auth");
 }
 
+export function installedProtectedConsoleConfigured(plistPath = launchAgentPath(consoleLabel)): boolean {
+  if (!installedConsoleRequiresOperatorProof(plistPath)) return false;
+  return consoleUiManifestPath(launchAgentProgramArguments(plistPath)) !== undefined;
+}
+
 export function installedConsolePort(plistPath = launchAgentPath(consoleLabel)): number | undefined {
   requireMac("installed console port lookup");
   if (!existsSync(plistPath)) return undefined;

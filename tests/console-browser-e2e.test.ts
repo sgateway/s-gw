@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import os from "node:os";
@@ -176,8 +176,12 @@ describeBrowser("React local console (real headless Chrome)", () => {
   it("opens the protected console only after operator sign-in", async () => {
     process.env.SGW_MASTER_PASSPHRASE = "protected-browser-fixture";
     process.env.SGW_SECRET_BACKEND = "local";
+    const store = new SecretStore();
+    await store.enableProtectedConsole();
+    const manifest = JSON.parse(readFileSync(path.join(repoRoot, "dist/console-ui-manifest.json"), "utf8")) as Record<string, string>;
     let code = "";
-    running = await startConsoleServer({ port: 0, operatorAuth: { displayCode: (value) => { code = value; } } });
+    running = await startConsoleServer({ port: 0, store, protectedUiManifest: manifest,
+      operatorAuth: { displayCode: (value) => { code = value; } } });
     const launched = await launchChrome(running.url);
     cdp = launched.cdp;
 

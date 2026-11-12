@@ -7,6 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { KNOWN_COMMANDS, suggestCommands, unknownCommandMessage } from "../src/command-suggest.js";
+import { consoleProofPath } from "../src/console-control.js";
+import { getSgwInstanceKey } from "../src/paths.js";
+import { SecretStore } from "../src/store.js";
 import { CURRENT_VERSION } from "../src/version.js";
 
 const repoRoot = process.cwd();
@@ -123,6 +126,89 @@ describe("operator enrollment CLI", () => {
       expect(existsSync(path.join(home, "store.json"))).toBe(false);
     } finally {
       await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("protected console CLI routing", () => {
+  it("keeps start --no-service free of store and service startup", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-no-service-start-"));
+    try {
+      const out = JSON.parse(runCliSync(["src/cli.ts", "start", "--no-service", "--no-menubar"], {
+        cwd: repoRoot,
+        env: { ...process.env, SGW_HOME: home, SGW_RECOVERY_HOME: `${home}-recovery` },
+        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
+      }));
+      expect(out).toEqual({ ok: true, consoleUrl: "http://127.0.0.1:8718/" });
+      expect(existsSync(path.join(home, "store.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(`${home}-recovery`, { recursive: true, force: true });
+    }
+  });
+
+  it("does not accept a matching URL-only listener for a protected store", async () => {
+    const home = realpathSync(await mkdtemp(path.join(os.tmpdir(), "sgw-protected-cli-")));
+    const recovery = `${home}-recovery`;
+    const oldEnv = { ...process.env };
+    process.env.SGW_HOME = home;
+    process.env.SGW_RECOVERY_HOME = recovery;
+    process.env.SGW_MASTER_PASSPHRASE = "disposable protected console test";
+    process.env.SGW_DISABLE_KEYCHAIN = "1";
+    process.env.SGW_DISABLE_UPDATE_CHECK = "1";
+    const store = new SecretStore(home);
+    const fake = createServer((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ ok: true, name: "s-gw", instanceKey: getSgwInstanceKey(home) }));
+    });
+    try {
+      await store.enableProtectedConsole();
+      await new Promise<void>(resolve => fake.listen(0, "127.0.0.1", resolve));
+      const port = (fake.address() as AddressInfo).port;
+      await writeFile(consoleProofPath(store.storePath, port), "not a proof socket");
+      expect(() => runCliSync(["src/cli.ts", "console", "verify-listener", "--port", String(port)], {
+        cwd: repoRoot, env: { ...process.env }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
+      })).toThrow(/Operator control socket is not private|macOS peer verification/);
+    } finally {
+      await new Promise<void>(resolve => fake.close(() => resolve()));
+      process.env = oldEnv;
+      await rm(home, { recursive: true, force: true });
+      await rm(recovery, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "darwin")("keeps protected browser and start paths from creating ordinary background services", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "sgw-protected-background-"));
+    const recovery = `${home}-recovery`;
+    const oldEnv = { ...process.env };
+    process.env.SGW_HOME = home;
+    process.env.SGW_RECOVERY_HOME = recovery;
+    process.env.SGW_MASTER_PASSPHRASE = "disposable protected background test";
+    process.env.SGW_DISABLE_KEYCHAIN = "1";
+    process.env.SGW_DISABLE_UPDATE_CHECK = "1";
+    try {
+      await new SecretStore(home).enableProtectedConsole();
+      const options: ExecFileSyncOptionsWithStringEncoding = {
+        cwd: repoRoot, env: { ...process.env }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
+      };
+      expect(() => runCliSync(["src/cli.ts", "app", "open", "--browser"], options))
+        .toThrow(/protected store cannot use the ordinary background console service/);
+      expect(() => runCliSync(["src/cli.ts", "start", "--no-open-app"], options))
+        .toThrow(/protected store cannot use the ordinary background console service/);
+      expect(() => runCliSync(["src/cli.ts", "service", "install"], options))
+        .toThrow(/protected store cannot use the ordinary background console service/);
+      const setup = JSON.parse(runCliSync(["src/cli.ts", "setup", "--no-service", "--no-menubar",
+        "--no-open-app", "--no-agents"], options));
+      expect(setup.ok).toBe(true);
+      expect(setup.opened).toBeUndefined();
+      if (process.platform === "win32") {
+        const noService = JSON.parse(runCliSync(["src/cli.ts", "start", "--no-service", "--no-menubar"], options));
+        expect(noService.service).toBeUndefined();
+      }
+    } finally {
+      process.env = oldEnv;
+      await rm(home, { recursive: true, force: true });
+      await rm(recovery, { recursive: true, force: true });
     }
   });
 });

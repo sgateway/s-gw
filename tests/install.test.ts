@@ -12,6 +12,7 @@ import {
   getPackageLayout,
   installedConsolePort,
   installedConsoleRequiresOperatorProof,
+  installedProtectedConsoleConfigured,
   macAppProcessRecordPath,
   menuBarLabel,
   packageHealth,
@@ -35,7 +36,10 @@ describe("customer package layout", () => {
       expect(installedConsolePort(plistPath)).toBe(8718);
       await writeFile(plistPath, buildConsoleLaunchAgentPlist(9876, dir, {}, true));
       expect(installedConsoleRequiresOperatorProof(plistPath)).toBe(true);
+      expect(installedProtectedConsoleConfigured(plistPath)).toBe(false);
       expect(installedConsolePort(plistPath)).toBe(9876);
+      await writeFile(plistPath, buildConsoleLaunchAgentPlist(9876, dir, {}, true, false, "/trusted/ui.json"));
+      expect(installedProtectedConsoleConfigured(plistPath)).toBe(true);
       await writeFile(plistPath, `<key>ProgramArguments</key><array><string>--ui-manifest</string><string>/tmp/ui.json</string></array>`);
       expect(() => installedConsoleRequiresOperatorProof(plistPath)).toThrow("invalid protected UI manifest path");
       await writeFile(plistPath, "<key>ProgramArguments</key><array><string>--operator-auth</string></array>");

@@ -152,6 +152,12 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsoleAccessResponse {
+    console_access: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct InstanceKeyResponse {
     #[serde(rename = "instanceKey")]
     instance_key: Option<String>,
@@ -367,6 +373,25 @@ pub fn open_browser_backup(
         .clone()
         .or_else(|| runtime_instance_key(runtime))
         .ok_or_else(|| "s-gw could not verify the local credential home.".to_string())?;
+
+    let access: ConsoleAccessResponse = run_json(runtime, &["console", "access-mode"])?;
+    if access.console_access == "protected" {
+        run_cli(
+            runtime,
+            &[
+                "app",
+                "open",
+                "--browser",
+                "--console-url",
+                settings.console_url.as_str(),
+            ],
+            None,
+        )?;
+        return Ok("Opened the protected browser backup.".into());
+    }
+    if access.console_access != "ordinary" {
+        return Err("The local console access mode is unknown.".into());
+    }
 
     let mut state = probe_console(&settings.console_url, &expected_key);
     if state == ConsoleState::Unavailable {

@@ -34,6 +34,18 @@ function Resolve-NodePath {
   return "node"
 }
 
+function Get-ConsoleAccessMode([string]$CliPath, [string]$NodePath) {
+  $raw = & $NodePath $CliPath "console" "access-mode"
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not verify the credential store's console access mode."
+  }
+  $mode = (($raw -join "`n") | ConvertFrom-Json).consoleAccess
+  if ($mode -notin @("ordinary", "protected")) {
+    throw "The credential store returned an unknown console access mode."
+  }
+  return $mode
+}
+
 function New-ConsoleUrl {
   if ($ConsoleUrl.Trim()) {
     return $ConsoleUrl.Trim()
@@ -147,6 +159,9 @@ function Open-ConsoleWindow([string]$Url) {
 $url = New-ConsoleUrl
 $cliPath = Resolve-CliPath
 $nodePath = Resolve-NodePath
+if ((Get-ConsoleAccessMode -CliPath $cliPath -NodePath $nodePath) -eq "protected") {
+  throw "This protected store cannot use the legacy Windows browser client. Use the native desktop app or a trusted foreground operator console."
+}
 $ready = (Test-ConsoleReady $url) -and (Test-ConsoleOwner $cliPath $nodePath)
 
 if ($NoStart -and -not $ready) {

@@ -18,6 +18,7 @@ import {
   uninstallWindowsLoginService,
 } from "../src/install.js";
 import { getSgwInstanceKey } from "../src/paths.js";
+import { SecretStore } from "../src/store.js";
 import { deleteKeychainPassphrase, setKeychainPassphrase } from "../src/unlock.js";
 
 const repoRoot = process.cwd();
@@ -561,6 +562,32 @@ describe("Windows client packaging", () => {
       await rm(`${firstHome}-recovery`, { recursive: true, force: true });
       await rm(otherHome, { recursive: true, force: true });
       await rm(`${otherHome}-recovery`, { recursive: true, force: true });
+    }
+  }, windowsProcessTestTimeout);
+
+  it.skipIf(process.platform !== "win32")("refuses the legacy browser client for a protected store", async () => {
+    const home = await mkdtemp(path.join(windowsTestRoot(), "sgw-windows-protected-client-"));
+    const recovery = `${home}-recovery`;
+    const oldHome = process.env.SGW_HOME;
+    const oldRecovery = process.env.SGW_RECOVERY_HOME;
+    process.env.SGW_HOME = home;
+    process.env.SGW_RECOVERY_HOME = recovery;
+    try {
+      await new SecretStore(home).enableProtectedConsole();
+      const layout = getPackageLayout();
+      const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-File",
+        layout.windowsClientScriptPath, "-NoStart", "-InstanceKey", getSgwInstanceKey(home)], {
+        cwd: repoRoot,
+        env: { ...process.env, SGW_CLI_PATH: layout.cliPath, SGW_NODE_PATH: process.execPath },
+        encoding: "utf8", windowsHide: true, timeout: 30_000
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/protected store cannot use the legacy Windows browser client/);
+    } finally {
+      restoreEnv("SGW_HOME", oldHome);
+      restoreEnv("SGW_RECOVERY_HOME", oldRecovery);
+      await rm(home, { recursive: true, force: true });
+      await rm(recovery, { recursive: true, force: true });
     }
   }, windowsProcessTestTimeout);
 

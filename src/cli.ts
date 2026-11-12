@@ -40,6 +40,7 @@ import {
   installWindowsLoginService,
   installedConsolePort,
   installedConsoleRequiresOperatorProof,
+  installedProtectedConsoleConfigured,
   launchAgentStatus,
   normalizeMenuBarCountMode,
   openDesktopApp,
@@ -203,7 +204,7 @@ async function main(): Promise<void> {
     }
     if (second === "verify-listener") {
       const { url } = appConsoleEndpoint(parsed.flags);
-      await waitForInstalledConsoleAuthority(url);
+      await waitForInstalledConsoleAuthority(url, await store.getConsoleAccessMode() === "protected");
       printJson({ ok: true, consoleUrl: url });
       return;
     }
@@ -302,7 +303,7 @@ async function main(): Promise<void> {
   }
 
   if (first === "start") {
-    await handleStartCommand(parsed.flags);
+    await handleStartCommand(store, parsed.flags);
     return;
   }
 
@@ -312,7 +313,7 @@ async function main(): Promise<void> {
   }
 
   if (first === "service") {
-    await handleServiceCommand(second, parsed.flags);
+    await handleServiceCommand(store, second, parsed.flags);
     return;
   }
 
@@ -347,7 +348,7 @@ async function main(): Promise<void> {
   }
 
   if (first === "app") {
-    await handleAppCommand(second, parsed.flags);
+    await handleAppCommand(store, second, parsed.flags);
     return;
   }
 
@@ -1294,6 +1295,8 @@ async function handleSetupCommand(
   }
 
   await store.init();
+  const protectedStore = await store.getConsoleAccessMode() === "protected";
+  if (protectedStore && !hasFlag(flags, "no-service")) assertProtectedBackgroundConsole();
   const secretKeychainRepair = process.platform === "darwin"
     ? await store.repairKeychainAccess()
     : undefined;
@@ -1335,7 +1338,8 @@ async function handleSetupCommand(
   }
 
   const opened = shouldOpenUi(flags) && !(process.platform === "win32" && hasFlag(flags, "no-service"))
-    ? await openPreferredUi(port, consoleUrl)
+    && !(protectedStore && process.platform === "darwin" && hasFlag(flags, "no-service"))
+    ? await openPreferredUi(port, consoleUrl, protectedStore)
     : undefined;
   const agents = hasFlag(flags, "no-agents")
     ? { skipped: true, results: [] }
@@ -1367,30 +1371,33 @@ async function handleSetupCommand(
   });
 }
 
-async function handleStartCommand(flags: Record<string, string | boolean | string[]>): Promise<void> {
+async function handleStartCommand(store: SecretStore,
+  flags: Record<string, string | boolean | string[]>): Promise<void> {
   const port = numericFlag(flags, "port", 8718);
   const consoleUrl = `http://127.0.0.1:${port}/`;
-  if (process.platform === "win32") {
-    if (hasFlag(flags, "no-service") && !hasFlag(flags, "no-menubar")) {
+  if (hasFlag(flags, "no-service")) {
+    if (process.platform === "win32" && !hasFlag(flags, "no-menubar")) {
       throw new Error("--no-service requires --no-menubar on Windows because the tray helper requires its matching console.");
     }
-    if (hasFlag(flags, "no-service")) {
-      printJson({ ok: true, consoleUrl, opened: undefined, service: undefined });
-      return;
-    }
+    printJson({ ok: true, consoleUrl, opened: undefined, service: undefined });
+    return;
+  }
+  const protectedStore = await store.getConsoleAccessMode() === "protected";
+  if (protectedStore) assertProtectedBackgroundConsole();
+  if (process.platform === "win32") {
     const service = await installWindowsLoginService({
       port,
       start: true,
       tray: !hasFlag(flags, "no-menubar")
     });
-    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
+    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl, protectedStore) : undefined;
     printJson({ ok: true, consoleUrl, opened, service });
     return;
   }
 
   if (process.platform === "linux") {
     const service = await installSystemdUserService({ port, start: true });
-    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
+    const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl, protectedStore) : undefined;
     printJson({ ok: true, consoleUrl, opened, service });
     return;
   }
@@ -1398,11 +1405,12 @@ async function handleStartCommand(flags: Record<string, string | boolean | strin
   const service = launchAgentStatus("console").installed
     ? startInstalledLaunchAgent("console")
     : await installConsoleLaunchAgent({ port, start: true });
-  const menuBar = launchAgentStatus("menubar").installed
-    ? startInstalledLaunchAgent("menubar")
-    : await installMenuBarLaunchAgent({ port, start: true });
+  const menuBar = hasFlag(flags, "no-menubar") ? launchAgentStatus("menubar")
+    : launchAgentStatus("menubar").installed
+      ? startInstalledLaunchAgent("menubar")
+      : await installMenuBarLaunchAgent({ port, start: true });
 
-  const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl) : undefined;
+  const opened = shouldOpenUi(flags) ? await openPreferredUi(port, consoleUrl, protectedStore) : undefined;
 
   printJson({ ok: true, consoleUrl, opened, service, menuBar });
 }
@@ -1542,6 +1550,7 @@ function stopBackgroundSurfaces() {
 }
 
 async function handleServiceCommand(
+  store: SecretStore,
   action: string | undefined,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
@@ -1571,6 +1580,15 @@ async function handleServiceCommand(
   }
   if ((launchdSocket || directBind) && (process.platform !== "darwin" || action !== "install" || ordinaryService)) {
     throw new Error("Console socket mode can currently be selected only for a protected macOS service install.");
+  }
+  if ((action === "install" || action === "start") &&
+      await store.getConsoleAccessMode() === "protected") {
+    if (ordinaryService) {
+      throw new Error("This protected store cannot install an ordinary console service.");
+    }
+    if (process.platform !== "darwin" || action === "start" || !protectedService || !uiManifestPath) {
+      assertProtectedBackgroundConsole();
+    }
   }
   if (process.platform === "win32") {
     if (action === "install") {
@@ -2546,6 +2564,7 @@ function onePasswordHandleName(itemTitle: string, fieldLabel: string): string {
 }
 
 async function handleAppCommand(
+  store: SecretStore,
   action: string | undefined,
   flags: Record<string, string | boolean | string[]>
 ): Promise<void> {
@@ -2590,15 +2609,17 @@ async function handleAppCommand(
 
   if (action === "open") {
     const { port, url: consoleUrl } = appConsoleEndpoint(flags);
+    const protectedStore = await store.getConsoleAccessMode() === "protected";
     if (hasFlag(flags, "browser")) {
+      if (protectedStore) assertProtectedBackgroundConsole();
       const service = await ensureBrowserConsole(port);
-      await waitForInstalledConsoleAuthority(consoleUrl);
+      await waitForInstalledConsoleAuthority(consoleUrl, protectedStore);
       await openBrowser(consoleUrl);
       printJson({ kind: "web-console", consoleUrl, service });
       return;
     }
 
-    printJson(await openPreferredUi(port, consoleUrl));
+    printJson(await openPreferredUi(port, consoleUrl, protectedStore));
     return;
   }
 
@@ -2715,7 +2736,7 @@ async function handleGuardRun(
   process.exitCode = code;
 }
 
-async function openPreferredUi(port: number, consoleUrl: string) {
+async function openPreferredUi(port: number, consoleUrl: string, protectedStore = false) {
   if (process.platform === "win32" || process.platform === "linux") {
     try {
       const opened = await openDesktopApp({ port, consoleUrl });
@@ -2726,7 +2747,7 @@ async function openPreferredUi(port: number, consoleUrl: string) {
     }
   }
 
-  if (installedConsoleRequiresOperatorProof()) {
+  if (protectedStore || installedConsoleRequiresOperatorProof()) {
     await waitForProtectedConsoleAuthority(consoleUrl);
   }
   try {
@@ -2734,14 +2755,14 @@ async function openPreferredUi(port: number, consoleUrl: string) {
     return { kind: "mac-app", ...opened };
   } catch {
     const service = await ensureBrowserConsole(port);
-    await waitForInstalledConsoleAuthority(consoleUrl);
+    await waitForInstalledConsoleAuthority(consoleUrl, protectedStore);
     await openBrowser(consoleUrl);
     return { kind: "web-console", consoleUrl, service };
   }
 }
 
-async function waitForInstalledConsoleAuthority(consoleUrl: string): Promise<void> {
-  if (process.platform === "darwin" && installedConsoleRequiresOperatorProof()) {
+async function waitForInstalledConsoleAuthority(consoleUrl: string, protectedStore = false): Promise<void> {
+  if (protectedStore || (process.platform === "darwin" && installedConsoleRequiresOperatorProof())) {
     await waitForProtectedConsoleAuthority(consoleUrl);
     return;
   }
@@ -2759,6 +2780,19 @@ async function ensureBrowserConsole(port: number): Promise<unknown> {
   return launchAgentStatus("console").installed
     ? startInstalledLaunchAgent("console")
     : installConsoleLaunchAgent({ port, start: true });
+}
+
+function assertProtectedBackgroundConsole(): void {
+  if (process.platform !== "darwin") {
+    throw new Error("This protected store cannot use the ordinary background console service. " +
+      "Run `s-gw console --operator-auth --ui-manifest <trusted manifest>` in a trusted foreground terminal, " +
+      "or use the native desktop app.");
+  }
+  if (!installedProtectedConsoleConfigured()) {
+    throw new Error("This protected store needs an installed operator-authenticated console service " +
+      "with a pinned UI manifest. Install it with `s-gw service install --operator-auth " +
+      "--ui-manifest <trusted manifest> --start`, then use `s-gw console enroll` in a trusted terminal.");
+  }
 }
 
 function shouldOpenUi(flags: Record<string, string | boolean | string[]>): boolean {
