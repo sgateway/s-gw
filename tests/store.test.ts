@@ -3870,12 +3870,13 @@ describe("SecretStore", () => {
     });
     expect(first.state).toBe("pending");
     await store.approveRequestWithScopedPolicy(first.id);
-    const same = await store.createRequest(secret.handle, action, "same agent after restart", {
+    const restarted = new SecretStore(tmpHome);
+    const same = await restarted.createRequest(secret.handle, action, "same agent after restart", {
       managedPrincipal: principalForVerifiedPeer(`linux:managed:${generation}`, "Codex", "new-session"), env: {}
     });
     expect(same.state).toBe("approved");
     for (const principalId of [`linux:managed:${"b".repeat(32)}`, "linux:uid:231001"]) {
-      const reassigned = await store.createRequest(secret.handle, action, "reassigned UID", {
+      const reassigned = await restarted.createRequest(secret.handle, action, "reassigned UID", {
         managedPrincipal: principalForVerifiedPeer(principalId, "Codex", "replacement-session"), env: {}
       });
       expect(reassigned.state).toBe("pending");
