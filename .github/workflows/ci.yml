@@ -140,6 +140,15 @@ jobs:
           sudo "$node_path" scripts/test-linux-broker-runtime-static.mjs
           sudo CI=true SGW_TEST_MANAGED_RELAY=1 "$node_path" scripts/test-linux-managed-mcp-native.mjs --root "$(id -u)" "$(id -g)"
 
+  filter-only-newer-host:
+    name: Filter-only seccomp payload (Ubuntu 26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libc6-dev
+      - run: bash scripts/test-anthropic-filter-only-linux.sh
+
   macos-native:
     name: macOS native surfaces
     runs-on: macos-15
