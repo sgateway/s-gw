@@ -1,5 +1,5 @@
 import {
-  linuxAgentUnitName, validateLinuxAgentPlan,
+  linuxAgentUnitName, linuxProcessGroupsAreDedicated, validateLinuxAgentPlan,
   type LinuxAgentUnitPlan, type LinuxAgentUnitState
 } from "./linux-agent-unit.js";
 import type { PeerSession } from "./peer-identity.js";
@@ -8,6 +8,7 @@ export interface LinuxUnitProcessEvidence {
   pid: number;
   uids: readonly [number, number, number, number];
   gids: readonly [number, number, number, number];
+  procStatus: string;
   cgroup: string;
   invocationId: string;
   networkNamespace: string;
@@ -166,6 +167,8 @@ function assertLiveUnit(unit: LinuxAgentUnitState, process: LinuxUnitProcessEvid
       process.uids.some(value => value !== uid) ||
       !Array.isArray(process.gids) || process.gids.length !== 4 ||
       process.gids.some(value => value !== gid) ||
+      typeof process.procStatus !== "string" ||
+      !linuxProcessGroupsAreDedicated(process.procStatus, gid) ||
       process.cgroup !== unit.cgroup || process.invocationId !== unit.invocationId ||
       !netNamespace.test(process.networkNamespace) ||
       !pidNamespace.test(process.pidNamespace) ||

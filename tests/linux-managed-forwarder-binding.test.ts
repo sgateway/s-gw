@@ -38,6 +38,7 @@ function fixture(): LinuxManagedForwarderBindingInput {
     agentProcess: {
       pid: 101, uids: [31001, 31001, 31001, 31001],
       gids: [31001, 31001, 31001, 31001],
+      procStatus: "Groups:\t31001\n",
       cgroup: agentCgroup, invocationId: agentInvocation, networkNamespace,
       pidNamespace: agentPidNamespace, ipcNamespace: agentIpcNamespace,
       mountNamespace: agentMountNamespace
@@ -49,6 +50,7 @@ function fixture(): LinuxManagedForwarderBindingInput {
     forwarderProcess: {
       pid: 202, uids: [32001, 32001, 32001, 32001],
       gids: [32001, 32001, 32001, 32001],
+      procStatus: "Groups:\t32001\n",
       cgroup: forwarderCgroup, invocationId: forwarderInvocation, networkNamespace,
       pidNamespace: forwarderPidNamespace, ipcNamespace: forwarderIpcNamespace,
       mountNamespace: forwarderMountNamespace
@@ -130,6 +132,21 @@ describe("root-attested Linux forwarder binding", () => {
     const changedFsUid = fixture();
     changedFsUid.forwarderProcess.uids = [32001, 32001, 32001, 30001];
     expect(() => bindLinuxManagedForwarderSession(changedFsUid)).toThrow();
+  });
+
+  it("rejects supplementary groups on either process", () => {
+    const agentExtra = fixture();
+    agentExtra.agentProcess.procStatus = "Groups:\t31001 32001\n";
+    expect(() => bindLinuxManagedForwarderSession(agentExtra)).toThrow();
+    const forwarderExtra = fixture();
+    forwarderExtra.forwarderProcess.procStatus = "Groups:\t32001 30001\n";
+    expect(() => bindLinuxManagedForwarderSession(forwarderExtra)).toThrow();
+    const missingGroups = fixture();
+    missingGroups.forwarderProcess.procStatus = "Name:\tforwarder\n";
+    expect(() => bindLinuxManagedForwarderSession(missingGroups)).toThrow();
+    const emptyGroups = fixture();
+    emptyGroups.forwarderProcess.procStatus = "Groups:\t\n";
+    expect(() => bindLinuxManagedForwarderSession(emptyGroups)).not.toThrow();
   });
 
   it("rejects stale process, cgroup, invocation, and root generation", () => {
