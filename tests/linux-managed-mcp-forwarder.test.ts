@@ -19,7 +19,7 @@ function status(uid: number, gid: number) {
     "CapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n";
 }
 
-describe("managed MCP TCP forwarder", () => {
+describe.skipIf(process.platform === "win32")("managed MCP TCP forwarder", () => {
   it("checks the dedicated forwarder identity and private network namespace", () => {
     const proof = {
       version: 1 as const, sessionId: "session-a", uid: 32001, gid: 32001,
