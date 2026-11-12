@@ -19,7 +19,8 @@ const planDir = "/run/s-gw/agent-plans";
 const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
 const rootPidfdHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-linux-peer-identity`, import.meta.url));
 const rootPeerHelper = fileURLToPath(new URL(`../dist/native/linux-${process.arch}/s-gw-peer-credentials`, import.meta.url));
-const maxFrame = 32 * 1024;
+export const linuxManagedControlMaxFrame = 32 * 1024;
+const maxFrame = linuxManagedControlMaxFrame;
 export const unsafeStartupEnv = ["NODE_OPTIONS", "NODE_PATH", "NODE_TLS_REJECT_UNAUTHORIZED",
   "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "OPENSSL_CONF", "SSL_CERT_FILE", "SSL_CERT_DIR",
   "GLIBC_TUNABLES", "MALLOC_CHECK_", "MALLOC_PERTURB_", "TZDIR"];
@@ -466,11 +467,11 @@ function safeUnitEnvironment(value: string | undefined): boolean {
 export function assertControlUnitPreflight(output: string, runtime: {
   unitFile: string; runtimeRoot: string; preflight: string;
   node: string; entry: string; args: string[];
-}): void {
+}, expectedState: "active" | "inactive" = "active"): void {
   const unit = parseUnitProperties(output);
   const failed: string[] = [];
   if (unit.get("Id") !== "s-gw-agent-control.service") failed.push("Id");
-  if (unit.get("ActiveState") !== "active") failed.push("ActiveState");
+  if (unit.get("ActiveState") !== expectedState) failed.push("ActiveState");
   if (unit.get("FragmentPath") !== runtime.unitFile) failed.push("FragmentPath");
   // Some systemd versions omit an unconfigured EnvironmentFiles property, even with --all.
   const environmentFiles = unit.get("EnvironmentFiles");

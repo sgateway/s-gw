@@ -1,0 +1,79 @@
+#include "policy-core.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static int parse_cases(void) {
+    struct sgw_policy_agent agents[2];
+    const char *good = "REGISTER-V1 231000 231000 alpha_1 231001 231001 beta-2\n";
+    if (sgw_policy_parse_register(good, agents) || agents[0].uid != 231000 ||
+        agents[1].gid != 231001 || strcmp(agents[1].session, "beta-2")) return 1;
+    const char *bad[] = {
+        "REGISTER-V1 -1 231000 alpha 231001 231001 beta\n",
+        "REGISTER-V1 231000 231000 alpha 231001 231001 beta extra\n",
+        "REGISTER-V1 231000 231000 alpha 231001 231001 beta\nCHECK-V1 1 x\n",
+        "REGISTER-V1 231000 231000 alpha 231001 231001 beta",
+        "REGISTER-V1 231000 231000 alpha 231001 231001 bad/session\n",
+        "REGISTER-V1 0 231000 alpha 231001 231001 beta\n"
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (!sgw_policy_parse_register(bad[i], agents)) return 2;
+    }
+    uid_t uid;
+    char session[SGW_POLICY_SESSION_MAX + 1];
+    if (sgw_policy_parse_check("CHECK-V1 231000 alpha_1\n", &uid, session) ||
+        uid != 231000 || strcmp(session, "alpha_1")) return 3;
+    const char *bad_checks[] = {
+        "CHECK-V1 -1 alpha\n", "CHECK-V1 231000 alpha extra\n",
+        "CHECK-V1 231000 alpha", "CHECK-V1 231000 alpha\nCHECK-V1 1 beta\n",
+        "CHECK-V1 231000 bad/session\n"
+    };
+    for (size_t i = 0; i < sizeof(bad_checks) / sizeof(bad_checks[0]); i++) {
+        if (!sgw_policy_parse_check(bad_checks[i], &uid, session)) return 4;
+    }
+    return 0;
+}
+
+static int state_cases(void) {
+    struct sgw_policy_state state = {0};
+    struct sgw_policy_agent pair[2] = {
+        { .uid = 231000, .gid = 231000, .session = "alpha" },
+        { .uid = 231001, .gid = 231001, .session = "beta" }
+    };
+    struct sgw_policy_proof proof = {1, 1, 1, 1, 1, 1};
+    if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof) ||
+        sgw_policy_register(&state, pair) || !sgw_policy_register(&state, pair)) return 1;
+    if (!sgw_policy_ready(&state, 0, 231000, "alpha", &proof) ||
+        !sgw_policy_ready(&state, 0, 231001, "beta", &proof)) return 2;
+    if (sgw_policy_ready(&state, 501, 231000, "alpha", &proof) ||
+        sgw_policy_ready(&state, 0, 231000, "beta", &proof) ||
+        sgw_policy_ready(&state, 0, 231002, "alpha", &proof) ||
+        sgw_policy_ready(&state, 0, 231000, "alpha", NULL)) return 3;
+    int *parts[] = {
+        &proof.signed_provider, &proof.enabled_socket_filter, &proof.provider_alive,
+        &proof.exact_uid_policy, &proof.current_boot_probes, &proof.continuous_denial
+    };
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        *parts[i] = 0;
+        if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 4;
+        *parts[i] = 1;
+    }
+    sgw_policy_reset(&state);
+    if (sgw_policy_ready(&state, 0, 231000, "alpha", &proof)) return 5;
+    pair[1].uid = pair[0].uid;
+    if (!sgw_policy_register(&state, pair)) return 6;
+    pair[1].uid = 231001;
+    pair[1].gid = pair[0].gid;
+    if (!sgw_policy_register(&state, pair)) return 7;
+    pair[1].gid = 231001;
+    strcpy(pair[1].session, "alpha");
+    if (!sgw_policy_register(&state, pair)) return 8;
+    return 0;
+}
+
+int main(void) {
+    int parsed = parse_cases();
+    int state = state_cases();
+    if (parsed || state) fprintf(stderr, "policy core failed: parse=%d state=%d\n", parsed, state);
+    return parsed || state ? 1 : 0;
+}

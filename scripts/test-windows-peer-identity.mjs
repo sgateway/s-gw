@@ -20,6 +20,9 @@ const tokenSource = resolve(root, "native/windows-peer-identity/test-token.c");
 const appContainerSource = resolve(root, "native/windows-peer-identity/test-appcontainer.c");
 const hostPreflightSource = resolve(root, "native/windows-peer-identity/test-host-preflight.c");
 const wfpSource = resolve(root, "native/windows-peer-identity/wfp-boundary.c");
+const launcherSource = resolve(root, "native/windows-peer-identity/agent-launcher.c");
+const launcherTestSource = resolve(root, "native/windows-peer-identity/test-agent-launcher.c");
+const launcherChildSource = resolve(root, "native/windows-peer-identity/test-agent-launcher-child.c");
 const parentEnvCanary = randomBytes(16).toString("hex");
 const sharedHost = process.argv.length === 3 && process.argv[2] === "--shared-host";
 if (process.argv.length > 2 && !sharedHost) {
@@ -442,6 +445,9 @@ try {
   const tokenProbe = compileFixture(tokenSource, "test-token", ["advapi32.lib"]);
   const appContainerFixture = compileFixture(appContainerSource, "test-appcontainer",
     ["advapi32.lib", "userenv.lib", "ws2_32.lib", "ole32.lib", "fwpuclnt.lib", "dnsapi.lib"], [wfpSource]);
+  const launcherChild = compileFixture(launcherChildSource, "test-agent-launcher-child", []);
+  const launcherFixture = compileFixture(launcherTestSource, "test-agent-launcher",
+    ["advapi32.lib", "userenv.lib", "ole32.lib", "fwpuclnt.lib"], [launcherSource, wfpSource]);
   rootInspectionFixture = compileFixture(hostPreflightSource, "test-host-preflight", ["advapi32.lib"]);
   rootArgs = sharedHost ? ["root-snapshot"] : ["prepared-host", acceptanceRoot];
   const inspected = spawnSync(rootInspectionFixture, rootArgs,
@@ -544,6 +550,11 @@ try {
     assert.match(wfpCheck.stdout, /WFP-JOB-REVOKED/);
     assert.match(wfpCheck.stdout, /WFP-PREFLIGHT-REVOKED/);
     if (!sharedHost) {
+      const launched = spawnSync(launcherFixture, [launcherChild],
+        { encoding: "utf8", windowsHide: true, timeout: 60_000 });
+      assert.equal(launched.status, 0,
+        launched.stderr || launched.error?.message || "The broker-owned launcher fixture failed.");
+      assert.match(launched.stdout, /LAUNCHER-SUSPEND-REGISTER-REVOKE-PASSED/);
       dnsCapture = await startDnsCapture();
       await acceptsAppContainer(profiles[0], brokerSid, logonLuid, sessionId,
         { intruderProfile: profiles[1], sameProfileOutOfJob: true });
