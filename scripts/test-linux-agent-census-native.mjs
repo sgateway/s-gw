@@ -89,19 +89,27 @@ async function checkCensus(pid, cgroup, shouldPass) {
 
 async function assertHeldFd(pid, mode) {
   const base = `/proc/${pid}/fd`;
-  const extra = (await readdir(base)).filter(value => /^\d+$/.test(value))
-    .map(Number).filter(value => value > 2).sort((a, b) => a - b);
+  const fds = (await readdir(base)).filter(value => /^\d+$/.test(value))
+    .map(Number).sort((a, b) => a - b);
+  const extra = fds.filter(value => value > 2);
+  const targets = new Map();
+  for (const fd of fds.slice(0, 16)) {
+    try { targets.set(fd, (await readlink(`${base}/${fd}`)).slice(0, 256)); }
+    catch (error) { targets.set(fd, `<${error.code || "readlink-error"}>`); }
+  }
+  const detail = (`count=${fds.length}; fds=${fds.slice(0, 16).join(",")}` +
+    `${fds.length > 16 ? ",..." : ""}; ` +
+    `targets=${[...targets].map(([fd, target]) => `${fd}=${target}`).join(",")}`).slice(0, 2048);
   if (mode === "extra") {
-    if (extra.length !== 1 || extra[0] !== 3 ||
-        !(await readlink(`${base}/3`)).endsWith("/ready")) {
-      throw new Error("Census extra-FD adversary did not hold its regular descriptor.");
+    if (extra.length !== 1 || extra[0] !== 3 || !targets.get(3)?.endsWith("/ready")) {
+      throw new Error(`Census extra-FD adversary did not hold its regular descriptor: ${detail}`);
     }
     return;
   }
   if (extra.length !== 2 || extra[0] !== 3 || extra[1] !== 4 ||
-      !/^socket:\[\d+\]$/.test(await readlink(`${base}/3`)) ||
-      !/^socket:\[\d+\]$/.test(await readlink(`${base}/4`))) {
-    throw new Error("Census socket adversary did not hold its connected descriptors.");
+      !/^socket:\[\d+\]$/.test(targets.get(3) || "") ||
+      !/^socket:\[\d+\]$/.test(targets.get(4) || "")) {
+    throw new Error(`Census socket adversary did not hold its connected descriptors: ${detail}`);
   }
 }
 
