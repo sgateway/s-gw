@@ -132,7 +132,89 @@ describe("MCP end-to-end flow", () => {
       await client.close();
     }
   }, 20_000);
+
+  it("keeps the result of a command that outlives the client's request timeout", async () => {
+    const { handle, requestId } = prepareSlowRequest(2_500);
+    // the server answers after 400 ms; the client would give up after 1.5 s
+    const client = await connect({ SGW_MCP_FOREGROUND_MS: "400" });
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toContain("sgw_wait_execution");
+
+      const first = await client.callTool({ name: "sgw_execute_request", arguments: { requestId } }, undefined, { timeout: 1_500 });
+      expect(first.isError).not.toBe(true);
+      const pending = JSON.parse(first.content[0].text);
+      expect(pending.running).toBe(true);
+      expect(pending.runId).toMatch(/^run_/);
+      expect(pending.operation).toBe("sgw_execute_request");
+
+      let payload = pending;
+      for (let i = 0; i < 20 && payload.running; i++) {
+        const next = await client.callTool({ name: "sgw_wait_execution", arguments: { runId: pending.runId } }, undefined, { timeout: 1_500 });
+        expect(next.isError).not.toBe(true);
+        payload = JSON.parse(next.content[0].text);
+      }
+      expect(payload.running).toBeUndefined();
+      expect(payload.exitCode).toBe(0);
+      expect(payload.stdout).not.toContain("mcp-e2e-secret-value");
+      expect(payload.stdout).toContain(`<<SGW_SECRET:${handle}>>`);
+      expect(payload.proof).toMatch(/^s-gw-proof:/);
+
+      const unknown = await client.callTool({ name: "sgw_wait_execution", arguments: { runId: "run_missing" } });
+      expect(unknown.isError).toBe(true);
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
+  it("shows the failure this guards against when the budget is longer than the client waits", async () => {
+    const { requestId } = prepareSlowRequest(2_500);
+    const client = await connect({ SGW_MCP_FOREGROUND_MS: "600000" });
+    try {
+      await expect(
+        client.callTool({ name: "sgw_execute_request", arguments: { requestId } }, undefined, { timeout: 1_000 })
+      ).rejects.toThrow(/timed out/i);
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
 });
+
+function prepareSlowRequest(delayMs: number): { handle: string; requestId: string } {
+  runCli(["init"]);
+  const added = JSON.parse(
+    runCli(
+      ["secret", "add", "--name", "mcp-e2e-slow", "--type", "api-token", "--value-stdin", "--inject-env", "SGW_E2E_TOKEN", "--allow-command", process.execPath],
+      "mcp-e2e-secret-value-1234567890"
+    )
+  );
+  const requested = JSON.parse(
+    runCli([
+      "request", "env-command", added.handle,
+      "--command", process.execPath,
+      "--inject-env", "SGW_E2E_TOKEN",
+      "--arg", "-e",
+      "--arg", `setTimeout(() => console.log(process.env.SGW_E2E_TOKEN), ${delayMs})`,
+      "--reason", "vitest slow mcp e2e"
+    ])
+  );
+  const requestId = requested.id ?? requested.request?.id;
+  runCli(["approve", requestId]);
+  return { handle: added.handle, requestId };
+}
+
+async function connect(extraEnv: Record<string, string>): Promise<Client> {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [tsxCli, "src/mcp-server.ts"],
+    cwd: repoRoot,
+    env: { ...(testEnv as Record<string, string>), ...extraEnv },
+    stderr: "pipe"
+  });
+  const client = new Client({ name: "codex-mcp-client", version: "0.0.1" });
+  await client.connect(transport);
+  return client;
+}
 
 function runCli(args: string[], input?: string): string {
   return execFileSync(process.execPath, [tsxCli, "src/cli.ts", ...args], {

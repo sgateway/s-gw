@@ -14,6 +14,7 @@ Core rules:
 - Use `sgw_list_handles` and `sgw_describe_handle` when the agent needs to reason about available secrets.
 - Use `sgw_request_execution` to create a bounded operation manifest. The user must approve the request locally before execution.
 - Use `sgw_execute_request` only after approval. Returned output is sanitized and should be treated as the only model-visible result.
+- If an execution answers with `running: true` and a `runId`, the command is still going. Call `sgw_wait_execution` with that `runId` until the result arrives. Do not start the command again.
 - If a secret-backed action is too broad, ask for a narrower operation instead of requesting blanket access.
 
 s-gw is local-first. The MCP server runs on the user's machine over stdio. Raw secrets should remain in the local encrypted ledger or local OS/vault-backed stores.
