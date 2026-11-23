@@ -3,6 +3,9 @@ import { sanitizeKnownSecrets, tokenForHandle } from "./scanner.js";
 export const SGW_OUTPUT_TRUNCATED = "\n<<SGW_OUTPUT_TRUNCATED>>";
 export const MIN_STABLE_SECRET_FRAGMENT = 6;
 export const MAX_CAPTURE_HEADROOM_BYTES = 1_048_576;
+export const MIN_ENCODED_SECRET_LENGTH = 8;
+
+type SecretPair = { handle: string; value: string };
 
 export function utf8ByteLength(text: string): number {
   return Buffer.byteLength(text, "utf8");
@@ -56,20 +59,90 @@ export function appendUtf8Bounded(
   return { text: clipUtf8Bytes(combined, maxBytes), truncated: true };
 }
 
+export function encodedSecretForms(value: string): string[] {
+  if (value.length < MIN_ENCODED_SECRET_LENGTH) {
+    return [];
+  }
+  const raw = Buffer.from(value, "utf8");
+  const hex = raw.toString("hex");
+  const candidates = [
+    raw.toString("base64"),
+    raw.toString("base64url"),
+    hex,
+    hex.toUpperCase(),
+    uriEncoded(value)
+  ];
+  const forms: string[] = [];
+  for (const form of candidates) {
+    if (form === value || form.length < MIN_ENCODED_SECRET_LENGTH || forms.includes(form)) {
+      continue;
+    }
+    forms.push(form);
+  }
+  return forms;
+}
+
+export function sanitizeKnownSecretForms(text: string, pairs: SecretPair[]): string {
+  let out = text;
+  const ordered = [...pairs].sort((left, right) => right.value.length - left.value.length);
+  for (const pair of ordered) {
+    // sanitizeKnownSecrets goes longest first, so padded base64 is replaced
+    // before its unpadded twin and no stray "=" is left behind.
+    out = sanitizeKnownSecrets(out, withEncodedForms([pair]));
+  }
+  return out;
+}
+
 export function sanitizeCapturedOutput(
   text: string,
-  pairs: Array<{ handle: string; value: string }>,
+  pairs: SecretPair[],
   maxBytes: number,
-  options: { rawTruncated?: boolean } = {}
+  options: { rawTruncated?: boolean; encodedForms?: boolean; fragmentsOnlyWhenTruncated?: boolean } = {}
 ): { text: string; changed: boolean } {
   const body = stripTrailingTruncationMarkers(text);
-  const replaced = sanitizeKnownSecrets(body, pairs);
-  const minFragment = options.rawTruncated ? 1 : MIN_STABLE_SECRET_FRAGMENT;
-  const redacted = redactTrailingSecretFragments(replaced, pairs, minFragment);
+  const replaced = options.encodedForms
+    ? sanitizeKnownSecretForms(body, pairs)
+    : sanitizeKnownSecrets(body, pairs);
+  const minFragment = trailingFragmentFloor(options);
+  // A capture cut can land inside an encoded copy too, so those prefixes count as fragments.
+  const fragmentPairs = options.encodedForms ? withEncodedForms(pairs) : pairs;
+  const redacted = redactTrailingSecretFragments(replaced, fragmentPairs, minFragment);
   return {
     text: capUtf8Bytes(redacted, maxBytes),
     changed: redacted !== body
   };
+}
+
+function trailingFragmentFloor(options: { rawTruncated?: boolean; fragmentsOnlyWhenTruncated?: boolean }): number {
+  if (options.rawTruncated) {
+    return 1;
+  }
+  // Command output is arbitrary text: a complete stream that merely ends in a
+  // word shared with a secret's prefix must come back unchanged.
+  return options.fragmentsOnlyWhenTruncated ? 0 : MIN_STABLE_SECRET_FRAGMENT;
+}
+
+function withEncodedForms(pairs: SecretPair[]): SecretPair[] {
+  const out: SecretPair[] = [];
+  for (const pair of pairs) {
+    if (!pair.value) {
+      continue;
+    }
+    out.push(pair);
+    for (const form of encodedSecretForms(pair.value)) {
+      out.push({ handle: pair.handle, value: form });
+    }
+  }
+  return out;
+}
+
+function uriEncoded(value: string): string {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    // Lone surrogates cannot be percent-encoded; there is no such form to redact.
+    return "";
+  }
 }
 
 export function redactTrailingSecretFragments(

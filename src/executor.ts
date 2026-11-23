@@ -10,8 +10,9 @@ import {
   type ReusableExecutionPermit,
   type SecretStore
 } from "./store.js";
-import { sanitizeKnownSecrets } from "./scanner.js";
+import { appendUtf8Bounded, captureHeadroomBytes, encodedSecretForms, sanitizeCapturedOutput } from "./output-redaction.js";
 import { assertSshCredentialSupported, runOwnedSshSession } from "./ssh.js";
+import { listDescendantPids, signalPids } from "./process-descendants.js";
 import { killProcessTree, spawnIsolated } from "./process-tree.js";
 import type { AgentIdentityContext } from "./agent-context.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
@@ -344,7 +345,7 @@ function startRustEnvCommand(
     }
     const summary = parseCoreSummary(parsed, request);
     const secretValues = [secretValue, ...extraSecrets.map((item) => item.value)];
-    if (secretValues.some((value) => summary.stdout.includes(value) || summary.stderr.includes(value))) {
+    if (secretValues.some((value) => exposesSecret(summary, value))) {
       throw new Error("Rust execution core returned unsanitized output.");
     }
 
@@ -385,6 +386,14 @@ function parseCoreSummary(value: unknown, request: RequestRecord): ExecutionSumm
   }
 
   return summary as unknown as ExecutionSummary;
+}
+
+function exposesSecret(summary: ExecutionSummary, value: string): boolean {
+  if (!value) return false;
+  for (const form of [value, ...encodedSecretForms(value)]) {
+    if (summary.stdout.includes(form) || summary.stderr.includes(form)) return true;
+  }
+  return false;
 }
 
 function executionEngine(override?: ExecutionOptions["engine"]): "auto" | "rust" | "typescript" {
@@ -533,11 +542,10 @@ function startTypeScriptEnvCommand(
     { handle: request.handle, value: secretValue },
     ...extraSecrets.map((item) => ({ handle: item.handle, value: item.value }))
   ];
-  const longestSecretBytes = secretPairs.reduce((max, item) => Math.max(max, Buffer.byteLength(item.value, "utf8")), 0);
-  // Capture slightly more than the display cap so a secret that straddles the
-  // boundary is still present in full when we sanitize. Without this headroom,
-  // truncating raw output first could cut a secret in half and leak the prefix.
-  const captureCap = maxOutput + longestSecretBytes;
+  // Capture more than the display cap so a secret that straddles the boundary
+  // is still present in full when we sanitize. The headroom covers every secret,
+  // because tokens are shorter than long secrets and pull later bytes into view.
+  const captureCap = maxOutput + captureHeadroomBytes(secretPairs.map((item) => item.value));
   const env = buildExecutionEnv(request.action.injectEnv, secretValue, extraSecrets);
   const launch = assertAuthorized ? spawnIsolated : spawn;
   const child = launch(command, request.action.args, {
@@ -552,26 +560,25 @@ function startTypeScriptEnvCommand(
   }
   const monitor = monitorLegacyAuthorization(child, assertAuthorized);
 
-  let stdout = "";
-  let stderr = "";
+  const stdout = { text: "", truncated: false };
+  const stderr = { text: "", truncated: false };
   let timedOut = false;
   let killTimer: NodeJS.Timeout | undefined;
   const timeout = request.action.timeoutMs > 0
     ? setTimeout(() => {
       timedOut = true;
-      if (assertAuthorized) killProcessTree(child, "SIGTERM"); else child.kill("SIGTERM");
-      killTimer = setTimeout(() => {
-        if (assertAuthorized) killProcessTree(child, "SIGKILL"); else child.kill("SIGKILL");
-      }, 1_500);
+      if (assertAuthorized) {
+        killProcessTree(child, "SIGTERM");
+        killTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_500);
+        return;
+      }
+      const signalled = killWithDescendants(child, "SIGTERM");
+      killTimer = setTimeout(() => killWithDescendants(child, "SIGKILL", signalled), 1_500);
     }, request.action.timeoutMs)
     : undefined;
 
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdout = appendBounded(stdout, chunk.toString("utf8"), captureCap);
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderr = appendBounded(stderr, chunk.toString("utf8"), captureCap);
-  });
+  child.stdout.on("data", (chunk: Buffer) => appendCapture(stdout, chunk, captureCap));
+  child.stderr.on("data", (chunk: Buffer) => appendCapture(stderr, chunk, captureCap));
 
   const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.on("error", reject);
@@ -586,20 +593,18 @@ function startTypeScriptEnvCommand(
     const revoked = await monitor?.stop();
     if (revoked) throw revoked;
 
-    const sanitizedStdout = sanitizeKnownSecrets(stdout, secretPairs);
-    const sanitizedStderr = sanitizeKnownSecrets(stderr, secretPairs);
-    const cleanStdout = capBytes(sanitizedStdout, maxOutput);
-    const cleanStderr = capBytes(sanitizedStderr, maxOutput);
+    const cleanStdout = sanitizeCapture(stdout, secretPairs, maxOutput);
+    const cleanStderr = sanitizeCapture(stderr, secretPairs, maxOutput);
     return {
       exitCode: timedOut ? 124 : status.code,
       signal: status.signal,
-      stdout: cleanStdout,
-      stderr: cleanStderr,
-      proof: proofFor(request, cleanStdout, cleanStderr),
+      stdout: cleanStdout.text,
+      stderr: cleanStderr.text,
+      proof: proofFor(request, cleanStdout.text, cleanStderr.text),
       durationMs: Date.now() - started,
       timeoutMs: request.action.timeoutMs,
       timedOut,
-      sanitized: sanitizedStdout !== stdout || sanitizedStderr !== stderr
+      sanitized: cleanStdout.changed || cleanStderr.changed
     } satisfies ExecutionSummary;
   }).catch(async (error: unknown) => {
     if (timeout) clearTimeout(timeout);
@@ -609,6 +614,42 @@ function startTypeScriptEnvCommand(
   });
   void completion.catch(() => undefined);
   return { completion };
+}
+
+interface BoundedCapture {
+  text: string;
+  truncated: boolean;
+}
+
+function appendCapture(capture: BoundedCapture, chunk: Buffer, maxBytes: number): void {
+  const next = appendUtf8Bounded(capture.text, chunk.toString("utf8"), maxBytes);
+  capture.text = next.text;
+  capture.truncated ||= next.truncated;
+}
+
+function sanitizeCapture(
+  capture: BoundedCapture,
+  pairs: Array<{ handle: string; value: string }>,
+  maxBytes: number
+): { text: string; changed: boolean } {
+  return sanitizeCapturedOutput(capture.text, pairs, maxBytes, {
+    rawTruncated: capture.truncated,
+    encodedForms: true,
+    fragmentsOnlyWhenTruncated: true
+  });
+}
+
+// The default path keeps the caller's process group (Ctrl-C and terminal prompts
+// still work) and needs no cgroup, so the tree is found by walking parent pids.
+function killWithDescendants(child: ChildProcess, signal: NodeJS.Signals, earlier: number[] = []): number[] {
+  // A reaped child's pid can be reused, so only walk the tree of a live one.
+  const running = child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+  const pids = running ? listDescendantPids(child.pid!) : [];
+  // Orphans are reparented once the child exits, so the earlier snapshot is the
+  // only way left to reach a descendant that ignored the first signal.
+  signalPids([...earlier, ...pids], signal);
+  child.kill(signal);
+  return pids;
 }
 
 function monitorLegacyAuthorization(child: ChildProcess, assertAuthorized?: () => Promise<void>):
