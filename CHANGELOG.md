@@ -4,6 +4,15 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 
 ## Unreleased
 
+### Security
+
+- The npm package now bundles Anthropic sandbox-runtime 0.0.50 resolved against Zod 4.6.7 instead of the nested Zod 3 copy affected by GHSA-mrhx-c7xc-m3w5. A packed-consumer check verifies the installed tree and its audit before publishing. The package tarball grows from about 5.1 MB to 7.6 MB.
+- Updated body-parser to 2.4.0, Hono to 4.13.19, @hono/node-server to 2.1.9, fast-uri to 3.1.9, ip-address to 10.7.6, qs to 6.17.1, Vitest to 4.1.12, and the desktop app's `url` crate to 2.5.9.
+
+### Fixed
+
+- Documented the AppArmor settings the Anthropic sandbox needs on Ubuntu 24.04 and 26.04.
+
 ## 0.1.22 - 2026-10-05
 
 ### Added

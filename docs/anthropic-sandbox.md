@@ -10,6 +10,13 @@ s-gw run claude-code --sandbox anthropic --cwd /path/to/project
 
 The existing builtin guard is still the default. macOS and Linux use Anthropic sandbox-runtime 0.0.50. Linux needs bubblewrap, socat, ripgrep, and a writable delegated cgroup v2. The pinned runtime has no native Windows backend; the existing Windows app, CLI, SSH, and integrations remain supported.
 
+On Ubuntu, AppArmor can keep the sandbox from starting, because bubblewrap and the runtime's seccomp helper both need user namespaces that carry capabilities:
+
+- Ubuntu 24.04 and later: set `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+- Ubuntu 26.04: bubblewrap also has its own profile, `bwrap-userns-restrict`. While it is loaded the launch ends with `apply-seccomp: write /proc/self/setgroups ... Permission denied`. `sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict` unloads it until AppArmor reloads its profiles.
+
+Both settings loosen a host-wide protection, so apply them only where that is acceptable.
+
 ## Credential-backed actions
 
 The sandbox MCP connection exposes handle metadata, HTTPS requests, SSH requests, SSH uploads, and approved execution. It does not expose scanning, raw secret reads, or generic credential-bearing commands. Ordinary MCP retains its existing tools.

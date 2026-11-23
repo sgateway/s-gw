@@ -46,12 +46,20 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          # Ubuntu 26.04 also confines bwrap with its own AppArmor profile: whatever bwrap starts gets
+          # user namespaces without capabilities, and the sandbox's seccomp helper cannot start.
+          if [ -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict
+          fi
+          # stop here with the real cause if a runner image breaks this again
+          bwrap --unshare-user --dev-bind / / node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/x64/apply-seccomp /bin/true
       - run: npm run check:rust
       - run: npm run check
       - run: npm run build
       - run: npm test
       - run: npm run audit:release
       - run: npm run package:dry-run
+      - run: npm run test:packed-consumer
 
   macos-native:
     name: macOS native surfaces
