@@ -141,13 +141,22 @@ try {
     const execute = () => ordinaryMcp.callTool({ name: 'sgw_execute_request', arguments: { requestId: request.id } });
     assert.equal((await execute()).isError, true);
     legacyCli(['approve', request.id]);
-    const denied = await execute();
-    assert.equal(denied.isError, true);
-    assert.match(denied.content[0].text, /verified agent principal and session/);
-    const summary = legacyCli(['execute', request.id]);
+    const executed = await execute(); assert(!executed.isError, JSON.stringify(executed));
+    const summary = JSON.parse(executed.content[0].text);
     assert.equal(summary.exitCode, 0); assert.match(summary.stdout, /ordinary MCP success/);
     assert(!summary.stdout.includes(legacyValue)); assert.match(summary.stdout, /SGW_SECRET/);
     assert.equal((await execute()).isError, true);
+    // A request the operator created carries no agent session, so only the operator can run it.
+    const operatorRequest = legacyCli(['request', 'env-command', legacyHandle.handle, '--command', process.execPath, '--inject-env', 'SGW_LEGACY_CREDENTIAL',
+      '--args-json', JSON.stringify(['-e', 'console.log("operator CLI success", process.env.SGW_LEGACY_CREDENTIAL)']), '--timeout-ms', '10000']);
+    assert.equal(operatorRequest.state, 'pending'); assert.equal(operatorRequest.requesterSession, undefined);
+    legacyCli(['approve', operatorRequest.id]);
+    const foreign = await ordinaryMcp.callTool({ name: 'sgw_execute_request', arguments: { requestId: operatorRequest.id } });
+    assert.equal(foreign.isError, true);
+    assert.match(foreign.content[0].text, /only requests its own session created/);
+    const operatorSummary = legacyCli(['execute', operatorRequest.id]);
+    assert.equal(operatorSummary.exitCode, 0); assert.match(operatorSummary.stdout, /operator CLI success/);
+    assert(!operatorSummary.stdout.includes(legacyValue)); assert.match(operatorSummary.stdout, /SGW_SECRET/);
     assert(!String(await readFile(path.join(legacyEnv.SGW_HOME, 'store.json'))).includes(legacyValue));
   } finally { await ordinaryMcp.close(); }
   for (const handle of legacyCli(['secret', 'list'])) legacyCli(['secret', 'delete', handle.handle]);
@@ -252,32 +261,16 @@ try {
   const state = await api('api/state'); assert.equal(state.pendingRequests.length, 3);
   await api(`api/requests/${pending.changed}/deny`, {});
   const approved = await api(`api/requests/${pending.http}/approve`, { mode: 'timed-session', durationMs: 60000, agentScope: 'same-agent' });
-  assert.equal(approved.approvalGrantId, undefined);
+  assert(approved.approvalGrantId);
   await api(`api/requests/${pending.ssh}/approve`, { mode: 'per-transaction', agentScope: 'same-agent' });
   await writeFile(path.join(workspace, 'approved'), 'synthetic operator approved');
-  const deniedClaims = await waitFor(() => jsonFile('claims-denied.json'), 'ordinary MCP claim denial');
-  assert.equal(deniedClaims.http, pending.http); assert.equal(deniedClaims.ssh, pending.ssh);
-  assert.equal(httpHits, 0); assert.equal(sshAuthentications, 0);
-  const httpResult = await executeCli(pending.http);
-  const sshResult = await executeCli(pending.ssh);
-  assert.equal(httpResult.exitCode, 0); assert.equal(sshResult.exitCode, 0);
-  await writeFile(path.join(workspace, 'operator-results.json'), JSON.stringify({ http: httpResult, ssh: sshResult }));
-  const repeat = await waitFor(() => jsonFile('repeat-pending.json'), 'repeat HTTPS request');
-  assert.equal(repeat.state, 'pending');
-  assert.equal(httpHits, 1);
-  await api(`api/requests/${repeat.id}/approve`, { mode: 'per-transaction', agentScope: 'same-agent' });
-  await writeFile(path.join(workspace, 'repeat-approved'), 'synthetic operator approved repeat');
-  const repeatDenied = await waitFor(() => jsonFile('repeat-claim-denied.json'), 'repeat ordinary MCP claim denial');
-  assert.equal(repeatDenied.id, repeat.id); assert.equal(httpHits, 1);
-  const repeatResult = await executeCli(repeat.id);
-  assert.equal(repeatResult.exitCode, 0);
-  await writeFile(path.join(workspace, 'repeat-operator-result.json'), JSON.stringify(repeatResult));
   const result = await Promise.race([first.completion, new Promise((_resolve, reject) => { const timer = setTimeout(() => reject(new Error('E2E launcher timed out')), 30000); timer.unref(); })]);
   assert.equal(result.code, 0, result.output);
   assert.equal(httpHits, 2); assert.equal(sshAuthentications, 1); assert.deepEqual(commands, ['hostname']);
   const outputs = await readFile(path.join(workspace, 'results.json'), 'utf8');
   for (const value of values) { assert(!outputs.includes(value)); assert(!result.output.includes(value)); }
   await closedSession(); await waitFor(() => clients.size === 0, 'SSH session cleanup');
+  await api(`api/approval/grants/${approved.approvalGrantId}`, undefined, 'DELETE');
   await writeFile(path.join(workspace, 'fresh-mode'), '1');
   const fresh = launch(); const freshResult = await fresh.completion;
   assert.equal(freshResult.code, 0, freshResult.output);
@@ -335,8 +328,8 @@ try {
   for (const value of values) assert(!JSON.stringify(finalState).includes(value));
   console.log(JSON.stringify({ packageInstalled: true, ordinaryMcp: true, legacyEnvExecution: true, compiledLauncher: true, realHttps: true, realOpenSsh: true,
     consoleApproval: true, pendingDenied: true, changedActionDenied: true, replayDenied: true,
-    unverifiedManualOwnedClaimsDenied: true, operatorOwnedExecution: true,
-    unverifiedRepeatRequiresManualApproval: true, freshRunStillPending: true, credentialsRedacted: true, cleanup: true,
+    requesterSessionExecution: true, operatorCreatedClaimDenied: true,
+    exactGrantReused: true, freshRunAfterRevocationDenied: true, credentialsRedacted: true, cleanup: true,
     cgroupRequired: process.platform === 'linux' && process.argv.includes('--require-cgroup'), isolatedAuth,
     unknownInheritedEnvDenied: isolatedAuth,
     realAgent: realAgent || 'not requested' }));
