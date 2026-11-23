@@ -478,14 +478,19 @@ struct RequestRecord: Decodable, Identifiable, Hashable {
     return "Agent"
   }
 
+  var hasSignedLauncherIdentity: Bool {
+    agentSource == "signed-launcher" && hasVerifiedAgentIdentity
+  }
+
   var hasVerifiedAgentIdentity: Bool {
-    agentSource == "managed-peer" &&
+    (agentSource == "managed-peer" || agentSource == "signed-launcher") &&
       !(principalId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) &&
       !(agentSessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
   }
 
   var agentIdentitySummary: String {
-    hasVerifiedAgentIdentity ? "Verified OS identity" : "Unverified agent name"
+    if hasSignedLauncherIdentity { return "Trusted app signature" }
+    return hasVerifiedAgentIdentity ? "Verified OS identity" : "Unverified agent name"
   }
 
   var agentIdentityDetails: String {

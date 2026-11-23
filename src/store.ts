@@ -1,5 +1,13 @@
 import { assertHttpDestination, buildHttpRequestAction, SGW_HTTP_COMMAND } from "./http-action.js";
 import { assertNamedDestinationsAllowed, parseAllowedDestination } from "./destinations.js";
+import {
+  isAttestedLauncherChain,
+  launcherPrincipalId,
+  launcherSessionId,
+  validIdentifier,
+  validTeamId,
+  type LauncherSignature
+} from "./launcher-signature.js";
 import { normalizeManagedSshRoute, type ManagedSshRoute } from "./managed-ssh.js";
 import { buildModelRelayAction, grantFromModelRelayAction, normalizeModelRelayAction, SGW_MODEL_RELAY_COMMAND, type ModelRelayGrant } from "./model-relay-action.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -53,6 +61,7 @@ import type {
   ExecutionSummary,
   HandleSummary,
   ManagedSshRouteRecord,
+  ObservedLauncherSignature,
   RequestRecord,
   RequestState,
   SecretPolicy,
@@ -61,7 +70,8 @@ import type {
   SecretType,
   SecretValueCache,
   SshTransferSpec,
-  StoreFile
+  StoreFile,
+  TrustedLauncher
 } from "./types.js";
 
 const defaultApprovalSettings: ApprovalSettings = {
@@ -311,6 +321,27 @@ interface StoreControlState {
 }
 
 export type AuthorizationSealStatus = "sealed" | "unsealed" | "invalid" | "locked";
+
+export interface AddTrustedLauncherInput {
+  name: string;
+  teamId?: string;
+  identifier?: string;
+  /** Take the signature from the process ancestry recorded on this request. */
+  requestId?: string;
+  /** Also bind existing allow policies that name this agent to the pinned signature. */
+  bindPolicies?: boolean;
+}
+
+export interface AddTrustedLauncherResult {
+  launcher: TrustedLauncher;
+  principalId: string;
+  boundPolicies: number;
+}
+
+export interface RemoveTrustedLauncherResult {
+  launcher: TrustedLauncher;
+  revokedApprovalGrants: number;
+}
 
 export interface AuthorizationSealResult {
   status: AuthorizationSealStatus;
@@ -1206,6 +1237,90 @@ export class SecretStore {
     });
   }
 
+  async listTrustedLaunchers(): Promise<TrustedLauncher[]> {
+    const store = await this.read();
+    return [...(store.trustedLaunchers || [])].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Pins a code signature as the identity of an agent's launching application. Requests whose
+   * process ancestry carries that signature then count as a verified agent for grants and policies.
+   */
+  async addTrustedLauncher(input: AddTrustedLauncherInput): Promise<AddTrustedLauncherResult> {
+    return this.mutate((store) => {
+      const name = trustedLauncherName(input.name);
+      const signature = input.requestId
+        ? launcherSignatureFromRequest(store, input.requestId, input.identifier)
+        : { teamId: input.teamId, identifier: input.identifier };
+      if (!validTeamId(signature.teamId) || !validIdentifier(signature.identifier)) {
+        throw new Error("A trusted launcher needs a 10-character team ID and a signing identifier.");
+      }
+      if (isGeneralPurposeRuntime(signature.identifier)) {
+        throw new Error(
+          `${signature.identifier} is a general-purpose runtime. Any script it runs would share this identity, so it cannot be trusted as an agent.`
+        );
+      }
+      const launchers = store.trustedLaunchers || [];
+      if (launchers.some((item) => item.teamId === signature.teamId && item.identifier === signature.identifier)) {
+        throw new Error("This code signature is already trusted.");
+      }
+      if (launchers.some((item) => item.name.toLowerCase() === name.toLowerCase())) {
+        throw new Error(`A trusted launcher named ${name} already exists.`);
+      }
+
+      const now = new Date().toISOString();
+      const launcher: TrustedLauncher = {
+        id: shortId("launcher"),
+        name,
+        teamId: signature.teamId,
+        identifier: signature.identifier,
+        createdAt: now
+      };
+      store.trustedLaunchers = [...launchers, launcher];
+      store.audit.push(audit(
+        "agent.launcher.trusted",
+        `Trusted code signature ${launcher.teamId} ${launcher.identifier} as ${name}.`
+      ));
+
+      const principalId = launcherPrincipalId(launcher);
+      let boundPolicies = 0;
+      if (input.bindPolicies) {
+        for (const rule of store.approvalPolicyRules) {
+          const names = rule.conditions.agents || [];
+          if (rule.decision !== "allow" || rule.conditions.principalIds?.length || !names.includes(name.toLowerCase())) {
+            continue;
+          }
+          rule.conditions.principalIds = [principalId];
+          rule.updatedAt = now;
+          boundPolicies += 1;
+          store.audit.push(audit("approval.policy.updated", `Bound approval policy ${rule.name} to trusted launcher ${name}.`));
+        }
+      }
+      return { launcher, principalId, boundPolicies };
+    });
+  }
+
+  async removeTrustedLauncher(id: string): Promise<RemoveTrustedLauncherResult> {
+    return this.mutate((store) => {
+      const launchers = store.trustedLaunchers || [];
+      const launcher = launchers.find((item) => item.id === id);
+      if (!launcher) {
+        throw new Error(`Unknown trusted launcher: ${id}`);
+      }
+      const principalId = launcherPrincipalId(launcher);
+      const remaining = launchers.filter((item) => item.id !== id);
+      store.trustedLaunchers = remaining.length ? remaining : undefined;
+      const before = store.approvalGrants.length;
+      store.approvalGrants = store.approvalGrants.filter((grant) => grant.principalId !== principalId);
+      const revokedApprovalGrants = before - store.approvalGrants.length;
+      store.audit.push(audit(
+        "agent.launcher.removed",
+        `Removed trusted code signature ${launcher.teamId} ${launcher.identifier} (${launcher.name}) and ${revokedApprovalGrants} approval grants.`
+      ));
+      return { launcher, revokedApprovalGrants };
+    });
+  }
+
   async listManagedSshRoutes(): Promise<ManagedSshRouteRecord[]> {
     const store = await this.read();
     return [...(store.managedSshRoutes || [])].sort((a, b) => a.name.localeCompare(b.name));
@@ -1383,8 +1498,8 @@ export class SecretStore {
 
   async validateReusableExecutionPermit(permit: ReusableExecutionPermit, caller?: AgentIdentityContext): Promise<RequestRecord> {
     assertReusableExecutionPermit(permit, this.home);
-    assertExecutionCaller(permit, caller);
     const store = await this.read();
+    assertExecutionCaller(permit, caller, false, store);
     return validatedReusableExecutionRequest(store, permit);
   }
 
@@ -1397,7 +1512,7 @@ export class SecretStore {
     await ensureSgwHome(this.home);
     const started = await this.withSealKey(() => this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
-      assertExecutionCaller(permit, caller);
+      assertExecutionCaller(permit, caller, false, store);
       const request = validatedReusableExecutionRequest(store, permit);
       return launch(request);
     }));
@@ -1533,7 +1648,7 @@ export class SecretStore {
         throw new Error(`Unknown secret handle: ${request.handle}`);
       }
       const agent = identityFromRequest(request);
-      if (!canAutoApproveAgent(agent)) {
+      if (!canAutoApproveAgent(store, agent)) {
         throw new Error("An allow policy requires a verified agent. Approve this request once instead.");
       }
       const agentName = agent.principalId ? agent.name : durablePolicyAgentName(request);
@@ -1665,7 +1780,7 @@ export class SecretStore {
       if (request.state !== "approved") {
         throw new Error(`Request ${id} is ${request.state}; local approval is required before execution.`);
       }
-      assertExecutionCaller(request, caller, true);
+      assertExecutionCaller(request, caller, true, store);
 
       const unsealed = assertRequestApprovalSealed(request);
       if (unsealed) {
@@ -2382,6 +2497,7 @@ function controlPlaneFingerprint(store: StoreFile): string {
     approvalGrants: grants,
     approvalPolicyRules: rules,
     ...(store.managedSshRoutes?.length ? { managedSshRoutes: [...store.managedSshRoutes].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
+    ...(store.trustedLaunchers?.length ? { trustedLaunchers: [...store.trustedLaunchers].sort((a, b) => a.id.localeCompare(b.id)) } : {}),
     ...(store.credentialOps?.length ? { credentialOps: [...store.credentialOps].sort((a, b) => a.id.localeCompare(b.id)) } : {})
   };
   return createHash("sha256").update(JSON.stringify(canonicalValue(control))).digest("hex");
@@ -2421,7 +2537,8 @@ function controlPlaneSnapshot(store: StoreFile): StoreFile {
     approvalGrants: store.approvalGrants,
     approvalPolicyRules: store.approvalPolicyRules,
     managedSshRoutes: store.managedSshRoutes,
-    credentialOps: store.credentialOps?.length ? store.credentialOps : undefined
+    credentialOps: store.credentialOps?.length ? store.credentialOps : undefined,
+    trustedLaunchers: store.trustedLaunchers?.length ? store.trustedLaunchers : undefined
   };
 }
 
@@ -2505,6 +2622,7 @@ function controlPlaneIsEmpty(store: StoreFile): boolean {
     store.approvalPolicyRules.length === 0 &&
     !store.managedSshRoutes?.length &&
     !store.credentialOps?.length &&
+    !store.trustedLaunchers?.length &&
     store.consoleAccess === undefined &&
     JSON.stringify(canonicalValue(store.approvalSettings)) === JSON.stringify(canonicalValue(defaultApprovalSettings));
 }
@@ -3399,8 +3517,70 @@ function normalizeStoreFile(parsed: Partial<StoreFile>): StoreFile {
       : [],
     approvalPolicyRules: storedApprovalPolicyRules(parsed.approvalPolicyRules),
     managedSshRoutes: storedManagedSshRoutes(parsed.managedSshRoutes),
-    credentialOps: storedCredentialOps(parsed.credentialOps, secrets)
+    credentialOps: storedCredentialOps(parsed.credentialOps, secrets),
+    trustedLaunchers: storedTrustedLaunchers(parsed.trustedLaunchers)
   };
+}
+
+function trustedLauncherName(value: string): string {
+  const name = typeof value === "string" ? value.trim() : "";
+  if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) {
+    throw new Error("A trusted launcher needs a display name of at most 80 characters.");
+  }
+  return name;
+}
+
+// Interpreters run arbitrary scripts, so their signature says nothing about which agent is asking.
+function isGeneralPurposeRuntime(identifier: string): boolean {
+  const lower = identifier.toLowerCase();
+  return ["node", "bun", "deno", "ruby", "perl", "java", "bash", "zsh", "sh"].includes(lower) ||
+    /^python[0-9.]*$/.test(lower) || lower.startsWith("org.python.");
+}
+
+function launcherSignatureFromRequest(
+  store: StoreFile,
+  requestId: string,
+  identifier?: string
+): { teamId?: string; identifier?: string } {
+  const request = store.requests.find((item) => item.id === requestId);
+  if (!request) {
+    throw new Error(`Unknown request: ${requestId}`);
+  }
+  const candidates = (request.launcherSignatures || []).filter((item) => !isGeneralPurposeRuntime(item.identifier));
+  const wanted = identifier ? candidates.filter((item) => item.identifier === identifier) : candidates;
+  if (wanted.length === 1) {
+    return wanted[0];
+  }
+  if (wanted.length === 0) {
+    throw new Error(`Request ${requestId} has no matching signed launcher on record.`);
+  }
+  throw new Error(
+    `Request ${requestId} was launched under several signed applications. Choose one with --identifier: ` +
+      wanted.map((item) => item.identifier).join(", ")
+  );
+}
+
+// Absent stays absent so homes that never trusted a launcher serialize exactly as before.
+function storedTrustedLaunchers(value: unknown): TrustedLauncher[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error("trustedLaunchers must be an array.");
+  const ids = new Set<string>();
+  const principals = new Set<string>();
+  const launchers = value.map((item, index) => {
+    const record = item as TrustedLauncher;
+    const principal = record && typeof record === "object" ? `${record.teamId}:${record.identifier}` : "";
+    if (!record || typeof record !== "object" || Array.isArray(record) ||
+        typeof record.id !== "string" || !/^launcher_[A-Za-z0-9_-]{12}$/.test(record.id) || ids.has(record.id) ||
+        typeof record.name !== "string" || !record.name.trim() || record.name.length > 80 ||
+        !validTeamId(record.teamId) || !validIdentifier(record.identifier) || principals.has(principal) ||
+        !isCanonicalPolicyTimestamp(record.createdAt)) {
+      throw new Error(`Invalid trusted launcher at index ${index}.`);
+    }
+    ids.add(record.id);
+    principals.add(principal);
+    return { id: record.id, name: record.name, teamId: record.teamId, identifier: record.identifier, createdAt: record.createdAt };
+  });
+  return launchers.length ? launchers : undefined;
 }
 
 function storedCredentialOps(value: unknown, secrets: SecretRecord[]): CredentialOperation[] {
@@ -3669,8 +3849,61 @@ function normalizeStoredApprovalSettings(input?: Partial<ApprovalSettings>): App
   return settings;
 }
 
-function canAutoApproveAgent(agent: AgentIdentity): boolean {
-  return agent.source === "managed-peer" && Boolean(agent.principalId);
+function canAutoApproveAgent(store: StoreFile, agent: AgentIdentity): boolean {
+  if (!agent.principalId) return false;
+  if (agent.source === "managed-peer") return true;
+  // A stored request keeps its principal, so the trust list is checked again at every use.
+  return agent.source === "signed-launcher" && Boolean(trustedLauncherForPrincipal(store, agent.principalId));
+}
+
+function isVerifiedAgentSource(source: AgentIdentitySource | undefined): boolean {
+  return source === "managed-peer" || source === "signed-launcher";
+}
+
+function trustedLauncherForPrincipal(store: StoreFile, principalId: string): TrustedLauncher | undefined {
+  if (!controlIsSealed(store)) return undefined;
+  return (store.trustedLaunchers || []).find((item) => launcherPrincipalId(item) === principalId);
+}
+
+function trustedLauncherMatch(
+  store: StoreFile | undefined,
+  context: AgentIdentityContext
+): { trusted: TrustedLauncher; signature: LauncherSignature } | undefined {
+  const chain = context.launcherChain;
+  if (!store?.trustedLaunchers?.length || !isAttestedLauncherChain(chain) || !controlIsSealed(store)) {
+    return undefined;
+  }
+  for (const signature of chain.signatures) {
+    const trusted = store.trustedLaunchers
+      .find((item) => item.teamId === signature.teamId && item.identifier === signature.identifier);
+    if (trusted) return { trusted, signature };
+  }
+  return undefined;
+}
+
+// A kernel-verified peer wins. Otherwise the nearest ancestor whose code signature the
+// operator pinned names the agent. This identifies the launching app; it does not isolate it.
+function resolveAgentIdentity(store: StoreFile | undefined, reason: string, context: AgentIdentityContext): AgentIdentity {
+  if (context.managedPrincipal !== undefined) {
+    return requestAgentIdentity(reason, context);
+  }
+  const match = trustedLauncherMatch(store, context);
+  if (!match) {
+    return requestAgentIdentity(reason, context);
+  }
+  return {
+    name: match.trusted.name,
+    source: "signed-launcher",
+    principalId: launcherPrincipalId(match.signature),
+    agentSessionId: launcherSessionId(match.signature)
+  };
+}
+
+function observedLauncherSignatures(context: AgentIdentityContext): ObservedLauncherSignature[] | undefined {
+  if (!isAttestedLauncherChain(context.launcherChain) || !context.launcherChain.signatures.length) {
+    return undefined;
+  }
+  return context.launcherChain.signatures.map(({ teamId, identifier }) => ({ teamId, identifier }));
 }
 
 function isApprovalMode(value: unknown): value is ApprovalMode {
@@ -3807,7 +4040,7 @@ function activeApprovalGrant(
 ): ApprovalGrant | undefined {
   const settings = normalizeApprovalSettings(store.approvalSettings);
   store.approvalSettings = settings;
-  if (!canAutoApproveAgent(agent)) return undefined;
+  if (!canAutoApproveAgent(store, agent)) return undefined;
 
   const actionKey = approvalActionKey(handle, action);
   return store.approvalGrants.find((grant) => {
@@ -3842,7 +4075,7 @@ function createApprovalGrant(
     return undefined;
   }
 
-  if (!canAutoApproveAgent(identityFromRequest(request))) {
+  if (!canAutoApproveAgent(store, identityFromRequest(request))) {
     store.audit.push(audit(
       "approval.grant.skipped",
       `Approved request ${request.id} once because reusable approval requires a verified agent.`,
@@ -3983,6 +4216,7 @@ function createRequestInStore(
     principalId: agent.principalId,
     agentSessionId: agent.agentSessionId,
     loginSessionId: admission.loginSessionId,
+    launcherSignatures: observedLauncherSignatures(agentContext),
     action: admission.action,
     state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
     createdAt: now,
@@ -4087,7 +4321,7 @@ function executionAdmissionContext(
   }
 
   const normalizedAction = resolveManagedSshAction(store, action);
-  const agent = requestAgentIdentity(reason, agentContext);
+  const agent = resolveAgentIdentity(store, reason, agentContext);
   if (normalizedAction.kind === "model_relay" &&
       (agent.source !== "managed-peer" || !agent.principalId || !agent.agentSessionId)) {
     throw new Error("Model relay requests need a verified live agent session.");
@@ -4314,9 +4548,9 @@ function assertReusableExecutionPermit(permit: ReusableExecutionPermit, home: st
     typeof permit.reason !== "string" ||
     typeof permit.agentName !== "string" || !permit.agentName ||
     !isAgentIdentitySource(permit.agentSource) ||
-    (permit.agentSource === "managed-peer" && (typeof permit.principalId !== "string" || !permit.principalId)) ||
-    (permit.agentSource !== "managed-peer" && permit.principalId !== undefined) ||
-    (permit.agentSessionId !== undefined && (permit.agentSource !== "managed-peer" || !permit.agentSessionId)) ||
+    (isVerifiedAgentSource(permit.agentSource) && (typeof permit.principalId !== "string" || !permit.principalId)) ||
+    (!isVerifiedAgentSource(permit.agentSource) && permit.principalId !== undefined) ||
+    (permit.agentSessionId !== undefined && (!isVerifiedAgentSource(permit.agentSource) || !permit.agentSessionId)) ||
     typeof permit.createdAt !== "string" ||
     typeof permit.controlFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(permit.controlFingerprint) ||
     !permit.authorization ||
@@ -4329,6 +4563,7 @@ function assertReusableExecutionPermit(permit: ReusableExecutionPermit, home: st
 
 function isAgentIdentitySource(value: unknown): value is AgentIdentitySource {
   return value === "managed-peer" ||
+    value === "signed-launcher" ||
     value === "configured" ||
     value === "mcp-client" ||
     value === "runtime" ||
@@ -4638,7 +4873,7 @@ function matchingApprovalPolicyRule(
     if (rule.expiresAt && rule.expiresAt <= nowIso) {
       continue;
     }
-    if (rule.decision === "allow" && !canAutoApproveAgent(agent)) {
+    if (rule.decision === "allow" && !canAutoApproveAgent(store, agent)) {
       continue;
     }
     if (approvalPolicyMatches(rule, secret, action, agent, envBindings)) {
@@ -4926,19 +5161,20 @@ function durablePolicyAgentName(request: RequestRecord): string {
 function assertExecutionCaller(
   request: Pick<RequestRecord, "agentSource" | "principalId" | "agentSessionId">,
   caller?: AgentIdentityContext,
-  requireSession = false
+  requireSession = false,
+  store?: StoreFile
 ): void {
   // Operator CLI and UI calls omit caller; every MCP call supplies one.
   if (caller === undefined) return;
-  if (!caller.managedPrincipal) {
-    if (request.agentSource === "managed-peer") {
+  if (!caller.managedPrincipal && !trustedLauncherMatch(store, caller)) {
+    if (isVerifiedAgentSource(request.agentSource)) {
       throw new Error("This execution is bound to a different verified agent or session.");
     }
     if (requireSession) throw new Error("Agent execution requires a verified agent principal and session.");
     return;
   }
-  const agent = requestAgentIdentity("", caller);
-  if (request.agentSource !== "managed-peer" || agent.source !== "managed-peer" ||
+  const agent = resolveAgentIdentity(store, "", caller);
+  if (request.agentSource !== agent.source || !isVerifiedAgentSource(agent.source) ||
       !request.principalId || request.principalId !== agent.principalId ||
       request.agentSessionId !== agent.agentSessionId || (requireSession && !request.agentSessionId)) {
     throw new Error("This execution is bound to a different verified agent or session.");
@@ -4961,6 +5197,9 @@ function identityFromRequest(request: RequestRecord): AgentIdentity {
     }
     return { name, source: "managed-peer", principalId: request.principalId, agentSessionId: request.agentSessionId };
   }
+  if (request.agentSource === "signed-launcher" && request.principalId?.trim()) {
+    return { name, source: "signed-launcher", principalId: request.principalId, agentSessionId: request.agentSessionId };
+  }
   return { name, source: request.agentSource || "unknown" };
 }
 
@@ -4970,6 +5209,9 @@ function identityFromPermit(permit: ReusableExecutionPermit): AgentIdentity {
       throw new Error("Managed execution permit has no verified principal ID.");
     }
     return { name: permit.agentName, source: "managed-peer", principalId: permit.principalId, agentSessionId: permit.agentSessionId };
+  }
+  if (permit.agentSource === "signed-launcher" && permit.principalId?.trim()) {
+    return { name: permit.agentName, source: "signed-launcher", principalId: permit.principalId, agentSessionId: permit.agentSessionId };
   }
   return { name: permit.agentName, source: permit.agentSource };
 }
@@ -4992,8 +5234,8 @@ function scopedAllowPolicyInput(request: RequestRecord, agent: string): AddAppro
     conditions: {
       handles,
       envBindings: bindings,
-      agents: request.agentSource === "managed-peer" ? [] : [agent],
-      principalIds: request.agentSource === "managed-peer" ? [request.principalId!] : [],
+      agents: isVerifiedAgentSource(request.agentSource) ? [] : [agent],
+      principalIds: isVerifiedAgentSource(request.agentSource) ? [request.principalId!] : [],
       actionKinds: [action.kind],
       commands: [action.command],
       resolvedCommands: action.kind === "env_command" ? [action.resolvedCommand!] : [],

@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import type { AttestedLauncherChain } from "./launcher-signature.js";
 import type { AgentIdentitySource } from "./types.js";
 
 export type { AgentIdentitySource } from "./types.js";
@@ -37,6 +38,8 @@ export interface AgentIdentityContext {
   mcpClientName?: string;
   env?: NodeJS.ProcessEnv;
   managedPrincipal?: VerifiedAgentPrincipal;
+  /** Set only by an adapter that checked the running ancestor processes. */
+  launcherChain?: AttestedLauncherChain;
 }
 
 export function agentNameFromReason(reason: string): string {

@@ -18,7 +18,7 @@ export type ApprovalMode = "per-transaction" | "timed-session" | "login-session"
 export type ApprovalAgentScope = "same-agent" | "any-agent";
 export type ApprovalPolicyDecision = "ask" | "allow" | "deny";
 export type ApprovalPolicyActionKind = "env_command" | "ssh_session" | "http_request" | "model_relay";
-export type AgentIdentitySource = "managed-peer" | "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
+export type AgentIdentitySource = "managed-peer" | "signed-launcher" | "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
 
 export interface ApprovalSettings {
   mode: ApprovalMode;
@@ -246,6 +246,8 @@ export interface RequestRecord {
   approvalPolicyRuleId?: string;
   /** Keyed seal over the approved action and approver context; checked before execution. */
   approvalSeal?: string;
+  /** Team-signed ancestors of the requesting process, nearest first. Display and trust setup only. */
+  launcherSignatures?: ObservedLauncherSignature[];
   deniedAt?: string;
   executedAt?: string;
   resultSummary?: ExecutionSummary;
@@ -273,6 +275,21 @@ export interface StoreFile {
   approvalPolicyRules: ApprovalPolicyRule[];
   managedSshRoutes?: ManagedSshRouteRecord[];
   credentialOps?: CredentialOperation[];
+  /** Code signatures the operator trusts to identify an agent's launching application. */
+  trustedLaunchers?: TrustedLauncher[];
+}
+
+export interface TrustedLauncher {
+  id: string;
+  name: string;
+  teamId: string;
+  identifier: string;
+  createdAt: string;
+}
+
+export interface ObservedLauncherSignature {
+  teamId: string;
+  identifier: string;
 }
 
 export interface ScanCandidate {

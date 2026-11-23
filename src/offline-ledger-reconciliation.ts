@@ -68,7 +68,7 @@ const terminalStates = new Set(["denied", "executed", "failed"]);
 const requestStates = new Set([...terminalStates, "pending", "approved", "executing"]);
 const appLedgerFields = new Set([
   "version", "secrets", "requests", "audit", "approvalSettings", "approvalGrants",
-  "approvalPolicyRules", "managedSshRoutes", "credentialOps", "consoleAccess"
+  "approvalPolicyRules", "managedSshRoutes", "credentialOps", "consoleAccess", "trustedLaunchers"
 ]);
 const donorLedgerFields = new Set([
   "version", "writerGeneration", "secrets", "requests", "agentIdentities", "audit",

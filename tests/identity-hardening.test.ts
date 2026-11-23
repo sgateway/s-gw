@@ -2,7 +2,16 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { realpathSync } from "node:fs";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
+import {
+  attestLauncherChain,
+  launcherChainFromAttestation,
+  launcherPrincipalId,
+  launcherSessionId,
+  parseCodesignDetails,
+  parseProcessRow
+} from "../src/launcher-signature.js";
 import { extractNamedDestinations } from "../src/destinations.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
 import { buildSshSessionAction, SGW_SSH_SESSION_COMMAND } from "../src/ssh.js";
@@ -287,5 +296,173 @@ describe("sealed authorization state", () => {
     const { store } = await storeWithGrant();
     process.env.SGW_MASTER_PASSPHRASE = "a different passphrase";
     expect(await store.authorizationSealStatus()).toBe("invalid");
+  });
+});
+
+describe("launcher signature parsing", () => {
+  it("reads the identifier and team from codesign output", () => {
+    const report = [
+      "Executable=/Applications/Example.app/Contents/MacOS/example",
+      "Identifier=com.example.agent",
+      "Format=Mach-O thin (arm64)",
+      "TeamIdentifier=ABCDE12345"
+    ].join("\n");
+    expect(parseCodesignDetails(report)).toEqual({ teamId: "ABCDE12345", identifier: "com.example.agent" });
+  });
+
+  it("ignores code without a team identifier", () => {
+    expect(parseCodesignDetails("Identifier=com.apple.zsh\nTeamIdentifier=not set\n")).toBeUndefined();
+    expect(parseCodesignDetails("")).toBeUndefined();
+  });
+
+  it("reads the parent pid and start time from a ps row", () => {
+    expect(parseProcessRow("  827 Sun Nov 22 11:38:59 2026\n")).toEqual({ parentPid: 827, startedAt: "Sun Nov 22 11:38:59 2026" });
+    expect(parseProcessRow("\n")).toBeUndefined();
+  });
+
+  it("refuses a malformed attestation", () => {
+    expect(() => launcherChainFromAttestation([
+      { teamId: "short", identifier: "com.example.agent", pid: 10, startedAt: "x" }
+    ])).toThrow(/malformed/u);
+  });
+
+  it.skipIf(process.platform !== "darwin")("attests this process's ancestors without failing", () => {
+    const chain = attestLauncherChain();
+    expect(Array.isArray(chain?.signatures)).toBe(true);
+    for (const signature of chain?.signatures || []) {
+      expect(signature.teamId).toMatch(/^[A-Z0-9]{10}$/u);
+      expect(signature.pid).toBeGreaterThan(1);
+    }
+  });
+});
+
+describe("trusted launcher signature tier", () => {
+  const signature = { teamId: "ABCDE12345", identifier: "com.example.agent", pid: 4242, startedAt: "Sun Nov 22 10:00:00 2026" };
+  const signedAgent = () => ({ launcherChain: launcherChainFromAttestation([signature]), env: {} });
+  const principalId = launcherPrincipalId(signature);
+  const nodeAction = () => buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "TOKEN" });
+
+  async function tokenStore(label: string) {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: `launcher ${label}`,
+      type: "api-token",
+      value: fakeToken(`launcher_${label}`),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    return { store, secret };
+  }
+
+  it("records the signature but grants nothing until an operator trusts it", async () => {
+    const { store, secret } = await tokenStore("untrusted");
+    const first = await store.createRequest(secret.handle, nodeAction(), "Untrusted signed agent", signedAgent());
+    expect(first.agentSource).not.toBe("signed-launcher");
+    expect(first.principalId).toBeUndefined();
+    expect(first.launcherSignatures).toEqual([{ teamId: "ABCDE12345", identifier: "com.example.agent" }]);
+
+    await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
+    const second = await store.createRequest(secret.handle, nodeAction(), "Untrusted signed agent again", signedAgent());
+    expect(second.state).toBe("pending");
+  });
+
+  it("treats a trusted signature as a verified agent for grants and its own execution", async () => {
+    const { store, secret } = await tokenStore("trusted");
+    const seen = await store.createRequest(secret.handle, nodeAction(), "First contact", signedAgent());
+    const trusted = await store.addTrustedLauncher({ name: "Example Agent", requestId: seen.id });
+    expect(trusted.principalId).toBe(principalId);
+    expect(await store.authorizationSealStatus()).toBe("sealed");
+
+    const first = await store.createRequest(secret.handle, nodeAction(), "Trusted run", signedAgent());
+    expect(first).toMatchObject({
+      state: "pending",
+      agentName: "Example Agent",
+      agentSource: "signed-launcher",
+      principalId,
+      agentSessionId: launcherSessionId(signature)
+    });
+    await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
+
+    const reused = await store.createRequest(secret.handle, nodeAction(), "Trusted repeat", signedAgent());
+    expect(reused).toMatchObject({ state: "approved", approvalSource: "grant" });
+
+    const otherSession = { launcherChain: launcherChainFromAttestation([{ ...signature, pid: 9999 }]), env: {} };
+    await expect(store.claimApprovedRequest(reused.id, otherSession)).rejects.toThrow(/different verified agent or session/u);
+    await expect(store.claimApprovedRequest(reused.id, { mcpClientName: "example", env: {} }))
+      .rejects.toThrow(/different verified agent or session/u);
+    expect((await store.claimApprovedRequest(reused.id, signedAgent())).state).toBe("executing");
+  });
+
+  it("does not extend a grant to a different signature or a forged chain", async () => {
+    const { store, secret } = await tokenStore("others");
+    await store.addTrustedLauncher({ name: "Example Agent", teamId: "ABCDE12345", identifier: "com.example.agent" });
+    const first = await store.createRequest(secret.handle, nodeAction(), "Trusted run", signedAgent());
+    await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
+
+    const stranger = { launcherChain: launcherChainFromAttestation([{ ...signature, identifier: "com.example.other" }]), env: {} };
+    expect((await store.createRequest(secret.handle, nodeAction(), "Other app", stranger)).state).toBe("pending");
+
+    // Shaped like an attestation but not produced by the attestation module.
+    const forged = { launcherChain: { signatures: [signature] }, env: {} };
+    const fromForged = await store.createRequest(secret.handle, nodeAction(), "Forged chain", forged);
+    expect(fromForged.state).toBe("pending");
+    expect(fromForged.agentSource).not.toBe("signed-launcher");
+  });
+
+  it("revokes grants and verified standing when the signature is removed", async () => {
+    const { store, secret } = await tokenStore("removed");
+    const trusted = await store.addTrustedLauncher({ name: "Example Agent", teamId: "ABCDE12345", identifier: "com.example.agent" });
+    const first = await store.createRequest(secret.handle, nodeAction(), "Trusted run", signedAgent());
+    await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
+    const reused = await store.createRequest(secret.handle, nodeAction(), "Trusted repeat", signedAgent());
+    expect(reused.state).toBe("approved");
+
+    const removed = await store.removeTrustedLauncher(trusted.launcher.id);
+    expect(removed.revokedApprovalGrants).toBe(1);
+    await expect(store.claimApprovedRequest(reused.id, signedAgent())).rejects.toThrow();
+    const after = await store.createRequest(secret.handle, nodeAction(), "After removal", signedAgent());
+    expect(after.state).toBe("pending");
+    expect(after.agentSource).not.toBe("signed-launcher");
+  });
+
+  it("ignores the trust list while the stored state is unsealed", async () => {
+    const { store, secret } = await tokenStore("unsealed");
+    await store.addTrustedLauncher({ name: "Example Agent", teamId: "ABCDE12345", identifier: "com.example.agent" });
+    const manifest = path.join(tmpHome, ".store-control.json");
+    const raw = JSON.parse(await readFile(manifest, "utf8"));
+    delete raw.authorizationSeal;
+    await writeFile(manifest, `${JSON.stringify(raw, null, 2)}\n`);
+
+    const request = await store.createRequest(secret.handle, nodeAction(), "Unsealed trust", signedAgent());
+    expect(request.agentSource).not.toBe("signed-launcher");
+  });
+
+  it("refuses to trust a general-purpose runtime", async () => {
+    const { store } = await tokenStore("runtime");
+    await expect(store.addTrustedLauncher({ name: "Node", teamId: "HX7739G8FX", identifier: "node" }))
+      .rejects.toThrow(/general-purpose runtime/u);
+    expect(await store.listTrustedLaunchers()).toEqual([]);
+  });
+
+  it("can bind an existing name-based allow policy to the pinned signature", async () => {
+    const { store, secret } = await tokenStore("policy");
+    await store.addApprovalPolicyRule({
+      name: "Allow Example Agent",
+      decision: "allow",
+      conditions: {
+        agents: ["Example Agent"],
+        handles: [secret.handle],
+        commands: [process.execPath],
+        resolvedCommands: [realpathSync.native(process.execPath)]
+      }
+    });
+    const named = await store.createRequest(secret.handle, nodeAction(), "Example Agent by name", { agentName: "Example Agent", env: {} });
+    expect(named.state).toBe("pending");
+
+    const trusted = await store.addTrustedLauncher({
+      name: "Example Agent", teamId: "ABCDE12345", identifier: "com.example.agent", bindPolicies: true
+    });
+    expect(trusted.boundPolicies).toBe(1);
+    const signed = await store.createRequest(secret.handle, nodeAction(), "Signed policy run", signedAgent());
+    expect(signed).toMatchObject({ state: "approved", approvalSource: "policy", agentSource: "signed-launcher" });
   });
 });

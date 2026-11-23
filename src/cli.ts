@@ -74,6 +74,7 @@ import { getSgwInstanceKey } from "./paths.js";
 import { managedSshHostFingerprint } from "./managed-ssh.js";
 import { potentialBroadHttpAllows } from "./policy-audit.js";
 import { SGW_SSH_SESSION_COMMAND, closeOwnedSshSession, defaultSshInjectEnv } from "./ssh.js";
+import { attestLauncherChain, launcherPrincipalId } from "./launcher-signature.js";
 import { normalizeCommandGrant, SecretStore } from "./store.js";
 import {
   deleteKeychainPassphrase,
@@ -547,6 +548,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "agent" && second === "trust") {
+    await handleAgentTrustCommand(store, third, parsed.flags);
+    return;
+  }
+
   if (first === "agent" && second === "status") {
     printJson({ ok: true, results: agentIntegrationStatus({ agentIds: third ? [third] : undefined }) });
     return;
@@ -731,6 +737,42 @@ async function main(): Promise<void> {
   }
 
   throw new Error(unknownCommandMessage(parsed.command));
+}
+
+async function handleAgentTrustCommand(
+  store: SecretStore,
+  action: string | undefined,
+  flags: Record<string, string | boolean | string[]>
+): Promise<void> {
+  if (!action || action === "list") {
+    printJson(await store.listTrustedLaunchers());
+    return;
+  }
+  if (action === "current") {
+    // Shows which signed applications launched this shell, nearest first.
+    const chain = attestLauncherChain();
+    printJson((chain?.signatures || []).map(({ teamId, identifier }) => ({
+      teamId,
+      identifier,
+      principalId: launcherPrincipalId({ teamId, identifier })
+    })));
+    return;
+  }
+  if (action === "add") {
+    printJson(await store.addTrustedLauncher({
+      name: requireFlag(flags, "name"),
+      requestId: getFlag(flags, "request"),
+      teamId: getFlag(flags, "team-id"),
+      identifier: getFlag(flags, "identifier"),
+      bindPolicies: hasFlag(flags, "bind-policies")
+    }));
+    return;
+  }
+  if (action === "remove") {
+    printJson(await store.removeTrustedLauncher(requireFlag(flags, "id")));
+    return;
+  }
+  throw new Error("Usage: s-gw agent trust list|current|add|remove");
 }
 
 async function readProtectedUiManifest(filePath: string): Promise<Record<string, string>> {
@@ -2951,6 +2993,10 @@ Commands:
   s-gw approval clear
   s-gw scan-file PATH [--preview] [--backend keychain|local]
   s-gw agent list
+  s-gw agent trust list
+  s-gw agent trust current
+  s-gw agent trust add --name NAME (--request REQUEST_ID [--identifier ID] | --team-id TEAM --identifier ID) [--bind-policies]
+  s-gw agent trust remove --id LAUNCHER_ID
   s-gw agent status [AGENT]
   s-gw agent install [AGENT] [--dry-run]
   s-gw agent uninstall [AGENT] [--dry-run]

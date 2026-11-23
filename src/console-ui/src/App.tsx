@@ -4000,9 +4000,13 @@ function RequestStateBadge({ state }: { state: string }) {
 }
 
 function RequestIdentity({ request, details = false }: { request: RequestRecord; details?: boolean }) {
-  const verified = request.agentSource === "managed-peer" && Boolean(request.principalId && request.agentSessionId);
-  const label = verified ? "Verified peer" : request.agentSource === "mcp-client" ? "Unverified MCP name" : "Unverified agent name";
+  const signed = request.agentSource === "signed-launcher";
+  const verified = (request.agentSource === "managed-peer" || signed) && Boolean(request.principalId && request.agentSessionId);
+  const label = !verified
+    ? request.agentSource === "mcp-client" ? "Unverified MCP name" : "Unverified agent name"
+    : signed ? "Trusted app signature" : "Verified peer";
   const source = request.agentSource === "managed-peer" ? "managed peer" :
+    signed ? "code signature you trusted (identifies the launching app, not an isolated session)" :
     request.agentSource === "mcp-client" ? "MCP client declaration" :
     request.agentSource?.replaceAll("-", " ") || "unknown";
 

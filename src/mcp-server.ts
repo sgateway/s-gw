@@ -6,6 +6,7 @@ import { executeApprovedRequest, executeReusablePermit } from "./executor.js";
 import { buildEnvCommandAction, buildSshSessionAction, scanLocalFile, scanLocalText } from "./gateway.js";
 import { SecretStore } from "./store.js";
 import { defaultSshInjectEnv } from "./ssh.js";
+import { attestLauncherChain, launcherChainIsLive } from "./launcher-signature.js";
 import { CURRENT_VERSION } from "./version.js";
 
 import { discardPreparedSpool, prepareUpload } from "./ssh-upload.js";
@@ -26,10 +27,17 @@ const server = new McpServer({
   version: CURRENT_VERSION
 });
 
+// Checked once at startup: this process is launched by the agent host, so its ancestry does
+// not change while it runs. A dead ancestor invalidates the chain instead of being re-read.
+let launcherChain = operationsOnly ? undefined : attestLauncherChain();
+
 function mcpAgentContext() {
   if (operationsOnly) return { agentName: process.env.SGW_SANDBOX_AGENT_NAME };
+  if (launcherChain && !launcherChainIsLive(launcherChain)) {
+    launcherChain = undefined;
+  }
   // The client name is display metadata. A managed principal must come from a separate trusted peer adapter.
-  return { mcpClientName: server.server.getClientVersion()?.name };
+  return { mcpClientName: server.server.getClientVersion()?.name, launcherChain };
 }
 
 if (!operationsOnly) {

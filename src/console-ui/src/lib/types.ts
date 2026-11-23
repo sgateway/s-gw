@@ -3,7 +3,7 @@ export type RequestState = "pending" | "approved" | "executing" | "denied" | "ex
 export type ApprovalMode = "per-transaction" | "timed-session" | "login-session" | "always";
 export type ApprovalAgentScope = "same-agent" | "any-agent";
 export type ApprovalPolicyDecision = "ask" | "allow" | "deny";
-export type AgentIdentitySource = "managed-peer" | "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
+export type AgentIdentitySource = "managed-peer" | "signed-launcher" | "configured" | "mcp-client" | "runtime" | "process" | "reason" | "manual" | "unknown";
 
 export interface Readiness {
   ok: boolean;

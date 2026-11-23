@@ -702,7 +702,7 @@ private struct ApprovalTrustPath: View {
         image: AgentIconResolver.image(for: request.agentName),
         openSourceIcon: "bot",
         title: request.agentName,
-        detail: request.hasVerifiedAgentIdentity ? "Verified OS identity" : "Unverified name",
+        detail: request.hasVerifiedAgentIdentity ? request.agentIdentitySummary : "Unverified name",
         tint: request.hasVerifiedAgentIdentity ? HelperTheme.teal : HelperTheme.orange
       )
 
