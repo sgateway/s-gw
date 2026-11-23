@@ -12,6 +12,7 @@ Notable changes to s-gw are documented here. The project follows [Semantic Versi
 ### Fixed
 
 - Documented the AppArmor settings the Anthropic sandbox needs on Ubuntu 24.04 and 26.04.
+- MCP executions that run longer than the client waits for a tool call no longer lose their result. After 45 seconds `sgw_execute_request` and `sgw_run_execution` answer with `running: true` and a `runId`, and the new `sgw_wait_execution` tool returns the sanitized result when the command ends. Before, the client reported "Request timed out" while the command finished unseen.
 
 ## 0.1.22 - 2026-10-05
 

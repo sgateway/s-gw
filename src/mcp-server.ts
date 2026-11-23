@@ -10,6 +10,7 @@ import { CURRENT_VERSION } from "./version.js";
 
 import { prepareUpload } from "./ssh-upload.js";
 import { buildHttpRequestAction } from "./http-action.js";
+import { LongRuns } from "./mcp-long-run.js";
 import { runSandboxMcpBridge } from "./sandbox-broker.js";
 
 if (process.env.SGW_SANDBOX_BROKER_PORT) {
@@ -24,6 +25,25 @@ const server = new McpServer({
 
 function mcpAgentContext() {
   return { mcpClientName: server.server.getClientVersion()?.name };
+}
+
+const longRuns = new LongRuns<unknown>();
+
+// A command can outlive the MCP client's request timeout. Answer before that happens and let the
+// agent collect the result with sgw_wait_execution, instead of finishing with nobody listening.
+async function finishOrDefer(label: string, work: () => Promise<unknown>) {
+  return longRunReply(await longRuns.start(label, work));
+}
+
+function longRunReply(outcome: Awaited<ReturnType<typeof longRuns.start>>) {
+  if (outcome.done) return asText(outcome.value);
+  return asText({
+    running: true,
+    runId: outcome.runId,
+    operation: outcome.label,
+    elapsedMs: outcome.elapsedMs,
+    next: "The command is still running. Call sgw_wait_execution with this runId to get the result. Do not start it again."
+  });
 }
 
 if (!operationsOnly) {
@@ -154,11 +174,11 @@ server.registerTool(
         request: admission.request
       });
     }
-    return asText({
+    return finishOrDefer("sgw_run_execution", async () => ({
       approvalRequired: false,
       reusableAuthorization: admission.permit.authorization,
       summary: await executeReusablePermit(store, admission.permit)
-    });
+    }));
   }
 );
 }
@@ -256,7 +276,20 @@ server.registerTool(
       requestId: z.string().min(1)
     }
   },
-  async ({ requestId }) => asText(await executeApprovedRequest(store, requestId, { operationsOnly }))
+  async ({ requestId }) => finishOrDefer("sgw_execute_request", () => executeApprovedRequest(store, requestId, { operationsOnly }))
+);
+
+server.registerTool(
+  "sgw_wait_execution",
+  {
+    title: "Wait For Running Execution",
+    description: "Get the result of an execution that answered with running: true. Returns the same sanitized result, or running: true again if it needs more time.",
+    inputSchema: {
+      runId: z.string().min(1),
+      waitMs: z.number().int().nonnegative().optional()
+    }
+  },
+  async ({ runId, waitMs }) => longRunReply(await longRuns.wait(runId, waitMs))
 );
 
 function asText(value: unknown) {
