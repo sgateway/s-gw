@@ -59,6 +59,7 @@ jobs:
       - run: npm test
       - run: npm run audit:release
       - run: npm run package:dry-run
+      - run: npm run test:packed-consumer
 
   macos-native:
     name: macOS native surfaces
