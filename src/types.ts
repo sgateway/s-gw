@@ -244,6 +244,8 @@ export interface RequestRecord {
   approvalSource?: RequestApprovalSource;
   approvalGrantId?: string;
   approvalPolicyRuleId?: string;
+  /** Keyed seal over the approved action and approver context; checked before execution. */
+  approvalSeal?: string;
   deniedAt?: string;
   executedAt?: string;
   resultSummary?: ExecutionSummary;

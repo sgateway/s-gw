@@ -4,7 +4,8 @@ import {
   createHash,
   createHmac,
   randomBytes,
-  scryptSync
+  scryptSync,
+  timingSafeEqual
 } from "node:crypto";
 import type { EncryptedBox } from "./types.js";
 import { requireUnlockPassphrase } from "./unlock.js";
@@ -63,6 +64,33 @@ export function fingerprintSecret(value: string, passphrase = requirePassphrase(
     .digest();
 
   return createHmac("sha256", fpKey).update(value).digest("base64url").slice(0, 24);
+}
+
+// Keyed from the unlock passphrase so a seal cannot be produced by editing store
+// files alone. A process that can read the passphrase can still mint one.
+export function authorizationSealKey(passphrase = requirePassphrase()): Buffer {
+  return createHash("sha256")
+    .update("s-gw-authorization-seal-v1:")
+    .update(passphrase)
+    .digest();
+}
+
+export function authorizationSeal(scope: string, payload: string, key = authorizationSealKey()): string {
+  return createHmac("sha256", key).update(scope).update("\0").update(payload).digest("base64url");
+}
+
+export function authorizationSealMatches(
+  seal: unknown,
+  scope: string,
+  payload: string,
+  key = authorizationSealKey()
+): boolean {
+  if (typeof seal !== "string" || !seal) {
+    return false;
+  }
+  const expected = Buffer.from(authorizationSeal(scope, payload, key));
+  const actual = Buffer.from(seal);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 export function shortId(prefix = ""): string {

@@ -238,12 +238,15 @@ describe.skipIf(process.platform !== "darwin")("Keychain unlock and store lock",
       expect(changed.secrets[0].encrypted).not.toEqual(original.secrets[0].encrypted);
 
       await writeFile(`${release}-1`, "");
+      // The first write reads the unlock key for the authorization seal, before taking the lock.
       await waitForFile(`${waiting}-2`);
+      await writeFile(`${release}-2`, "");
+      await waitForFile(`${waiting}-3`);
       concurrent = startWorker("add-policy", { ...writerEnv, SGW_TEST_LOCK_TIMEOUT_MS: "300" });
       const writerResult = await withDeadline(concurrent.done, 10_000);
       expect(writerResult, writerResult.stderr).toMatchObject({ code: 0 });
 
-      await writeFile(`${release}-2`, "");
+      await writeFile(`${release}-3`, "");
       const deleted = await withDeadline(deleting.done, 10_000);
       expect(deleted, deleted.stderr).toMatchObject({ code: 0 });
       const finalStore = JSON.parse(await readFile(path.join(home, "store.json"), "utf8"));
@@ -252,6 +255,7 @@ describe.skipIf(process.platform !== "darwin")("Keychain unlock and store lock",
     } finally {
       await writeFile(`${release}-1`, "").catch(() => undefined);
       await writeFile(`${release}-2`, "").catch(() => undefined);
+      await writeFile(`${release}-3`, "").catch(() => undefined);
       if (concurrent?.child.exitCode === null) concurrent.child.kill();
       await concurrent?.done.catch(() => undefined);
       if (updating?.child.exitCode === null) updating.child.kill();

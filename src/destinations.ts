@@ -95,6 +95,58 @@ export function assertDestinationsAllowed(
   }
 }
 
+// Env-command argv is free text, so only URLs and host-style flags count as
+// named destinations. A bare token like "deploy.sh" also parses as a hostname
+// and would block ordinary commands on a handle that lists destinations.
+export function extractNamedDestinations(action: CommandAction): NetworkDestination[] {
+  if (action.kind !== "env_command") {
+    return extractActionDestinations(action);
+  }
+
+  const found: NetworkDestination[] = [];
+  for (let index = 0; index < action.args.length; index += 1) {
+    const arg = action.args[index] ?? "";
+    const fromUrl = parseUrlDestination(arg.trim());
+    if (fromUrl) {
+      found.push(fromUrl);
+      continue;
+    }
+
+    const eq = arg.indexOf("=");
+    if (eq > 0 && HOST_FLAGS.has(arg.slice(0, eq).toLowerCase())) {
+      const nested = parseDestinationValue(arg.slice(eq + 1));
+      if (nested) {
+        found.push(nested);
+      }
+      continue;
+    }
+
+    if (HOST_FLAGS.has(arg.toLowerCase())) {
+      const nested = parseDestinationValue(action.args[index + 1] || "");
+      if (nested) {
+        found.push(nested);
+      }
+    }
+  }
+
+  return uniqueDestinations(found);
+}
+
+// Unlike assertDestinationsAllowed this never demands a destination: a command
+// that names none is left to the handle's command allowlist.
+export function assertNamedDestinationsAllowed(allowed: string[] | undefined, action: CommandAction): void {
+  const rules = (allowed || []).map((item) => item.trim().toLowerCase()).filter(Boolean);
+  if (rules.length === 0) {
+    return;
+  }
+
+  const blocked = extractNamedDestinations(action)
+    .find((destination) => !rules.some((rule) => destinationMatches(rule, destination)));
+  if (blocked) {
+    throw new Error(`Destination ${destinationKey(blocked)} is not allowed by this handle policy.`);
+  }
+}
+
 export function parseAllowedDestination(value: string): string {
   const trimmed = value.trim().toLowerCase();
   if (!trimmed || trimmed.includes("\0") || /[\s/\\]/.test(trimmed)) {

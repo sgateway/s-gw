@@ -3414,6 +3414,12 @@ describe("SecretStore", () => {
     raw.approvalGrants[0].actionKey = legacyKey;
     await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
 
+    // A grant rewritten outside s-gw is unsealed and must not approve anything on its own.
+    const unsealed = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat", verifiedCodex);
+    expect(unsealed.kind).toBe("request");
+    expect(await store.authorizationSealStatus()).toBe("unsealed");
+    await store.sealAuthorizationState();
+
     const matching = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat", verifiedCodex);
     expect(matching.kind).toBe("reusable");
 

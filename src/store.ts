@@ -1,5 +1,5 @@
 import { assertHttpDestination, buildHttpRequestAction, SGW_HTTP_COMMAND } from "./http-action.js";
-import { parseAllowedDestination } from "./destinations.js";
+import { assertNamedDestinationsAllowed, parseAllowedDestination } from "./destinations.js";
 import { normalizeManagedSshRoute, type ManagedSshRoute } from "./managed-ssh.js";
 import { buildModelRelayAction, grantFromModelRelayAction, normalizeModelRelayAction, SGW_MODEL_RELAY_COMMAND, type ModelRelayGrant } from "./model-relay-action.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -7,7 +7,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { decryptSecret, encryptSecret, fingerprintSecret, requirePassphrase, shortId } from "./crypto.js";
+import { authorizationSeal, authorizationSealKey, authorizationSealMatches, decryptSecret, encryptSecret, fingerprintSecret, requirePassphrase, shortId } from "./crypto.js";
 import { agentNameFromReason, requestAgentIdentity, requestAgentName, type AgentIdentity, type AgentIdentityContext, type VerifiedAgentPrincipal } from "./agent-context.js";
 import { isAbsoluteCommand, resolveCommandExecutable, verifyPinnedCommand } from "./command-path.js";
 import { normalizeOnePasswordReference, readOnePasswordReference } from "./onepassword.js";
@@ -71,6 +71,8 @@ const defaultApprovalSettings: ApprovalSettings = {
 };
 
 const maxApprovalDurationMs = 30 * 24 * 60 * 60 * 1000;
+// Not env-configurable on purpose: the claim runs inside the agent's MCP process.
+const approvedRequestTtlMs = 60 * 60 * 1000;
 const macosSecurityCli = "/usr/bin/security";
 // Concurrent clients may need to serialize a durable control-plane write on a slow disk.
 const lockTimeoutMs = 30_000;
@@ -304,6 +306,69 @@ interface StoreControlState {
    * newer runtime owns and drop fields it does not understand.
    */
   writerVersion?: string;
+  /** Keyed seal over the control-plane fingerprint. Absent on unsealed or recovered homes. */
+  authorizationSeal?: string;
+}
+
+export type AuthorizationSealStatus = "sealed" | "unsealed" | "invalid" | "locked";
+
+export interface AuthorizationSealResult {
+  status: AuthorizationSealStatus;
+  previous: AuthorizationSealStatus;
+  secrets: number;
+  approvalGrants: number;
+  approvalPolicyRules: number;
+}
+
+interface ControlSealProbe {
+  fingerprint: string;
+  empty: boolean;
+  status(): AuthorizationSealStatus;
+}
+
+// Seal state of each loaded store object, taken before any updater touches it.
+const controlSealProbes = new WeakMap<StoreFile, ControlSealProbe>();
+
+// null: no unlock passphrase is available.
+interface SealKeyState {
+  key: Buffer | null;
+}
+
+const sealKeys = new AsyncLocalStorage<SealKeyState>();
+const lockedSealMessage = "s-gw is locked. Unlock it before approving, executing, or changing sealed approvals.";
+const unsealedAuthorizationMessage =
+  "Stored approvals and policies are not sealed by this s-gw installation. Review them, run `s-gw store seal`, then request approval again.";
+const sealKeyCacheMs = 60_000;
+let cachedSealKey: { key: Buffer; at: number } | undefined;
+
+// The unlock passphrase may come from the OS credential store, which must never be
+// read while the store lock is held. Every locked operation therefore carries a key
+// that was resolved before it took the lock.
+function sealKey(): Buffer {
+  const state = sealKeys.getStore();
+  if (!state) {
+    return authorizationSealKey();
+  }
+  if (state.key === null) {
+    throw new Error(lockedSealMessage);
+  }
+  return state.key;
+}
+
+function resolveSealKey(): Buffer | null {
+  try {
+    // An environment passphrase is free to read; only credential-store reads are worth caching.
+    if (process.env.SGW_MASTER_PASSPHRASE) {
+      return authorizationSealKey();
+    }
+    if (cachedSealKey && Date.now() - cachedSealKey.at < sealKeyCacheMs) {
+      return cachedSealKey.key;
+    }
+    cachedSealKey = { key: authorizationSealKey(), at: Date.now() };
+    return cachedSealKey.key;
+  } catch {
+    return null;
+  }
 }
 
 interface PendingStoreControlState {
@@ -381,6 +446,7 @@ export class SecretStore {
   readonly home: string;
   readonly storePath: string;
   private readonly consoleAccess = new AsyncLocalStorage<ConsoleRequestAccess>();
+  private seededSealKey: Buffer | undefined;
 
   constructor(home = getSgwHome()) {
     this.home = home;
@@ -418,7 +484,7 @@ export class SecretStore {
       throw new Error("Cannot add an empty secret.");
     }
 
-    const passphrase = requirePassphrase();
+    const passphrase = this.unlockForWrite();
     return this.mutate(async (store) => {
       const fingerprint = fingerprintSecret(input.value, passphrase);
       assertNoPendingCredentialAdd(store, fingerprint);
@@ -467,7 +533,7 @@ export class SecretStore {
       throw new Error("Cannot add an empty secret.");
     }
 
-    const passphrase = requirePassphrase();
+    const passphrase = this.unlockForWrite();
     return this.mutate(async (store) => {
       const fingerprint = fingerprintSecret(input.value, passphrase);
       assertNoPendingCredentialAdd(store, fingerprint);
@@ -526,7 +592,7 @@ export class SecretStore {
   async addKeychainSecretStaged(input: AddKeychainSecretInput): Promise<SecretRecord> {
     if (!input.value) throw new Error("Cannot add an empty secret.");
 
-    const passphrase = requirePassphrase();
+    const passphrase = this.unlockForWrite();
     const fingerprint = fingerprintSecret(input.value, passphrase);
     const service = input.service || defaultSecretKeychainService();
     const { operation, resumed } = await this.mutate((store) => {
@@ -660,7 +726,7 @@ export class SecretStore {
 
   async addOnePasswordReference(input: AddOnePasswordReferenceInput): Promise<SecretRecord> {
     const reference = normalizeOnePasswordReference(input.reference);
-    const passphrase = requirePassphrase();
+    const passphrase = this.unlockForWrite();
     return this.mutate(async (store) => {
       const fingerprint = fingerprintSecret(`onepassword:${reference}`, passphrase);
       assertNoPendingCredentialAdd(store, fingerprint);
@@ -837,7 +903,7 @@ export class SecretStore {
       return;
     }
 
-    const passphrase = requirePassphrase();
+    const passphrase = this.unlockForWrite();
     await this.mutate((store) => {
       const now = new Date().toISOString();
       pruneExpiredApprovalGrants(store, now);
@@ -1250,6 +1316,8 @@ export class SecretStore {
           request.approvalSource !== "manual") {
         throw new Error("An approved model relay request is required.");
       }
+      const unsealed = assertRequestApprovalSealed(request);
+      if (unsealed) throw new Error(unsealed);
       assertModelRelayCaller(request, principal);
       const now = new Date().toISOString();
       const approvedAt = request.approvedAt ? Date.parse(request.approvedAt) : NaN;
@@ -1327,12 +1395,12 @@ export class SecretStore {
   ): Promise<T> {
     assertReusableExecutionPermit(permit, this.home);
     await ensureSgwHome(this.home);
-    const started = await this.withStoreLock(async (lock) => {
+    const started = await this.withSealKey(() => this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
       assertExecutionCaller(permit, caller);
       const request = validatedReusableExecutionRequest(store, permit);
       return launch(request);
-    });
+    }));
     return started.completion;
   }
 
@@ -1361,7 +1429,7 @@ export class SecretStore {
       }
 
       const pendingMs = options.pendingOlderThanMs ?? 24 * 60 * 60 * 1000;
-      const approvedMs = options.approvedOlderThanMs ?? 60 * 60 * 1000;
+      const approvedMs = options.approvedOlderThanMs ?? approvedRequestTtlMs;
       cleaned.push(...cleanupOldRequests(store, now, pendingMs, approvedMs));
 
       return {
@@ -1373,6 +1441,46 @@ export class SecretStore {
 
   async listStoreBackups(): Promise<StoreBackupSummary[]> {
     return listStoreBackups(this.home);
+  }
+
+  async authorizationSealStatus(): Promise<AuthorizationSealStatus> {
+    const store = await this.read();
+    return controlSealProbes.get(store)?.status() ?? "unsealed";
+  }
+
+  /**
+   * Operator step after an upgrade, a recovery, or a deliberate manual edit: accept the stored
+   * handles, grants and policies as they are now and seal them with the unlock key.
+   */
+  async sealAuthorizationState(): Promise<AuthorizationSealResult> {
+    await ensureSgwHome(this.home);
+    const key = authorizationSealKey();
+    return sealKeys.run({ key }, () => this.withStoreLock(async (lock) => {
+      const store = await this.loadOrRecoverUnlocked(lock);
+      this.assertConsoleAccess(store);
+      const previous = controlSealProbes.get(store)?.status() ?? "unsealed";
+      const fingerprint = controlPlaneFingerprint(store);
+      const seal = authorizationSeal("control", controlSealPayload(this.home, fingerprint), key);
+      const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
+      await lock.assertOwned();
+      await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, checkpoint, seal));
+      controlSealProbes.set(store, controlSealProbe(this.home, store, await readControlState(this.home)));
+
+      const revision = await captureStoreRevision(this.home, this.storePath);
+      store.audit.push(audit(
+        "store.authorization.sealed",
+        `Sealed ${store.secrets.length} handles, ${store.approvalGrants.length} approval grants and ` +
+          `${store.approvalPolicyRules.length} policy rules (previous state: ${previous}).`
+      ));
+      await this.writeUnlocked(store, revision, lock);
+      return {
+        status: "sealed",
+        previous,
+        secrets: store.secrets.length,
+        approvalGrants: store.approvalGrants.length,
+        approvalPolicyRules: store.approvalPolicyRules.length
+      };
+    }));
   }
 
   async getRequest(id: string): Promise<RequestRecord> {
@@ -1559,6 +1667,24 @@ export class SecretStore {
       }
       assertExecutionCaller(request, caller, true);
 
+      const unsealed = assertRequestApprovalSealed(request);
+      if (unsealed) {
+        request.state = "failed";
+        request.updatedAt = now;
+        request.error = unsealed;
+        store.audit.push(audit("request.seal_invalid", `Refused request ${id}: ${unsealed}`, request.handle, id, request));
+        return { request, error: unsealed };
+      }
+
+      if (manualApprovalExpired(request, now)) {
+        const expired = "Approved request expired before execution. Create a fresh request to retry.";
+        request.state = "failed";
+        request.updatedAt = now;
+        request.error = expired;
+        store.audit.push(audit("request.expired", `Approved request ${id} expired before execution.`, request.handle, id, request));
+        return { request, error: expired };
+      }
+
       let upgradedLegacyAbsolute = false;
       let denyingRuleName: string | undefined;
       try {
@@ -1739,6 +1865,7 @@ export class SecretStore {
         const store = await this.readUnlocked();
         if (await controlStateMatches(this.home, store)) {
           this.assertConsoleAccess(store, continuationRequestId, continuationHandle);
+          controlSealProbes.set(store, controlSealProbe(this.home, store, await readControlState(this.home)));
           return store;
         }
       } catch (error) {
@@ -1775,6 +1902,9 @@ export class SecretStore {
     const previousFingerprint = previous ? controlPlaneFingerprint(previous) : undefined;
     const nextFingerprint = controlPlaneFingerprint(store);
     const controlChanged = previousFingerprint !== nextFingerprint;
+    const nextSeal = controlChanged || !manifest
+      ? nextControlSeal(this.home, controlSealProbes.get(store), previousFingerprint, nextFingerprint)
+      : undefined;
 
     if (expectedRevision.manifestFingerprint && expectedRevision.manifestFingerprint !== previousFingerprint) {
       throw new Error("s-gw store control manifest changed while a write was in progress; retry the operation.");
@@ -1814,7 +1944,7 @@ export class SecretStore {
     if (controlChanged || !controlState) {
       const checkpoint = nextCheckpoint || await ensureSealedControlPlaneCheckpoint(this.home, store, nextFingerprint, lock);
       await lock.assertOwned();
-      await writeControlState(this.home, controlStateFor(this.home, store, nextFingerprint, checkpoint));
+      await writeControlState(this.home, controlStateFor(this.home, store, nextFingerprint, checkpoint, nextSeal));
       await unlink(pendingControlStatePath(this.home)).catch(() => undefined);
     }
     await ensureStoreMarker(this.home);
@@ -1831,7 +1961,7 @@ export class SecretStore {
     continuationHandle?: string
   ): Promise<T> {
     await ensureSgwHome(this.home);
-    return this.withStoreLock(async (lock) => {
+    return this.withSealKey(() => this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
       this.assertConsoleAccess(store, continuationRequestId, continuationHandle);
       const revision = await captureStoreRevision(this.home, this.storePath);
@@ -1841,7 +1971,26 @@ export class SecretStore {
         await this.writeUnlocked(store, revision, lock);
       }
       return result;
-    });
+    }));
+  }
+
+  // Resolves the seal key before the store lock is taken, so nothing under the lock
+  // has to read the unlock passphrase.
+  private async withSealKey<T>(operation: () => Promise<T>): Promise<T> {
+    if (sealKeys.getStore()) {
+      return operation();
+    }
+    const seeded = this.seededSealKey;
+    this.seededSealKey = undefined;
+    return sealKeys.run({ key: seeded ?? resolveSealKey() }, operation);
+  }
+
+  // Secret writes already read the unlock passphrase before taking the lock, so reuse it
+  // instead of asking the OS credential store a second time.
+  private unlockForWrite(): string {
+    const passphrase = requirePassphrase();
+    this.seededSealKey = authorizationSealKey(passphrase);
+    return passphrase;
   }
 
   private assertConsoleAccess(store: StoreFile, continuationRequestId?: string, continuationHandle?: string): void {
@@ -1862,6 +2011,12 @@ export class SecretStore {
   }
 
   private async loadOrRecoverUnlocked(lock: StoreLock): Promise<StoreFile> {
+    const store = await this.loadOrRecoverStore(lock);
+    controlSealProbes.set(store, controlSealProbe(this.home, store, await readControlState(this.home)));
+    return store;
+  }
+
+  private async loadOrRecoverStore(lock: StoreLock): Promise<StoreFile> {
     const manifest = await readControlState(this.home);
     await assertRecoveryVaultMatches(this.home, manifest);
     await assertWriterRuntimeIsCurrent(this.home, manifest);
@@ -1890,6 +2045,7 @@ export class SecretStore {
       }
 
       const fresh = emptyStore();
+      controlSealProbes.set(fresh, controlSealProbe(this.home, fresh, undefined));
       const revision = await captureStoreRevision(this.home, this.storePath);
       await this.writeUnlocked(fresh, revision, lock);
       return fresh;
@@ -2290,7 +2446,8 @@ function controlStateFor(
   home: string,
   store: StoreFile,
   fingerprint = controlPlaneFingerprint(store),
-  checkpoint?: SealedControlPlaneCheckpoint
+  checkpoint?: SealedControlPlaneCheckpoint,
+  seal?: string
 ): StoreControlState {
   return {
     version: 1,
@@ -2302,8 +2459,110 @@ function controlStateFor(
     recoveryCheckpoint: checkpoint ? path.basename(checkpoint.path) : undefined,
     recoveryVaultId: recoveryVaultId(home),
     recoveryNamespace: recoveryNamespace(home),
-    writerVersion: CURRENT_VERSION
+    writerVersion: CURRENT_VERSION,
+    authorizationSeal: seal
   };
+}
+
+function controlSealPayload(home: string, fingerprint: string): string {
+  return `${recoveryVaultId(home)}:${fingerprint}`;
+}
+
+function controlSealStatus(
+  home: string,
+  manifest: StoreControlState | undefined,
+  fingerprint: string
+): AuthorizationSealStatus {
+  if (!manifest?.authorizationSeal || manifest.fingerprint !== fingerprint) {
+    return "unsealed";
+  }
+  try {
+    return authorizationSealMatches(manifest.authorizationSeal, "control", controlSealPayload(home, fingerprint), sealKey())
+      ? "sealed"
+      : "invalid";
+  } catch {
+    return "locked";
+  }
+}
+
+function controlSealProbe(home: string, store: StoreFile, manifest: StoreControlState | undefined): ControlSealProbe {
+  const fingerprint = controlPlaneFingerprint(store);
+  let cached: AuthorizationSealStatus | undefined;
+  return {
+    fingerprint,
+    empty: controlPlaneIsEmpty(store),
+    status() {
+      cached ??= controlSealStatus(home, manifest, fingerprint);
+      return cached;
+    }
+  };
+}
+
+// Nothing to forge in an empty control plane, so a new home may seal itself.
+function controlPlaneIsEmpty(store: StoreFile): boolean {
+  return store.secrets.length === 0 &&
+    store.approvalGrants.length === 0 &&
+    store.approvalPolicyRules.length === 0 &&
+    !store.managedSshRoutes?.length &&
+    !store.credentialOps?.length &&
+    store.consoleAccess === undefined &&
+    JSON.stringify(canonicalValue(store.approvalSettings)) === JSON.stringify(canonicalValue(defaultApprovalSettings));
+}
+
+function controlIsSealed(store: StoreFile): boolean {
+  return controlSealProbes.get(store)?.status() === "sealed";
+}
+
+// The seal only carries forward from a state that was itself sealed (or empty),
+// so recovered, hand-edited, or older-writer state stays unsealed until an operator reseals it.
+function nextControlSeal(
+  home: string,
+  probe: ControlSealProbe | undefined,
+  previousFingerprint: string | undefined,
+  nextFingerprint: string
+): string | undefined {
+  if (!probe || (previousFingerprint !== undefined && previousFingerprint !== probe.fingerprint)) {
+    return undefined;
+  }
+  const status = probe.status();
+  if (status === "locked") {
+    throw new Error(lockedSealMessage);
+  }
+  if (status !== "sealed" && !probe.empty) {
+    return undefined;
+  }
+  try {
+    return authorizationSeal("control", controlSealPayload(home, nextFingerprint), sealKey());
+  } catch {
+    // An empty home created while locked stays unsealed until its first unlocked change.
+    return undefined;
+  }
+}
+
+function requestApprovalPayload(request: RequestRecord): string {
+  return JSON.stringify([
+    request.id,
+    request.handle,
+    request.agentSource ?? null,
+    request.principalId ?? null,
+    request.agentSessionId ?? null,
+    request.approvalSource ?? null,
+    request.approvalGrantId ?? null,
+    request.approvalPolicyRuleId ?? null,
+    request.approvedAt ?? null,
+    canonicalValue(request.action)
+  ]);
+}
+
+function sealRequestApproval(request: RequestRecord): void {
+  request.approvalSeal = authorizationSeal("request", requestApprovalPayload(request), sealKey());
+}
+
+function assertRequestApprovalSealed(request: RequestRecord): string | undefined {
+  const sealed = authorizationSealMatches(request.approvalSeal, "request", requestApprovalPayload(request), sealKey());
+  return sealed
+    ? undefined
+    : "This approval is not sealed by this s-gw installation or was changed after approval. Create a fresh request to retry.";
 }
 
 /**
@@ -2394,7 +2653,8 @@ function parseControlState(raw: string): StoreControlState | undefined {
       (value.recoveryCheckpoint !== undefined && !isSealedCheckpointName(value.recoveryCheckpoint)) ||
       (value.recoveryVaultId !== undefined && !/^[a-f0-9]{64}$/.test(value.recoveryVaultId)) ||
       (value.recoveryNamespace !== undefined && !/^[a-f0-9]{24}$/.test(value.recoveryNamespace)) ||
-      (value.writerVersion !== undefined && !isRuntimeVersion(value.writerVersion))
+      (value.writerVersion !== undefined && !isRuntimeVersion(value.writerVersion)) ||
+      (value.authorizationSeal !== undefined && typeof value.authorizationSeal !== "string")
     ) {
       return undefined;
     }
@@ -3668,6 +3928,8 @@ interface ExecutionAdmissionContext {
   now: string;
   policyRule?: ApprovalPolicyRule;
   grant?: ApprovalGrant;
+  /** A grant or allow rule matched but the stored authorization state is not sealed. */
+  unsealedAutoApproval?: boolean;
 }
 
 function createRequestInStore(
@@ -3737,6 +3999,9 @@ function createRequestInStore(
     grant.lastRequestId = record.id;
     grant.updatedAt = now;
   }
+  if (record.state === "approved") {
+    sealRequestApproval(record);
+  }
 
   store.requests.push(record);
   const superseded = record.state === "pending" ? supersedeOlderPendingDuplicates(store, record, now) : [];
@@ -3745,6 +4010,15 @@ function createRequestInStore(
     : (allowedByPolicy ? "request.auto_approved_by_policy" : (grant ? "request.auto_approved" : "request.created"));
   const message = requestCreationMessage(record, grant, policyRule, superseded.length);
   store.audit.push(audit(eventType, message, secret.handle, record.id, record));
+  if (admission.unsealedAutoApproval) {
+    store.audit.push(audit(
+      "approval.autoapprove.skipped",
+      `Request ${record.id} waits for manual approval. ${unsealedAuthorizationMessage}`,
+      secret.handle,
+      record.id,
+      record
+    ));
+  }
   return record;
 }
 
@@ -3828,6 +4102,13 @@ function executionAdmissionContext(
   const grant = admittedAction.kind === "model_relay"
     ? undefined
     : activeApprovalGrant(store, handle, admittedAction, agent, now, loginSessionId);
+  if ((grant || policyRule?.decision === "allow") && !controlIsSealed(store)) {
+    return {
+      secret, action: admittedAction, agent, loginSessionId, now,
+      policyRule: policyRule?.decision === "allow" ? undefined : policyRule,
+      unsealedAutoApproval: true
+    };
+  }
   return { secret, action: admittedAction, agent, loginSessionId, now, policyRule, grant };
 }
 
@@ -3836,6 +4117,10 @@ function automaticRequestAuthorizationError(
   request: RequestRecord,
   nowIso: string
 ): string | undefined {
+  if ((request.approvalSource === "grant" || request.approvalSource === "policy") && !controlIsSealed(store)) {
+    return unsealedAuthorizationMessage;
+  }
+
   if (request.approvalSource === "grant") {
     const grant = activeApprovalGrant(store, request.handle, request.action, identityFromRequest(request), nowIso);
     if (!request.approvalGrantId || !grant || grant.id !== request.approvalGrantId) {
@@ -3863,6 +4148,9 @@ function automaticRequestAuthorizationError(
 function validatedReusableExecutionRequest(store: StoreFile, permit: ReusableExecutionPermit): RequestRecord {
   if (controlPlaneFingerprint(store) !== permit.controlFingerprint) {
     throw new Error("s-gw execution authorization changed before the command started; retry the command.");
+  }
+  if (!controlIsSealed(store)) {
+    throw new Error(unsealedAuthorizationMessage);
   }
 
   const secret = store.secrets.find((item) => item.handle === permit.handle);
@@ -4098,6 +4386,19 @@ function cleanupDuplicatePendingRequests(store: StoreFile, nowIso: string): Requ
   }
 
   return cleaned;
+}
+
+// Grant and policy approvals are re-checked against live authorization at claim,
+// so only a one-off human approval can go stale here.
+function manualApprovalExpired(request: RequestRecord, nowIso: string): boolean {
+  if (request.approvalSource === "grant" || request.approvalSource === "policy") {
+    return false;
+  }
+  const approved = Date.parse(request.approvedAt || request.createdAt);
+  if (!Number.isFinite(approved)) {
+    return false;
+  }
+  return Date.parse(nowIso) - approved >= approvedRequestTtlMs;
 }
 
 function cleanupOldRequests(
@@ -4589,6 +4890,8 @@ function approvePendingRequest(
   if (request.action.kind === "model_relay" && options.mode && options.mode !== "per-transaction") {
     throw new Error("Model relay approval is available only for this agent session.");
   }
+  // Fail before touching the request if the approval could not be sealed.
+  sealKey();
 
   request.state = "approved";
   request.approvedAt = now;
@@ -4598,6 +4901,7 @@ function approvePendingRequest(
   const grant = createApprovalGrant(store, request, now,
     request.action.kind === "model_relay" ? { mode: "per-transaction" } : options);
   request.approvalGrantId = grant?.id;
+  sealRequestApproval(request);
   store.audit.push(
     policyRule
       ? audit("request.approved_by_policy", `Approved execution request ${id} with approval policy ${policyRule.name}.`, request.handle, id, request)
@@ -5393,6 +5697,10 @@ export function assertActionAllowed(secret: SecretRecord, action: CommandAction)
     if (allowed.length === 0 || !allowed.some(commandAllowsSshSession)) {
       throw new Error(`Handle ${secret.handle} is not allowed for s-gw-owned SSH sessions. Add ${SGW_SSH_SESSION_COMMAND} to the handle policy.`);
     }
+    // A managed route is already an operator-pinned destination.
+    if (!action.ssh?.managed && !action.ssh?.managedRouteId) {
+      assertNamedDestinationsAllowed(secret.policy.allowedDestinations, action);
+    }
     return;
   }
 
@@ -5400,6 +5708,7 @@ export function assertActionAllowed(secret: SecretRecord, action: CommandAction)
   if (allowed.length === 0 || !allowed.includes(requestedCommand)) {
     throw new Error(`Command '${action.command}' is not allowed for handle ${secret.handle}.`);
   }
+  assertNamedDestinationsAllowed(secret.policy.allowedDestinations, action);
 }
 
 function assertCredentialBackedExecutableAllowed(action: CommandAction): void {

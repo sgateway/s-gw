@@ -720,6 +720,16 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (first === "store" && second === "seal-status") {
+    printJson({ authorizationSeal: await store.authorizationSealStatus() });
+    return;
+  }
+
+  if (first === "store" && second === "seal") {
+    printJson(await store.sealAuthorizationState());
+    return;
+  }
+
   throw new Error(unknownCommandMessage(parsed.command));
 }
 
@@ -2953,6 +2963,8 @@ Commands:
   s-gw requests cleanup [--pending-ttl-ms 86400000] [--approved-ttl-ms 3600000] [--no-dedupe]
   s-gw execute-next [--handle HANDLE] [--kind env_command|ssh_session] [--command CMD] [--strict-legacy-revocation]
   s-gw store backups
+  s-gw store seal-status
+  s-gw store seal
   s-gw approve REQUEST_ID [--mode per-transaction|timed-session|login-session|always] [--duration 8h] [--agent-scope same-agent|any-agent] [--confirm-route 'user@host:port SHA256:...']
   s-gw approve-policy REQUEST_ID [--confirm-route 'user@host:port SHA256:...']
   s-gw deny REQUEST_ID
