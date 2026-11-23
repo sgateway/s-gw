@@ -40,6 +40,10 @@ export interface AgentIdentityContext {
   managedPrincipal?: VerifiedAgentPrincipal;
   /** Set only by an adapter that checked the running ancestor processes. */
   launcherChain?: AttestedLauncherChain;
+  /** Ancestor executables or publishers observed on Linux and Windows. Evidence only. */
+  observedLaunchers?: readonly string[];
+  /** Random per-process value held by the MCP server; never stored in clear. */
+  sessionNonce?: string;
 }
 
 export function agentNameFromReason(reason: string): string {

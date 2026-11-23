@@ -140,7 +140,7 @@ describe("MCP end-to-end flow", () => {
     }
   }, 20_000);
 
-  it("denies execution before approval and returns sanitized output after approval", async () => {
+  it("denies execution before approval and returns sanitized output to the requesting client after approval", async () => {
     runCli(["init"]);
     const addPayload = JSON.parse(
       runCli(
@@ -210,10 +210,9 @@ describe("MCP end-to-end flow", () => {
         name: "sgw_execute_request",
         arguments: { requestId: requestPayload.request.id }
       });
-      expect(executed.isError).toBe(true);
-      expect(executed.content[0].text).toContain("verified agent principal and session");
+      expect(executed.isError).not.toBe(true);
 
-      const summary = JSON.parse(runCli(["execute", requestPayload.request.id]));
+      const summary = JSON.parse(executed.content[0].text);
       expect(summary.exitCode).toBe(0);
       expect(summary.stdout).not.toContain("mcp-e2e-secret-value");
       expect(summary.stdout).toContain(`<<SGW_SECRET:${addPayload.handle}>>`);
@@ -223,7 +222,7 @@ describe("MCP end-to-end flow", () => {
     }
   }, 20_000);
 
-  it("requires a verified peer by default for automatic MCP approval while preserving manual approval", async () => {
+  it("approves a declared MCP client name by policy and keeps a reason-only client on manual approval", async () => {
     runCli(["init"]);
     const secret = JSON.parse(runCli([
       "secret", "add", "--name", "verified MCP fixture", "--type", "api-token", "--value-stdin",
@@ -246,32 +245,58 @@ describe("MCP end-to-end flow", () => {
       args: ["-e", "process.stdout.write('approved')"], injectEnv: "TOKEN",
       reason: "ordinary MCP verified-only check"
     };
+    // A generic client name is not an agent name, so this client is known only from its reason text.
+    const unnamedTransport = new StdioClientTransport({
+      command: process.execPath, args: [tsxCli, "src/mcp-server.ts"], cwd: repoRoot,
+      env: { ...testEnv, SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } as Record<string, string>, stderr: "pipe"
+    });
+    const unnamed = new Client({ name: "mcp-client", version: "0.0.1" });
+    await unnamed.connect(unnamedTransport);
+    const unnamedArgs = { ...args, reason: "Codex asked for this" };
     try {
       const first = await client.callTool({ name: "sgw_request_execution", arguments: args });
       expect(first.isError).not.toBe(true);
-      expect(JSON.parse(first.content[0].text).request.state).toBe("pending");
+      expect(JSON.parse(first.content[0].text).request).toMatchObject({
+        state: "approved", approvalSource: "policy", agentName: "Codex", agentSource: "mcp-client"
+      });
 
       runCli(["approval", "set", "--mode", "per-transaction", "--require-verified-agent"]);
 
-      const pending = await client.callTool({ name: "sgw_request_execution", arguments: args });
-      expect(pending.isError).not.toBe(true);
-      const request = JSON.parse(pending.content[0].text).request;
-      expect(request).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "mcp-client" });
+      const again = await client.callTool({ name: "sgw_request_execution", arguments: args });
+      expect(again.isError).not.toBe(true);
+      const allowed = JSON.parse(again.content[0].text).request;
+      expect(allowed).toMatchObject({ state: "approved", approvalSource: "policy", agentSource: "mcp-client" });
+      const ownRun = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: allowed.id } });
+      expect(ownRun.isError).not.toBe(true);
+      expect(JSON.parse(ownRun.content[0].text)).toMatchObject({ exitCode: 0, stdout: "approved" });
 
       const reusable = await client.callTool({ name: "sgw_run_execution", arguments: args });
       expect(reusable.isError).not.toBe(true);
-      expect(JSON.parse(reusable.content[0].text)).toMatchObject({ approvalRequired: true, request: { state: "pending" } });
+      expect(JSON.parse(reusable.content[0].text)).toMatchObject({
+        approvalRequired: false, reusableAuthorization: { kind: "policy" }, summary: { exitCode: 0, stdout: "approved" }
+      });
+
+      const pending = await unnamed.callTool({ name: "sgw_request_execution", arguments: unnamedArgs });
+      expect(pending.isError).not.toBe(true);
+      const request = JSON.parse(pending.content[0].text).request;
+      expect(request).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "reason" });
+
+      const held = await unnamed.callTool({ name: "sgw_run_execution", arguments: unnamedArgs });
+      expect(held.isError).not.toBe(true);
+      expect(JSON.parse(held.content[0].text)).toMatchObject({ approvalRequired: true, request: { state: "pending" } });
 
       const manual = JSON.parse(runCli(["approve", request.id, "--mode", "timed-session"]));
       expect(manual.approvalSource).toBe("manual");
       expect(manual.approvalGrantId).toBeUndefined();
       expect(JSON.parse(runCli(["approval", "grants", "list"]))).toEqual([]);
-      const executed = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
-      expect(executed.isError).toBe(true);
-      expect(executed.content[0].text).toContain("verified agent principal and session");
-      expect(JSON.parse(runCli(["execute", request.id]))).toMatchObject({ exitCode: 0, stdout: "approved" });
+      const stolen = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(stolen.isError).toBe(true);
+      expect(stolen.content[0].text).toContain("only requests its own session created");
+      const executed = await unnamed.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(executed.isError).not.toBe(true);
+      expect(JSON.parse(executed.content[0].text)).toMatchObject({ exitCode: 0, stdout: "approved" });
 
-      const repeat = await client.callTool({ name: "sgw_request_execution", arguments: args });
+      const repeat = await unnamed.callTool({ name: "sgw_request_execution", arguments: unnamedArgs });
       const repeatRequest = JSON.parse(repeat.content[0].text).request;
       expect(repeatRequest.state).toBe("pending");
 
@@ -287,17 +312,17 @@ describe("MCP end-to-end flow", () => {
           name: "sgw_execute_request", arguments: { requestId: repeatRequest.id }
         });
         expect(claimed.isError).toBe(true);
-        expect(claimed.content[0].text).toContain("verified agent principal and session");
+        expect(claimed.content[0].text).toContain("only requests its own session created");
         expect(JSON.parse(runCli(["execute", repeatRequest.id]))).toMatchObject({ exitCode: 0, stdout: "approved" });
       } finally {
         await otherClient.close();
       }
     } finally {
-      await client.close();
+      await Promise.all([client.close(), unnamed.close()]);
     }
   }, 30_000);
 
-  it("does not let either ordinary MCP client claim a manually approved owned HTTPS request", async () => {
+  it("lets only the requesting MCP client claim a manually approved owned HTTPS request", async () => {
     runCli(["init"]);
     const secret = JSON.parse(runCli([
       "secret", "add", "--name", "owned HTTPS claim fixture", "--type", "api-token", "--value-stdin",
@@ -321,17 +346,22 @@ describe("MCP end-to-end flow", () => {
       expect(request).toMatchObject({ state: "pending", agentSource: "mcp-client" });
       runCli(["approve", request.id]);
 
-      for (const client of clients) {
-        const denied = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
-        expect(denied.isError).toBe(true);
-        expect(denied.content[0].text).toMatch(/verified agent principal and session/);
-      }
+      const denied = await clients[1].callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(denied.isError).toBe(true);
+      expect(denied.content[0].text).toContain("only requests its own session created");
+      expect(requestState(request.id)).toBe("approved");
+
+      // example.test never resolves, so the requester gets past the claim and fails on the network.
+      const claimed = await clients[0].callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(claimed.isError).toBe(true);
+      expect(claimed.content[0].text).not.toContain("own session created");
+      expect(requestState(request.id)).toBe("failed");
     } finally {
       await Promise.all(clients.map(client => client.close()));
     }
   }, 30_000);
 
-  it.skipIf(process.platform === "win32")("keeps a manually approved legacy SSH request out of another MCP client", async () => {
+  it.skipIf(process.platform === "win32")("lets only the requesting MCP client or the operator run a manually approved legacy SSH request", async () => {
     const fakeSsh = path.join(tmpHome, "fake-ssh");
     await writeFile(fakeSsh, `#!${process.execPath}\nif (!process.argv.includes("-M")) process.stdout.write("legacy SSH result");\n`);
     await chmod(fakeSsh, 0o755);
@@ -360,21 +390,32 @@ describe("MCP end-to-end flow", () => {
         await client.connect(transport);
         clients.push(client);
       }
-      const pending = await clients[0].callTool({ name: "sgw_request_ssh_session", arguments: {
+      const sshArgs = {
         handle: secret.handle, target: "fixture@example.test", args: ["id"],
         reason: "ordinary MCP legacy SSH claim fixture"
-      } });
+      };
+      const pending = await clients[0].callTool({ name: "sgw_request_ssh_session", arguments: sshArgs });
       const request = JSON.parse(pending.content[0].text).request;
       expect(request).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "mcp-client" });
       expect(request.action.ssh.managedRouteId).toBeUndefined();
       runCli(["approve", request.id, "--mode", "per-transaction"]);
 
-      for (const client of clients) {
-        const denied = await client.callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
-        expect(denied.isError).toBe(true);
-        expect(denied.content[0].text).toContain("verified agent principal and session");
-      }
-      expect(JSON.parse(runCli(["execute", request.id]))).toMatchObject({ exitCode: 0, stdout: "legacy SSH result" });
+      const denied = await clients[1].callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(denied.isError).toBe(true);
+      expect(denied.content[0].text).toContain("only requests its own session created");
+      expect(requestState(request.id)).toBe("approved");
+      const own = await clients[0].callTool({ name: "sgw_execute_request", arguments: { requestId: request.id } });
+      expect(own.isError).not.toBe(true);
+      expect(JSON.parse(own.content[0].text)).toMatchObject({ exitCode: 0, stdout: "legacy SSH result" });
+
+      const second = await clients[0].callTool({ name: "sgw_request_ssh_session", arguments: sshArgs });
+      const forOperator = JSON.parse(second.content[0].text).request;
+      expect(forOperator.state).toBe("pending");
+      runCli(["approve", forOperator.id, "--mode", "per-transaction"]);
+      const stillDenied = await clients[1].callTool({ name: "sgw_execute_request", arguments: { requestId: forOperator.id } });
+      expect(stillDenied.isError).toBe(true);
+      expect(stillDenied.content[0].text).toContain("only requests its own session created");
+      expect(JSON.parse(runCli(["execute", forOperator.id]))).toMatchObject({ exitCode: 0, stdout: "legacy SSH result" });
     } finally {
       await Promise.all(clients.map(client => client.close()));
     }
@@ -482,6 +523,11 @@ describe("MCP end-to-end flow", () => {
     }
   }, 20_000);
 });
+
+function requestState(id: string): string | undefined {
+  const requests = JSON.parse(runCli(["requests", "--all"])) as Array<{ id: string; state: string }>;
+  return requests.find((item) => item.id === id)?.state;
+}
 
 function runCli(args: string[], input?: string): string {
   return execFileSync(process.execPath, [tsxCli, "src/cli.ts", ...args], {

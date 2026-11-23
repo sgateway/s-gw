@@ -1,8 +1,28 @@
-# Trusted launcher signature (macOS)
+# Agent identity and launcher evidence
 
-## What it is
+## Three levels
 
-An ordinary stdio MCP client is identified only by the name it declares. s-gw does not let a declared name use reusable grants or allow policies, and it does not let that client execute an approved request itself.
+| Level | How the agent is identified | Platforms | What it is good for |
+| --- | --- | --- | --- |
+| Declared name | The name set by the s-gw integration (`SGW_AGENT_NAME`), the MCP client name, or a detected runtime or process | macOS, Linux, Windows | Reusable grants and name-based allow policies, as in 0.1.22. Identifies the agent; does not prove it |
+| Pinned launcher signature | The code signature of the application that launched the s-gw MCP server, pinned by the operator | macOS | Grants and policies bound to a real application instead of a string |
+| Verified peer | A kernel-verified OS identity from a managed launcher | Where a managed launcher is installed | The paths that need real isolation, such as model relay |
+
+A name taken only from the free-form reason on a request never gets a grant or a policy.
+
+Whatever the level, an approved request can be executed by the agent session that created it, by the operator, or by a matching verified peer. Another MCP client that learns the request ID cannot execute it.
+
+## Launcher evidence on every platform
+
+Each request records which applications launched the requesting MCP server, nearest first:
+
+- macOS: team-signed code signatures (`codesign:<TEAM ID>:<identifier>`);
+- Windows: the Authenticode publisher when the signature is valid, otherwise the executable path;
+- Linux: the executable path of each ancestor.
+
+This is evidence for the operator and is never enforced on its own. When a known agent name arrives from a different launcher than before, s-gw writes an `agent.launcher.changed` audit event and carries on.
+
+## Pinning a signature (macOS)
 
 On macOS, an operator can pin the code signature of the application that launches the s-gw MCP server. Requests from a process whose ancestry carries a pinned signature are treated as a verified agent for three things:
 
@@ -41,7 +61,7 @@ Removing a signature also removes the reusable grants issued to it.
 
 General-purpose runtimes such as `node`, `python`, `bun`, `deno` and shells cannot be pinned, because every script they run would share the identity.
 
-The trust list is part of the sealed authorization state. It is ignored while that state is unsealed; run `s-gw store seal` after an upgrade or a recovery.
+The trust list is part of the sealed authorization state, which s-gw seals and reseals on its own.
 
 ## What it does not do
 
@@ -54,4 +74,4 @@ This identifies the launching application. It is not an isolation boundary and m
 
 The tier stops casual impersonation by name, environment variable or process name, and it lets policies follow a real application instead of a string. Separating the broker from the agent's OS user, described in [OS identity for confined agents](agent-os-identity.md), is what provides isolation.
 
-Set `SGW_DISABLE_LAUNCHER_ATTESTATION=1` to turn the check off. Linux and Windows have no equivalent in this release.
+Set `SGW_DISABLE_LAUNCHER_ATTESTATION=1` to turn launcher checks and evidence off. Pinning is macOS-only in this release; Linux and Windows record launcher evidence but have nothing to pin.

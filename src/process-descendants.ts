@@ -1,9 +1,10 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 
 // Absolute on purpose: a PATH lookup could run an attacker-planted ps.
 const PS_BINARY = "/bin/ps";
 const PS_TIMEOUT_MS = 1_000;
+const TASKKILL_TIMEOUT_MS = 5_000;
 
 export function listDescendantPids(rootPid: number): number[] {
   if (process.platform === "win32" || !Number.isInteger(rootPid) || rootPid <= 0) {
@@ -27,6 +28,25 @@ export function signalPids(pids: number[], signal: NodeJS.Signals): void {
     } catch {
       // Already gone, or not ours to signal.
     }
+  }
+}
+
+// Windows has no cheap parent table to walk, so taskkill /T finds and ends the tree itself.
+export function killWindowsProcessTree(pid: number): void {
+  // 0 and 4 are the idle and System processes.
+  if (process.platform !== "win32" || !Number.isInteger(pid) || pid <= 4 || pid === process.pid) {
+    return;
+  }
+  // Absolute for the same reason as ps above.
+  const taskkill = `${process.env.SystemRoot || "C:\\Windows"}\\System32\\taskkill.exe`;
+  try {
+    spawnSync(taskkill, ["/PID", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      timeout: TASKKILL_TIMEOUT_MS,
+      windowsHide: true
+    });
+  } catch {
+    // Best effort: the caller still kills the direct child.
   }
 }
 

@@ -19,7 +19,9 @@ import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 const hour = 60 * 60 * 1000;
-const verifiedCodex = { managedPrincipal: principalForVerifiedPeer("test:codex", "Codex", "session-1"), env: {} };
+// Without this the tests would pick up whichever agent happens to be running them.
+const quietEnv = { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" };
+const verifiedCodex = { managedPrincipal: principalForVerifiedPeer("test:codex", "Codex", "session-1"), env: quietEnv };
 
 function fakeToken(label: string): string {
   return ["sk", "-proj-", label, "_1234567890abcdef"].join("");
@@ -261,35 +263,63 @@ describe("sealed authorization state", () => {
     await expect(store.claimApprovedRequest(request.id)).rejects.toThrow(/changed after approval/u);
   });
 
-  it("stops grants from approving once the seal is removed, until an operator reseals", async () => {
+  it("reseals on its own when the seal goes missing and records that it did", async () => {
     const { store, secret, action } = await storeWithGrant();
     await editJson(manifestPath(), (manifest) => { delete manifest.authorizationSeal; });
     expect(await store.authorizationSealStatus()).toBe("unsealed");
 
-    const waiting = await store.createRequest(secret.handle, action(), "Unsealed grant reuse", verifiedCodex);
-    expect(waiting.state).toBe("pending");
-    const skipped = (await store.auditLog()).filter((event) => event.requestId === waiting.id).map((event) => event.type);
-    expect(skipped).toContain("approval.autoapprove.skipped");
-
-    // A one-off human approval is sealed on its own and still runs.
-    await store.approveRequest(waiting.id);
-    expect((await store.claimApprovedRequest(waiting.id)).state).toBe("executing");
-
-    const sealed = await store.sealAuthorizationState();
-    expect(sealed).toMatchObject({ status: "sealed", previous: "unsealed", approvalGrants: 1 });
-    const reused = await store.createRequest(secret.handle, action(), "Resealed grant reuse", verifiedCodex);
+    // No operator step: the next write reseals, and the grant keeps working.
+    const reused = await store.createRequest(secret.handle, action(), "Reuse after lost seal", verifiedCodex);
     expect(reused.state).toBe("approved");
+    expect(await store.authorizationSealStatus()).toBe("sealed");
+
+    const events = (await store.auditLog()).map((event) => event.type);
+    expect(events).toContain("store.authorization.resealed");
+    expect(events).not.toContain("approval.autoapprove.skipped");
   });
 
-  it("refuses to claim a grant-approved request after the seal is replaced", async () => {
+  it("reseals after a replaced seal and still runs a grant-approved request", async () => {
     const { store, secret, action } = await storeWithGrant();
     const reused = await store.createRequest(secret.handle, action(), "Grant reuse before tamper", verifiedCodex);
     expect(reused.state).toBe("approved");
 
     await editJson(manifestPath(), (manifest) => { manifest.authorizationSeal = "not-a-real-seal"; });
     expect(await store.authorizationSealStatus()).toBe("invalid");
-    await expect(store.claimApprovedRequest(reused.id)).rejects.toThrow(/not sealed by this s-gw installation/u);
-    expect((await store.getRequest(reused.id)).state).toBe("denied");
+    expect((await store.claimApprovedRequest(reused.id)).state).toBe("executing");
+
+    const resealed = (await store.auditLog()).find((event) => event.type === "store.authorization.resealed");
+    expect(resealed?.message).toMatch(/changed outside s-gw \(seal was invalid\)/u);
+  });
+
+  it("treats an unsealed home from an older version as an upgrade and carries pending approvals", async () => {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: "upgrade token",
+      type: "api-token",
+      value: fakeToken("upgrade_path"),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    const request = await store.createRequest(
+      secret.handle,
+      buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "TOKEN" }),
+      "Approved just before the upgrade"
+    );
+    await store.approveRequest(request.id);
+
+    // What an older runtime leaves behind: no seal anywhere and its own writer version.
+    await editJson(manifestPath(), (manifest) => {
+      delete manifest.authorizationSeal;
+      manifest.writerVersion = "0.1.22";
+    });
+    await editJson(store.storePath, (raw) => {
+      delete raw.requests.find((item: { id: string }) => item.id === request.id).approvalSeal;
+    });
+
+    expect((await store.claimApprovedRequest(request.id)).state).toBe("executing");
+    const sealed = (await store.auditLog()).find((event) => event.type === "store.authorization.sealed");
+    expect(sealed?.message).toMatch(/after upgrading from 0\.1\.22, and carried over 1 approved requests/u);
+    expect((await store.auditLog()).map((event) => event.type)).not.toContain("store.authorization.resealed");
+    expect(await store.authorizationSealStatus()).toBe("sealed");
   });
 
   it("does not accept a seal made with a different unlock key", async () => {
@@ -338,7 +368,7 @@ describe("launcher signature parsing", () => {
 
 describe("trusted launcher signature tier", () => {
   const signature = { teamId: "ABCDE12345", identifier: "com.example.agent", pid: 4242, startedAt: "Sun Nov 22 10:00:00 2026" };
-  const signedAgent = () => ({ launcherChain: launcherChainFromAttestation([signature]), env: {} });
+  const signedAgent = () => ({ launcherChain: launcherChainFromAttestation([signature]), env: quietEnv });
   const principalId = launcherPrincipalId(signature);
   const nodeAction = () => buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "TOKEN" });
 
@@ -385,9 +415,9 @@ describe("trusted launcher signature tier", () => {
     const reused = await store.createRequest(secret.handle, nodeAction(), "Trusted repeat", signedAgent());
     expect(reused).toMatchObject({ state: "approved", approvalSource: "grant" });
 
-    const otherSession = { launcherChain: launcherChainFromAttestation([{ ...signature, pid: 9999 }]), env: {} };
+    const otherSession = { launcherChain: launcherChainFromAttestation([{ ...signature, pid: 9999 }]), env: quietEnv };
     await expect(store.claimApprovedRequest(reused.id, otherSession)).rejects.toThrow(/different verified agent or session/u);
-    await expect(store.claimApprovedRequest(reused.id, { mcpClientName: "example", env: {} }))
+    await expect(store.claimApprovedRequest(reused.id, { mcpClientName: "example", env: quietEnv }))
       .rejects.toThrow(/different verified agent or session/u);
     expect((await store.claimApprovedRequest(reused.id, signedAgent())).state).toBe("executing");
   });
@@ -398,11 +428,11 @@ describe("trusted launcher signature tier", () => {
     const first = await store.createRequest(secret.handle, nodeAction(), "Trusted run", signedAgent());
     await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
 
-    const stranger = { launcherChain: launcherChainFromAttestation([{ ...signature, identifier: "com.example.other" }]), env: {} };
+    const stranger = { launcherChain: launcherChainFromAttestation([{ ...signature, identifier: "com.example.other" }]), env: quietEnv };
     expect((await store.createRequest(secret.handle, nodeAction(), "Other app", stranger)).state).toBe("pending");
 
     // Shaped like an attestation but not produced by the attestation module.
-    const forged = { launcherChain: { signatures: [signature] }, env: {} };
+    const forged = { launcherChain: { signatures: [signature] }, env: quietEnv };
     const fromForged = await store.createRequest(secret.handle, nodeAction(), "Forged chain", forged);
     expect(fromForged.state).toBe("pending");
     expect(fromForged.agentSource).not.toBe("signed-launcher");
@@ -424,16 +454,17 @@ describe("trusted launcher signature tier", () => {
     expect(after.agentSource).not.toBe("signed-launcher");
   });
 
-  it("ignores the trust list while the stored state is unsealed", async () => {
-    const { store, secret } = await tokenStore("unsealed");
+  it("keeps the trust list working after an automatic reseal", async () => {
+    const { store, secret } = await tokenStore("resealed");
     await store.addTrustedLauncher({ name: "Example Agent", teamId: "ABCDE12345", identifier: "com.example.agent" });
     const manifest = path.join(tmpHome, ".store-control.json");
     const raw = JSON.parse(await readFile(manifest, "utf8"));
     delete raw.authorizationSeal;
     await writeFile(manifest, `${JSON.stringify(raw, null, 2)}\n`);
 
-    const request = await store.createRequest(secret.handle, nodeAction(), "Unsealed trust", signedAgent());
-    expect(request.agentSource).not.toBe("signed-launcher");
+    const request = await store.createRequest(secret.handle, nodeAction(), "After a lost seal", signedAgent());
+    expect(request.agentSource).toBe("signed-launcher");
+    expect((await store.auditLog()).map((event) => event.type)).toContain("store.authorization.resealed");
   });
 
   it("refuses to trust a general-purpose runtime", async () => {
@@ -455,8 +486,9 @@ describe("trusted launcher signature tier", () => {
         resolvedCommands: [realpathSync.native(process.execPath)]
       }
     });
-    const named = await store.createRequest(secret.handle, nodeAction(), "Example Agent by name", { agentName: "Example Agent", env: {} });
-    expect(named.state).toBe("pending");
+    // A declared name still matches a name-based policy, as it did before verified identities.
+    const named = await store.createRequest(secret.handle, nodeAction(), "Example Agent by name", { agentName: "Example Agent", env: quietEnv });
+    expect(named).toMatchObject({ state: "approved", approvalSource: "policy", agentSource: "configured" });
 
     const trusted = await store.addTrustedLauncher({
       name: "Example Agent", teamId: "ABCDE12345", identifier: "com.example.agent", bindPolicies: true
@@ -464,5 +496,105 @@ describe("trusted launcher signature tier", () => {
     expect(trusted.boundPolicies).toBe(1);
     const signed = await store.createRequest(secret.handle, nodeAction(), "Signed policy run", signedAgent());
     expect(signed).toMatchObject({ state: "approved", approvalSource: "policy", agentSource: "signed-launcher" });
+  });
+});
+
+describe("declared agent names and session-bound execution", () => {
+  const declared = (nonce?: string) => ({ agentName: "Claude Desktop", env: quietEnv, sessionNonce: nonce });
+  const nodeAction = () => buildEnvCommandAction({ command: process.execPath, args: ["-e", "0"], injectEnv: "TOKEN" });
+
+  async function tokenStore(label: string) {
+    const store = new SecretStore();
+    const secret = await store.addSecret({
+      name: `declared ${label}`,
+      type: "api-token",
+      value: fakeToken(`declared_${label}`),
+      policy: { injectEnv: "TOKEN", allowedCommands: [process.execPath] }
+    });
+    return { store, secret };
+  }
+
+  it("keeps reusable grants working for an agent identified by its configured name", async () => {
+    const { store, secret } = await tokenStore("grant");
+    const first = await store.createRequest(secret.handle, nodeAction(), "First run", declared("session-a"));
+    expect(first).toMatchObject({ state: "pending", agentName: "Claude Desktop", agentSource: "configured" });
+    const approved = await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
+    expect(approved.approvalGrantId).toBeTruthy();
+
+    const reused = await store.createRequest(secret.handle, nodeAction(), "Repeat run", declared("session-a"));
+    expect(reused).toMatchObject({ state: "approved", approvalSource: "grant" });
+    const other = await store.createRequest(secret.handle, nodeAction(), "Other agent", { agentName: "Codex", env: quietEnv });
+    expect(other.state).toBe("pending");
+  });
+
+  it("keeps a name-based allow policy working", async () => {
+    const { store, secret } = await tokenStore("policy");
+    await store.addApprovalPolicyRule({
+      name: "Allow Claude Desktop",
+      decision: "allow",
+      conditions: {
+        agents: ["Claude Desktop"],
+        handles: [secret.handle],
+        commands: [process.execPath],
+        resolvedCommands: [realpathSync.native(process.execPath)]
+      }
+    });
+    const request = await store.createRequest(secret.handle, nodeAction(), "Policy run", declared("session-a"));
+    expect(request).toMatchObject({ state: "approved", approvalSource: "policy" });
+  });
+
+  it("does not let a name taken from the request reason use a grant", async () => {
+    const { store, secret } = await tokenStore("reason");
+    const first = await store.createRequest(secret.handle, nodeAction(), "Codex wants to run this", { env: quietEnv });
+    expect(first.agentSource).toBe("reason");
+    const approved = await store.approveRequest(first.id, { mode: "timed-session", durationMs: 4 * hour });
+    expect(approved.approvalGrantId).toBeUndefined();
+    const second = await store.createRequest(secret.handle, nodeAction(), "Codex wants to run this again", { env: quietEnv });
+    expect(second.state).toBe("pending");
+  });
+
+  it("lets only the session that created a request execute it", async () => {
+    const { store, secret } = await tokenStore("session");
+    const request = await store.createRequest(secret.handle, nodeAction(), "Session bound", declared("session-a"));
+    expect(request.requesterSession).toMatch(/^[a-f0-9]{64}$/u);
+    expect(request.requesterSession).not.toContain("session-a");
+    await store.approveRequest(request.id);
+
+    await expect(store.claimApprovedRequest(request.id, declared("session-b"))).rejects.toThrow(/own session created/u);
+    await expect(store.claimApprovedRequest(request.id, declared())).rejects.toThrow(/own session created/u);
+    expect((await store.getRequest(request.id)).state).toBe("approved");
+    expect((await store.claimApprovedRequest(request.id, declared("session-a"))).state).toBe("executing");
+  });
+
+  it("leaves operator-created requests to the operator", async () => {
+    const { store, secret } = await tokenStore("operator");
+    const request = await store.createRequest(secret.handle, nodeAction(), "Operator request");
+    await store.approveRequest(request.id);
+    await expect(store.claimApprovedRequest(request.id, declared("session-a"))).rejects.toThrow(/own session created/u);
+    expect((await store.claimApprovedRequest(request.id)).state).toBe("executing");
+  });
+
+  it("notes when a known agent name arrives from a different launcher, without blocking it", async () => {
+    const { store, secret } = await tokenStore("launcher");
+    const from = (launcher: string) => ({ ...declared("session-a"), observedLaunchers: [launcher, "exe:/usr/bin/zsh"] });
+    const first = await store.createRequest(secret.handle, nodeAction(), "First launcher", from("exe:/opt/agent/bin/agent"));
+    const same = await store.createRequest(secret.handle, nodeAction(), "Same launcher", from("exe:/opt/agent/bin/agent"));
+    const moved = await store.createRequest(secret.handle, nodeAction(), "New launcher", from("exe:/tmp/other/agent"));
+
+    expect(first.launchers).toEqual(["exe:/opt/agent/bin/agent", "exe:/usr/bin/zsh"]);
+    expect(moved.state).toBe("pending");
+    const changed = (await store.auditLog()).filter((event) => event.type === "agent.launcher.changed");
+    expect(changed.map((event) => event.requestId)).toEqual([moved.id]);
+    expect(same.id).not.toBe(moved.id);
+  });
+
+  it("refuses a request whose session binding was edited after approval", async () => {
+    const { store, secret } = await tokenStore("rebind");
+    const request = await store.createRequest(secret.handle, nodeAction(), "Rebound", declared("session-a"));
+    await store.approveRequest(request.id);
+    const raw = JSON.parse(await readFile(store.storePath, "utf8"));
+    delete raw.requests.find((item: { id: string }) => item.id === request.id).requesterSession;
+    await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
+    await expect(store.claimApprovedRequest(request.id)).rejects.toThrow(/changed after approval/u);
   });
 });

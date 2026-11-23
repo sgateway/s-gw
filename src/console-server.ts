@@ -827,7 +827,7 @@ async function handleApi(
     const body = await readJson(req);
     if (body.requireVerifiedAgentForAutoApproval !== undefined &&
         body.requireVerifiedAgentForAutoApproval !== true) {
-      throw new HttpError(400, "Automatic approval requires a verified agent.");
+      throw new HttpError(400, "Automatic approval requires an identified agent.");
     }
     sendJson(
       res,

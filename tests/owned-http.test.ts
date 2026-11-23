@@ -185,9 +185,14 @@ describe("owned HTTPS operations", () => {
     const first = await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "HTTP grant fixture", verified);
     await f.store.approveRequest(first.id, { mode: "timed-session", durationMs: 60_000, agentScope: "any-agent" });
     expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "same operation", verified)).state).toBe("approved");
-    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "name-only operation", { mcpClientName: "Codex" })).state).toBe("pending");
+    const named = { mcpClientName: "Codex" };
+    const reasonOnly = { env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } };
+    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "name-only operation", named)).state).toBe("approved");
+    expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction(spec), "Codex reason-only operation", reasonOnly)).state).toBe("pending");
     for (const change of [{ method: "PUT" as const }, { body: "second body" }, { headers: { "x-operation": "second" } }, { auth: { kind: "header" as const, name: "x-service-key" } }]) {
-      expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction({ ...spec, ...change }), "changed operation", verified)).state).toBe("pending");
+      for (const agent of [verified, named]) {
+        expect((await f.store.createRequest(f.handle.handle, buildHttpRequestAction({ ...spec, ...change }), "changed operation", agent)).state).toBe("pending");
+      }
     }
   });
 

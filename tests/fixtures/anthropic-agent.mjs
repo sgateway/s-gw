@@ -81,32 +81,25 @@ try {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
   const executed = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: pending.id } });
-  assert.equal(executed.isError, true);
-  assert.match(executed.content[0].text, /verified agent principal and session/);
-  writeFileSync(`${root}/workspace/ssh-claim-denied`, 'ordinary MCP claim denied');
-  while (!existsSync(`${root}/workspace/ssh-operator-executed`)) {
-    if (Date.now() > deadline) throw new Error('Fixture operator SSH execution timed out');
-    await new Promise(resolve => setTimeout(resolve, 30));
-  }
-  const result = JSON.parse(readFileSync(`${root}/workspace/ssh-operator-result.json`, 'utf8'));
+  assert(!executed.isError, JSON.stringify(executed));
+  const result = JSON.parse(executed.content[0].text);
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /owned SSH fixture complete/);
-  checks.push('operator executes approved SSH action after ordinary claim denial');
-  const httpClaim = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } });
-  assert.equal(httpClaim.isError, true);
-  assert.match(httpClaim.content[0].text, /verified agent principal and session/);
-  writeFileSync(`${root}/workspace/http-claim-denied`, 'ordinary MCP claim denied');
-  while (!existsSync(`${root}/workspace/operator-executed`)) {
-    if (Date.now() > deadline) throw new Error('Fixture operator execution timed out');
-    await new Promise(resolve => setTimeout(resolve, 30));
-  }
-  const httpOutput = JSON.parse(readFileSync(`${root}/workspace/operator-result.json`, 'utf8'));
+  checks.push('external broker executes the approved SSH action this session requested; pending action was denied');
+  const httpExecuted = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } });
+  assert(!httpExecuted.isError, JSON.stringify(httpExecuted));
+  const httpOutput = JSON.parse(httpExecuted.content[0].text);
   assert.equal(httpOutput.exitCode, 0);
   assert.match(httpOutput.stdout, /owned HTTPS fixture complete/);
   assert.match(httpOutput.stdout, /SGW_RESPONSE_CREDENTIAL_WITHHELD/);
   assert.match(httpOutput.stdout, /SGW_SECRET/);
   assert.equal((await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: httpPending.id } })).isError, true);
-  checks.push('operator HTTPS authentication, credential-field redaction and replay denial work after denied agent claim');
+  checks.push('external HTTPS authentication, credential-field redaction and replay denial work for this session');
+  writeFileSync(`${root}/workspace/agent-output.json`, JSON.stringify([result, httpOutput]));
+  const foreign = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: process.env.SGW_TEST_OPERATOR_REQUEST_ID } });
+  assert.equal(foreign.isError, true);
+  assert.match(foreign.content[0].text, /only requests its own session created/);
+  checks.push('approved request created outside this session stays with the operator');
   const changed = await client.callTool({ name: 'sgw_request_ssh_session', arguments: { handle, target: 'fixture@example.test', args: ['uptime'] } });
   assert.equal(JSON.parse(changed.content[0].text).request.state, 'pending');
   const replay = await client.callTool({ name: 'sgw_execute_request', arguments: { requestId: pending.id } });

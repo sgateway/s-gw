@@ -24,4 +24,4 @@
 The native app and local console expose the same local store and CLI behavior. Documentation should describe supported behavior rather than a specific UI layout unless the distinction matters.
 
 - [Anthropic sandbox and owned connections](anthropic-sandbox.md)
-- [Trusted launcher signature (macOS)](trusted-launcher-signature.md)
+- [Agent identity and launcher evidence](trusted-launcher-signature.md)

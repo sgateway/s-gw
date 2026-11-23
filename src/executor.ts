@@ -12,7 +12,7 @@ import {
 } from "./store.js";
 import { appendUtf8Bounded, captureHeadroomBytes, encodedSecretForms, sanitizeCapturedOutput } from "./output-redaction.js";
 import { assertSshCredentialSupported, runOwnedSshSession } from "./ssh.js";
-import { listDescendantPids, signalPids } from "./process-descendants.js";
+import { killWindowsProcessTree, listDescendantPids, signalPids } from "./process-descendants.js";
 import { killProcessTree, spawnIsolated } from "./process-tree.js";
 import type { AgentIdentityContext } from "./agent-context.js";
 import type { ExecutionSummary, RequestRecord, SecretRecord } from "./types.js";
@@ -648,6 +648,8 @@ function killWithDescendants(child: ChildProcess, signal: NodeJS.Signals, earlie
   // Orphans are reparented once the child exits, so the earlier snapshot is the
   // only way left to reach a descendant that ignored the first signal.
   signalPids([...earlier, ...pids], signal);
+  // listDescendantPids finds nothing on Windows, so the tree is ended there in one step.
+  if (running && process.platform === "win32") killWindowsProcessTree(child.pid!);
   child.kill(signal);
   return pids;
 }

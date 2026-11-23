@@ -370,6 +370,9 @@ const lockedSealMessage = "s-gw is locked. Unlock it before approving, executing
 const unsealedAuthorizationMessage =
   "Stored approvals and policies are not sealed by this s-gw installation. Review them, run `s-gw store seal`, then request approval again.";
 const sealKeyCacheMs = 60_000;
+// First version that seals the control manifest. An unsealed home last written by an older
+// version is an upgrade; an unsealed home written by this version or later is an anomaly.
+const sealedSinceVersion = "0.2.0";
 let cachedSealKey: { key: Buffer; at: number } | undefined;
 
 // The unlock passphrase may come from the OS credential store, which must never be
@@ -1066,7 +1069,7 @@ export class SecretStore {
 
   async setApprovalSettings(input: SetApprovalSettingsInput): Promise<ApprovalSettings> {
     if (input.requireVerifiedAgentForAutoApproval === false) {
-      throw new Error("Automatic approval requires a verified agent. Approve ordinary agent requests once instead.");
+      throw new Error("Automatic approval requires an identified agent and cannot be opened to unidentified requests.");
     }
     return this.mutate((store) => {
       const settings = normalizeApprovalSettings(input);
@@ -1649,7 +1652,7 @@ export class SecretStore {
       }
       const agent = identityFromRequest(request);
       if (!canAutoApproveAgent(store, agent)) {
-        throw new Error("An allow policy requires a verified agent. Approve this request once instead.");
+        throw new Error("An allow policy requires an identified agent. Approve this request once instead.");
       }
       const agentName = agent.principalId ? agent.name : durablePolicyAgentName(request);
       let rule = matchingApprovalPolicyRuleForAction(store, secret, request.action, agent, now);
@@ -2079,14 +2082,71 @@ export class SecretStore {
     return this.withSealKey(() => this.withStoreLock(async (lock) => {
       const store = await this.loadOrRecoverUnlocked(lock);
       this.assertConsoleAccess(store, continuationRequestId, continuationHandle);
+      const resealed = await this.sealIfUnsealed(store, lock);
       const revision = await captureStoreRevision(this.home, this.storePath);
-      const before = serializeStore(store);
+      // A reseal adds an audit event that has to be written even if the updater changes nothing.
+      const before = resealed ? "" : serializeStore(store);
       const result = await updater(store);
       if (serializeStore(store) !== before) {
         await this.writeUnlocked(store, revision, lock);
       }
       return result;
     }));
+  }
+
+  /**
+   * Seals an unsealed home without asking anyone. After an upgrade from a version that had no
+   * seal this is the expected migration. In any other case the stored approvals were changed
+   * outside s-gw (a restore, a hand edit, another tool), so the reseal is recorded as its own
+   * audit event for the operator to notice. Sealing never blocks work: the manual command it
+   * replaces was open to the same callers.
+   */
+  private async sealIfUnsealed(store: StoreFile, lock: StoreLock): Promise<boolean> {
+    const probe = controlSealProbes.get(store);
+    const key = sealKeys.getStore()?.key;
+    if (!probe || probe.empty || !key) {
+      return false;
+    }
+    const previous = probe.status();
+    if (previous === "sealed" || previous === "locked") {
+      return false;
+    }
+
+    const manifest = await readControlState(this.home);
+    const upgraded = !manifest?.authorizationSeal &&
+      (!manifest?.writerVersion || compareRuntimeVersions(manifest.writerVersion, sealedSinceVersion) < 0);
+    let carried = 0;
+    if (upgraded) {
+      // Approvals granted just before the upgrade stay usable.
+      for (const request of store.requests) {
+        if (request.state === "approved" && !request.approvalSeal) {
+          sealRequestApproval(request);
+          carried += 1;
+        }
+      }
+    }
+
+    const fingerprint = controlPlaneFingerprint(store);
+    const seal = authorizationSeal("control", controlSealPayload(this.home, fingerprint), key);
+    const checkpoint = await ensureSealedControlPlaneCheckpoint(this.home, store, fingerprint, lock);
+    await lock.assertOwned();
+    await writeControlState(this.home, controlStateFor(this.home, store, fingerprint, checkpoint, seal));
+    controlSealProbes.set(store, controlSealProbe(this.home, store, await readControlState(this.home)));
+
+    const counts = `${store.secrets.length} handles, ${store.approvalGrants.length} approval grants and ` +
+      `${store.approvalPolicyRules.length} policy rules`;
+    store.audit.push(upgraded
+      ? audit(
+        "store.authorization.sealed",
+        `Sealed ${counts} after upgrading from ${manifest?.writerVersion || "an earlier version"}` +
+          (carried ? `, and carried over ${carried} approved requests.` : ".")
+      )
+      : audit(
+        "store.authorization.resealed",
+        `Stored approvals were changed outside s-gw (seal was ${previous}). Resealed ${counts}. ` +
+          "Review them if you did not restore a backup or edit the store yourself."
+      ));
+    return true;
   }
 
   // Resolves the seal key before the store lock is taken, so nothing under the lock
@@ -2668,6 +2728,7 @@ function requestApprovalPayload(request: RequestRecord): string {
     request.approvalGrantId ?? null,
     request.approvalPolicyRuleId ?? null,
     request.approvedAt ?? null,
+    request.requesterSession ?? null,
     canonicalValue(request.action)
   ]);
 }
@@ -3849,11 +3910,19 @@ function normalizeStoredApprovalSettings(input?: Partial<ApprovalSettings>): App
   return settings;
 }
 
+// Sources that name the agent itself. A name lifted from free-form reason text never counts.
+const namedAgentSources: ReadonlySet<AgentIdentitySource> = new Set(["configured", "mcp-client", "runtime", "process"]);
+
 function canAutoApproveAgent(store: StoreFile, agent: AgentIdentity): boolean {
-  if (!agent.principalId) return false;
-  if (agent.source === "managed-peer") return true;
-  // A stored request keeps its principal, so the trust list is checked again at every use.
-  return agent.source === "signed-launcher" && Boolean(trustedLauncherForPrincipal(store, agent.principalId));
+  if (agent.source === "managed-peer") return Boolean(agent.principalId);
+  if (agent.source === "signed-launcher") {
+    // A stored request keeps its principal, so the trust list is checked again at every use.
+    return Boolean(agent.principalId && trustedLauncherForPrincipal(store, agent.principalId));
+  }
+  // Declared agent names keep the grants and policies they had before verified identities
+  // existed. They identify the agent; they do not prove it.
+  const name = agent.name.trim();
+  return namedAgentSources.has(agent.source) && name.length > 0 && name !== "Agent";
 }
 
 function isVerifiedAgentSource(source: AgentIdentitySource | undefined): boolean {
@@ -3897,6 +3966,18 @@ function resolveAgentIdentity(store: StoreFile | undefined, reason: string, cont
     principalId: launcherPrincipalId(match.signature),
     agentSessionId: launcherSessionId(match.signature)
   };
+}
+
+// Evidence, not enforcement: a familiar agent name arriving from an unfamiliar launcher is
+// worth a line in the audit log, and nothing more. The first launcher seen is not an event.
+function launcherChanged(store: StoreFile, record: RequestRecord): boolean {
+  const nearest = record.launchers?.[0];
+  if (!nearest || !record.agentName || record.agentName === "Agent") {
+    return false;
+  }
+  const earlier = store.requests
+    .filter((item) => item !== record && item.agentName === record.agentName && item.launchers?.length);
+  return earlier.length > 0 && !earlier.some((item) => item.launchers![0] === nearest);
 }
 
 function observedLauncherSignatures(context: AgentIdentityContext): ObservedLauncherSignature[] | undefined {
@@ -4078,7 +4159,7 @@ function createApprovalGrant(
   if (!canAutoApproveAgent(store, identityFromRequest(request))) {
     store.audit.push(audit(
       "approval.grant.skipped",
-      `Approved request ${request.id} once because reusable approval requires a verified agent.`,
+      `Approved request ${request.id} once because reusable approval requires an identified agent.`,
       request.handle,
       request.id,
       request
@@ -4217,6 +4298,8 @@ function createRequestInStore(
     agentSessionId: agent.agentSessionId,
     loginSessionId: admission.loginSessionId,
     launcherSignatures: observedLauncherSignatures(agentContext),
+    launchers: agentContext.observedLaunchers?.length ? [...agentContext.observedLaunchers].slice(0, 8) : undefined,
+    requesterSession: agentContext.sessionNonce ? requesterSessionBinding(agentContext.sessionNonce) : undefined,
     action: admission.action,
     state: deniedByPolicy ? "denied" : (grant || allowedByPolicy ? "approved" : "pending"),
     createdAt: now,
@@ -4244,6 +4327,15 @@ function createRequestInStore(
     : (allowedByPolicy ? "request.auto_approved_by_policy" : (grant ? "request.auto_approved" : "request.created"));
   const message = requestCreationMessage(record, grant, policyRule, superseded.length);
   store.audit.push(audit(eventType, message, secret.handle, record.id, record));
+  if (launcherChanged(store, record)) {
+    store.audit.push(audit(
+      "agent.launcher.changed",
+      `${record.agentName} sent this request from ${record.launchers![0]}. Earlier requests under that name came from a different launcher.`,
+      secret.handle,
+      record.id,
+      record
+    ));
+  }
   if (admission.unsealedAutoApproval) {
     store.audit.push(audit(
       "approval.autoapprove.skipped",
@@ -5158,8 +5250,25 @@ function durablePolicyAgentName(request: RequestRecord): string {
   throw new Error("s-gw could not identify the requesting agent. Approve once or create a policy with an explicit agent condition.");
 }
 
+function requesterSessionBinding(nonce: string): string {
+  return createHash("sha256").update("s-gw-requester-session-v1:").update(nonce).digest("hex");
+}
+
+// An agent identified only by name may run a request it created in this same MCP session.
+// Anything else (another process that learned the request ID, a request made by the operator,
+// a request from before this binding existed) is left for the operator to execute.
+function assertRequesterSession(
+  request: { requesterSession?: string },
+  caller: AgentIdentityContext
+): void {
+  if (!request.requesterSession || !caller.sessionNonce ||
+      requesterSessionBinding(caller.sessionNonce) !== request.requesterSession) {
+    throw new Error("An agent can execute only requests its own session created. Run this one from the s-gw app or CLI.");
+  }
+}
+
 function assertExecutionCaller(
-  request: Pick<RequestRecord, "agentSource" | "principalId" | "agentSessionId">,
+  request: Pick<RequestRecord, "agentSource" | "principalId" | "agentSessionId" | "requesterSession">,
   caller?: AgentIdentityContext,
   requireSession = false,
   store?: StoreFile
@@ -5170,7 +5279,7 @@ function assertExecutionCaller(
     if (isVerifiedAgentSource(request.agentSource)) {
       throw new Error("This execution is bound to a different verified agent or session.");
     }
-    if (requireSession) throw new Error("Agent execution requires a verified agent principal and session.");
+    if (requireSession) assertRequesterSession(request, caller);
     return;
   }
   const agent = resolveAgentIdentity(store, "", caller);

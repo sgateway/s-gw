@@ -17,6 +17,7 @@ import { SecretStore } from "../src/store.js";
 
 let tmpHome = "";
 const unixIt = process.platform === "win32" ? it.skip : it;
+const windowsIt = process.platform === "win32" ? it : it.skip;
 const spawned: ChildProcess[] = [];
 
 beforeEach(async () => {
@@ -231,6 +232,24 @@ describe("TypeScript environment command hardening", () => {
     expect(summary.durationMs).toBeLessThan(10_000);
     await expectGone(Number((await readFile(pidFile, "utf8")).trim()));
   }, 20_000);
+
+  windowsIt("kills a grandchild on Windows when the command times out", async () => {
+    const store = new SecretStore();
+    const pidFile = path.join(tmpHome, "grandchild.pid");
+    // The grandchild holds none of the command's pipes, so only a tree kill can end it.
+    const script = [
+      "const idle = 'setInterval(() => {}, 1000)'",
+      "const grandchild = require('node:child_process').spawn(process.execPath, ['-e', idle], { stdio: 'ignore' })",
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid))`,
+      "setInterval(() => {}, 1000)"
+    ].join(";");
+    const summary = await runNodeWithTimeout(store, script, 800);
+
+    expect(summary.timedOut).toBe(true);
+    expect(summary.exitCode).toBe(124);
+    expect(summary.durationMs).toBeLessThan(10_000);
+    await expectGone(Number((await readFile(pidFile, "utf8")).trim()));
+  }, 20_000);
 });
 
 describe("Rust core response verification", () => {
@@ -338,6 +357,15 @@ async function runShell(store: SecretStore, script: string, timeoutMs: number) {
   });
   const request = await store.createRequest(record.handle, buildEnvCommandAction({
     command: "/bin/sh", args: ["-c", script], injectEnv: "SGW_TIMEOUT_TOKEN", timeoutMs
+  }), "Environment command timeout test");
+  await store.approveRequest(request.id);
+  return executeApprovedRequest(store, request.id, { engine: "typescript" });
+}
+
+async function runNodeWithTimeout(store: SecretStore, script: string, timeoutMs: number) {
+  const record = await addCredential(store, "timeout node token", "timeout-node-secret-value-123456789");
+  const request = await store.createRequest(record.handle, buildEnvCommandAction({
+    command: process.execPath, args: ["-e", script], injectEnv: "SGW_TIMEOUT_TOKEN", timeoutMs
   }), "Environment command timeout test");
   await store.approveRequest(request.id);
   return executeApprovedRequest(store, request.id, { engine: "typescript" });

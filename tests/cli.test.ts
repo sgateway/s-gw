@@ -334,7 +334,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
   });
 
   // Windows process startup makes this multi-command case slower.
-  it("updates and auto-arranges approval policies, and requires a verified agent for approve-policy", async () => {
+  it("updates and auto-arranges approval policies, and limits approve-policy to a declared agent name", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-policy-"));
     const recoveryHome = `${home}-recovery`;
     const cargoTarget = `${home}-cargo`;
@@ -502,20 +502,56 @@ describe("CLI unknown-command behavior (end to end)", () => {
         "--arg",
         "--version"
       ]));
-      expect(request.state).toBe("pending");
+      expect(request).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "configured" });
 
-      expect(() => run(["approve-policy", request.id]))
-        .toThrow(/allow policy requires a verified agent/i);
-      const oneShot = JSON.parse(run(["approve", request.id]));
-      expect(oneShot).toMatchObject({
+      const scoped = JSON.parse(run(["approve-policy", request.id]));
+      expect(scoped.created).toBe(true);
+      expect(scoped.request).toMatchObject({
         id: request.id,
+        state: "approved",
+        approvalSource: "policy",
+        approvalPolicyRuleId: scoped.rule.id
+      });
+      expect(scoped.rule).toMatchObject({
+        decision: "allow",
+        conditions: {
+          handles: [secret.handle],
+          agents: ["codex"],
+          principalIds: [],
+          commands: [process.execPath],
+          resolvedCommands: [realpathSync.native(process.execPath)]
+        }
+      });
+      const requestArgs = [
+        "request", "env-command", secret.handle, "--command", process.execPath,
+        "--inject-env", "SGW_CLI_SCOPED_POLICY", "--arg", "--version"
+      ];
+      expect(JSON.parse(run(requestArgs))).toMatchObject({
+        state: "approved",
+        approvalSource: "policy",
+        approvalPolicyRuleId: scoped.rule.id
+      });
+
+      // Without a declared name the agent is known only from the reason text.
+      const { SGW_AGENT_NAME: _declared, ...unnamedEnv } = env;
+      const runUnnamed = (args: string[]) => runCliSync(["src/cli.ts", ...args], {
+        cwd: repoRoot,
+        env: { ...unnamedEnv, SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      const unnamedArgs = [...requestArgs, "--reason", "Codex asked for this"];
+      const unnamed = JSON.parse(runUnnamed(unnamedArgs));
+      expect(unnamed).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "reason" });
+      expect(() => run(["approve-policy", unnamed.id]))
+        .toThrow(/allow policy requires an identified agent/i);
+      const oneShot = JSON.parse(run(["approve", unnamed.id]));
+      expect(oneShot).toMatchObject({
+        id: unnamed.id,
         state: "approved",
         approvalSource: "manual"
       });
-      expect(JSON.parse(run([
-        "request", "env-command", secret.handle, "--command", process.execPath,
-        "--inject-env", "SGW_CLI_SCOPED_POLICY", "--arg", "--version"
-      ])).state).toBe("pending");
+      expect(JSON.parse(runUnnamed(unnamedArgs)).state).toBe("pending");
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(recoveryHome, { recursive: true, force: true });
@@ -523,7 +559,7 @@ describe("CLI unknown-command behavior (end to end)", () => {
     }
   }, process.platform === "win32" ? 30_000 : 15_000);
 
-  it("keeps name-only CLI requests pending even with an explicit --any-command allow rule", async () => {
+  it("approves a declared-name CLI request only under an explicit --any-command allow rule", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "sgw-cli-any-command-"));
     const recoveryHome = `${home}-recovery`;
     const env = {
@@ -608,7 +644,22 @@ describe("CLI unknown-command behavior (end to end)", () => {
       ]));
       expect(explicit.conditions.commands).toEqual([]);
       expect(explicit.conditions.resolvedCommands).toEqual([]);
-      expect(JSON.parse(run(requestArgs)).state).toBe("pending");
+      expect(JSON.parse(run(requestArgs))).toMatchObject({
+        state: "approved",
+        agentSource: "configured",
+        approvalSource: "policy",
+        approvalPolicyRuleId: explicit.id
+      });
+
+      // The same rule does not cover an agent that is named only in the reason text.
+      const { SGW_AGENT_NAME: _declared, ...unnamedEnv } = env;
+      const unnamed = JSON.parse(runCliSync(["src/cli.ts", ...requestArgs, "--reason", "Codex asked for this"], {
+        cwd: repoRoot,
+        env: { ...unnamedEnv, SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }));
+      expect(unnamed).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "reason" });
     } finally {
       await rm(home, { recursive: true, force: true });
       await rm(recoveryHome, { recursive: true, force: true });

@@ -76,7 +76,7 @@ describe("local console server", () => {
       body: JSON.stringify({ mode: "timed-session", durationMs: 60_000, requireVerifiedAgentForAutoApproval: false })
     });
     expect(rejected.status).toBe(400);
-    expect((await rejected.json()).error).toMatch(/requires a verified agent/i);
+    expect((await rejected.json()).error).toMatch(/requires an identified agent/i);
     expect(await fetchJson("api/approval")).toEqual(before);
 
     const updated = await fetchJson("api/approval", {
@@ -1161,7 +1161,7 @@ describe("local console server", () => {
     expect(state.requests.find((item: { id: string }) => item.id === request.id).state).toBe("failed");
   });
 
-  it("keeps name-only console timed approvals one-shot", async () => {
+  it("reuses a console timed approval for the same declared agent name only", async () => {
     running = await startConsoleServer({ port: 0 });
 
     const created = await fetchJson("api/secrets", {
@@ -1195,20 +1195,21 @@ describe("local console server", () => {
       }
     });
     expect(approved).toMatchObject({ id: first.id, state: "approved", approvalSource: "manual" });
-    expect(approved.approvalGrantId).toBeUndefined();
+    expect(approved.approvalGrantId).toMatch(/^grant_/);
 
     const sameAgent = await fetchJson("api/requests", {
       method: "POST",
       body: { ...commandBody, reason: "Console retry", agentName: "Codex" }
     });
-    expect(sameAgent.state).toBe("pending");
-    expect(sameAgent.approvalGrantId).toBeUndefined();
+    expect(sameAgent).toMatchObject({ state: "approved", approvalSource: "grant", agentSource: "configured" });
+    expect(sameAgent.approvalGrantId).toBe(approved.approvalGrantId);
 
     const otherAgent = await fetchJson("api/requests", {
       method: "POST",
       body: { ...commandBody, reason: "Console retry", agentName: "Claude" }
     });
     expect(otherAgent.state).toBe("pending");
+    expect(otherAgent.approvalGrantId).toBeUndefined();
   });
 
   it("lists and revokes approval grants through the console API", async () => {

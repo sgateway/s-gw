@@ -6,6 +6,8 @@ import { executeApprovedRequest, executeReusablePermit } from "./executor.js";
 import { buildEnvCommandAction, buildSshSessionAction, scanLocalFile, scanLocalText } from "./gateway.js";
 import { SecretStore } from "./store.js";
 import { defaultSshInjectEnv } from "./ssh.js";
+import { randomBytes } from "node:crypto";
+import { observeLauncherChain } from "./launcher-observation.js";
 import { attestLauncherChain, launcherChainIsLive } from "./launcher-signature.js";
 import { CURRENT_VERSION } from "./version.js";
 
@@ -30,14 +32,25 @@ const server = new McpServer({
 // Checked once at startup: this process is launched by the agent host, so its ancestry does
 // not change while it runs. A dead ancestor invalidates the chain instead of being re-read.
 let launcherChain = operationsOnly ? undefined : attestLauncherChain();
+// Linux and Windows have no signature to check the way macOS does, so the launching
+// executables or publishers are recorded as evidence. Slow on Windows, so it never blocks startup.
+let observedLaunchers: string[] = (launcherChain?.signatures || [])
+  .map((item) => `codesign:${item.teamId}:${item.identifier}`);
+if (!operationsOnly && process.platform !== "darwin") {
+  void observeLauncherChain().then((chain) => {
+    observedLaunchers = chain.map((item) => `${item.kind}:${item.id}`);
+  }).catch(() => undefined);
+}
+// Lets this process, and only this process, execute the requests it creates.
+const sessionNonce = randomBytes(32).toString("base64url");
 
 function mcpAgentContext() {
-  if (operationsOnly) return { agentName: process.env.SGW_SANDBOX_AGENT_NAME };
+  if (operationsOnly) return { agentName: process.env.SGW_SANDBOX_AGENT_NAME, sessionNonce };
   if (launcherChain && !launcherChainIsLive(launcherChain)) {
     launcherChain = undefined;
   }
   // The client name is display metadata. A managed principal must come from a separate trusted peer adapter.
-  return { mcpClientName: server.server.getClientVersion()?.name, launcherChain };
+  return { mcpClientName: server.server.getClientVersion()?.name, launcherChain, observedLaunchers, sessionNonce };
 }
 
 if (!operationsOnly) {

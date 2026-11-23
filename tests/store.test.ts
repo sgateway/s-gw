@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeApprovedRequest, executeReusablePermit } from "../src/executor.js";
 import { principalForVerifiedPeer } from "../src/agent-context.js";
+import type { AgentIdentityContext } from "../src/agent-context.js";
 import { buildEnvCommandAction, scanLocalText } from "../src/gateway.js";
 import { buildHttpRequestAction, SGW_HTTP_COMMAND } from "../src/http-action.js";
 import { tokenForHandle } from "../src/scanner.js";
@@ -3062,7 +3063,7 @@ describe("SecretStore", () => {
     expect(pending.agentName).toBe("Agent");
     expect(pending.agentSource).toBe("unknown");
 
-    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/requires a verified agent/i);
+    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/requires an identified agent/i);
     expect(await store.listApprovalPolicyRules()).toEqual([]);
     expect((await store.getRequest(pending.id)).state).toBe("pending");
   });
@@ -3413,12 +3414,6 @@ describe("SecretStore", () => {
     const legacyKey = argumentAgnosticApprovalActionKey(record.handle, storedFirstAction);
     raw.approvalGrants[0].actionKey = legacyKey;
     await writeFile(store.storePath, `${JSON.stringify(raw, null, 2)}\n`);
-
-    // A grant rewritten outside s-gw is unsealed and must not approve anything on its own.
-    const unsealed = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat", verifiedCodex);
-    expect(unsealed.kind).toBe("request");
-    expect(await store.authorizationSealStatus()).toBe("unsealed");
-    await store.sealAuthorizationState();
 
     const matching = await store.prepareOneShotExecution(record.handle, firstAction, "Codex legacy wrapper repeat", verifiedCodex);
     expect(matching.kind).toBe("reusable");
@@ -3889,7 +3884,7 @@ describe("SecretStore", () => {
     }
   });
 
-  it("keeps legacy name policies stored without allowing unattended use", async () => {
+  it("lets a declared agent name use a name policy but not a reason-only name or a verified peer", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "legacy policy token", type: "api-token", value: fakeOpenAiToken("legacy_policy"),
@@ -3902,15 +3897,21 @@ describe("SecretStore", () => {
         commands: [process.execPath], resolvedCommands: [resolvedNodeExecutable] }
     });
 
-    expect((await store.createRequest(secret.handle, action, "legacy", {
+    const declared = await store.createRequest(secret.handle, action, "legacy", {
       mcpClientName: "Codex", env: {}
-    })).state).toBe("pending");
+    });
+    expect(declared).toMatchObject({ state: "approved", agentName: "Codex", agentSource: "mcp-client" });
+    const fromReason = await store.createRequest(secret.handle, action, "Codex asked for this", {
+      env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" }
+    });
+    expect(fromReason).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "reason" });
+    // A verified peer is matched by principal, never by the name it carries.
     expect((await store.createRequest(secret.handle, action, "managed", {
       managedPrincipal: principalForVerifiedPeer("local:codex", "Codex"), env: {}
     })).state).toBe("pending");
   });
 
-  it("requires a verified peer before an allow policy approves automatically", async () => {
+  it("approves a declared agent name by allow policy but keeps a reason-only name pending", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "verified-only policy token", type: "api-token", value: fakeOpenAiToken("verified_only_policy"),
@@ -3924,30 +3925,39 @@ describe("SecretStore", () => {
       resolvedCommands: [resolvedNodeExecutable]
     } });
     const claimed = { mcpClientName: "Codex", env: {} };
+    const reasonOnly = { env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } };
     expect((await store.getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
     const first = await store.createRequest(secret.handle, action, "ordinary MCP", claimed);
-    expect(first.state).toBe("pending");
+    expect(first.state).toBe("approved");
+    expect(first.approvalPolicyRuleId).toBe((await store.listApprovalPolicyRules())[0].id);
 
     await store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: true });
     await store.setApprovalSettings({ mode: "per-transaction" });
     expect((await new SecretStore(tmpHome).getApprovalSettings()).requireVerifiedAgentForAutoApproval).toBe(true);
-    const pending = await store.createRequest(secret.handle, action, "claimed name", claimed);
-    expect(pending.state).toBe("pending");
-    expect((await store.prepareOneShotExecution(secret.handle, action, "claimed name", claimed)).kind).toBe("request");
-    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/verified agent/i);
+    expect((await store.createRequest(secret.handle, action, "claimed name", claimed)).state).toBe("approved");
+    expect((await store.prepareOneShotExecution(secret.handle, action, "claimed name", claimed)).kind).toBe("reusable");
+
+    const pending = await store.createRequest(secret.handle, action, "Codex requested this", reasonOnly);
+    expect(pending).toMatchObject({ state: "pending", agentName: "Codex", agentSource: "reason" });
+    expect((await store.prepareOneShotExecution(secret.handle, action, "Codex requested this", reasonOnly)).kind)
+      .toBe("request");
+    await expect(store.approveRequestWithScopedPolicy(pending.id)).rejects.toThrow(/identified agent/i);
 
     await store.approveRequest(pending.id);
-    await expect(executeApprovedRequest(store, pending.id, { caller: claimed, engine: "typescript" }))
-      .rejects.toThrow(/verified agent principal and session/);
-    expect((await store.getRequest(pending.id)).state).toBe("approved");
+    // Neither caller holds the session that created the request, so only the operator can run it.
+    for (const caller of [reasonOnly, claimed]) {
+      await expect(executeApprovedRequest(store, pending.id, { caller, engine: "typescript" }))
+        .rejects.toThrow(/only requests its own session created/);
+      expect((await store.getRequest(pending.id)).state).toBe("approved");
+    }
     expect((await executeApprovedRequest(store, pending.id, { engine: "typescript" })).stdout).toBe("policy");
     for (const context of [
       { agentName: "Codex", env: {} },
-      { env: { CODEX_SHELL: "1" } },
-      { env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } }
+      { env: { CODEX_SHELL: "1" } }
     ]) {
-      expect((await store.createRequest(secret.handle, action, "Codex requested this", context)).state).toBe("pending");
+      expect((await store.createRequest(secret.handle, action, "Codex requested this", context)).state).toBe("approved");
     }
+    expect((await store.createRequest(secret.handle, action, "Codex requested this", reasonOnly)).state).toBe("pending");
     await store.addApprovalPolicyRule({ decision: "allow", conditions: {
       handles: [secret.handle], principalIds: ["linux:codex"], commands: [process.execPath],
       resolvedCommands: [resolvedNodeExecutable]
@@ -3955,12 +3965,12 @@ describe("SecretStore", () => {
     const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
     expect((await store.createRequest(secret.handle, action, "verified peer", verified)).state).toBe("approved");
     await expect(store.setApprovalSettings({ mode: "per-transaction", requireVerifiedAgentForAutoApproval: false }))
-      .rejects.toThrow(/verified agent/i);
-    expect((await store.createRequest(secret.handle, action, "claimed name after rejected opt-out", claimed)).state)
+      .rejects.toThrow(/identified agent/i);
+    expect((await store.createRequest(secret.handle, action, "Codex asked again after rejected opt-out", reasonOnly)).state)
       .toBe("pending");
   });
 
-  it("requires a verified peer before a reusable grant approves automatically", async () => {
+  it("gives a reusable grant to a declared agent name but not to a reason-only name", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "verified-only grant token", type: "api-token", value: fakeOpenAiToken("verified_only_grant"),
@@ -3970,17 +3980,40 @@ describe("SecretStore", () => {
       command: process.execPath, args: ["-e", "process.stdout.write('grant')"], injectEnv: "TOKEN"
     });
     const claimed = { mcpClientName: "Codex", env: {} };
-    const first = await store.createRequest(secret.handle, action, "claimed name", claimed);
-    const manuallyApproved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
-    expect(manuallyApproved.approvalGrantId).toBeUndefined();
-    expect((await store.createRequest(secret.handle, action, "claimed name again", claimed)).state).toBe("pending");
+    const reasonOnly = { env: { SGW_DISABLE_PROCESS_AGENT_DETECTION: "1" } };
 
+    const unnamed = await store.createRequest(secret.handle, action, "Codex requested this", reasonOnly);
+    expect(unnamed).toMatchObject({ agentName: "Codex", agentSource: "reason" });
+    const once = await store.approveRequest(unnamed.id, { mode: "timed-session", agentScope: "same-agent" });
+    expect(once.state).toBe("approved");
+    expect(once.approvalGrantId).toBeUndefined();
+    expect((await store.auditLog()).find((event) => event.type === "approval.grant.skipped")?.message)
+      .toBe(`Approved request ${unnamed.id} once because reusable approval requires an identified agent.`);
+    expect((await store.createRequest(secret.handle, action, "Codex requested this again", reasonOnly)).state)
+      .toBe("pending");
+    expect(await store.listApprovalGrants()).toHaveLength(0);
+
+    const first = await store.createRequest(secret.handle, action, "claimed name", claimed);
+    expect(first.state).toBe("pending");
+    const manuallyApproved = await store.approveRequest(first.id, { mode: "timed-session", agentScope: "same-agent" });
+    expect(manuallyApproved.approvalGrantId).toBeDefined();
+    expect((await store.listApprovalGrants())[0]).toMatchObject({
+      id: manuallyApproved.approvalGrantId, agentName: "Codex", agentScope: "same-agent"
+    });
+    expect((await store.listApprovalGrants())[0].principalId).toBeUndefined();
+    expect(await store.createRequest(secret.handle, action, "claimed name again", claimed))
+      .toMatchObject({ state: "approved", approvalGrantId: manuallyApproved.approvalGrantId });
+    expect((await store.createRequest(secret.handle, action, "another name", { mcpClientName: "Claude", env: {} })).state)
+      .toBe("pending");
+
+    // The name grant does not carry over to a verified peer that shows the same name.
     const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
     const peerRequest = await store.createRequest(secret.handle, action, "verified peer", verified);
+    expect(peerRequest.state).toBe("pending");
     await store.approveRequest(peerRequest.id, { mode: "timed-session", agentScope: "any-agent" });
     expect((await store.prepareOneShotExecution(secret.handle, action, "verified repeat", verified)).kind).toBe("reusable");
-    expect((await store.prepareOneShotExecution(secret.handle, action, "name spoof", claimed)).kind).toBe("request");
-    expect((await store.listApprovalGrants())).toHaveLength(1);
+    expect((await store.prepareOneShotExecution(secret.handle, action, "Codex name spoof", reasonOnly)).kind).toBe("request");
+    expect((await store.listApprovalGrants())).toHaveLength(2);
   });
 
   it("binds managed reusable grants and one-shot permits to the verified principal", async () => {
@@ -4018,7 +4051,7 @@ describe("SecretStore", () => {
       .rejects.toThrow(/authorization changed|approval grant.*valid/i);
   });
 
-  it("checks the verified peer and session when claiming an approved request", async () => {
+  it("checks the verified peer or the creating session when claiming an approved request", async () => {
     const store = new SecretStore();
     const secret = await store.addSecret({
       name: "managed claim token", type: "api-token", value: fakeOpenAiToken("managed_claim"),
@@ -4054,33 +4087,73 @@ describe("SecretStore", () => {
     await expect(executeApprovedRequest(store, legacy.id, { caller: peer, engine: "typescript" }))
       .rejects.toThrow(/different verified agent or session/);
     await expect(executeApprovedRequest(store, legacy.id, { caller: ordinary, engine: "typescript" }))
-      .rejects.toThrow(/verified agent principal and session/);
+      .rejects.toThrow(/only requests its own session created/);
     expect((await store.getRequest(legacy.id)).state).toBe("approved");
     expect((await executeApprovedRequest(store, legacy.id, { engine: "typescript" })).stdout).toBe("claimed");
+
+    const session = { mcpClientName: "Codex", sessionNonce: "synthetic-session-nonce-a", env: {} };
+    const sameNameOtherSession = { mcpClientName: "Codex", sessionNonce: "synthetic-session-nonce-b", env: {} };
+    const own = await store.createRequest(secret.handle, action, "session claim", session);
+    expect(own.requesterSession).toMatch(/^[0-9a-f]{64}$/);
+    expect(own.requesterSession).not.toContain(session.sessionNonce);
+    expect(legacy.requesterSession).toBeUndefined();
+    await store.approveRequest(own.id);
+    for (const caller of [sameNameOtherSession, ordinary]) {
+      await expect(executeApprovedRequest(store, own.id, { caller, engine: "typescript" }))
+        .rejects.toThrow("An agent can execute only requests its own session created. Run this one from the s-gw app or CLI.");
+      expect((await store.getRequest(own.id)).state).toBe("approved");
+    }
+    await expect(executeApprovedRequest(store, own.id, { caller: peer, engine: "typescript" }))
+      .rejects.toThrow(/different verified agent or session/);
+    expect((await store.getRequest(own.id)).state).toBe("approved");
+    expect((await executeApprovedRequest(store, own.id, { caller: session, engine: "typescript" })).stdout).toBe("claimed");
+
+    const sessionForOperator = await store.createRequest(secret.handle, action, "session claim by operator", session);
+    await store.approveRequest(sessionForOperator.id);
+    expect((await executeApprovedRequest(store, sessionForOperator.id, { engine: "typescript" })).stdout).toBe("claimed");
 
     const operatorRequest = await store.createRequest(secret.handle, action, "operator claim", peer);
     await store.approveRequest(operatorRequest.id);
     expect((await executeApprovedRequest(store, operatorRequest.id, { engine: "typescript" })).stdout).toBe("claimed");
   });
 
-  it("keeps ordinary HTTPS and SSH approvals for operator execution", async () => {
+  it("keeps HTTPS and SSH approvals for the creating session or the operator", async () => {
     const store = new SecretStore();
     const httpSecret = await store.addSecret({ name: "claim HTTPS token", type: "api-token", value: "synthetic-http-token",
       policy: { allowedCommands: [SGW_HTTP_COMMAND], allowedDestinations: ["example.test:443"] } });
     const ordinary = { mcpClientName: "Codex", env: {} };
     const otherClient = { mcpClientName: "Claude", env: {} };
     const verified = { managedPrincipal: principalForVerifiedPeer("linux:codex", "Codex", "session-1"), env: {} };
+    const refusals: Array<[AgentIdentityContext, RegExp]> = [
+      [ordinary, /only requests its own session created/],
+      [otherClient, /only requests its own session created/],
+      [verified, /different verified agent or session/]
+    ];
     const http = await store.createRequest(httpSecret.handle, buildHttpRequestAction({
       url: "https://example.test/operation", method: "GET", headers: {}, auth: { kind: "bearer" }
     }), "ordinary HTTPS", ordinary);
     await store.approveRequest(http.id);
 
-    for (const caller of [ordinary, otherClient, verified]) {
-      await expect(store.claimApprovedRequest(http.id, caller)).rejects.toThrow(/verified agent/);
+    for (const [caller, refusal] of refusals) {
+      await expect(store.claimApprovedRequest(http.id, caller)).rejects.toThrow(refusal);
       expect((await store.getRequest(http.id)).state).toBe("approved");
     }
     expect((await store.claimApprovedRequest(http.id)).state).toBe("executing");
     await store.markFailed(http.id, "synthetic operator fixture complete");
+
+    const session = { mcpClientName: "Codex", sessionNonce: "synthetic-session-nonce-a", env: {} };
+    const otherSession = { mcpClientName: "Codex", sessionNonce: "synthetic-session-nonce-b", env: {} };
+    const sessionHttp = await store.createRequest(httpSecret.handle, buildHttpRequestAction({
+      url: "https://example.test/operation", method: "GET", headers: {}, auth: { kind: "bearer" }
+    }), "session HTTPS", session);
+    await store.approveRequest(sessionHttp.id);
+    const sessionRefusals: typeof refusals = [...refusals, [otherSession, /only requests its own session created/]];
+    for (const [caller, refusal] of sessionRefusals) {
+      await expect(store.claimApprovedRequest(sessionHttp.id, caller)).rejects.toThrow(refusal);
+      expect((await store.getRequest(sessionHttp.id)).state).toBe("approved");
+    }
+    expect((await store.claimApprovedRequest(sessionHttp.id, session)).state).toBe("executing");
+    await store.markFailed(sessionHttp.id, "synthetic session fixture complete");
 
     const sshSecret = await store.addSecret({ name: "claim SSH key", type: "ssh-key", value: "synthetic-ssh-key",
       policy: { allowedCommands: [SGW_SSH_SESSION_COMMAND] } });
@@ -4092,8 +4165,8 @@ describe("SecretStore", () => {
     const ssh = await store.createManagedSshRequest(sshSecret.handle, route.id,
       { injectEnv: "SGW_SSH_CREDENTIAL", args: ["id"] }, "ordinary managed SSH", ordinary);
     await store.approveRequest(ssh.id);
-    for (const caller of [ordinary, otherClient, verified]) {
-      await expect(store.claimApprovedRequest(ssh.id, caller)).rejects.toThrow(/verified agent/);
+    for (const [caller, refusal] of refusals) {
+      await expect(store.claimApprovedRequest(ssh.id, caller)).rejects.toThrow(refusal);
       expect((await store.getRequest(ssh.id)).state).toBe("approved");
     }
     expect((await store.claimApprovedRequest(ssh.id)).state).toBe("executing");
@@ -4103,8 +4176,8 @@ describe("SecretStore", () => {
       target: "tester@example.test", args: ["id"], injectEnv: "SGW_SSH_CREDENTIAL"
     }), "ordinary target SSH", ordinary);
     await store.approveRequest(targetSsh.id);
-    for (const caller of [ordinary, otherClient, verified]) {
-      await expect(store.claimApprovedRequest(targetSsh.id, caller)).rejects.toThrow(/verified agent/);
+    for (const [caller, refusal] of refusals) {
+      await expect(store.claimApprovedRequest(targetSsh.id, caller)).rejects.toThrow(refusal);
       expect((await store.getRequest(targetSsh.id)).state).toBe("approved");
     }
     expect((await store.claimApprovedRequest(targetSsh.id)).state).toBe("executing");

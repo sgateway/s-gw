@@ -248,6 +248,10 @@ export interface RequestRecord {
   approvalSeal?: string;
   /** Team-signed ancestors of the requesting process, nearest first. Display and trust setup only. */
   launcherSignatures?: ObservedLauncherSignature[];
+  /** Ancestor executables or publishers seen on Linux and Windows, nearest first. Evidence only. */
+  launchers?: string[];
+  /** Binds agent-side execution to the MCP session that created the request. */
+  requesterSession?: string;
   deniedAt?: string;
   executedAt?: string;
   resultSummary?: ExecutionSummary;

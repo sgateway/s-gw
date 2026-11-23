@@ -13,6 +13,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { anthropicSandboxConfig, isolatedAgentEnvironment, runAnthropicSandbox, sandboxAgentArguments, sandboxSessionRoot } from "../src/anthropic-sandbox.js";
 import { prepareGuardedRun, runGuardedAgent } from "../src/guard.js";
 import { buildEnvCommandAction } from "../src/gateway.js";
+import { buildHttpRequestAction } from "../src/http-action.js";
 import { executeApprovedRequest } from "../src/executor.js";
 import { SecretStore } from "../src/store.js";
 import { startSandboxBroker, runSandboxMcpBridge, ownedModuleCommand, brokerChildEnvironment } from "../src/sandbox-broker.js";
@@ -928,13 +929,19 @@ req.end();
     await new Promise<void>(resolve => https.listen(0, "127.0.0.1", resolve));
     const httpsAddress = https.address();
     if (!httpsAddress || typeof httpsAddress === "string") throw new Error("HTTPS fixture port missing");
-    await store.addSecret({ name: "sandbox HTTPS fixture", type: "api-token", value: httpPassword, policy: { allowedCommands: ["s-gw:https-request"], allowedDestinations: [`127.0.0.1:${httpsAddress.port}`] } });
+    const httpSecret = await store.addSecret({ name: "sandbox HTTPS fixture", type: "api-token", value: httpPassword, policy: { allowedCommands: ["s-gw:https-request"], allowedDestinations: [`127.0.0.1:${httpsAddress.port}`] } });
+    // Created and approved by the operator, so it carries no agent session and the sandboxed agent must not run it.
+    const operatorHttp = await store.createRequest(httpSecret.handle, buildHttpRequestAction({
+      url: `https://127.0.0.1:${httpsAddress.port}/operator-operation`, method: "GET", headers: {}, auth: { kind: "bearer" }
+    }), "Operator HTTPS fixture");
+    await store.approveRequest(operatorHttp.id);
+    expect(operatorHttp.requesterSession).toBeUndefined();
     process.env.NODE_EXTRA_CA_CERTS = tls.certFile;
     let launch: Promise<number> | undefined;
     try {
       launch = runGuardedAgent(store, {
         agent: "codex", command: process.execPath, args: [agent], cwd: path.join(root, "workspace"), sandbox: "anthropic",
-        env: { PATH: process.env.PATH, SGW_TEST_ROOT: root, SGW_TEST_PORT: String(address.port), SGW_TEST_HTTP_URL: `https://127.0.0.1:${httpsAddress.port}/operation`, SGW_TEST_ENV_REQUEST_ID: generic.id,
+        env: { PATH: process.env.PATH, SGW_TEST_ROOT: root, SGW_TEST_PORT: String(address.port), SGW_TEST_HTTP_URL: `https://127.0.0.1:${httpsAddress.port}/operation`, SGW_TEST_ENV_REQUEST_ID: generic.id, SGW_TEST_OPERATOR_REQUEST_ID: operatorHttp.id,
           SGW_MASTER_PASSPHRASE: process.env.SGW_MASTER_PASSPHRASE, SSH_AUTH_SOCK: "/synthetic/socket", BASH_ENV: "/missing/bash-env", NODE_OPTIONS: "--trace-warnings" }
       });
       const deadline = Date.now() + 15000;
@@ -948,41 +955,26 @@ req.end();
       await store.approveRequest(requestId!);
       expect(httpRequestId).toBeTruthy(); await store.approveRequest(httpRequestId!);
       await writeFile(path.join(root, "workspace", "approval-ready"), "approved fixture");
-      let sshClaimDenied = false;
-      while (!sshClaimDenied && Date.now() < deadline) {
-        try { await readFile(path.join(root, "workspace", "ssh-claim-denied")); sshClaimDenied = true; }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        if (!sshClaimDenied) await new Promise(resolve => setTimeout(resolve, 30));
-      }
-      expect(sshClaimDenied).toBe(true);
-      expect((await store.getRequest(requestId!)).state).toBe("approved");
-      const sshSummary = await executeApprovedRequest(store, requestId!);
-      expect(sshSummary.exitCode).toBe(0);
-      await writeFile(path.join(root, "workspace", "ssh-operator-result.json"), JSON.stringify(sshSummary));
-      await writeFile(path.join(root, "workspace", "ssh-operator-executed"), "trusted operator executed");
-      let claimDenied = false;
-      while (!claimDenied && Date.now() < deadline) {
-        try { await readFile(path.join(root, "workspace", "http-claim-denied")); claimDenied = true; }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        if (!claimDenied) await new Promise(resolve => setTimeout(resolve, 30));
-      }
-      expect(claimDenied).toBe(true);
-      expect(ownedHttpHits).toBe(0);
-      expect((await store.getRequest(httpRequestId!)).state).toBe("approved");
-      const httpSummary = await executeApprovedRequest(store, httpRequestId!, { http: { ca: tls.cert } });
-      expect(httpSummary.exitCode).toBe(0);
-      expect(ownedHttpHits).toBe(1);
-      await writeFile(path.join(root, "workspace", "operator-result.json"), JSON.stringify(httpSummary));
-      await writeFile(path.join(root, "workspace", "operator-executed"), "trusted operator executed");
       expect(await launch).toBe(0);
       expect(directConnections).toBe(0);
       const results = await readFile(path.join(root, "workspace", "results.json"), "utf8");
-      expect(JSON.parse(results)).toHaveLength(6);
+      expect(JSON.parse(results)).toHaveLength(7);
       expect(results).not.toContain(password);
       expect(results).not.toContain(httpPassword); expect(results).not.toContain(issued);
+      const agentOutput = await readFile(path.join(root, "workspace", "agent-output.json"), "utf8");
+      for (const value of [password, httpPassword, issued]) expect(agentOutput).not.toContain(value);
+      const sshSession = (await store.getRequest(requestId!)).requesterSession;
+      expect(sshSession).toMatch(/^[0-9a-f]{64}$/);
+      expect((await store.getRequest(httpRequestId!)).requesterSession).toBe(sshSession);
+      expect(ownedHttpHits).toBe(1);
       expect((await store.getRequest(httpRequestId!)).state).toBe("executed");
       expect((await store.getRequest(requestId!)).state).toBe("executed");
       expect((await store.getRequest(generic.id)).state).toBe("approved");
+      expect((await store.getRequest(operatorHttp.id)).state).toBe("approved");
+      const operatorSummary = await executeApprovedRequest(store, operatorHttp.id, { http: { ca: tls.cert } });
+      expect(operatorSummary.exitCode).toBe(0);
+      expect(ownedHttpHits).toBe(2);
+      expect(operatorSummary.stdout).not.toContain(httpPassword); expect(operatorSummary.stdout).not.toContain(issued);
       expect(SandboxManager.getProxyPort()).toBeUndefined();
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));

@@ -2385,7 +2385,7 @@ async function handleApprovalCommand(
       throw new Error("Use either --require-verified-agent or --allow-unverified-agent, not both.");
     }
     if (allowUnverified) {
-      throw new Error("Automatic approval now requires a verified agent. Approve ordinary requests once instead; --allow-unverified-agent is no longer supported.");
+      throw new Error("Automatic approval requires an identified agent; --allow-unverified-agent is no longer supported.");
     }
     printJson(
       await store.setApprovalSettings({
