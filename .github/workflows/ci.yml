@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, barry/anthropic-confinement-security-20261018]
+    branches: [main, barry/anthropic-confinement-security-20261018, barry/agent-identity-hardening]
   pull_request:
   workflow_dispatch:
 
